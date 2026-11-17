@@ -48,7 +48,7 @@
 <ul>
   <li>Each wrapped step is keyed by its script, the workflow and the job, so the same script in two jobs gets two keys.</li>
   <li>Steps that use an action (<code>uses:</code>) are not shell steps and run as usual.</li>
-  <li>Set <code>STOOP_SYNC_WRITE</code> only when you mean it. stoop treats the variable being present as yes, so don't set it to an empty string on pull requests; set it from a step guarded by <code>if:</code>, as above.</li>
+  <li>Set <code>STOOP_SYNC_WRITE</code> only on the default branch. An empty value or <code>0</code> is off, so <code>STOOP_SYNC_WRITE: ${{ github.ref == 'refs/heads/main' &amp;&amp; '1' || '' }}</code> works; setting it from a step guarded by <code>if:</code>, as above, is just as good.</li>
   <li>Sync never fails a step. If the remote is unreachable or refuses a push, stoop warns and the step runs as it would have without sync.</li>
 </ul>
 

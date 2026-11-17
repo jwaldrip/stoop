@@ -42,6 +42,7 @@ OPTIONS
 ENVIRONMENT
   STOOP_FULL=1      never skip; still record (nightly runs)
   STOOP_OFF=1       do not trace or skip anything
+                    (switches: empty, 0, false, no and off mean off; anything else is on)
 
 GITHUB ACTIONS
   Put this at the top of a workflow and every `run:` step is wrapped:
@@ -179,9 +180,9 @@ fn sync_for(o: &Opts) -> Result<sync::Remote, String> {
     let spec = o
         .sync
         .clone()
-        .or_else(|| std::env::var("STOOP_SYNC").ok())
+        .or_else(|| run::env_str("STOOP_SYNC"))
         .ok_or("no remote configured: pass --sync git[:remote] or set STOOP_SYNC")?;
-    let write = o.sync_write || std::env::var_os("STOOP_SYNC_WRITE").is_some();
+    let write = o.sync_write || run::env_flag("STOOP_SYNC_WRITE");
     sync::Remote::from_spec(&spec, &root, write)
 }
 
@@ -191,7 +192,7 @@ fn store_for(o: &Opts) -> proof::Store {
     proof::Store::new(
         o.store
             .clone()
-            .or_else(|| std::env::var_os("STOOP_STORE").map(PathBuf::from))
+            .or_else(|| run::env_str("STOOP_STORE").map(PathBuf::from))
             .unwrap_or_else(|| root.join(".stoop")),
     )
 }
