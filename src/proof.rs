@@ -51,6 +51,10 @@ pub fn sanitize(key: &str) -> String {
         .collect()
 }
 
+fn same_proof(a: &Proof, b: &Proof) -> bool {
+    a.inputs == b.inputs && a.env == b.env && a.outputs == b.outputs && a.probes == b.probes
+}
+
 pub fn now() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -83,8 +87,12 @@ impl Store {
 
     pub fn save(&self, key: &str, proof: Proof) -> io::Result<()> {
         let mut proofs = self.load(key);
-        proofs.retain(|p| p.inputs != proof.inputs || p.env != proof.env);
+        proofs.retain(|p| !same_proof(p, &proof));
         proofs.insert(0, proof);
+        self.write_proofs(key, proofs)
+    }
+
+    fn write_proofs(&self, key: &str, mut proofs: Vec<Proof>) -> io::Result<()> {
         proofs.truncate(MAX_PROOFS);
         let path = self.file(key);
         fs::create_dir_all(path.parent().unwrap())?;
@@ -101,6 +109,45 @@ impl Store {
         let tmp = path.with_extension(format!("tmp{}", std::process::id()));
         fs::write(&tmp, body)?;
         fs::rename(tmp, path)
+    }
+
+    /// The stored file, as published to a remote.
+    pub fn export(&self, key: &str) -> Option<Vec<u8>> {
+        fs::read(self.file(key)).ok()
+    }
+
+    /// Merge a published file into the local proofs, newest first. Returns how many
+    /// proofs were new. A file for another key or an unknown version is refused.
+    pub fn import(&self, key: &str, bytes: &[u8]) -> io::Result<usize> {
+        let bad = || io::Error::new(io::ErrorKind::InvalidData, "not a proof file for this key");
+        let theirs = serde_json::from_slice::<ProofFile>(bytes).map_err(|_| bad())?;
+        if theirs.v != 1 || theirs.key != key {
+            return Err(bad());
+        }
+        let mut proofs = self.load(key);
+        let mut added = 0;
+        for p in theirs.proofs {
+            if !proofs.iter().any(|q| same_proof(q, &p)) {
+                proofs.push(p);
+                added += 1;
+            }
+        }
+        if added > 0 {
+            proofs.sort_by_key(|p| std::cmp::Reverse(p.created));
+            self.write_proofs(key, proofs)?;
+        }
+        Ok(added)
+    }
+
+    pub fn key_of(bytes: &[u8]) -> Option<String> {
+        serde_json::from_slice::<ProofFile>(bytes)
+            .ok()
+            .map(|f| f.key)
+    }
+
+    pub fn newest_created(bytes: &[u8]) -> Option<u64> {
+        let f = serde_json::from_slice::<ProofFile>(bytes).ok()?;
+        f.proofs.iter().map(|p| p.created).max()
     }
 
     pub fn forget(&self, key: &str) -> io::Result<bool> {

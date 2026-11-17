@@ -3,6 +3,7 @@ mod input;
 mod pathutil;
 mod proof;
 mod run;
+mod sync;
 mod trace;
 
 use run::Opts;
@@ -20,6 +21,7 @@ USAGE
   stoop sh <script> [args...]                   shell mode for CI (see below)
   stoop ls [--store DIR]                        list recorded proofs
   stoop forget <key> [--store DIR]              drop a proof
+  stoop pull | prune [--sync git[:remote]]       fetch or expire shared proofs
 
 OPTIONS
   --key NAME        name the proof (default: derived from the command)
@@ -31,6 +33,8 @@ OPTIONS
   --max-age DUR     a proof stops counting after DUR (default 7d; 0 = never)
   --probe CMD       external state to verify: CMD's output must match for a skip
                     (repeatable; declares that a networked step is covered)
+  --sync SPEC       share proofs through the git remote (see SHARING PROOFS)
+  --sync-write      publish proofs to the remote (trusted runs only)
   --ignore PATTERN  paths whose reads do not count (also .stoopignore)
   --no-record       check and run, but never write a proof (untrusted jobs)
   --quiet           print nothing about the decision
@@ -44,6 +48,15 @@ GITHUB ACTIONS
     defaults:
       run:
         shell: stoop sh {0}
+
+SHARING PROOFS
+  --sync git[:REMOTE]  fetch proofs from the repository's git remote on a miss
+                       (refs/stoop/<key>); no server to host. Or set STOOP_SYNC.
+  --sync-write         publish proofs to it. Off by default: only trusted runs
+                       (the default branch) should write. Or STOOP_SYNC_WRITE=1.
+  stoop pull           fetch every published proof once, at the start of a job
+  stoop prune          delete published proofs older than --max-age (needs write)
+  Without push access, cache the `.stoop/` directory with the CI's own cache.
 
 BLIND SPOTS
   stoop sees files, not behavior. It cannot see the network, the clock, or
@@ -69,7 +82,7 @@ fn real_main(mut args: Vec<String>) -> i32 {
             println!("stoop {}", env!("CARGO_PKG_VERSION"));
             return 0;
         }
-        Some(c @ ("run" | "explain" | "sh" | "ls" | "forget")) => {
+        Some(c @ ("run" | "explain" | "sh" | "ls" | "forget" | "pull" | "prune")) => {
             let c = c.to_string();
             args.remove(0);
             c
@@ -108,6 +121,44 @@ fn real_main(mut args: Vec<String>) -> i32 {
                 }
             }
         }
+        "pull" => match sync_for(&o) {
+            Err(e) => {
+                eprintln!("stoop: {e}");
+                2
+            }
+            Ok(r) => match r.pull_all(&store_for(&o)) {
+                Ok(n) => {
+                    if !o.quiet {
+                        eprintln!("stoop: pulled {n} new proofs");
+                    }
+                    0
+                }
+                // Sync never fails a job: a remote that is down means a cold run, not a red build.
+                Err(e) => {
+                    eprintln!("stoop: sync: could not pull proofs ({e}); continuing");
+                    0
+                }
+            },
+        },
+        "prune" => match sync_for(&o) {
+            Err(e) => {
+                eprintln!("stoop: {e}");
+                2
+            }
+            Ok(r) => {
+                let age = o.max_age.unwrap_or(run::DEFAULT_MAX_AGE);
+                match r.prune(age) {
+                    Ok(n) => {
+                        eprintln!("stoop: removed {n} expired proofs from the remote");
+                        0
+                    }
+                    Err(e) => {
+                        eprintln!("stoop: {e}");
+                        1
+                    }
+                }
+            }
+        },
         "sh" => {
             let Some(script) = rest.first() else {
                 eprintln!("stoop: sh needs a script path");
@@ -120,6 +171,18 @@ fn real_main(mut args: Vec<String>) -> i32 {
             run::run(o, c == "explain")
         }
     }
+}
+
+fn sync_for(o: &Opts) -> Result<sync::Remote, String> {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let root = o.root.clone().unwrap_or_else(|| run::find_root(&cwd));
+    let spec = o
+        .sync
+        .clone()
+        .or_else(|| std::env::var("STOOP_SYNC").ok())
+        .ok_or("no remote configured: pass --sync git[:remote] or set STOOP_SYNC")?;
+    let write = o.sync_write || std::env::var_os("STOOP_SYNC_WRITE").is_some();
+    sync::Remote::from_spec(&spec, &root, write)
 }
 
 fn store_for(o: &Opts) -> proof::Store {
@@ -162,6 +225,8 @@ fn parse(args: &[String]) -> Result<(Opts, Vec<String>), String> {
             "--ignore-env" => o.ignore_env.push(val("--ignore-env")?),
             "--max-age" => o.max_age = Some(run::parse_age(&val("--max-age")?)?),
             "--probe" => o.probes.push(val("--probe")?),
+            "--sync" => o.sync = Some(val("--sync")?),
+            "--sync-write" => o.sync_write = true,
             "--quiet" => o.quiet = true,
             _ => return Err(format!("unknown option {a}")),
         }
