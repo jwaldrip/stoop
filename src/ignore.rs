@@ -83,7 +83,7 @@ impl Rule {
     }
 }
 
-fn glob(p: &[u8], s: &[u8]) -> bool {
+pub fn glob(p: &[u8], s: &[u8]) -> bool {
     // Iterative matcher with backtracking on the last `*` / `**`.
     let (mut pi, mut si) = (0usize, 0usize);
     // (pattern index after the star, string index to retry from, star crosses '/')
