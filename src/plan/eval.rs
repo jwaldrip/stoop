@@ -123,6 +123,9 @@ impl VirtualTree<'_> {
         Ok(state)
     }
     fn id(&mut self, p: &str, expected: &str) -> Result<String, String> {
+        if p == ".git" || p.starts_with(".git/") {
+            return Err("git metadata is not represented by the commit tree".into());
+        }
         let state = self.state(p)?;
         match state {
             State::Absent => Ok("a".into()),
