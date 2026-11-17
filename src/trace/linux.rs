@@ -552,9 +552,30 @@ fn read_cstr(pid: i32, addr: u64) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// `ip:port` for an IPv4 or IPv6 sockaddr, so a refusal says what the step talked to.
+fn describe_dest(sa: &[u8]) -> String {
+    let family = u16::from_ne_bytes([sa[0], sa[1]]) as i32;
+    let port = |i: usize| sa.get(i..i + 2).map(|b| u16::from_be_bytes([b[0], b[1]]));
+    match family {
+        libc::AF_INET => match (port(2), sa.get(4..8)) {
+            (Some(p), Some(a)) => format!("connect to {}.{}.{}.{}:{p}", a[0], a[1], a[2], a[3]),
+            _ => "connect to an IPv4 address".to_string(),
+        },
+        libc::AF_INET6 => match (port(2), sa.get(8..24)) {
+            (Some(p), Some(a)) => {
+                let mut octets = [0u8; 16];
+                octets.copy_from_slice(a);
+                format!("connect to [{}]:{p}", std::net::Ipv6Addr::from(octets))
+            }
+            _ => "connect to an IPv6 address".to_string(),
+        },
+        _ => "connect to a vsock peer".to_string(),
+    }
+}
+
 impl Tracer {
     fn flag(&mut self, why: &str) {
-        if !self.t.unsound.iter().any(|u| u == why) {
+        if self.t.unsound.len() < 16 && !self.t.unsound.iter().any(|u| u == why) {
             self.t.unsound.push(why.to_string());
         }
     }
@@ -630,9 +651,12 @@ impl Tracer {
             return;
         };
         match u16::from_ne_bytes([sa[0], sa[1]]) as i32 {
-            libc::AF_INET | libc::AF_INET6 | libc::AF_VSOCK => self.flag(&format!(
-                "it used the network, whose results a file trace cannot see; {blind}"
-            )),
+            libc::AF_INET | libc::AF_INET6 | libc::AF_VSOCK => {
+                let dest = describe_dest(&sa);
+                self.flag(&format!(
+                    "it used the network ({dest}), whose results a file trace cannot see; cover it with --probe, or {blind}"
+                ));
+            }
             libc::AF_UNIX => {
                 let rest = &sa[2..];
                 let end = rest.iter().position(|&b| b == 0).unwrap_or(rest.len());

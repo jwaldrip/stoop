@@ -7,6 +7,7 @@ use crate::proof::{now, sanitize, Proof, Store};
 use crate::trace::{self, Trace};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::Instant;
 
 #[derive(Default)]
@@ -24,6 +25,8 @@ pub struct Opts {
     pub allow_network: bool,
     /// Extra text searched for runner variable names (a CI step's script body).
     pub mention: String,
+    /// External state to verify: commands whose output must be unchanged for a skip.
+    pub probes: Vec<String>,
     /// Seconds a proof stays valid; 0 means forever. Default: 7 days.
     pub max_age: Option<u64>,
     pub argv: Vec<String>,
@@ -85,6 +88,39 @@ pub fn ambient_env(mention: &str, ignore: &[String]) -> Vec<String> {
         .collect();
     names.sort();
     names
+}
+
+/// Run each probe and hash what it prints. `None` if any fails: an external fact that
+/// could not be established is never assumed unchanged.
+pub fn run_probes(probes: &[String], cwd: &Path, quiet: bool) -> Option<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for p in probes {
+        let res = Command::new("sh")
+            .arg("-c")
+            .arg(p)
+            .current_dir(cwd)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        match res {
+            Ok(o) if o.status.success() => {
+                out.insert(p.clone(), blake3::hash(&o.stdout).to_hex().to_string());
+            }
+            Ok(o) => {
+                if !quiet {
+                    eprintln!("stoop: probe `{p}` failed ({})", o.status);
+                }
+                return None;
+            }
+            Err(e) => {
+                if !quiet {
+                    eprintln!("stoop: cannot run probe `{p}`: {e}");
+                }
+                return None;
+            }
+        }
+    }
+    Some(out)
 }
 
 fn env_hashes(names: &[String]) -> BTreeMap<String, String> {
@@ -193,6 +229,7 @@ pub fn run(o: Opts, explain: bool) -> i32 {
     let proofs = store.load(&key);
     let mut why = String::from("no proof yet");
     let mut hit: Option<&Proof> = None;
+    let mut probe_now: Option<Option<BTreeMap<String, String>>> = None;
     for (i, p) in proofs.iter().enumerate() {
         let expired = max_age > 0 && now().saturating_sub(p.created) > max_age;
         let diffs: Vec<(String, &'static str)> = if expired {
@@ -218,6 +255,24 @@ pub fn run(o: Opts, explain: bool) -> i32 {
             }
             d
         };
+        let mut diffs = diffs;
+        if diffs.is_empty() && (!p.probes.is_empty() || !o.probes.is_empty()) {
+            // External state is checked last: it can be slow, and files rule most proofs out first.
+            let fresh = probe_now.get_or_insert_with(|| run_probes(&o.probes, &cwd, o.quiet));
+            match fresh {
+                None => diffs.push(("probe".to_string(), "failed")),
+                Some(m) if *m != p.probes => {
+                    let which = m
+                        .keys()
+                        .chain(p.probes.keys())
+                        .find(|k| m.get(*k) != p.probes.get(*k))
+                        .cloned()
+                        .unwrap_or_else(|| "probe".to_string());
+                    diffs.push((format!("probe `{which}`"), "changed"));
+                }
+                Some(_) => {}
+            }
+        }
         if diffs.is_empty() {
             hit = Some(p);
             break;
@@ -261,7 +316,13 @@ pub fn run(o: Opts, explain: bool) -> i32 {
     }
 
     // 2. Run it, watched. Anything that stops the watch from working just runs the command.
-    let trace = match trace::run(&o.argv, &cwd, o.allow_network) {
+    let probes_before = if o.probes.is_empty() {
+        Some(BTreeMap::new())
+    } else {
+        run_probes(&o.probes, &cwd, o.quiet)
+    };
+    // Declaring a probe is declaring the external dependency, so network use is accepted.
+    let trace = match trace::run(&o.argv, &cwd, o.allow_network || !o.probes.is_empty()) {
         Ok(t) => t,
         Err(e) => {
             if !o.quiet {
@@ -274,6 +335,26 @@ pub fn run(o: Opts, explain: bool) -> i32 {
     if status != 0 || o.no_record {
         return status;
     }
+    // The external state the command saw must still be what it was when it finished.
+    let probes = match probes_before {
+        None => {
+            if !o.quiet {
+                eprintln!("stoop: not recorded: a probe failed before the run, so the external state is unknown");
+            }
+            return status;
+        }
+        Some(before) => {
+            if !o.probes.is_empty()
+                && run_probes(&o.probes, &cwd, o.quiet).as_ref() != Some(&before)
+            {
+                if !o.quiet {
+                    eprintln!("stoop: not recorded: a probe changed while the command ran");
+                }
+                return status;
+            }
+            before
+        }
+    };
 
     // 3. It passed: write down what it read.
     let ignore = Ignore::new(&o.ignore, Some(&root.join(".stoopignore")));
@@ -287,6 +368,7 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                 env: env_now,
                 inputs,
                 outputs,
+                probes,
             };
             match store.save(&key, proof) {
                 Ok(()) if !o.quiet => eprintln!("stoop: recorded {n} inputs for {key}"),

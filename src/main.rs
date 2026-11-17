@@ -29,6 +29,8 @@ OPTIONS
   --ignore-env NAME exempt a variable that changes without mattering
   --allow-network   record runs that used the network (see BLIND SPOTS)
   --max-age DUR     a proof stops counting after DUR (default 7d; 0 = never)
+  --probe CMD       external state to verify: CMD's output must match for a skip
+                    (repeatable; declares that a networked step is covered)
   --ignore PATTERN  paths whose reads do not count (also .stoopignore)
   --no-record       check and run, but never write a proof (untrusted jobs)
   --quiet           print nothing about the decision
@@ -159,6 +161,7 @@ fn parse(args: &[String]) -> Result<(Opts, Vec<String>), String> {
             "--allow-network" => o.allow_network = true,
             "--ignore-env" => o.ignore_env.push(val("--ignore-env")?),
             "--max-age" => o.max_age = Some(run::parse_age(&val("--max-age")?)?),
+            "--probe" => o.probes.push(val("--probe")?),
             "--quiet" => o.quiet = true,
             _ => return Err(format!("unknown option {a}")),
         }
