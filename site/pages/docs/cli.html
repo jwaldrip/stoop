@@ -1,0 +1,83 @@
+<!--meta {"title": "CLI reference", "description": "Every stoop command, option, environment variable and exit code.", "lede": "Every command, option, environment variable and exit code. <code>stoop --help</code> prints the short form.", "image": "06-hood", "alt": "A leather falconry hood, glove, jesses and a brass bell on a wooden perch."}-->
+<h2 id="commands">Commands</h2>
+<table>
+  <thead><tr><th>Command</th><th>What it does</th></tr></thead>
+  <tbody>
+    <tr><td><code>stoop run [options] -- &lt;command&gt; [args...]</code></td><td>Skip the command if a proof matches; otherwise run it traced and record a proof if it passes. The default, so <code>stoop -- make test</code> works too.</td></tr>
+    <tr><td><code>stoop explain [options] -- &lt;command&gt; [args...]</code></td><td>Say what would happen and why, without running anything. Prints what differed in each proof it checked.</td></tr>
+    <tr><td><code>stoop sh &lt;script&gt; [args...]</code></td><td>Shell mode for CI. Runs the script with <code>bash --noprofile --norc -eo pipefail</code>, keyed by the script's contents, <code>GITHUB_WORKFLOW</code>, <code>GITHUB_JOB</code> and the working directory. Made for <code>shell: stoop sh {0}</code>.</td></tr>
+    <tr><td><code>stoop ls [--store DIR]</code></td><td>List keys: proof count, inputs in the newest proof, and when it was created (Unix seconds).</td></tr>
+    <tr><td><code>stoop forget &lt;key&gt; [--store DIR]</code></td><td>Drop every proof for a key.</td></tr>
+    <tr><td><code>stoop pull [--sync git[:remote]]</code></td><td>Fetch every published proof from the remote once. Use it at the start of a job.</td></tr>
+    <tr><td><code>stoop prune [--sync git[:remote]] [--max-age DUR]</code></td><td>Delete published proofs older than <code>--max-age</code> (default 7d). Needs write access.</td></tr>
+    <tr><td><code>stoop --help</code>, <code>stoop --version</code></td><td>Help text and version.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="options">Options</h2>
+<p>Options go before <code>--</code>. Everything after it is the command.</p>
+<dl>
+  <dt id="opt-key">--key NAME</dt>
+  <dd>Name the proof yourself. The default is the program name plus a hash of the arguments and the working directory, like <code>cargo-46fcb2881638d3cc</code>.</dd>
+  <dt id="opt-root">--root DIR</dt>
+  <dd>The repository root. Defaults to the nearest directory containing <code>.git</code>, else the working directory. Paths inside the root are stored relative to it, and only reads inside it can be recorded as absent.</dd>
+  <dt id="opt-store">--store DIR</dt>
+  <dd>Where proofs live. Defaults to <code>&lt;root&gt;/.stoop</code>, or <code>$STOOP_STORE</code>.</dd>
+  <dt id="opt-env">--env NAME</dt>
+  <dd>Count this variable too. The environment already counts, minus runner bookkeeping (<code>GITHUB_</code>, <code>RUNNER_</code>, <code>ACTIONS_</code>, <code>INPUT_</code>, <code>STOOP_</code>); use this to put one of those back. Repeatable.</dd>
+  <dt id="opt-ignore-env">--ignore-env NAME</dt>
+  <dd>Exempt a variable that changes without mattering, such as a per-run token. Repeatable.</dd>
+  <dt id="opt-probe">--probe CMD</dt>
+  <dd>External state to verify. CMD runs with <code>sh -c</code> before the command; its output is hashed into the proof and must match again for a skip. A probe that fails, or prints something different after the command finishes, means nothing is recorded. Declaring a probe accepts network use for that step. Repeatable.</dd>
+  <dt id="opt-allow-network">--allow-network</dt>
+  <dd>Record runs that used the network anyway. You are vouching that the network can't change the result.</dd>
+  <dt id="opt-max-age">--max-age DUR</dt>
+  <dd>A proof stops counting after DUR: <code>90s</code>, <code>30m</code>, <code>12h</code>, <code>7d</code>, or a bare number of seconds. Default <code>7d</code>; <code>0</code> means never expire.</dd>
+  <dt id="opt-ignore">--ignore PATTERN</dt>
+  <dd>Paths whose reads don't count. Same syntax as <a href="stoopignore.html"><code>.stoopignore</code></a>. Repeatable.</dd>
+  <dt id="opt-no-record">--no-record</dt>
+  <dd>Check and skip as usual, but never write a proof. For jobs you don't trust.</dd>
+  <dt id="opt-sync">--sync git[:REMOTE]</dt>
+  <dd>On a miss, fetch this key's proofs from <code>refs/stoop/&lt;key&gt;</code> on the git remote (default <code>origin</code>) and check again. See <a href="ci.html#sync">git sync</a>.</dd>
+  <dt id="opt-sync-write">--sync-write</dt>
+  <dd>Publish proofs to that remote after a recorded run. Off by default; use it on the default branch only.</dd>
+  <dt id="opt-quiet">--quiet</dt>
+  <dd>Print nothing about the decision. The command's own output is untouched.</dd>
+</dl>
+
+<h2 id="environment">Environment</h2>
+<table>
+  <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
+  <tbody>
+    <tr><td><code>STOOP_FULL=1</code></td><td>Never skip; still record. For the nightly full run.</td></tr>
+    <tr><td><code>STOOP_OFF=1</code></td><td>Don't trace or skip; run commands directly.</td></tr>
+    <tr><td><code>STOOP_STORE=DIR</code></td><td>Default for <code>--store</code>.</td></tr>
+    <tr><td><code>STOOP_SYNC=git[:REMOTE]</code></td><td>Default for <code>--sync</code>.</td></tr>
+    <tr><td><code>STOOP_SYNC_WRITE=1</code></td><td>Same as <code>--sync-write</code>.</td></tr>
+  </tbody>
+</table>
+<p class="note">These are switches: stoop checks whether the variable is set, not what it is set to. <code>STOOP_SYNC_WRITE=</code> with an empty value still turns writing on, so leave it unset where you don't want it.</p>
+
+<h2 id="exit-codes">Exit codes</h2>
+<table>
+  <thead><tr><th>Command</th><th>Exit code</th></tr></thead>
+  <tbody>
+    <tr><td><code>run</code>, <code>sh</code></td><td>0 on a skip; otherwise the command's own code (128 + signal if it was killed). 127 if it couldn't be started.</td></tr>
+    <tr><td><code>explain</code></td><td>0 if the command would be skipped, 1 if it would run.</td></tr>
+    <tr><td><code>forget</code></td><td>0 if proofs were dropped, 1 if there were none for the key.</td></tr>
+    <tr><td><code>prune</code></td><td>0 on success, 1 if the remote refused.</td></tr>
+    <tr><td>Any</td><td>2 for a usage error, such as an unknown option.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="messages">What the messages mean</h2>
+<dl>
+  <dt>stoop: skip KEY: N inputs unchanged since T ago (Xms)</dt>
+  <dd>A proof matched. The command did not run.</dd>
+  <dt>stoop: run KEY: REASON</dt>
+  <dd>No proof matched. REASON is what differed from the newest one: <code>no proof yet</code>, <code>src/main.rs changed</code>, <code>env changed</code>, <code>proof expired</code>, <code>STOOP_FULL is set</code>.</dd>
+  <dt>stoop: recorded N inputs for KEY</dt>
+  <dd>The run passed and a proof was written.</dd>
+  <dt>stoop: not recorded: REASON</dt>
+  <dd>The run passed but couldn't be vouched for. See <a href="how-it-works.html#fails-wide">when it runs anyway</a>.</dd>
+</dl>

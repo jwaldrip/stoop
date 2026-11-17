@@ -1,0 +1,41 @@
+<!--meta {"title": "Blind spots", "description": "What a file trace can't see, and the settings that cover each gap: probes, expiry, the nightly full run.", "lede": "stoop sees files. Here is everything it can't see, and what covers each gap.", "image": "05-fog", "alt": "A peregrine on a dead branch, half lost in valley fog."}-->
+<h2 id="network">The network</h2>
+<p>A response from a server never shows up as a file read. So a run that connects out is not recorded, and stoop says where it connected:</p>
+<pre><code>stoop: not recorded: it used the network (connect to 192.168.64.1:53), whose results a file trace cannot see; cover it with --probe, or pass --allow-network to record it anyway</code></pre>
+<p>Connections to local services (a database on a Unix socket or localhost) are treated the same way. You have two ways to cover it:</p>
+<dl>
+  <dt>--probe CMD</dt>
+  <dd>
+    <p>Tell stoop how to check the external thing. The probe's output is hashed into the proof and must match before a skip. It runs before the command and again after, and if it changed in between, nothing is recorded.</p>
+<pre><code><span class="p">$</span> stoop run --probe 'curl -s https://example.com | sha256sum' \
+    -- sh -c 'curl -s https://example.com &gt; page.html'
+stoop: run sh-c98f8f9c8fef6d65: no proof yet
+stoop: recorded 71 inputs for sh-c98f8f9c8fef6d65
+<span class="p">$</span> stoop run --probe 'curl -s https://example.com | sha256sum' \
+    -- sh -c 'curl -s https://example.com &gt; page.html'
+stoop: skip sh-c98f8f9c8fef6d65: 71 inputs unchanged since 0s ago (100ms)</code></pre>
+    <p>Good probes are cheap and exact: a lockfile hash from a registry, <code>git ls-remote</code> for a dependency's branch, a schema version from a migration table.</p>
+  </dd>
+  <dt>--allow-network</dt>
+  <dd>Record it anyway. You are saying the network can't change the result, for example a download whose content is already pinned by a checksum the command verifies.</dd>
+</dl>
+
+<h2 id="clock">The clock and randomness</h2>
+<p>A test that depends on today's date, or on a random seed, reads nothing that a trace can see. Two settings bound how long that can hide:</p>
+<ul>
+  <li><strong>Expiry.</strong> A proof stops counting after 7 days by default. <code>--max-age</code> changes that; shorter is safer.</li>
+  <li><strong>The nightly full run.</strong> <code>STOOP_FULL=1</code> never skips and still records, so a scheduled run re-proves everything. See <a href="ci.html#nightly">the recipe</a>.</li>
+</ul>
+<p>Flaky tests stay flaky. If one passes once, stoop records that pass. The determinism check on the <a href="roadmap.html">roadmap</a> is aimed at this.</p>
+
+<h2 id="outside">Services outside the process tree</h2>
+<p>If a command depends on something it doesn't open itself, such as a daemon that reads files on its behalf, those reads are invisible. Cover the daemon's state with a probe, or don't wrap that step.</p>
+
+<h2 id="outputs">Output outside the repository</h2>
+<p>stoop checks that what a run wrote inside the repository is still there. It doesn't track output written elsewhere. A step whose whole job is to produce files outside the repository (publishing, deploying, filling a shared cache) shouldn't be wrapped.</p>
+
+<h2 id="git">Reading .git</h2>
+<p>A command that reads <code>.git</code> could depend on history, which a working-tree comparison can't see. Such runs aren't recorded. If the read can't change the result, add <code>.git</code> to <a href="stoopignore.html"><code>.stoopignore</code></a>.</p>
+
+<h2 id="platform">Platforms</h2>
+<p>Tracing needs Linux on x86-64 or arm64. Elsewhere stoop runs the command untraced and records nothing. Programs that use <code>io_uring</code> for file access are told it is unavailable (<code>ENOSYS</code>) so they fall back to calls the tracer can see; Node, for one, handles this.</p>

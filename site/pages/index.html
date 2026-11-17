@@ -1,0 +1,205 @@
+<!--meta {"title": "stoop: run only what matters", "description": "stoop wraps a command, traces every file it reads, and skips it when none of them changed since it last passed. No input lists."}-->
+<body>
+<a class="skip" href="#main">Skip to the page</a>
+<div data-chrome-progress role="progressbar" aria-label="Reading progress" aria-valuemin="0" aria-valuemax="100"></div>
+
+<header class="dive" id="top">
+  <figure class="dive-photo">
+    <img src="images/01-stoop.webp" srcset="images/01-stoop-800.webp 800w, images/01-stoop.webp 1024w" sizes="(max-width: 900px) 100vw, 40vw" width="1024" height="1536" alt="A peregrine falcon in its stoop, wings folded, plunging head first through a cold morning sky above a limestone valley." fetchpriority="high">
+  </figure>
+  <div class="dive-body">
+    <div class="topline">
+      <a class="lockup" href="index.html" aria-label="stoop">{{logo}}</a>
+      <nav aria-label="Site">
+        <a href="docs/getting-started.html">Field guide</a>
+        <a href="docs/cli.html">CLI</a>
+        <a href="https://github.com/jwaldrip/stoop">GitHub</a>
+      </nav>
+    </div>
+    <h1>Run only what matters.</h1>
+    <p class="lede"><strong>stoop</strong> wraps a command and watches every file it reads. The next time, if none of those files changed, it skips the command. If one did, it runs it and learns again. There are no input lists to write and none to keep current.</p>
+    <div class="install">
+      <pre><code><span class="p">$</span> cargo install --locked --git https://github.com/jwaldrip/stoop</code></pre>
+      <p>Tracing needs Linux on x86-64 or arm64. On macOS stoop builds and runs the command untraced, and records nothing.</p>
+    </div>
+    <p class="onward"><a href="docs/getting-started.html">Start with the field guide</a></p>
+
+    <figure>
+      <div class="term" role="img" aria-label="Terminal session: stoop runs cargo build and records 668 inputs, skips the same build in 289 milliseconds, then reports that an edit to src/ignore.rs means the build would run.">
+        <div class="cmd">stoop run -- cargo build</div>
+        <div class="out">stoop: run cargo-46fcb2881638d3cc: no proof yet</div>
+        <div class="elide">   … cargo compiles …</div>
+        <div class="out">stoop: recorded 668 inputs for cargo-46fcb2881638d3cc</div>
+        <div class="cmd">stoop run -- cargo build</div>
+        <div class="out hit">stoop: skip cargo-46fcb2881638d3cc: 668 inputs unchanged since 1s ago (289ms)</div>
+        <div class="cmd">echo '// tweak' &gt;&gt; src/ignore.rs</div>
+        <div class="cmd">stoop explain -- cargo build</div>
+        <div class="out">proof 1 (1s ago):
+  changed: src/ignore.rs</div>
+        <div class="out">stoop: would run cargo-46fcb2881638d3cc: src/ignore.rs changed</div>
+      </div>
+      <figcaption>Captured, not typed: stoop's own source as a fresh clone, Linux arm64 in a throwaway container, stoop at commit <code>c9082e1</code>. Only cargo's progress lines are cut.</figcaption>
+    </figure>
+  </div>
+</header>
+
+<main id="main">
+<section class="flock" id="why">
+  <h2>Most of a pipeline has nothing new to say.</h2>
+  <div class="flock-text">
+    <p>CI reruns every step on every push. Most of those steps read the same files they read last time and reach the same answer. When agents push all day, that waste compounds.</p>
+    <p>stoop picks out the step whose inputs moved and lets the rest stay folded.</p>
+  </div>
+  <figure class="flock-photo">
+    <img src="images/02-murmuration.webp" srcset="images/02-murmuration-800.webp 800w, images/02-murmuration.webp 1536w" sizes="100vw" width="1536" height="1024" loading="lazy" alt="A murmuration of thousands of starlings over a frosted marsh, and one peregrine diving at a single bird at its edge." data-chrome-lightbox>
+  </figure>
+</section>
+
+<section class="ledger" id="numbers">
+  <div>
+    <h3>From the transcript above</h3>
+    <p>One cargo build of stoop itself, measured with the shell's <code>time</code>. A skip still hashes every input byte for byte, the toolchain included. That is the cost of being sure.</p>
+  </div>
+  <table>
+    <thead><tr><th scope="col">Measured</th><th scope="col">What happened</th></tr></thead>
+    <tbody>
+      <tr><td class="num">3.64&thinsp;s</td><td>First run: cargo built the project while stoop traced it, then recorded 668 inputs.</td></tr>
+      <tr><td class="num">0.29&thinsp;s</td><td>Second run: all 668 inputs unchanged, so the build was skipped.</td></tr>
+      <tr><td class="num">1 line</td><td>A comment appended to <code>src/ignore.rs</code>. <code>stoop explain</code> named the file and exited 1: this would run.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="watch" id="how">
+  <figure class="watch-photo">
+    <img src="images/03-ledge.webp" srcset="images/03-ledge-800.webp 800w, images/03-ledge.webp 1536w" sizes="(max-width: 900px) 100vw, 50vw" width="1536" height="1024" loading="lazy" alt="A peregrine on a limestone ledge, eye fixed on the valley far below." data-chrome-lightbox>
+  </figure>
+  <div class="watch-body">
+    <h2>It watches the command, not a list.</h2>
+    <p>Declared inputs drift. Someone adds a config file, a script reads an environment variable, a toolchain updates, and the cache key never hears about it. stoop doesn't ask. It looks.</p>
+    <ol class="beats">
+      <li><strong>Watch.</strong> The command runs under a tracer: ptrace plus a seccomp filter, so only file system calls stop. Every path the process tree opens, executes, looks up or lists is noted, child processes included.</li>
+      <li><strong>Record.</strong> When the command passes, stoop writes a proof: each path with a hash of every byte, files that were looked for and absent, directory listings, symlink targets, the environment, and what the run wrote inside the repository.</li>
+      <li><strong>Compare.</strong> Next time it hashes the same paths. If all of them match, the environment matches, and the outputs are still in place, the command is skipped in the time it takes to hash them.</li>
+      <li><strong>When unsure, run.</strong> No proof, an expired proof, a trace that might be incomplete, a read of <code>.git</code>, or use of the network: the command runs and nothing is recorded. Being wrong costs a rerun, never a missed failure.</li>
+    </ol>
+    <p><a href="docs/how-it-works.html">How it works, in full</a></p>
+  </div>
+</section>
+
+<section class="lines" id="ci">
+  <div class="lines-body">
+    <h2>Two lines in GitHub Actions.</h2>
+    <p>Put this at the top of a workflow and every <code>run:</code> step goes through stoop. No per-step edits.</p>
+<pre><code><span class="k">defaults</span>:
+  <span class="k">run</span>:
+    <span class="k">shell</span>: stoop sh {0}</code></pre>
+    <p class="aside">Each step is keyed by its script, the workflow and the job. Steps that use an action (checkout, setup) run as usual, and the step that installs stoop sets <code>shell: bash</code> for itself. Share proofs between runs through your git remote with <code>--sync git</code>, or cache the <code>.stoop/</code> directory with the CI's own cache. Pull requests read; only the default branch writes.</p>
+    <p><a href="docs/ci.html">Recipes for GitHub Actions, GitLab CI, CircleCI and Buildkite</a></p>
+  </div>
+  <figure class="lines-photo">
+    <img src="images/04-city.webp" srcset="images/04-city-800.webp 800w, images/04-city.webp 1536w" sizes="(max-width: 900px) 100vw, 45vw" width="1536" height="1024" loading="lazy" alt="A peregrine on the parapet of a high-rise at dawn, the city in haze far below." data-chrome-lightbox>
+  </figure>
+</section>
+
+<section class="sight" id="sight">
+  <div>
+    <h2>What it sees, and what it can't.</h2>
+    <table>
+      <tbody>
+        <tr><th scope="row">Files read, executed, looked up or listed</th><td>Traced. Every byte hashed, inside the repository and out, so a changed compiler or lockfile counts.</td></tr>
+        <tr><th scope="row">A file that was absent and appears</th><td>Recorded as absent inside the repository, so a new config file that would be picked up triggers a run.</td></tr>
+        <tr><th scope="row">The environment</th><td>Every variable, minus the runner's per-run bookkeeping. <code>--ignore-env NAME</code> exempts one that changes without mattering.</td></tr>
+        <tr><th scope="row">What the run wrote in the repository</th><td>Must still be there, unchanged, for a skip. Throwaway output goes in <code>.stoopignore</code>.</td></tr>
+        <tr><th scope="row">External state you can check</th><td><code>--probe CMD</code>: the command's output is hashed into the proof and must match again before a skip.</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div>
+    <figure class="fog">
+      <img src="images/05-fog.webp" srcset="images/05-fog-800.webp 800w, images/05-fog.webp 1536w" sizes="(max-width: 900px) 100vw, 35vw" width="1536" height="1024" loading="lazy" alt="A peregrine on a dead branch, half lost in valley fog." data-chrome-lightbox>
+    </figure>
+    <dl class="blind">
+      <dt>The network</dt>
+      <dd>A run that connects out is not recorded, and stoop names where it connected. Cover it with a probe, or pass <code>--allow-network</code>.</dd>
+      <dt>The clock and randomness</dt>
+      <dd>Invisible to a file trace. Proofs expire after 7 days, and <code>STOOP_FULL=1</code> re-proves everything. Run that nightly.</dd>
+      <dt>Anything outside Linux</dt>
+      <dd>Tracing is Linux only. Elsewhere the command just runs.</dd>
+    </dl>
+    <p><a href="docs/blind-spots.html">Blind spots and how to cover them</a></p>
+  </div>
+</section>
+
+<section class="against" id="compared">
+  <div class="intro">
+    <h2>Declared inputs, observed inputs.</h2>
+    <p>Build caches have to know what a task depends on. Most are told. stoop finds out. The other tools do things stoop doesn't, like task graphs, restoring cached outputs and, in Bazel's case, remote execution. stoop is one binary around one command, and it sits happily inside any of them.</p>
+  </div>
+  <table>
+    <thead><tr><th scope="col">Tool</th><th scope="col">How it learns what a task depends on</th><th scope="col">What you keep current</th></tr></thead>
+    <tbody>
+      <tr><th scope="row">Bazel</th><td>Each target declares its sources and dependencies in BUILD files. <a class="src" href="https://bazel.build/concepts/dependencies">bazel.build</a></td><td>BUILD files</td></tr>
+      <tr><th scope="row">Nx</th><td>Hashes a target's inputs: file sets, runtime values and environment variables named in <code>nx.json</code> or project config. <a class="src" href="https://nx.dev/docs/reference/inputs">nx.dev</a></td><td><code>inputs</code> and <code>namedInputs</code></td></tr>
+      <tr><th scope="row">Turborepo</th><td>By default hashes every git-tracked file in the package; the <code>inputs</code> key narrows it. <a class="src" href="https://turborepo.dev/docs/crafting-your-repository/configuring-tasks">turborepo.dev</a></td><td><code>inputs</code> globs</td></tr>
+      <tr><th scope="row">actions/cache</th><td>You compose the key, usually from <code>hashFiles()</code> over globs you choose. <a class="src" href="https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching">docs.github.com</a></td><td>The key expression</td></tr>
+      <tr class="us"><th scope="row">stoop</th><td>Traces the files the command actually opened, executed, looked up or listed, and hashes those.</td><td>Nothing. A <code>.stoopignore</code> for noise, if you want one.</td></tr>
+    </tbody>
+  </table>
+</section>
+
+<section class="guide" id="guide">
+  <figure class="guide-photo">
+    <img src="images/06-hood.webp" srcset="images/06-hood-800.webp 800w, images/06-hood.webp 1536w" sizes="(max-width: 900px) 100vw, 42vw" width="1536" height="1024" loading="lazy" alt="A leather falconry hood, glove, jesses and a brass bell on a wooden perch atop a limestone wall." data-chrome-lightbox>
+  </figure>
+  <div class="guide-body">
+    <h2>The field guide.</h2>
+    <p>Everything you need to wrap a step, share proofs between runs, and know where the edges are.</p>
+    <ol class="contents">
+      <li><span class="n">i</span><a href="docs/getting-started.html">Getting started</a><p>Install, the first run, reading <code>explain</code>.</p></li>
+      <li><span class="n">ii</span><a href="docs/how-it-works.html">How it works</a><p>The tracer, proofs, keys, and every reason it refuses to record.</p></li>
+      <li><span class="n">iii</span><a href="docs/ci.html">CI recipes</a><p>GitHub Actions, GitLab CI, CircleCI, Buildkite, the cache directory and git sync.</p></li>
+      <li><span class="n">iv</span><a href="docs/cli.html">CLI reference</a><p>Every command, flag, variable and exit code.</p></li>
+      <li><span class="n">v</span><a href="docs/stoopignore.html">.stoopignore</a><p>Paths whose reads don't count.</p></li>
+      <li><span class="n">vi</span><a href="docs/blind-spots.html">Blind spots</a><p>The network, the clock, randomness, and the knobs that cover them.</p></li>
+      <li><span class="n">vii</span><a href="docs/faq.html">FAQ</a><p>Short answers to the questions people ask first.</p></li>
+      <li><span class="n">viii</span><a href="docs/roadmap.html">Roadmap</a><p>Where it is going. Not shipped.</p></li>
+    </ol>
+  </div>
+</section>
+
+<section class="ahead" id="ahead">
+  <div class="ahead-body">
+    <h2>Still learning to fly.</h2>
+    <p>Today a skip needs byte-equal inputs. The roadmap loosens that one careful step at a time. None of this is built yet.</p>
+    <ol>
+      <li><strong>Equal build artifacts.</strong> Skip downstream steps when a rebuild produced the same bytes, and hash executables without build ids and timestamps.</li>
+      <li><strong>Normalized source.</strong> Ignore comment and whitespace edits, per language, keeping directives that change behavior.</li>
+      <li><strong>Finer grain.</strong> Use coverage to tie a test to the code it actually ran.</li>
+      <li><strong>A determinism check.</strong> Run twice at record time and refuse to record a step that disagrees with itself.</li>
+      <li><strong>Static vetoes.</strong> Refuse to skip a step whose code calls the clock or a random source. This can only make stoop run more, never less.</li>
+      <li><strong>Restored outputs.</strong> Let a skip also put back what the command produced.</li>
+    </ol>
+    <p><a href="docs/roadmap.html">The roadmap, with the reasoning</a></p>
+  </div>
+  <figure class="ahead-photo">
+    <img src="images/08-eyas.webp" srcset="images/08-eyas-800.webp 800w, images/08-eyas.webp 1536w" sizes="(max-width: 900px) 100vw, 45vw" width="1536" height="1024" loading="lazy" alt="A young peregrine with brown streaked plumage at the edge of its cliff nest, wings half open." data-chrome-lightbox>
+  </figure>
+</section>
+</main>
+
+<footer class="dusk">
+  <img src="images/07-dusk.webp" srcset="images/07-dusk-800.webp 800w, images/07-dusk.webp 1536w" sizes="100vw" width="1536" height="1024" loading="lazy" alt="A lone peregrine high over a limestone escarpment at dusk.">
+  <div class="foot">
+    <a class="lockup" href="#top" aria-label="Back to the top">{{logo}}</a>
+    <nav aria-label="Footer">
+      <a href="docs/getting-started.html">Field guide</a>
+      <a href="https://github.com/jwaldrip/stoop">GitHub</a>
+      <a href="https://github.com/jwaldrip/stoop/issues">Issues</a>
+      <a href="https://github.com/jwaldrip/stoop/blob/main/LICENSE">MIT license</a>
+    </nav>
+    <p>The name is the peregrine's hunting dive: fold in, drop on the one thing that matters.</p>
+  </div>
+</footer>
+</body>
+</html>
