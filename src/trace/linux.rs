@@ -25,6 +25,7 @@ const PR_SET_NO_NEW_PRIVS: libc::c_int = 38;
 const SECCOMP_MODE_FILTER: libc::c_ulong = 2;
 const SECCOMP_RET_ALLOW: u32 = 0x7fff_0000;
 const SECCOMP_RET_TRACE: u32 = 0x7ff0_0000;
+const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const NT_PRSTATUS: usize = 1;
 const AT_FDCWD: i32 = -100;
 const PATH_MAX: usize = 4096;
@@ -194,10 +195,6 @@ fn table() -> Vec<(i64, Vec<Op>)> {
                 dir: false,
             }],
         ),
-        (
-            s(libc::SYS_io_uring_setup),
-            vec![Unsound("it used io_uring, which the tracer cannot follow")],
-        ),
         (s(libc::SYS_connect), vec![Connect]),
     ];
     #[cfg(target_arch = "x86_64")]
@@ -328,13 +325,24 @@ fn table() -> Vec<(i64, Vec<Op>)> {
     t
 }
 
-fn bpf_filter(nrs: &[i64]) -> Vec<libc::sock_filter> {
+/// Syscalls the kernel refuses with ENOSYS for traced processes. io_uring moves file
+/// operations out of reach of a syscall tracer; runtimes that use it (libuv, tokio)
+/// fall back to ordinary syscalls when it is unavailable, so denying it keeps every
+/// file access visible.
+#[allow(clippy::unnecessary_cast)] // c_long is i64 on the supported arches, but not everywhere
+fn denied() -> Vec<i64> {
+    vec![libc::SYS_io_uring_setup as i64]
+}
+
+fn bpf_filter(nrs: &[i64], deny: &[i64]) -> Vec<libc::sock_filter> {
     const LD_W_ABS: u16 = 0x20;
     const JEQ_K: u16 = 0x15;
     const RET_K: u16 = 0x06;
-    let n = nrs.len();
-    let l_trace = 3 + n + 1;
-    let mut f = Vec::with_capacity(l_trace + 1);
+    let (n, d) = (nrs.len(), deny.len());
+    let l_allow = 3 + n + d;
+    let l_trace = l_allow + 1;
+    let l_errno = l_allow + 2;
+    let mut f = Vec::with_capacity(l_errno + 1);
     let ins = |code, jt, jf, k| libc::sock_filter { code, jt, jf, k };
     f.push(ins(LD_W_ABS, 0, 0, 4)); // arch
     f.push(ins(JEQ_K, 0, (l_trace - 2) as u8, AUDIT_ARCH));
@@ -343,8 +351,13 @@ fn bpf_filter(nrs: &[i64]) -> Vec<libc::sock_filter> {
         let idx = 3 + i;
         f.push(ins(JEQ_K, (l_trace - idx - 1) as u8, 0, *nr as u32));
     }
+    for (i, nr) in deny.iter().enumerate() {
+        let idx = 3 + n + i;
+        f.push(ins(JEQ_K, (l_errno - idx - 1) as u8, 0, *nr as u32));
+    }
     f.push(ins(RET_K, 0, 0, SECCOMP_RET_ALLOW));
     f.push(ins(RET_K, 0, 0, SECCOMP_RET_TRACE));
+    f.push(ins(RET_K, 0, 0, SECCOMP_RET_ERRNO | libc::ENOSYS as u32));
     f
 }
 
@@ -376,7 +389,7 @@ pub fn run(argv: &[String], cwd: &Path, allow_network: bool) -> io::Result<Trace
     }
     let tbl = table();
     let nrs: Vec<i64> = tbl.iter().map(|(n, _)| *n).collect();
-    let filter = bpf_filter(&nrs);
+    let filter = bpf_filter(&nrs, &denied());
     let prog = libc::sock_fprog {
         len: filter.len() as u16,
         filter: filter.as_ptr() as *mut libc::sock_filter,
@@ -733,6 +746,13 @@ impl Tracer {
                 Op::Write { dirfd, path, dir } => {
                     if let Some(p) = self.resolve(pid, &args, dirfd, path) {
                         if dir {
+                            // We see the call before it runs. mkdir on a path that already
+                            // exists fails with EEXIST and creates nothing: `create_dir_all`
+                            // and `mkdir -p` do this for every ancestor, and recording those
+                            // would turn the whole repository into "output".
+                            if std::fs::symlink_metadata(&p).is_ok() {
+                                continue;
+                            }
                             self.t.created_dirs.push(p.clone());
                         }
                         self.t.written.insert(p);

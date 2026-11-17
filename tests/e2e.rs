@@ -417,6 +417,40 @@ fn shell_mode_keys_on_script_content_not_its_file_name() {
 }
 
 #[test]
+fn mkdir_over_existing_ancestors_does_not_hide_the_inputs() {
+    // `mkdir -p` (and Rust's create_dir_all, and so cargo) calls mkdir on every ancestor
+    // of the target, top down. Those calls fail with EEXIST. They once turned the whole
+    // repository into "output" and an edit to a read file went unnoticed.
+    let w = Ws::new("mkdirp");
+    let script = "mkdir -p \"$PWD/out/deep\"; cat in.txt > /dev/null";
+    let (c, e) = w.sh(script);
+    assert_eq!(c, 0, "{e}");
+    w.write("in.txt", "edited");
+    let (_, e) = w.sh(script);
+    assert!(
+        !skipped(&e) && e.contains("in.txt changed"),
+        "an edit to a file the command read must be seen: {e}"
+    );
+}
+
+#[test]
+fn io_uring_is_refused_inside_a_traced_command_so_runtimes_fall_back() {
+    let w = Ws::new("iouring");
+    // syscall 425 is io_uring_setup on x86-64 and arm64. Entries = 0 is EINVAL natively;
+    // under stoop the kernel answers ENOSYS (38) before the call is looked at.
+    let probe = "perl -e 'syscall(425, 0, 0); exit(($!+0) == 38 ? 0 : 7)'; cat in.txt > /dev/null";
+    let (code, e) = w.sh(probe);
+    assert_eq!(
+        code, 0,
+        "io_uring_setup should have been refused with ENOSYS: {e}"
+    );
+    assert!(
+        e.contains("recorded"),
+        "refusing io_uring must not make the run unrecordable: {e}"
+    );
+}
+
+#[test]
 fn an_expired_proof_no_longer_skips() {
     let w = Ws::new("expiry");
     let run = |age: &str| {
