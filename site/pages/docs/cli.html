@@ -56,7 +56,7 @@
     <tr><td><code>STOOP_SYNC_WRITE=1</code></td><td>Same as <code>--sync-write</code>.</td></tr>
   </tbody>
 </table>
-<p class="note">These are switches: stoop checks whether the variable is set, not what it is set to. <code>STOOP_SYNC_WRITE=</code> with an empty value still turns writing on, so leave it unset where you don't want it.</p>
+<p class="note">These are switches. A variable that is empty, or set to <code>0</code>, <code>false</code>, <code>no</code> or <code>off</code>, is off; anything else is on. That makes the common CI idiom <code>STOOP_SYNC_WRITE: ${{ github.ref == 'refs/heads/main' &amp;&amp; '1' || '' }}</code> safe: the empty string on a pull request does not turn publishing on. An empty <code>STOOP_SYNC</code> or <code>STOOP_STORE</code> counts as unset.</p>
 
 <h2 id="exit-codes">Exit codes</h2>
 <table>

@@ -142,6 +142,25 @@ fn env_hashes(names: &[String]) -> BTreeMap<String, String> {
 /// (the clock above all): a test that depends on today's date is wrong for at most this long.
 pub const DEFAULT_MAX_AGE: u64 = 7 * 86_400;
 
+/// An on/off environment switch. Empty, `0`, `false`, `no` and `off` are off. That
+/// matters for the common CI idiom `X: ${{ cond && '1' || '' }}`, which sets the
+/// variable to an empty string when the condition is false: merely being set must
+/// not turn on something that publishes proofs.
+pub fn env_flag(name: &str) -> bool {
+    match std::env::var(name) {
+        Ok(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v.is_empty() || matches!(v.as_str(), "0" | "false" | "no" | "off"))
+        }
+        Err(_) => false,
+    }
+}
+
+/// A string environment variable; empty counts as unset.
+pub fn env_str(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
 /// "90s", "30m", "12h", "7d", or a bare number of seconds. "0" means never expire.
 pub fn parse_age(s: &str) -> Result<u64, String> {
     let s = s.trim();
@@ -190,7 +209,7 @@ pub fn run(o: Opts, explain: bool) -> i32 {
         eprintln!("stoop: no command given");
         return 2;
     }
-    if std::env::var_os("STOOP_OFF").is_some() && !explain {
+    if env_flag("STOOP_OFF") && !explain {
         return plain(&o.argv);
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -208,10 +227,10 @@ pub fn run(o: Opts, explain: bool) -> i32 {
     let store = Store::new(
         o.store
             .clone()
-            .or_else(|| std::env::var_os("STOOP_STORE").map(PathBuf::from))
+            .or_else(|| env_str("STOOP_STORE").map(PathBuf::from))
             .unwrap_or_else(|| root.join(".stoop")),
     );
-    let full = std::env::var_os("STOOP_FULL").is_some();
+    let full = env_flag("STOOP_FULL");
     let max_age = o
         .max_age
         .or_else(|| {
@@ -232,9 +251,9 @@ pub fn run(o: Opts, explain: bool) -> i32 {
     let remote = o
         .sync
         .clone()
-        .or_else(|| std::env::var("STOOP_SYNC").ok())
+        .or_else(|| env_str("STOOP_SYNC"))
         .and_then(|spec| {
-            let write = o.sync_write || std::env::var_os("STOOP_SYNC_WRITE").is_some();
+            let write = o.sync_write || env_flag("STOOP_SYNC_WRITE");
             match Remote::from_spec(&spec, &root, write) {
                 Ok(r) => Some(r),
                 Err(e) => {

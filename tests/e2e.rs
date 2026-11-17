@@ -603,6 +603,82 @@ fn republishing_keeps_proofs_other_runs_published() {
     assert!(skipped(&run_sync(&c, &["--sync", "git"]).1), "variant two");
 }
 
+/// Run with `--sync git` and the given STOOP_* variables set in the environment.
+fn run_with_env(w: &Ws, vars: &[(&str, &str)]) -> String {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_stoop"));
+    c.args([
+        "run", "--root", ".", "--key", "s", "--sync", "git", "--", "sh", "-c", SCRIPT,
+    ])
+    .current_dir(&w.root)
+    .env(
+        "STOOP_STORE",
+        w.root.join("..").join(format!(
+            "{}-store",
+            w.root.file_name().unwrap().to_string_lossy()
+        )),
+    )
+    .env_remove("STOOP_FULL")
+    .env_remove("STOOP_OFF")
+    .env_remove("STOOP_SYNC_WRITE");
+    for (k, v) in vars {
+        c.env(k, v);
+    }
+    String::from_utf8_lossy(&c.output().unwrap().stderr).into_owned()
+}
+
+#[test]
+fn an_empty_or_false_sync_write_variable_does_not_publish() {
+    // The CI idiom `STOOP_SYNC_WRITE: ${{ cond && '1' || '' }}` sets the variable to an
+    // empty string when the condition is false. That must not turn publishing on.
+    for (i, v) in ["", "0", "false", "no", "off", "  "].iter().enumerate() {
+        let remote = bare(&format!("envoff{i}"));
+        let w = Ws::new(&format!("envoff{i}")).with_remote(&remote);
+        let e = run_with_env(&w, &[("STOOP_SYNC_WRITE", v)]);
+        assert!(
+            e.contains("recorded") && !e.contains("published"),
+            "value {v:?}: {e}"
+        );
+        assert!(
+            published(&remote).is_empty(),
+            "value {v:?} must not publish"
+        );
+    }
+}
+
+#[test]
+fn a_truthy_sync_write_variable_publishes() {
+    for (i, v) in ["1", "true", "yes"].iter().enumerate() {
+        let remote = bare(&format!("envon{i}"));
+        let w = Ws::new(&format!("envon{i}")).with_remote(&remote);
+        let e = run_with_env(&w, &[("STOOP_SYNC_WRITE", v)]);
+        assert!(e.contains("published"), "value {v:?}: {e}");
+        assert_eq!(published(&remote).len(), 1, "value {v:?}");
+    }
+}
+
+#[test]
+fn an_empty_or_zero_full_variable_does_not_force_a_rerun() {
+    let remote = bare("fullzero");
+    let w = Ws::new("fullzero").with_remote(&remote);
+    run_with_env(&w, &[]);
+    for v in ["", "0", "false"] {
+        let e = run_with_env(&w, &[("STOOP_FULL", v)]);
+        assert!(
+            skipped(&e),
+            "STOOP_FULL={v:?} must not disable skipping: {e}"
+        );
+    }
+    assert!(!skipped(&run_with_env(&w, &[("STOOP_FULL", "1")])));
+}
+
+#[test]
+fn an_empty_off_variable_does_not_disable_stoop() {
+    let remote = bare("offempty");
+    let w = Ws::new("offempty").with_remote(&remote);
+    run_with_env(&w, &[]);
+    assert!(skipped(&run_with_env(&w, &[("STOOP_OFF", "")])));
+}
+
 #[test]
 fn io_uring_is_refused_inside_a_traced_command_so_runtimes_fall_back() {
     let w = Ws::new("iouring");
