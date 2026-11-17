@@ -427,6 +427,8 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                 inputs,
                 outputs,
                 probes,
+                removed: Vec::new(),
+                ignore: None,
             };
             if let Some(r) = remote.as_ref().filter(|r| r.write) {
                 // Fold in anything other runs published since we looked, so a push never
@@ -544,4 +546,22 @@ pub fn build_inputs(root: &Path, trace: &Trace, ignore: &Ignore) -> Result<Vec<I
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
+}
+
+#[cfg(test)]
+mod flag_tests {
+    #[test]
+    fn env_flag_truthiness() {
+        const NAME: &str = "STOOP_S0_TEST_FLAG";
+        for value in ["", "0", "false", "no", "off", " FALSE ", "Off"] {
+            std::env::set_var(NAME, value);
+            assert!(!super::env_flag(NAME), "{value:?}");
+        }
+        for value in ["1", "true", "yes", "anything"] {
+            std::env::set_var(NAME, value);
+            assert!(super::env_flag(NAME), "{value:?}");
+        }
+        std::env::remove_var(NAME);
+        assert!(!super::env_flag(NAME));
+    }
 }

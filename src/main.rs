@@ -1,8 +1,16 @@
+#[allow(dead_code)]
+mod gha;
 mod ignore;
 mod input;
+#[allow(dead_code)]
+mod job;
 mod pathutil;
+#[allow(dead_code)]
+mod plan;
 mod proof;
 mod run;
+#[allow(dead_code)]
+mod stepkey;
 mod sync;
 mod trace;
 
@@ -249,14 +257,13 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
     };
     let cwd = std::env::current_dir().unwrap_or_default();
     let root = o.root.clone().unwrap_or_else(|| run::find_root(&cwd));
-    let mut h = blake3::Hasher::new();
-    h.update(&body);
-    for v in ["GITHUB_WORKFLOW", "GITHUB_JOB"] {
-        h.update(std::env::var(v).unwrap_or_default().as_bytes());
-        h.update(&[0]);
-    }
-    h.update(pathutil::to_key(&root, &cwd).as_bytes());
-    o.key = Some(format!("sh-{}", &h.finalize().to_hex()[..20]));
+    o.key = Some(stepkey::sh_key(
+        &body,
+        &std::env::var("GITHUB_WORKFLOW").unwrap_or_default(),
+        &std::env::var("GITHUB_JOB").unwrap_or_default(),
+        &pathutil::to_key(&root, &cwd),
+        None,
+    ));
     o.ignore.push(script.to_string());
     o.ignore
         .push(pathutil::to_key(&root, std::path::Path::new(script)));
