@@ -22,6 +22,10 @@ pub struct Proof {
     /// place, because skipping does not run the command that makes them.
     #[serde(default)]
     pub outputs: Vec<Input>,
+    /// External state the user vouched for with `--probe`: command text to the hash
+    /// of its output when the run happened. A skip needs every probe to match again.
+    #[serde(default)]
+    pub probes: BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -148,6 +152,7 @@ mod tests {
                 id: id.into(),
             }],
             outputs: vec![],
+            probes: BTreeMap::new(),
         }
     }
 

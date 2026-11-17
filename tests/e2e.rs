@@ -92,6 +92,23 @@ fn a_file_that_was_absent_and_appears_runs_the_command() {
 }
 
 #[test]
+fn a_changed_binary_file_the_command_reads_runs_it_again() {
+    let w = Ws::new("binary");
+    let mut blob: Vec<u8> = (0..300_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 11) as u8)
+        .collect();
+    blob.extend_from_slice(&[0, 255, 0, 0]);
+    fs::write(w.root.join("data.bin"), &blob).unwrap();
+    let script = "wc -c data.bin > /dev/null";
+    w.sh(script);
+    assert!(skipped(&w.sh(script).1));
+    blob[150_000] ^= 1; // same size, one bit different, far from either end
+    fs::write(w.root.join("data.bin"), &blob).unwrap();
+    let (_, e) = w.sh(script);
+    assert!(!skipped(&e) && e.contains("data.bin changed"), "{e}");
+}
+
+#[test]
 fn a_new_entry_in_a_listed_directory_runs_the_command() {
     let w = Ws::new("listing");
     w.write("tests/a.txt", "a");
@@ -235,6 +252,77 @@ fn an_ignored_variable_may_change_freely() {
     let w = Ws::new("env-ignore");
     run_with_foo(&w, "a", &["--ignore-env", "FOO"]);
     assert!(skipped(&run_with_foo(&w, "b", &["--ignore-env", "FOO"])));
+}
+
+const NET: &str =
+    "cat in.txt > /dev/null; bash -c 'exec 3<>/dev/tcp/127.0.0.1/9' 2>/dev/null; true";
+
+fn with_probe(w: &Ws, probe: &str, script: &str) -> (i32, String) {
+    w.stoop(&[
+        "run", "--root", ".", "--key", "p", "--probe", probe, "--", "sh", "-c", script,
+    ])
+}
+
+#[test]
+fn a_declared_probe_lets_a_networked_step_be_recorded_and_skipped() {
+    let w = Ws::new("probe");
+    w.write("probe.txt", "v1");
+    let (_, e) = with_probe(&w, "cat probe.txt", NET);
+    assert!(e.contains("recorded"), "{e}");
+    assert!(skipped(&with_probe(&w, "cat probe.txt", NET).1));
+}
+
+#[test]
+fn a_changed_probe_runs_the_command_again() {
+    let w = Ws::new("probe-changed");
+    w.write("probe.txt", "v1");
+    with_probe(&w, "cat probe.txt", NET);
+    w.write("probe.txt", "v2");
+    let (_, e) = with_probe(&w, "cat probe.txt", NET);
+    assert!(
+        !skipped(&e) && e.contains("probe `cat probe.txt` changed"),
+        "{e}"
+    );
+}
+
+#[test]
+fn a_failing_probe_is_never_assumed_unchanged() {
+    let w = Ws::new("probe-fails");
+    let (_, e) = with_probe(&w, "false", NET);
+    assert!(e.contains("not recorded") && e.contains("probe"), "{e}");
+    assert!(!skipped(&with_probe(&w, "false", NET).1));
+}
+
+#[test]
+fn dropping_a_probe_invalidates_the_proof() {
+    let w = Ws::new("probe-dropped");
+    w.write("probe.txt", "v1");
+    with_probe(&w, "cat probe.txt", NET);
+    let (_, e) = w.stoop(&[
+        "run",
+        "--allow-network",
+        "--root",
+        ".",
+        "--key",
+        "p",
+        "--",
+        "sh",
+        "-c",
+        NET,
+    ]);
+    assert!(!skipped(&e), "{e}");
+}
+
+#[test]
+fn a_probe_that_changes_during_the_run_blocks_recording() {
+    let w = Ws::new("probe-midrun");
+    w.write("probe.txt", "v1");
+    let script = "cat in.txt > /dev/null; echo changed > probe.txt";
+    let (_, e) = with_probe(&w, "cat probe.txt", script);
+    assert!(
+        e.contains("not recorded") && e.contains("changed while the command ran"),
+        "{e}"
+    );
 }
 
 #[test]

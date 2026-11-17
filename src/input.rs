@@ -1,7 +1,7 @@
 //! What a command read, as comparable fingerprints.
 //!
 //! An input is a path plus an id describing its state:
-//! - `f:<hash>`  regular file (content hash; sampled for large files outside the root)
+//! - `f:<hash>`  regular file (hash of every byte)
 //! - `a`         does not exist (recorded only inside the root)
 //! - `d`         directory that was looked at, not listed
 //! - `dl:<hash>` directory whose entries were listed
@@ -10,7 +10,7 @@
 use crate::pathutil::from_key;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -25,9 +25,6 @@ pub struct Mismatch {
     pub path: String,
     pub why: &'static str,
 }
-
-const FULL_HASH_LIMIT: u64 = 1 << 20;
-const SAMPLE: u64 = 64 * 1024;
 
 /// Current id for `path`, or `None` when the path is not worth recording
 /// (outside the root and absent, or a device, socket or pipe).
@@ -55,7 +52,7 @@ pub fn identify(path: &Path, inside: bool, listed: bool) -> Option<String> {
                     Some("d".to_string())
                 }
             } else if ft.is_file() {
-                match hash_file(path, m.len(), inside) {
+                match hash_file(path) {
                     Ok(h) => Some(format!("f:{h}")),
                     Err(_) => inside.then(|| "u".to_string()),
                 }
@@ -81,21 +78,11 @@ fn list_hash(dir: &Path) -> Option<String> {
     Some(h.finalize().to_hex().to_string())
 }
 
-fn hash_file(path: &Path, len: u64, full: bool) -> io::Result<String> {
+/// Every byte counts, whatever the file is: source, binary, archive, model weights.
+fn hash_file(path: &Path) -> io::Result<String> {
     let mut f = fs::File::open(path)?;
     let mut h = blake3::Hasher::new();
-    if full || len <= FULL_HASH_LIMIT {
-        h.update_reader(&mut f)?;
-    } else {
-        // Toolchain-sized files outside the root: size plus head, middle and tail.
-        h.update(&len.to_le_bytes());
-        let mut buf = vec![0u8; SAMPLE as usize];
-        for off in [0, len / 2 - SAMPLE / 2, len - SAMPLE] {
-            f.seek(SeekFrom::Start(off))?;
-            f.read_exact(&mut buf)?;
-            h.update(&buf);
-        }
-    }
+    h.update_reader(&mut f)?;
     Ok(h.finalize().to_hex().to_string())
 }
 
@@ -226,6 +213,33 @@ mod tests {
         assert_eq!(m.len(), 2);
         assert!(m.iter().any(|m| m.path == "a" && m.why == "changed"));
         assert!(m.iter().any(|m| m.path == "gone" && m.why == "appeared"));
+    }
+
+    #[test]
+    fn one_changed_byte_anywhere_in_a_large_binary_changes_its_id() {
+        let d = tmp("bigbin");
+        let f = d.join("model.bin");
+        let mut bytes: Vec<u8> = (0..(8u32 << 20))
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
+        bytes.extend_from_slice(&[0, 0, 0, 0, 255, 0]); // NULs and high bytes
+        fs::write(&f, &bytes).unwrap();
+        for inside in [true, false] {
+            let base = identify(&f, inside, false).unwrap();
+            // Positions chosen away from the head, middle and tail of the file.
+            for pos in [100_000usize, 3_000_001, 6_999_999] {
+                let mut b = bytes.clone();
+                b[pos] ^= 1;
+                fs::write(&f, &b).unwrap();
+                assert_ne!(
+                    base,
+                    identify(&f, inside, false).unwrap(),
+                    "byte {pos} (inside={inside})"
+                );
+            }
+            fs::write(&f, &bytes).unwrap();
+            assert_eq!(base, identify(&f, inside, false).unwrap());
+        }
     }
 
     #[test]
