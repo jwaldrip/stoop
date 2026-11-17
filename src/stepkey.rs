@@ -19,18 +19,15 @@ pub fn sh_key(
     format!("sh-{}", &h.finalize().to_hex()[..20])
 }
 
-pub fn canonical_matrix(raw: &str) -> Option<String> {
+pub fn canonical_matrix(raw: &str) -> Result<Option<String>, String> {
     if raw.trim().is_empty() {
-        return None;
+        return Ok(None);
     }
     match serde_json::from_str::<serde_json::Value>(raw) {
-        Ok(serde_json::Value::Null) => None,
-        Ok(serde_json::Value::Object(o)) if o.is_empty() => None,
-        Ok(value) => Some(value.to_string()),
-        Err(e) => {
-            eprintln!("stoop: invalid STOOP_MATRIX ({e}); matrix unavailable");
-            None
-        }
+        Ok(serde_json::Value::Null) => Ok(None),
+        Ok(serde_json::Value::Object(o)) if o.is_empty() => Ok(None),
+        Ok(value) => Ok(Some(value.to_string())),
+        Err(e) => Err(format!("invalid STOOP_MATRIX: {e}")),
     }
 }
 
@@ -51,18 +48,27 @@ mod tests {
             sh_key(body, "workflow", "job", "src", None),
             format!("sh-{}", &old.finalize().to_hex()[..20])
         );
+        assert_eq!(
+            sh_key(body, "w", "j", "src", None),
+            "sh-9de6e2a8cd53977b52f4"
+        );
     }
     #[test]
     fn matrix_separates_and_canonicalizes() {
-        let a = canonical_matrix("{\"z\": 1, \"a\": {\"y\":2,\"x\":1}}").unwrap();
-        let b = canonical_matrix("{\"a\":{\"x\":1,\"y\":2},\"z\":1}").unwrap();
+        let a = canonical_matrix("{\"z\": 1, \"a\": {\"y\":2,\"x\":1}}")
+            .unwrap()
+            .unwrap();
+        let b = canonical_matrix("{\"a\":{\"x\":1,\"y\":2},\"z\":1}")
+            .unwrap()
+            .unwrap();
         assert_eq!(a, b);
         assert_ne!(
             sh_key(b"x", "w", "j", "", Some(&a)),
             sh_key(b"x", "w", "j", "", None)
         );
-        for v in ["", "null", "{}", "  { }  ", "bad"] {
-            assert_eq!(canonical_matrix(v), None);
+        for v in ["", "null", "{}", "  { }  "] {
+            assert_eq!(canonical_matrix(v).unwrap(), None);
         }
+        assert!(canonical_matrix("bad").is_err());
     }
 }

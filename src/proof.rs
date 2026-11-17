@@ -267,6 +267,59 @@ mod tests {
     }
 
     #[test]
+    fn digest_and_equality_cover_the_same_fields() {
+        let mut base = proof("f:1");
+        base.inputs.push(Input {
+            path: "b".into(),
+            id: "f:2".into(),
+        });
+        let mut variants = vec![base.clone()];
+        let mut v = base.clone();
+        v.created += 1;
+        variants.push(v);
+        let mut v = base.clone();
+        v.argv.push("changed".into());
+        variants.push(v);
+        let mut v = base.clone();
+        v.inputs[0].id = "changed".into();
+        variants.push(v);
+        let mut v = base.clone();
+        v.inputs.reverse();
+        variants.push(v);
+        let mut v = base.clone();
+        v.outputs.push(Input {
+            path: "out".into(),
+            id: "f:3".into(),
+        });
+        variants.push(v);
+        let mut v = base.clone();
+        v.removed.push("gone".into());
+        variants.push(v);
+        let mut v = base.clone();
+        v.env.insert("ENV".into(), "hash".into());
+        variants.push(v);
+        let mut v = base.clone();
+        v.probes.insert("probe".into(), "hash".into());
+        variants.push(v);
+        let mut v = base.clone();
+        v.ignore = Some(vec![]);
+        variants.push(v);
+        let mut v = base;
+        v.ignore = Some(vec!["x".into()]);
+        variants.push(v);
+        for a in &variants {
+            for b in &variants {
+                assert_eq!(same_proof(a, b), a.digest() == b.digest());
+            }
+        }
+        assert_eq!(variants[0].digest(), variants[1].digest());
+        assert_eq!(variants[0].digest(), variants[2].digest());
+        for changed in &variants[3..] {
+            assert_ne!(variants[0].digest(), changed.digest());
+        }
+    }
+
+    #[test]
     fn round_trips_and_keeps_newest_first() {
         let s = store("rt");
         s.save("k", proof("f:1")).unwrap();
