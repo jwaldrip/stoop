@@ -1,0 +1,29 @@
+<!--meta {"title": "Roadmap", "description": "Where stoop is going: equal artifacts, normalized source, coverage granularity, determinism checks, static vetoes, restored outputs. None of it shipped yet.", "lede": "Where it's going. Nothing on this page is built yet; the shipped behavior is everything else in this guide.", "image": "08-eyas", "alt": "A young peregrine at the edge of its cliff nest, wings half open."}-->
+<h2 id="direction">The direction</h2>
+<p>Today stoop skips when every input is byte-equal to last time. The goal is to skip when the <em>effective</em> input is equal, loosening the rule only where it can be shown not to hide a change. Each step below either lets stoop skip more safely or makes it run more when it should.</p>
+
+<h2 id="items">Planned</h2>
+<dl class="plain">
+  <dt>Equal build artifacts (early cutoff)</dt>
+  <dd>When a rebuild produces the same bytes, steps downstream of it should skip. This already works when builds are reproducible, because a downstream step that reads the output sees the same bytes. Next is hashing executables by what loads, ignoring build ids, timestamps and debug sections.</dd>
+  <dt>Normalized source</dt>
+  <dd>Hash source with comments and whitespace removed, per language and conservatively, keeping directives that change behavior such as <code>//go:build</code>, pragmas, and docstrings that are runtime values.</dd>
+  <dt>Coverage granularity</dt>
+  <dd>Tie a test to the code it actually executed, so an edit to a function no test calls doesn't rerun the suite.</dd>
+  <dt>A determinism check</dt>
+  <dd>Run a step twice when recording and refuse to record one that disagrees with itself. Aimed at flaky tests and hidden clock or random reads.</dd>
+  <dt>Static vetoes</dt>
+  <dd>Scan what a step read for clock, randomness and network calls, and refuse to skip. A static signal can only make stoop run more, never less.</dd>
+  <dt>Restored outputs</dt>
+  <dd>Let a skip also put back what the command produced, so a build skipped on a fresh runner leaves its artifacts in place.</dd>
+</dl>
+
+<h2 id="shipped">Recently shipped</h2>
+<ul>
+  <li>Probes for external state (<code>--probe</code>).</li>
+  <li>Hashing every byte of every input, with no sampling.</li>
+  <li>Naming the destination when a run is refused for using the network.</li>
+  <li>Sharing proofs through the git remote (<code>--sync git</code>, <code>stoop pull</code>, <code>stoop prune</code>).</li>
+  <li>Tracing Node, by refusing <code>io_uring</code>.</li>
+</ul>
+<p>Ideas and objections are welcome in <a href="https://github.com/jwaldrip/stoop/issues">the issue tracker</a>.</p>

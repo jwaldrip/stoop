@@ -1,0 +1,135 @@
+<!--meta {"title": "CI recipes", "description": "Use stoop in GitHub Actions, GitLab CI, CircleCI and Buildkite, and share proofs through a CI cache or your git remote.", "lede": "Where stoop earns its keep. Wrap the steps, then give runs a way to share what they proved.", "image": "04-city", "alt": "A peregrine on the parapet of a high-rise at dawn above a hazy city."}-->
+<h2 id="shape">The shape of it</h2>
+<p>Every recipe has the same three parts:</p>
+<ol>
+  <li><strong>Install stoop</strong> on a Linux runner.</li>
+  <li><strong>Wrap the steps.</strong> In GitHub Actions one <code>defaults</code> block does it; elsewhere, put <code>stoop run --</code> in front of each command.</li>
+  <li><strong>Share proofs between runs.</strong> A fresh runner has an empty <code>.stoop/</code>, so nothing would ever skip. Either cache that directory with the CI's own cache, or sync proofs through your git remote. Pull request runs read; only the default branch writes.</li>
+</ol>
+<div class="note">
+  <p><strong>Why only the default branch writes.</strong> A proof is a claim that lets later runs skip checks. Proofs written by code that hasn't been reviewed shouldn't let main skip anything. Branches read main's proofs, so a branch that matches main skips what main already proved.</p>
+</div>
+<p>stoop has no prebuilt binaries yet, so these recipes install with <code>cargo install</code>. Cache the binary the way you cache any other tool if the install time matters.</p>
+
+<h2 id="github-actions">GitHub Actions</h2>
+<p>With sync through the repository's own remote. Proofs live at <code>refs/stoop/&lt;key&gt;</code>, which branch and tag listings ignore.</p>
+<pre><code><span class="k">name</span>: CI
+<span class="k">on</span>:
+  <span class="k">pull_request</span>:
+  <span class="k">push</span>:
+    <span class="k">branches</span>: [main]
+
+<span class="k">defaults</span>:
+  <span class="k">run</span>:
+    <span class="k">shell</span>: stoop sh {0}       <span class="c"># every run: step goes through stoop</span>
+
+<span class="k">jobs</span>:
+  <span class="k">test</span>:
+    <span class="k">runs-on</span>: ubuntu-latest
+    <span class="k">permissions</span>:
+      <span class="k">contents</span>: write          <span class="c"># main pushes refs/stoop/*</span>
+    <span class="k">env</span>:
+      <span class="k">STOOP_SYNC</span>: git
+    <span class="k">steps</span>:
+      - <span class="k">uses</span>: actions/checkout@v4
+      - <span class="k">name</span>: Install stoop
+        <span class="k">shell</span>: bash               <span class="c"># stoop is not installed yet</span>
+        <span class="k">run</span>: cargo install --locked --git https://github.com/jwaldrip/stoop
+      - <span class="k">name</span>: Publish proofs from main only
+        <span class="k">if</span>: github.ref == 'refs/heads/main'
+        <span class="k">shell</span>: bash
+        <span class="k">run</span>: echo "STOOP_SYNC_WRITE=1" &gt;&gt; "$GITHUB_ENV"
+      - <span class="k">name</span>: Fetch published proofs
+        <span class="k">shell</span>: bash
+        <span class="k">run</span>: stoop pull
+      - <span class="k">run</span>: cargo fmt --check
+      - <span class="k">run</span>: cargo clippy --all-targets -- -D warnings
+      - <span class="k">run</span>: cargo test</code></pre>
+<ul>
+  <li>Each wrapped step is keyed by its script, the workflow and the job, so the same script in two jobs gets two keys.</li>
+  <li>Steps that use an action (<code>uses:</code>) are not shell steps and run as usual.</li>
+  <li>Set <code>STOOP_SYNC_WRITE</code> only when you mean it. stoop treats the variable being present as yes, so don't set it to an empty string on pull requests; set it from a step guarded by <code>if:</code>, as above.</li>
+  <li>Sync never fails a step. If the remote is unreachable or refuses a push, stoop warns and the step runs as it would have without sync.</li>
+</ul>
+
+<h3 id="github-cache">Or with the Actions cache</h3>
+<p>If you'd rather not give the job push access, cache <code>.stoop/</code>. A run can restore caches saved on its own branch and on the default branch (<a href="https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching">GitHub's cache access rules</a>), so save only on main:</p>
+<pre><code>      - <span class="k">uses</span>: actions/cache/restore@v4
+        <span class="k">with</span>:
+          <span class="k">path</span>: .stoop
+          <span class="k">key</span>: stoop-${{ github.job }}-${{ github.run_id }}
+          <span class="k">restore-keys</span>: stoop-${{ github.job }}-
+      <span class="c"># ... your run: steps ...</span>
+      - <span class="k">if</span>: github.ref == 'refs/heads/main'
+        <span class="k">uses</span>: actions/cache/save@v4
+        <span class="k">with</span>:
+          <span class="k">path</span>: .stoop
+          <span class="k">key</span>: stoop-${{ github.job }}-${{ github.run_id }}</code></pre>
+
+<h2 id="gitlab">GitLab CI</h2>
+<p>GitLab keeps caches for protected and unprotected branches separate by default (<a href="https://docs.gitlab.com/ci/caching/">GitLab caching docs</a>), so a merge request pipeline can't read the cache main saved. Git sync is the way to share main's proofs with merge requests:</p>
+<pre><code><span class="k">test</span>:
+  <span class="k">image</span>: rust:1
+  <span class="k">variables</span>:
+    <span class="k">STOOP_SYNC</span>: git
+  <span class="k">before_script</span>:
+    - cargo install --locked --git https://github.com/jwaldrip/stoop
+    - if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then export STOOP_SYNC_WRITE=1; fi
+    - stoop pull
+  <span class="k">script</span>:
+    - stoop run -- cargo test</code></pre>
+<p>Reading uses whatever credentials the checkout used. Publishing from main needs a token allowed to push to the repository; point a remote at it and name that remote in the spec, for example <code>STOOP_SYNC: git:publish</code>.</p>
+<p>The simpler, per-branch alternative: cache <code>.stoop/</code> with <code>key: stoop-$CI_JOB_NAME-$CI_COMMIT_REF_SLUG</code>. Each branch then reuses its own earlier pipelines' proofs, but starts cold.</p>
+
+<h2 id="circleci">CircleCI</h2>
+<p>Restore everywhere, save from main only, using a step-level <code>when</code>:</p>
+<pre><code><span class="k">version</span>: 2.1
+<span class="k">jobs</span>:
+  <span class="k">test</span>:
+    <span class="k">docker</span>:
+      - <span class="k">image</span>: rust:1
+    <span class="k">steps</span>:
+      - checkout
+      - <span class="k">run</span>: cargo install --locked --git https://github.com/jwaldrip/stoop
+      - <span class="k">restore_cache</span>:
+          <span class="k">keys</span>:
+            - stoop-main-
+      - <span class="k">run</span>: stoop run -- cargo test
+      - <span class="k">when</span>:
+          <span class="k">condition</span>:
+            <span class="k">equal</span>: [ main, &lt;&lt; pipeline.git.branch &gt;&gt; ]
+          <span class="k">steps</span>:
+            - <span class="k">save_cache</span>:
+                <span class="k">key</span>: stoop-main-{{ .Revision }}
+                <span class="k">paths</span>: [ .stoop ]</code></pre>
+<p>Or use git sync exactly as in the GitLab recipe, gating <code>STOOP_SYNC_WRITE</code> on <code>CIRCLE_BRANCH</code>.</p>
+
+<h2 id="buildkite">Buildkite</h2>
+<p>Buildkite has no built-in cache on self-hosted agents, which makes git sync the natural fit: nothing to host, and the agent already talks to the remote.</p>
+<pre><code><span class="k">steps</span>:
+  - <span class="k">label</span>: ":rust: test"
+    <span class="k">env</span>:
+      <span class="k">STOOP_SYNC</span>: git
+    <span class="k">command</span>: |
+      if [ "$BUILDKITE_BRANCH" = "$BUILDKITE_PIPELINE_DEFAULT_BRANCH" ]; then export STOOP_SYNC_WRITE=1; fi
+      stoop pull
+      stoop run -- cargo test</code></pre>
+<p>Install stoop on the agent image once. Publishing needs the agent's git credentials to allow pushes from default-branch builds.</p>
+
+<h2 id="sync">How git sync works</h2>
+<ul>
+  <li><code>--sync git</code> (or <code>STOOP_SYNC=git</code>) uses the remote named <code>origin</code>; <code>git:NAME</code> picks another.</li>
+  <li>On a miss, stoop fetches <code>refs/stoop/&lt;key&gt;</code> for that one key and checks again. <code>stoop pull</code> fetches every published proof once, which is cheaper at the start of a job that runs many steps.</li>
+  <li>With <code>--sync-write</code> (or <code>STOOP_SYNC_WRITE=1</code>), a recorded run publishes its proofs, merged with what is already there.</li>
+  <li><code>stoop prune</code> deletes published proofs older than <code>--max-age</code> (default 7 days). It needs write access; a scheduled job on main is the place for it.</li>
+  <li>Shallow checkouts are fine: the proof refs are fetched on their own.</li>
+</ul>
+<p class="status">Tested: the sync suite runs against a bare git remote, and the ref mechanics (push, shallow fetch, delete) were checked against GitHub. Not yet verified: a full authenticated sync run inside a hosted CI provider.</p>
+
+<h2 id="nightly">The nightly full run</h2>
+<p>A file trace can't see the clock. Re-prove everything on a schedule so a test that depends on today's date can't hide behind a proof for long:</p>
+<pre><code><span class="k">on</span>:
+  <span class="k">schedule</span>:
+    - <span class="k">cron</span>: "17 4 * * *"
+<span class="k">env</span>:
+  <span class="k">STOOP_FULL</span>: "1"            <span class="c"># never skip, still record</span></code></pre>

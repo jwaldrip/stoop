@@ -1,0 +1,63 @@
+<!--meta {"title": "How it works", "description": "How stoop traces a command, what a proof holds, how keys are formed, and every reason it refuses to record.", "lede": "A tracer, a proof, and a comparison. Plus the long list of reasons it would rather run than guess.", "image": "02-murmuration", "alt": "A murmuration of starlings and one peregrine diving at a single bird at its edge."}-->
+<h2 id="trace">The trace</h2>
+<p>stoop starts the command under <code>ptrace</code> with a seccomp filter in front of it. The filter lets ordinary system calls through untouched and stops only the ones that name a file, a directory or a connection, so a traced build pays for its file activity, not for every call it makes. Children, threads and anything they exec are followed.</p>
+<p>From those stops stoop collects every path the process tree:</p>
+<ul>
+  <li>opened for reading,</li>
+  <li>executed (the compiler, the interpreter, a helper script),</li>
+  <li>looked up, including lookups that found nothing,</li>
+  <li>listed as a directory,</li>
+  <li>followed as a symlink,</li>
+</ul>
+<p>and every path it created or rewrote inside the repository.</p>
+
+<h2 id="proof">The proof</h2>
+<p>When the command exits 0, stoop writes a proof: a JSON file under <code>.stoop/proofs/</code> holding</p>
+<table>
+  <thead><tr><th>Part</th><th>What is stored</th></tr></thead>
+  <tbody>
+    <tr><td>Inputs</td><td>Each path with an id: a hash of every byte for a file, a hash of the entry list for a listed directory, the target for a symlink, and "absent" for a path inside the repository that was looked for and not found.</td></tr>
+    <tr><td>Environment</td><td>A hash of each variable's value. See <a href="#env">the environment</a> below.</td></tr>
+    <tr><td>Outputs</td><td>What the run left inside the repository, with hashes. A skip needs them still in place.</td></tr>
+    <tr><td>Probes</td><td>For each <code>--probe</code> command, a hash of what it printed.</td></tr>
+  </tbody>
+</table>
+<p>A failing run records nothing. Neither does a run started with <code>--no-record</code>.</p>
+
+<h2 id="compare">The comparison</h2>
+<p>Next time, before running anything, stoop loads the proofs for the key, newest first, and checks each in turn: not expired, same environment, every input still the same, every output still in place, every probe still printing the same thing. The first proof that passes means a skip. If none passes, the command runs and the reason given is what differed from the newest proof. <code>stoop explain</code> prints what differed in each proof it checked.</p>
+<p>Checking costs one hash of every recorded input. For the cargo build in the <a href="getting-started.html">getting started</a> transcript that was 668 inputs, the Rust toolchain included, in 289 ms. Every file is hashed byte for byte, with no sampling and no trust in timestamps.</p>
+
+<h2 id="keys">Keys</h2>
+<p>A key names one command in one place. By default it is the program's name plus a hash of the full argument list and the working directory relative to the repository root, for example <code>cargo-46fcb2881638d3cc</code>. Change an argument and you get a different key. <code>--key NAME</code> sets one yourself.</p>
+<p>In shell mode (<code>stoop sh</code>, used by GitHub Actions), the key comes from the step's script contents, the workflow name, the job name and the working directory. The script file itself is not an input: the runner gives it a new name on every run.</p>
+
+<h2 id="history">Branches, reverts and history</h2>
+<p>Proofs are content-addressed. They don't know which branch or commit made them, only what the command read. Each key keeps its 8 most recent proofs, so a branch that matches what main already proved can skip, and so can a revert, as long as the earlier proof's conditions still hold.</p>
+<p>That last part matters for builds. A proof requires the outputs its run left in the repository to still be there and unchanged. If a later build rewrote <code>target/</code>, an earlier build proof no longer matches even after you revert the source, so the build runs again. Steps with no outputs in the repository (tests, linters, type checks, or anything writing elsewhere) do reuse earlier proofs across a revert. Restoring outputs on a skip is <a href="roadmap.html">on the roadmap</a>, not built.</p>
+
+<h2 id="env">The environment</h2>
+<p>A variable that a program reads never appears in a file trace, so the whole environment counts. Two groups are left out:</p>
+<ul>
+  <li>The runner's per-run bookkeeping: anything starting <code>GITHUB_</code>, <code>RUNNER_</code>, <code>ACTIONS_</code>, <code>INPUT_</code> or <code>STOOP_</code>, unless the command text names it.</li>
+  <li>Values that differ on every start of the same machine: <code>_</code>, <code>PWD</code>, <code>OLDPWD</code>, <code>SHLVL</code>, <code>TERM</code>, <code>HOSTNAME</code>, <code>INVOCATION_ID</code>, <code>JOURNAL_STREAM</code>, <code>SSH_AUTH_SOCK</code>, <code>XDG_RUNTIME_DIR</code>.</li>
+</ul>
+<p><code>--ignore-env NAME</code> leaves out one more. <code>--env NAME</code> puts one back in, for example a <code>GITHUB_</code> variable the step depends on without naming it.</p>
+
+<h2 id="fails-wide">When it runs anyway</h2>
+<p>stoop fails wide. Each of these means the command runs, and the ones marked "not recorded" also mean no proof is written:</p>
+<table>
+  <thead><tr><th>Situation</th><th>What happens</th></tr></thead>
+  <tbody>
+    <tr><td>No proof for the key</td><td>Runs, then records.</td></tr>
+    <tr><td>Newest proof older than <code>--max-age</code> (7 days by default)</td><td>Runs, then records.</td></tr>
+    <tr><td><code>STOOP_FULL=1</code></td><td>Runs even when a proof matches, then records.</td></tr>
+    <tr><td>The command failed</td><td>Exits with its code; not recorded.</td></tr>
+    <tr><td>The trace may be incomplete</td><td>Not recorded, with the reason.</td></tr>
+    <tr><td>The command read <code>.git</code></td><td>Not recorded: a skip could hide a history change. Add <code>.git</code> to <code>.stoopignore</code> if that read cannot change the result.</td></tr>
+    <tr><td>The command used the network or a local service</td><td>Not recorded, naming the destination, unless a <code>--probe</code> covers it or <code>--allow-network</code> is set.</td></tr>
+    <tr><td>A probe failed, or changed while the command ran</td><td>Not recorded.</td></tr>
+    <tr><td>Tracing is unavailable (not Linux)</td><td>Runs untraced; not recorded.</td></tr>
+    <tr><td><code>STOOP_OFF=1</code></td><td>Runs the command directly; no tracing, no skipping.</td></tr>
+  </tbody>
+</table>

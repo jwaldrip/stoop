@@ -1,0 +1,51 @@
+<!--meta {"title": "Getting started", "description": "Install stoop, wrap your first command, and read what it tells you.", "lede": "Install it, wrap one command, and read what it tells you. Five minutes, most of them spent waiting on the first run.", "image": "03-ledge", "alt": "A peregrine on a limestone ledge, watching the valley below."}-->
+<h2 id="install">Install</h2>
+<p>stoop is a single Rust binary. Until prebuilt releases are published, install it from source with cargo:</p>
+<pre><code><span class="p">$</span> cargo install --locked --git https://github.com/jwaldrip/stoop</code></pre>
+<p>Or build it from a clone:</p>
+<pre><code><span class="p">$</span> git clone https://github.com/jwaldrip/stoop &amp;&amp; cd stoop
+<span class="p">$</span> cargo build --release      <span class="c"># binary at target/release/stoop</span></code></pre>
+<div class="note">
+  <p><strong>Tracing needs Linux on x86-64 or arm64.</strong> On macOS stoop builds and runs the wrapped command untraced, so it never skips and never records. That keeps a workflow portable; the savings happen on Linux runners.</p>
+</div>
+
+<h2 id="first-run">Wrap a command</h2>
+<p>Put <code>stoop run --</code> in front of anything you'd run in CI. The first time, there is no proof, so it runs and records:</p>
+<pre><code><span class="p">$</span> stoop run -- cargo build
+stoop: run cargo-46fcb2881638d3cc: no proof yet
+stoop: recorded 668 inputs for cargo-46fcb2881638d3cc</code></pre>
+<p>Run it again with nothing changed and it skips:</p>
+<pre><code><span class="p">$</span> stoop run -- cargo build
+stoop: skip cargo-46fcb2881638d3cc: 668 inputs unchanged since 1s ago (289ms)</code></pre>
+<p><code>run</code> is the default, so <code>stoop -- cargo build</code> does the same. The exit code is the command's own, and 0 on a skip.</p>
+<p>Proofs live in <code>.stoop/</code> at the repository root. Add it to <code>.gitignore</code>; it is a cache, not source.</p>
+
+<h2 id="explain">Ask before it runs</h2>
+<p><code>stoop explain</code> says what would happen without running anything. It exits 0 when the command would be skipped and 1 when it would run, so scripts can branch on it.</p>
+<pre><code><span class="p">$</span> echo '// tweak' &gt;&gt; src/ignore.rs
+<span class="p">$</span> stoop explain -- cargo build
+proof 1 (1s ago):
+  changed: src/ignore.rs
+stoop: would run cargo-46fcb2881638d3cc: src/ignore.rs changed</code></pre>
+<p>Every line above is real output, captured from a fresh clone of stoop building itself on Linux.</p>
+
+<h2 id="manage">Look at what it kept</h2>
+<pre><code><span class="p">$</span> stoop ls
+cargo-46fcb2881638d3cc	3 proofs	560 inputs	created 1794951294
+<span class="p">$</span> stoop forget cargo-46fcb2881638d3cc</code></pre>
+<p>Each key keeps up to 8 proofs. <code>forget</code> drops all of them for that key.</p>
+
+<h2 id="not-recorded">When it refuses to record</h2>
+<p>stoop would rather run a command again than skip one it can't vouch for. When a run can't be trusted it says so, runs normally, and writes nothing:</p>
+<pre><code><span class="p">$</span> stoop run -- sh -c "curl -sI https://example.com | head -1"
+stoop: run sh-5347c74b88ffd993: no proof yet
+HTTP/2 200
+stoop: not recorded: it used the network (connect to 192.168.64.1:53), whose results a file trace cannot see; cover it with --probe, or pass --allow-network to record it anyway</code></pre>
+<p>That address is the container's DNS resolver: the first thing curl talked to. <a href="blind-spots.html">Blind spots</a> covers what to do about it.</p>
+
+<h2 id="ci">Then put it in CI</h2>
+<p>That is where it pays. In GitHub Actions, one <code>defaults</code> block wraps every <code>run:</code> step:</p>
+<pre><code><span class="k">defaults</span>:
+  <span class="k">run</span>:
+    <span class="k">shell</span>: stoop sh {0}</code></pre>
+<p><a href="ci.html">CI recipes</a> has the full workflow, plus GitLab CI, CircleCI and Buildkite.</p>

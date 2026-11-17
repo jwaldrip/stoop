@@ -1,0 +1,37 @@
+<!--meta {"title": ".stoopignore", "description": "Tell stoop which paths' reads don't count, and which outputs don't need to stay in place.", "lede": "For reads that can't change the result, and output nobody needs to keep. One pattern per line.", "image": "05-fog", "alt": "A peregrine half hidden in valley fog."}-->
+<h2 id="what">What it does</h2>
+<p>A path that matches is left out of the proof entirely. Reading it doesn't count as an input, and writing it doesn't make it an output that must stay in place. Patterns come from <code>.stoopignore</code> at the repository root, from <code>--ignore PATTERN</code>, and from a short built-in list.</p>
+<p>Ignore with care. Every pattern is a promise that changes there can't change the command's result. When in doubt, leave it out: the cost of a pattern you didn't need is a rerun; the cost of one you shouldn't have written is a skip that hides a failure.</p>
+
+<h2 id="syntax">Syntax</h2>
+<pre><code><span class="c"># a name with no slash matches that component anywhere</span>
+node_modules
+<span class="c"># a path with a slash is anchored to the root and covers everything under it</span>
+reports/junit.xml
+<span class="c"># an absolute path does the same outside the repository</span>
+/opt/hostedtoolcache/cache-stats
+<span class="c"># * stays inside one component, ** crosses them, ? is one character</span>
+docs/**/generated
+*.log</code></pre>
+<ul>
+  <li>Blank lines and lines starting with <code>#</code> are skipped.</li>
+  <li>A trailing <code>/</code> is ignored, so <code>build/</code> and <code>build</code> are the same pattern.</li>
+  <li>Paths inside the repository are matched relative to its root.</li>
+</ul>
+
+<h2 id="defaults">Always ignored</h2>
+<p>These never count, because they change on every run or describe the machine rather than the work:</p>
+<pre><code>/proc  /sys  /dev  /run  /tmp  /var/tmp  /var/run
+/etc/resolv.conf  /etc/hosts  /etc/hostname  /etc/mtab
+.stoop</code></pre>
+
+<h2 id="common">Common entries</h2>
+<table>
+  <thead><tr><th>Pattern</th><th>Why</th></tr></thead>
+  <tbody>
+    <tr><td><code>reports/junit.xml</code></td><td>A test report the run writes. Without it, the report would be an output that must still exist for a skip.</td></tr>
+    <tr><td><code>coverage</code></td><td>Coverage output, for the same reason.</td></tr>
+    <tr><td><code>.git</code></td><td>Only if a command reads <code>.git</code> and the read can't change its result. By default a <code>.git</code> read means the run is not recorded, because a skip could hide a history change.</td></tr>
+  </tbody>
+</table>
+<p>Don't ignore a dependency directory like <code>node_modules</code> just because it is big. If the command reads it, a change there can change the result.</p>

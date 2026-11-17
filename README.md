@@ -1,38 +1,60 @@
-# stoop
+<p align="center">
+  <a href="https://jwaldrip.github.io/stoop/">
+    <picture>
+      <source media="(prefers-color-scheme: dark)" srcset="assets/stoop-logo-on-dark.svg">
+      <img alt="stoop" src="assets/stoop-logo-on-light.svg" width="300">
+    </picture>
+  </a>
+</p>
 
-Run only what matters.
+<h3 align="center">Run only what matters.</h3>
 
-`stoop` wraps a command. If everything the command read the last time it passed is unchanged, it skips the command. If not, it runs it and records what it read. There are no input lists to write and none to keep current.
+<p align="center">
+  Wrap a command. <b>stoop</b> traces every file it reads, and skips it when none of them changed since it last passed.<br>
+  No input lists to write, and none to keep current.
+</p>
 
-```
-$ stoop run -- cargo test
-stoop: run cargo-184b0d9cbc5273d9: no proof yet
-...
-stoop: recorded 167 inputs for cargo-184b0d9cbc5273d9
+<p align="center">
+  <a href="https://jwaldrip.github.io/stoop/">Website</a> &middot;
+  <a href="https://jwaldrip.github.io/stoop/docs/getting-started.html">Field guide</a> &middot;
+  <a href="https://jwaldrip.github.io/stoop/docs/ci.html">CI recipes</a> &middot;
+  <a href="https://jwaldrip.github.io/stoop/docs/cli.html">CLI reference</a>
+</p>
 
-$ stoop run -- cargo test
-stoop: skip cargo-184b0d9cbc5273d9: 167 inputs unchanged since 12s ago (2ms)
+<p align="center">
+  <a href="https://github.com/jwaldrip/stoop/actions/workflows/ci.yml"><img src="https://github.com/jwaldrip/stoop/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <img src="https://img.shields.io/badge/tracing-Linux%20x86--64%20%7C%20arm64-4b5868" alt="Tracing: Linux x86-64 and arm64">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-4b5868" alt="MIT license"></a>
+</p>
 
-$ echo "// x" >> src/main.rs
-$ stoop explain -- cargo test
-stoop: would run cargo-184b0d9cbc5273d9: src/main.rs changed
-```
+<p align="center">
+  <img src="assets/readme-hero.jpg" alt="A murmuration of thousands of starlings over a frosted marsh, and one peregrine diving at a single bird at its edge." width="100%">
+</p>
 
-The name is the peregrine's hunting dive: fold in, drop on the one thing that matters.
+## Most of a pipeline has nothing new to say
 
-## How it decides
+CI reruns every step on every push. Most of those steps read the same files they read last time and reach the same answer. When agents push all day, that waste compounds.
 
-The command runs under a tracer (ptrace plus a seccomp filter, so only file syscalls stop). The tracer records every path the process tree opened, looked up, listed or executed. When the command passes, `stoop` stores a proof: each of those paths with a content hash, plus the files the run produced inside the repository.
+A stoop is a peregrine's hunting dive: it folds in, ignores the rest of the sky, and drops on the one thing that matters. **stoop** does that for CI. It picks out the step whose inputs moved and skips the rest.
 
-Next time, it hashes the same paths. If every one matches, and the outputs are still in place, the command is skipped. A file that did not exist and now does, a new entry in a directory the command listed, a changed toolchain binary or a changed lockfile all count as changes, because the command looked at them.
+<p align="center">
+  <img src="assets/demo-terminal.png" alt="Terminal: stoop runs cargo build and records 668 inputs, skips the same build in 289 ms, then explains that an edit to src/ignore.rs means the build would run." width="760">
+</p>
 
-Proofs are content-addressed, so they do not care which branch or commit produced them. Reverting an edit finds the proof from before it. Up to eight proofs are kept per command.
+<p align="center"><sub>Captured, not typed: a fresh clone of stoop building itself, Linux arm64 in a throwaway container, stoop at <code>c9082e1</code>. Only cargo's progress lines are cut.</sub></p>
 
-When it cannot be sure, it runs. No proof, an expired proof, a trace that may be incomplete, a read of `.git`, use of the network: the command runs and nothing is recorded.
+## How it works
 
-## Use it in GitHub Actions
+1. **Watch.** The command runs under a tracer (ptrace plus a seccomp filter, so only file system calls stop). Every path the process tree opens, executes, looks up or lists is noted.
+2. **Record.** When the command passes, stoop writes a proof: each path with a hash of every byte, files looked for and absent, directory listings, symlink targets, the environment, and what the run wrote inside the repository.
+3. **Compare.** Next time it hashes the same paths. If all of them match and the outputs are still in place, the command is skipped.
+4. **When unsure, run.** No proof, an expired proof, a trace that might be incomplete, a read of `.git`, or use of the network: the command runs and nothing is recorded.
 
-Put this at the top of a workflow and every `run:` step is wrapped, with no per-step edits:
+Proofs are content-addressed and keyed by command, so a branch that matches what main already proved can skip. Up to 8 are kept per command, so steps that leave no output in the repository (tests, lint, type checks) also skip after a revert.
+
+## Two lines in GitHub Actions
+
+Put this at the top of a workflow and every `run:` step goes through stoop:
 
 ```yaml
 defaults:
@@ -40,71 +62,76 @@ defaults:
     shell: stoop sh {0}
 ```
 
-Each step's script is keyed by its contents, the workflow and the job. Restore the proof store (`.stoop/`) from the default branch before the steps and save it after merges, so branches reuse what main already proved. Untrusted jobs should pass `--no-record` so only trusted runs write proofs.
+Each step is keyed by its script, the workflow and the job. Steps that use an action run as usual; the step that installs stoop sets `shell: bash` for itself. Share proofs between runs through your own git remote (`--sync git`, no server to host) or by caching `.stoop/` with the CI's own cache. Pull requests read; only the default branch writes.
 
-Steps that are not `run:` steps (checkout, setup actions) run as usual.
+Full workflows for GitHub Actions, GitLab CI, CircleCI and Buildkite are in the [CI recipes](https://jwaldrip.github.io/stoop/docs/ci.html).
 
-## What counts as an input
+## Install
 
-| Counts | How |
+```sh
+cargo install --locked --git https://github.com/jwaldrip/stoop
+```
+
+Prebuilt binaries aren't published yet. Tracing needs Linux on x86-64 or arm64; on macOS stoop builds and runs the command untraced, so a workflow stays portable but never skips there.
+
+```sh
+stoop run -- cargo test        # skip or run
+stoop explain -- cargo test    # say what would run and why (exit 1 if it would run)
+stoop ls                       # list proofs
+```
+
+## What it sees, and what it can't
+
+| Counts as an input | How |
 |---|---|
-| Files read, executed, looked up or listed | traced; content hashed (toolchain-sized files outside the repo are sampled) |
-| A file that was absent and appears | recorded as absent inside the repo |
-| The whole environment | every variable, minus runner bookkeeping and per-start noise; `--ignore-env NAME` exempts one |
-| Output the run wrote inside the repo | must still be present and unchanged for a skip; list throwaway output in `.stoopignore` |
+| Files read, executed, looked up or listed | Traced; every byte hashed, inside the repository and out |
+| A file that was absent and appears | Recorded as absent inside the repository |
+| The environment | Every variable, minus runner bookkeeping; `--ignore-env NAME` exempts one |
+| External state you can check | `--probe CMD`: its output must match for a skip |
+| What the run wrote in the repository | Must still be in place for a skip; throwaway output goes in `.stoopignore` |
 
-## Blind spots
+stoop sees files. It can't see:
 
-`stoop` sees files. It cannot see:
+- **The network.** A run that connects out isn't recorded, and stoop names where it connected. Cover it with `--probe`, or pass `--allow-network`.
+- **The clock and randomness.** Proofs expire after 7 days (`--max-age`), and `STOOP_FULL=1` re-proves everything. Run that nightly.
+- **Services outside the process tree**, and output written outside the repository.
 
-- **The network.** A run that connects to an IP address or an unlisted local socket is not recorded (`--allow-network` overrides).
-- **The clock and randomness.** Proofs expire after 7 days (`--max-age`), and `STOOP_FULL=1` re-proves everything. Run it nightly.
-- **Services outside the process tree** that the command talks to through files or sockets it does not open itself.
+[Blind spots and how to cover them](https://jwaldrip.github.io/stoop/docs/blind-spots.html)
 
-Output outside the repository is not tracked. A step whose job is to produce files elsewhere should not be wrapped.
+## Declared inputs, observed inputs
 
-Tracing needs Linux (x86-64 or arm64). On other systems `stoop` runs the command untraced and records nothing.
+Build caches have to know what a task depends on. Most are told; stoop finds out.
 
-## `.stoopignore`
+| Tool | How it learns what a task depends on |
+|---|---|
+| Bazel | Each target declares its sources and dependencies in BUILD files ([docs](https://bazel.build/concepts/dependencies)) |
+| Nx | Hashes a target's configured inputs: file sets, runtime values and environment variables ([docs](https://nx.dev/docs/reference/inputs)) |
+| Turborepo | Hashes every git-tracked file in the package by default; `inputs` narrows it ([docs](https://turborepo.dev/docs/crafting-your-repository/configuring-tasks)) |
+| `actions/cache` | You compose the key, usually from `hashFiles()` over globs you choose ([docs](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching)) |
+| **stoop** | Traces the files the command actually opened, executed, looked up or listed |
 
-One pattern per line, relative to the repository root.
-
-```
-# a component name matches anywhere
-node_modules
-# a path with a slash is anchored to the root and covers what is under it
-reports/junit.xml
-# * stays inside a component, ** crosses them
-docs/**/generated
-```
-
-Add `.git` if a command reads it and the read cannot change the result. By default a read of `.git` means the proof is not recorded.
-
-## Commands
-
-```
-stoop run [options] -- <command>      skip or run
-stoop explain [options] -- <command>  say what would run and why (exit 1 if it would run)
-stoop sh <script>                     shell mode for CI
-stoop ls                              list proofs
-stoop forget <key>                    drop a proof
-```
-
-`stoop --help` has the options.
+Those tools do things stoop doesn't, like task graphs, restoring cached outputs and, in Bazel's case, remote execution. stoop is one binary around one command, and it works inside any of them.
 
 ## Roadmap
 
-The goal is to skip when the effective input is equal, not just when the bytes are. From strictest to loosest:
+Not built yet. Today a skip needs byte-equal inputs; the plan loosens that only where it can be shown not to hide a change:
 
-1. **Byte-equal inputs.** Done.
-2. **Equal build artifacts (early cutoff).** Works already when builds are reproducible: the build step reruns, and a downstream step that only reads its output sees the same bytes and skips. Next: hash executables by loaded segments, ignoring build ids, timestamps and debug sections. Line-number strings still change the output when an edit shifts lines.
-3. **Normalized source.** Hash a file with comments and whitespace removed, per language, conservatively (keep directives such as `//go:build`, pragmas and docstrings that are runtime values).
-4. **Static vetoes.** Scan the files a step read for clock, randomness and network calls and refuse to skip. A static signal can only make `stoop` run more, never less.
-5. **Remote proofs and restored outputs**, so a skip can also restore what the command produced.
+- **Equal build artifacts:** skip downstream steps when a rebuild produced the same bytes.
+- **Normalized source:** ignore comment and whitespace edits, per language.
+- **Coverage granularity:** tie a test to the code it actually ran.
+- **A determinism check:** run twice at record time and refuse to record a step that disagrees with itself.
+- **Static vetoes:** refuse to skip a step whose code calls the clock or a random source.
+- **Restored outputs:** let a skip put back what the command produced.
+
+[The roadmap, with the reasoning](https://jwaldrip.github.io/stoop/docs/roadmap.html)
+
+## Documentation
+
+The [field guide](https://jwaldrip.github.io/stoop/docs/getting-started.html) covers [getting started](https://jwaldrip.github.io/stoop/docs/getting-started.html), [how it works](https://jwaldrip.github.io/stoop/docs/how-it-works.html), [CI recipes](https://jwaldrip.github.io/stoop/docs/ci.html), [every flag](https://jwaldrip.github.io/stoop/docs/cli.html), [`.stoopignore`](https://jwaldrip.github.io/stoop/docs/stoopignore.html), [blind spots](https://jwaldrip.github.io/stoop/docs/blind-spots.html) and the [FAQ](https://jwaldrip.github.io/stoop/docs/faq.html). The site's source is in [`site/`](site/).
 
 ## Build
 
-```
+```sh
 cargo build --release
 cargo test        # the end-to-end tests need Linux
 ```

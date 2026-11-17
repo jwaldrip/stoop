@@ -1,0 +1,33 @@
+<!--meta {"title": "FAQ", "description": "Short answers about stoop: safety, speed, caches, monorepos, Node, macOS, and where the idea comes from.", "lede": "The questions people ask first, answered short.", "image": "07-dusk", "alt": "A lone peregrine high over a limestone escarpment at dusk."}-->
+<h2 id="safe">Can a skip hide a broken build?</h2>
+<p>Only through a blind spot: something the command depended on that isn't a file it read, like the network, the clock, or a service outside its process tree. stoop refuses to record runs that touch the network or local services unless you cover them, expires proofs after 7 days, and re-proves everything when <code>STOOP_FULL=1</code> is set. Everything it can't vouch for, it runs. <a href="blind-spots.html">Blind spots</a> lists them all.</p>
+
+<h2 id="fast">How fast is a skip?</h2>
+<p>As fast as hashing every recorded input. The cargo build in <a href="getting-started.html">getting started</a> recorded 668 inputs, the Rust toolchain included; skipping it took 289 ms against 3.64 s for the build. stoop reads every byte rather than trusting timestamps, so the cost grows with the size of what the command read.</p>
+
+<h2 id="tracing-cost">Does tracing slow the first run down?</h2>
+<p>Some. The seccomp filter only stops file and connection system calls, so compute-heavy steps pay little and steps that touch many files pay more. Measure your own steps with <code>time</code> under <code>STOOP_OFF=1</code> and without.</p>
+
+<h2 id="vs-cache">How is this different from a build cache?</h2>
+<p>A build cache needs to be told what a task depends on, through declared inputs, globs, or a key you compose. stoop watches the command and finds out. Build caches also restore outputs and model task graphs, which stoop doesn't. They combine fine: wrap the cache's command in stoop and both do their job. The <a href="../index.html#compared">comparison on the home page</a> has sources.</p>
+
+<h2 id="outputs">Why did a reverted change rebuild?</h2>
+<p>Because the build's earlier proof also requires the outputs it left in the repository to be in place, and the build in between rewrote them. Steps with no outputs in the repository, like tests, lint and type checks, do skip after a revert. Restoring outputs is <a href="roadmap.html">on the roadmap</a>.</p>
+
+<h2 id="node">Does it work with Node, Python, Go, Java?</h2>
+<p>It works with programs, not languages: anything that reads files through ordinary system calls on Linux. Node's <code>io_uring</code> file access is refused with <code>ENOSYS</code>, so Node falls back to calls the tracer sees. 32-bit programs on a 64-bit kernel use a syscall ABI the tracer doesn't follow; those runs aren't recorded.</p>
+
+<h2 id="monorepo">Monorepos?</h2>
+<p>Yes, and that's where it shines: wrap each package's step, and each one only runs when something it actually read changed. The key includes the working directory, so <code>npm test</code> in two packages gets two keys.</p>
+
+<h2 id="macos">Why Linux only?</h2>
+<p>The tracer is built on <code>ptrace</code> and seccomp. On macOS stoop still builds, and runs the command without tracing, so one workflow works on both; it just never skips there.</p>
+
+<h2 id="untrusted">Is it safe on pull requests from forks?</h2>
+<p>Proofs only matter if something reads them. Pull request runs can read the default branch's proofs and should never write shared ones: keep <code>STOOP_SYNC_WRITE</code> unset there, save the CI cache only from the default branch, and use <code>--no-record</code> if you want a job to write nothing even locally.</p>
+
+<h2 id="prior-art">Is tracing new?</h2>
+<p>No. Build tools have watched file access before, among them <a href="https://github.com/kgaughan/memoize.py">memoize.py</a> with strace and <a href="https://gittup.org/tup/">tup</a>. stoop applies the idea to CI steps: any command, no build file, proofs shared between runs.</p>
+
+<h2 id="name">Why "stoop"?</h2>
+<p>A stoop is a peregrine's hunting dive. It folds its wings, ignores everything else in the sky, and drops on the one thing that matters.</p>
