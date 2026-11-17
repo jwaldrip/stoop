@@ -5,11 +5,17 @@ use yaml_rust2::parser::{Event, EventReceiver, Parser};
 use yaml_rust2::{Yaml, YamlLoader};
 
 #[derive(Default)]
-struct AliasCheck(bool);
-impl EventReceiver for AliasCheck {
+struct ScalarCheck(Option<String>);
+impl EventReceiver for ScalarCheck {
     fn on_event(&mut self, event: Event) {
-        if matches!(event, Event::Alias(_)) {
-            self.0 = true;
+        match event {
+            Event::Alias(_) => self.0 = Some("YAML aliases are not supported".into()),
+            Event::Scalar(value, yaml_rust2::scanner::TScalarStyle::Plain, _, _)
+                if ["Null", "NULL", "-0"].contains(&value.as_str()) =>
+            {
+                self.0 = Some(format!("unsupported ambiguous YAML scalar {value}"));
+            }
+            _ => {}
         }
     }
 }
@@ -54,12 +60,12 @@ fn convert(y: &Yaml) -> Result<Value, String> {
 }
 
 pub fn parse(path: &str, text: &str) -> Result<Workflow, String> {
-    let mut aliases = AliasCheck::default();
+    let mut check = ScalarCheck::default();
     Parser::new_from_str(text)
-        .load(&mut aliases, true)
+        .load(&mut check, true)
         .map_err(|e| e.to_string())?;
-    if aliases.0 {
-        return Err("YAML aliases are not supported".into());
+    if let Some(error) = check.0 {
+        return Err(error);
     }
     let docs = YamlLoader::load_from_str(text).map_err(|e| e.to_string())?;
     if docs.len() != 1 {
@@ -120,6 +126,54 @@ fn env(v: Option<&Value>) -> Result<Map<String, Value>, String> {
         }
     }
     Ok(out)
+}
+
+fn stoop_settings(layers: &[Option<&Value>]) -> Result<Option<u64>, String> {
+    let mut effective = Map::new();
+    for layer in layers {
+        for (k, v) in object(*layer, "env")? {
+            if ["STOOP_FULL", "STOOP_OFF", "STOOP_MAX_AGE"].contains(&k.as_str()) {
+                effective.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    for name in ["STOOP_FULL", "STOOP_OFF"] {
+        if let Some(v) = effective.get(name) {
+            let s = match v {
+                Value::String(s) => s.clone(),
+                Value::Bool(b) => b.to_string(),
+                Value::Number(n) => n.to_string(),
+                Value::Null => String::new(),
+                _ => return Err(format!("{name} is not a scalar")),
+            };
+            if s.contains("${{") {
+                return Err(format!("{name} is an expression"));
+            }
+            let lower = s.trim().to_ascii_lowercase();
+            if !["", "0", "false", "no", "off"].contains(&lower.as_str()) {
+                return Err(format!("{name} is enabled"));
+            }
+        }
+    }
+    match effective.get("STOOP_MAX_AGE") {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => {
+            let s = match v {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                _ => return Err("STOOP_MAX_AGE is not a duration".into()),
+            };
+            if s.contains("${{") {
+                return Err("STOOP_MAX_AGE is an expression".into());
+            }
+            if s.trim().is_empty() {
+                return Ok(None);
+            }
+            crate::run::parse_age(&s)
+                .map(Some)
+                .map_err(|e| format!("STOOP_MAX_AGE: {e}"))
+        }
+    }
 }
 fn run_defaults(v: Option<&Value>) -> Result<Map<String, Value>, String> {
     let outer = object(v, "defaults")?;
@@ -223,6 +277,49 @@ fn action_class(name: &str) -> Option<&'static str> {
     }
     None
 }
+fn check_setup(name: &str, fields: &Map<String, Value>) -> Result<(), String> {
+    let n = name.to_ascii_lowercase();
+    if n == "jdx/mise-action" || n == "pnpm/action-setup" {
+        return Err(format!("{name} reads repository configuration"));
+    }
+    for field in [
+        "node-version-file",
+        "python-version-file",
+        "go-version-file",
+        "java-version-file",
+        "jdk-file",
+        "global-json-file",
+        "bun-version-file",
+        "deno-version-file",
+        "version-file",
+        "package_json_file",
+    ] {
+        if fields.contains_key(field) {
+            return Err(format!("{name} reads repository file via {field}"));
+        }
+    }
+    let required = match n.as_str() {
+        "actions/setup-python" => Some("python-version"),
+        "ruby/setup-ruby" => Some("ruby-version"),
+        "actions/setup-dotnet" => Some("dotnet-version"),
+        _ => None,
+    };
+    if let Some(field) = required {
+        match fields.get(field) {
+            Some(Value::String(s))
+                if !s.is_empty() && !s.eq_ignore_ascii_case("default") && !s.contains("${{") => {}
+            _ => return Err(format!("{name} requires explicit {field}")),
+        }
+    }
+    for field in ["bundler-cache", "run_install"] {
+        if let Some(v) = fields.get(field) {
+            if v != &Value::Bool(false) && v != "false" && v != "" {
+                return Err(format!("{name} {field} can run repository code"));
+            }
+        }
+    }
+    Ok(())
+}
 fn action_with(class: &str, name: &str, fields: &Map<String, Value>) -> Result<Value, String> {
     let mut result = Map::new();
     for (k, v) in fields {
@@ -231,7 +328,12 @@ fn action_with(class: &str, name: &str, fields: &Map<String, Value>) -> Result<V
                 || (["submodules", "lfs"].contains(&k.as_str())
                     && v != &Value::Bool(false)
                     && v != "false")
-                || (k == "clean" && (v == &Value::Bool(false) || v == "false")))
+                || (k == "clean"
+                    && !matches!(v, Value::Null)
+                    && !v
+                        .as_str()
+                        .is_some_and(|s| s.is_empty() || s.eq_ignore_ascii_case("true"))
+                    && v != &Value::Bool(true)))
         {
             return Err(format!("checkout {k} is not supported"));
         }
@@ -305,6 +407,40 @@ fn build(
             .get(job)
             .and_then(Value::as_object)
             .ok_or("job missing or not an object")?;
+        if let Some(k) = j.keys().find(|k| {
+            ![
+                "runs-on",
+                "env",
+                "defaults",
+                "steps",
+                "container",
+                "services",
+                "cache-mode",
+                "name",
+                "permissions",
+                "needs",
+                "if",
+                "concurrency",
+                "timeout-minutes",
+                "continue-on-error",
+                "strategy",
+                "uses",
+                "outputs",
+                "environment",
+            ]
+            .contains(&k.as_str())
+        }) {
+            return Err(format!("unsupported job field {k}"));
+        }
+        if let Some(strategy) = j.get("strategy") {
+            if let Some(k) = object(Some(strategy), "strategy")?
+                .keys()
+                .find(|k| !["matrix", "fail-fast", "max-parallel"].contains(&k.as_str()))
+            {
+                return Err(format!("unsupported strategy field {k}"));
+            }
+        }
+        stoop_settings(&[w.root.get("env"), j.get("env")])?;
         let needs = match j.get("needs") {
             None => vec![],
             Some(Value::String(s)) => vec![s.clone()],
@@ -356,11 +492,34 @@ fn build(
             .get("steps")
             .and_then(Value::as_array)
             .ok_or("steps must be an array")?;
+        let mut seen_checkout = false;
+        let mut seen_traced = false;
         for (n, step) in steps.iter().enumerate() {
             let idx = n + 1;
-            let result = step_key(step, idx, &defaults, &w.name, job, leg.as_deref());
+            let result = step_key(
+                step,
+                idx,
+                &defaults,
+                (&w.name, job),
+                leg.as_deref(),
+                &[w.root.get("env"), j.get("env")],
+                seen_traced,
+            );
             match result {
                 Ok(Some((key, desc))) => {
+                    if matches!(&desc, StepSpec::Neutral { what, .. } if action_name(what).is_some_and(|name| name.eq_ignore_ascii_case("actions/checkout")))
+                    {
+                        if seen_traced {
+                            return Err("checkout after traced step".into());
+                        }
+                        seen_checkout = true;
+                    }
+                    if matches!(&desc, StepSpec::Traced { .. }) {
+                        if !seen_checkout {
+                            return Err("traced step requires preceding checkout".into());
+                        }
+                        seen_traced = true;
+                    }
                     keyed_steps.push(key);
                     spec.steps.push(desc);
                 }
@@ -381,20 +540,30 @@ fn build(
         {
             return Err("no traced steps".into());
         }
-        let key = json!({"schema": 1, "provider":"github", "workflow":w.name, "job":job, "matrix":leg, "runs_on":spec.runs_on, "container": static_value(j.get("container").unwrap_or(&Value::Null))?, "services": static_value(j.get("services").unwrap_or(&Value::Null))?, "env": all_env, "defaults":defaults, "steps":keyed_steps});
+        let key = json!({"schema": 1, "provider":"github", "workflow":w.name, "job":job, "matrix":leg, "runs_on":spec.runs_on, "container": static_value(j.get("container").unwrap_or(&Value::Null))?, "services": static_value(j.get("services").unwrap_or(&Value::Null))?, "env": all_env, "defaults":defaults, "workflow_cache_mode":static_value(w.root.get("cache-mode").unwrap_or(&Value::Null))?, "cache_mode":static_value(j.get("cache-mode").unwrap_or(&Value::Null))?, "steps":keyed_steps});
         let bytes = serde_json::to_vec(&key).map_err(|e| e.to_string())?;
         spec.key = Some(format!("job-{}", &blake3::hash(&bytes).to_hex()[..32]));
         Ok(())
     };
     work().map_err(|e| (None, e))
 }
+fn action_name(uses: &str) -> Option<String> {
+    let (path, _) = uses.rsplit_once('@')?;
+    Some(
+        path.split(['/', '\\'])
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
+}
 fn step_key(
     step: &Value,
     index: usize,
     defaults: &Map<String, Value>,
-    workflow: &str,
-    job: &str,
+    identity: (&str, &str),
     leg: Option<&str>,
+    env_layers: &[Option<&Value>],
+    seen_traced: bool,
 ) -> Result<Option<(Value, StepSpec)>, String> {
     let s = step.as_object().ok_or("step must be an object")?;
     if let Some(k) = s.keys().find(|k| {
@@ -424,6 +593,9 @@ fn step_key(
     let e = env(s.get("env"))?;
     let raw_env = object(s.get("env"), "step env")?;
     let marker = raw_env.get("STOOP_PLAN") == Some(&Value::String("neutral".into()));
+    let mut layers = env_layers.to_vec();
+    layers.push(s.get("env"));
+    let env_age = stoop_settings(&layers)?;
     let run = string(s.get("run"), "run")?;
     let uses = string(s.get("uses"), "uses")?;
     if run.is_some() == uses.is_some() {
@@ -440,8 +612,9 @@ fn step_key(
     if let Some(run) = run {
         static_value(&json!(run))?;
         if shell_text.split_whitespace().take(2).eq(["stoop", "sh"]) {
-            let age = shell(shell_text)?;
-            let key = crate::stepkey::sh_key(run.as_bytes(), workflow, job, &cwd_key(wd)?, leg);
+            let age = shell(shell_text)?.or(env_age);
+            let key =
+                crate::stepkey::sh_key(run.as_bytes(), identity.0, identity.1, &cwd_key(wd)?, leg);
             return Ok(Some((
                 json!({"traced":{"key":key,"if":true,"env":e,"shell":shell_text,"working-directory":wd}}),
                 StepSpec::Traced {
@@ -454,6 +627,9 @@ fn step_key(
         if !marker {
             return Err("run step is not traced and has no STOOP_PLAN neutral marker".into());
         }
+        if seen_traced {
+            return Err("neutral marker after traced step".into());
+        }
         return Ok(Some((
             json!({"neutral":{"run":run,"env":e,"if":true,"shell":shell_text,"working-directory":wd}}),
             StepSpec::Neutral {
@@ -464,25 +640,35 @@ fn step_key(
     }
     let uses = uses.unwrap();
     static_value(&json!(uses))?;
-    if uses.starts_with("./") || uses.starts_with("docker://") {
+    if uses.starts_with("./")
+        || uses.starts_with(".\\")
+        || uses.to_ascii_lowercase().starts_with("docker://")
+    {
         return Err(format!("unsupported action {uses}"));
     }
-    let (name, reference) = uses.rsplit_once('@').ok_or("action has no ref")?;
+    let (_, reference) = uses.rsplit_once('@').ok_or("action has no ref")?;
+    let name = action_name(uses).ok_or("action has no ref")?;
     if name.is_empty() || reference.is_empty() {
         return Err("action has no ref".into());
     }
-    let class = action_class(name);
+    let class = action_class(&name);
     if class.is_none() && !marker {
         return Err(format!("action {uses} is not allowlisted"));
     }
+    if marker && seen_traced {
+        return Err("neutral marker after traced step".into());
+    }
     let with = object(s.get("with"), "with")?;
     if class == Some("checkout") {
-        action_with("checkout", name, with)?;
+        action_with("checkout", &name, with)?;
+    }
+    if class == Some("setup") {
+        check_setup(&name, with)?;
     }
     let fields = if marker {
         static_value(&Value::Object(with.clone()))?
     } else {
-        action_with(class.unwrap(), name, with)?
+        action_with(class.unwrap(), &name, with)?
     };
     let is_cache = class == Some("cache") && !marker;
     let mut value = json!({"uses":uses,"with":fields,"env":e});
@@ -504,7 +690,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     fn fixture(extra: &str, steps: &str) -> String {
-        format!("name: fixture\non: push\ndefaults:\n  run:\n    shell: stoop sh {{0}}\njobs:\n  test:\n    runs-on: ubuntu-latest\n{extra}    steps:\n{steps}")
+        format!("name: fixture\non: push\ndefaults:\n  run:\n    shell: stoop sh {{0}}\njobs:\n  test:\n    runs-on: ubuntu-latest\n{extra}    steps:\n      - uses: actions/checkout@v4\n{steps}")
     }
     fn spec(text: &str) -> JobSpec {
         let w = parse(".github/workflows/ci.yml", text).unwrap();
@@ -525,7 +711,7 @@ mod tests {
     #[test]
     fn traced_key_matches_runtime_and_working_directory() {
         let s = spec(&fixture("", RUN));
-        match &s.steps[0] {
+        match &s.steps[1] {
             StepSpec::Traced { key, .. } => assert_eq!(
                 *key,
                 crate::stepkey::sh_key(b"cargo test", "fixture", "test", "", None)
@@ -536,7 +722,7 @@ mod tests {
             "",
             "      - run: cargo test\n        working-directory: ./app\n",
         ));
-        match &s.steps[0] {
+        match &s.steps[1] {
             StepSpec::Traced { key, .. } => assert_eq!(
                 *key,
                 crate::stepkey::sh_key(b"cargo test", "fixture", "test", "app", None)
@@ -604,8 +790,108 @@ mod tests {
     #[test]
     fn neutral_marker_cannot_hide_a_traced_step_or_checkout_ref() {
         let s = spec(&fixture("", "      - shell: stoop  sh {0}\n        run: cargo test\n        env: {STOOP_PLAN: neutral}\n"));
-        assert!(matches!(s.steps.first(), Some(StepSpec::Traced { .. })));
+        assert!(matches!(s.steps.get(1), Some(StepSpec::Traced { .. })));
         let s = spec(&fixture("", "      - uses: actions/checkout@v4\n        with: {ref: other}\n        env: {STOOP_PLAN: neutral}\n      - run: cargo test\n"));
         assert!(s.blocked.unwrap().detail.contains("checkout ref"));
+    }
+    #[test]
+    fn review_blockers_and_checkout_safety() {
+        let cases = [
+            ("    snapshot: image\n", RUN, "snapshot"),
+            ("    unknown: value\n", RUN, "unknown"),
+            ("    env: {STOOP_FULL: '1'}\n", RUN, "STOOP_FULL"),
+            ("    env: {STOOP_OFF: '${{ secrets.x }}'}\n", RUN, "STOOP_OFF"),
+            ("", "      - run: x\n        env: {STOOP_OFF: '1'}\n", "STOOP_OFF"),
+            ("", "      - uses: actions/setup-node@v4\n        with: {node-version-file: .nvmrc}\n      - run: x\n", "node-version-file"),
+            ("", "      - uses: actions/setup-python@v5\n      - run: x\n", "python-version"),
+            ("", "      - uses: ruby/setup-ruby@v1\n      - run: x\n", "ruby-version"),
+            ("", "      - uses: actions/setup-dotnet@v4\n      - run: x\n", "dotnet-version"),
+            ("", "      - uses: jdx/mise-action@v2\n      - run: x\n", "repository configuration"),
+            ("", "      - uses: pnpm/action-setup@v4\n      - run: x\n", "repository configuration"),
+            ("", "      - uses: ruby/setup-ruby@v1\n        with: {ruby-version: '3.3', bundler-cache: true}\n      - run: x\n", "bundler-cache"),
+            ("", "      - uses: actions/checkout/@v4\n        with: {ref: other}\n        env: {STOOP_PLAN: neutral}\n      - run: x\n", "checkout ref"),
+            ("", "      - uses: actions//checkout@v4\n        with: {path: other}\n        env: {STOOP_PLAN: neutral}\n      - run: x\n", "checkout path"),
+            ("", "      - uses: actions/checkout@v4\n        with: {clean: 'False'}\n      - run: x\n", "checkout clean"),
+            ("", "      - run: x\n      - shell: bash\n        run: npm test\n        env: {STOOP_PLAN: neutral}\n", "neutral marker after"),
+            ("", "      - run: x\n      - uses: actions/checkout@v4\n", "checkout after"),
+        ];
+        for (extra, steps, expected) in cases {
+            let detail = spec(&fixture(extra, steps)).blocked.expect(expected).detail;
+            assert!(
+                detail.contains(expected),
+                "{detail} does not contain {expected}"
+            );
+        }
+        let no_checkout = fixture("", RUN).replace("      - uses: actions/checkout@v4\n", "");
+        assert!(spec(&no_checkout)
+            .blocked
+            .unwrap()
+            .detail
+            .contains("checkout"));
+        for scalar in ["Null", "NULL", "-0"] {
+            assert!(parse(
+                "ci.yml",
+                &fixture(&format!("    env: {{FOO: {scalar}}}\n"), RUN)
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn max_age_precedence_and_marker_setup() {
+        let text = fixture("    env: {STOOP_MAX_AGE: 1h}\n", "      - shell: bash\n        run: setup\n        env: {STOOP_PLAN: neutral}\n      - run: test\n        env: {STOOP_MAX_AGE: 60}\n");
+        let s = spec(&text);
+        assert!(s.blocked.is_none(), "{:?}", s.blocked);
+        assert!(matches!(
+            s.steps.last(),
+            Some(StepSpec::Traced {
+                max_age: Some(60),
+                ..
+            })
+        ));
+        let changed = text.replace(
+            "      - run: test",
+            "      - shell: stoop sh --max-age 2h {0}\n        run: test",
+        );
+        assert!(matches!(
+            spec(&changed).steps.last(),
+            Some(StepSpec::Traced {
+                max_age: Some(7200),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn keyed_and_excluded_fields_table() {
+        let base = fixture("", "      - shell: bash\n        run: prepare\n        env: {STOOP_PLAN: neutral}\n      - uses: actions/setup-node@v4\n        with: {node-version: '20', token: ignored}\n      - run: cargo test\n        env: {FOO: bar}\n");
+        let key0 = key(&base);
+        for (from, to) in [
+            ("ubuntu-latest", "macos-latest"),
+            ("    steps:", "    env: {VAR: new}\n    steps:"),
+            ("    steps:", "    container: image\n    steps:"),
+            (
+                "    steps:",
+                "    services: {db: {image: postgres}}\n    steps:",
+            ),
+            ("    steps:", "    cache-mode: read\n    steps:"),
+            ("on: push", "on: push\ncache-mode: write"),
+            ("FOO: bar", "FOO: other"),
+            ("run: prepare", "run: other"),
+            ("setup-node@v4", "setup-node@v5"),
+            ("node-version: '20'", "node-version: '22'"),
+            ("run: cargo test", "run: cargo build"),
+            ("shell: stoop sh {0}", "shell: stoop sh --quiet {0}"),
+        ] {
+            assert_ne!(key0, key(&base.replace(from, to)), "{from}");
+        }
+        for (from, to) in [
+            ("token: ignored", "token: changed"),
+            ("    steps:", "    name: renamed\n    steps:"),
+            ("    steps:", "    needs: other\n    steps:"),
+            ("    steps:", "    if: false\n    steps:"),
+        ] {
+            assert_eq!(key0, key(&base.replace(from, to)), "{from}");
+        }
     }
 }
