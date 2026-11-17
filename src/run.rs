@@ -4,6 +4,7 @@ use crate::ignore::Ignore;
 use crate::input::{identify, par_map, verify, Input};
 use crate::pathutil::{absolutize, to_key};
 use crate::proof::{now, sanitize, Proof, Store};
+use crate::sync::Remote;
 use crate::trace::{self, Trace};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -27,6 +28,10 @@ pub struct Opts {
     pub mention: String,
     /// External state to verify: commands whose output must be unchanged for a skip.
     pub probes: Vec<String>,
+    /// Share proofs through a git remote: `git` or `git:<remote>`.
+    pub sync: Option<String>,
+    /// Publish proofs to that remote. Off by default; for trusted runs only.
+    pub sync_write: bool,
     /// Seconds a proof stays valid; 0 means forever. Default: 7 days.
     pub max_age: Option<u64>,
     pub argv: Vec<String>,
@@ -224,75 +229,109 @@ pub fn run(o: Opts, explain: bool) -> i32 {
     env_names.dedup();
     let env_now = env_hashes(&env_names);
 
+    let remote = o
+        .sync
+        .clone()
+        .or_else(|| std::env::var("STOOP_SYNC").ok())
+        .and_then(|spec| {
+            let write = o.sync_write || std::env::var_os("STOOP_SYNC_WRITE").is_some();
+            match Remote::from_spec(&spec, &root, write) {
+                Ok(r) => Some(r),
+                Err(e) => {
+                    eprintln!("stoop: sync: {e}");
+                    None
+                }
+            }
+        });
+
     // 1. Is there a proof whose inputs all still match?
     let t0 = Instant::now();
-    let proofs = store.load(&key);
-    let mut why = String::from("no proof yet");
-    let mut hit: Option<&Proof> = None;
+    let mut proofs = store.load(&key);
+    let mut pulled = false;
     let mut probe_now: Option<Option<BTreeMap<String, String>>> = None;
-    for (i, p) in proofs.iter().enumerate() {
-        let expired = max_age > 0 && now().saturating_sub(p.created) > max_age;
-        let diffs: Vec<(String, &'static str)> = if expired {
-            vec![("proof".to_string(), "expired")]
-        } else if p.env != env_now {
-            vec![("env".to_string(), "changed")]
-        } else {
-            let mut d: Vec<(String, &'static str)> = verify(&root, &p.inputs, explain)
-                .into_iter()
-                .map(|m| (m.path, m.why))
-                .collect();
-            if d.is_empty() {
-                // Inputs match, but a skip also needs what the run produced to be in place.
-                d = verify(&root, &p.outputs, explain)
+    let mut why;
+    let mut hit_idx: Option<usize>;
+    loop {
+        why = String::from("no proof yet");
+        hit_idx = None;
+        for (i, p) in proofs.iter().enumerate() {
+            let expired = max_age > 0 && now().saturating_sub(p.created) > max_age;
+            let diffs: Vec<(String, &'static str)> = if expired {
+                vec![("proof".to_string(), "expired")]
+            } else if p.env != env_now {
+                vec![("env".to_string(), "changed")]
+            } else {
+                let mut d: Vec<(String, &'static str)> = verify(&root, &p.inputs, explain)
                     .into_iter()
-                    .map(|m| {
-                        (
-                            format!("output {}", m.path),
-                            if m.why == "removed" { "missing" } else { m.why },
-                        )
-                    })
+                    .map(|m| (m.path, m.why))
                     .collect();
-            }
-            d
-        };
-        let mut diffs = diffs;
-        if diffs.is_empty() && (!p.probes.is_empty() || !o.probes.is_empty()) {
-            // External state is checked last: it can be slow, and files rule most proofs out first.
-            let fresh = probe_now.get_or_insert_with(|| run_probes(&o.probes, &cwd, o.quiet));
-            match fresh {
-                None => diffs.push(("probe".to_string(), "failed")),
-                Some(m) if *m != p.probes => {
-                    let which = m
-                        .keys()
-                        .chain(p.probes.keys())
-                        .find(|k| m.get(*k) != p.probes.get(*k))
-                        .cloned()
-                        .unwrap_or_else(|| "probe".to_string());
-                    diffs.push((format!("probe `{which}`"), "changed"));
+                if d.is_empty() {
+                    // Inputs match, but a skip also needs what the run produced to be in place.
+                    d = verify(&root, &p.outputs, explain)
+                        .into_iter()
+                        .map(|m| {
+                            (
+                                format!("output {}", m.path),
+                                if m.why == "removed" { "missing" } else { m.why },
+                            )
+                        })
+                        .collect();
                 }
-                Some(_) => {}
+                d
+            };
+            let mut diffs = diffs;
+            if diffs.is_empty() && (!p.probes.is_empty() || !o.probes.is_empty()) {
+                // External state is checked last: it can be slow, and files rule most proofs out first.
+                let fresh = probe_now.get_or_insert_with(|| run_probes(&o.probes, &cwd, o.quiet));
+                match fresh {
+                    None => diffs.push(("probe".to_string(), "failed")),
+                    Some(m) if *m != p.probes => {
+                        let which = m
+                            .keys()
+                            .chain(p.probes.keys())
+                            .find(|k| m.get(*k) != p.probes.get(*k))
+                            .cloned()
+                            .unwrap_or_else(|| "probe".to_string());
+                        diffs.push((format!("probe `{which}`"), "changed"));
+                    }
+                    Some(_) => {}
+                }
+            }
+            if diffs.is_empty() {
+                hit_idx = Some(i);
+                break;
+            }
+            if i == 0 {
+                let first = &diffs[0];
+                let more = if diffs.len() > 1 {
+                    format!(" (+{} more)", diffs.len() - 1)
+                } else {
+                    String::new()
+                };
+                why = format!("{} {}{}", first.0, first.1, more);
+            }
+            if explain {
+                eprintln!("proof {} ({}):", i + 1, ago(p.created));
+                for (path, w) in diffs.iter().take(20) {
+                    eprintln!("  {w}: {path}");
+                }
             }
         }
-        if diffs.is_empty() {
-            hit = Some(p);
+        // A miss with a remote configured: someone else may already have proved this.
+        if hit_idx.is_some() || pulled || remote.is_none() {
             break;
         }
-        if i == 0 {
-            let first = &diffs[0];
-            let more = if diffs.len() > 1 {
-                format!(" (+{} more)", diffs.len() - 1)
-            } else {
-                String::new()
-            };
-            why = format!("{} {}{}", first.0, first.1, more);
-        }
-        if explain {
-            eprintln!("proof {} ({}):", i + 1, ago(p.created));
-            for (path, w) in diffs.iter().take(20) {
-                eprintln!("  {w}: {path}");
+        pulled = true;
+        match remote.as_ref().map(|r| r.pull(&store, &key)) {
+            Some(Ok(0)) | None => break,
+            Some(Ok(_)) => proofs = store.load(&key),
+            Some(Err(e)) => {
+                eprintln!("stoop: sync: could not fetch proofs ({e}); continuing");
+                break;
             }
         }
     }
+    let hit: Option<&Proof> = hit_idx.map(|i| &proofs[i]);
     if let Some(p) = hit {
         if !full {
             if !o.quiet {
@@ -370,10 +409,31 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                 outputs,
                 probes,
             };
-            match store.save(&key, proof) {
-                Ok(()) if !o.quiet => eprintln!("stoop: recorded {n} inputs for {key}"),
-                Ok(()) => {}
-                Err(e) => eprintln!("stoop: could not save proof: {e}"),
+            if let Some(r) = remote.as_ref().filter(|r| r.write) {
+                // Fold in anything other runs published since we looked, so a push never
+                // drops their proofs.
+                if let Err(e) = r.pull(&store, &key) {
+                    eprintln!("stoop: sync: could not refresh from the remote ({e}); continuing");
+                }
+            }
+            let saved = match store.save(&key, proof) {
+                Ok(()) => {
+                    if !o.quiet {
+                        eprintln!("stoop: recorded {n} inputs for {key}");
+                    }
+                    true
+                }
+                Err(e) => {
+                    eprintln!("stoop: could not save proof: {e}");
+                    false
+                }
+            };
+            if let Some(r) = remote.as_ref().filter(|r| saved && r.write) {
+                match r.push(&store, &key) {
+                    Ok(()) if !o.quiet => eprintln!("stoop: published {key} to the remote"),
+                    Ok(()) => {}
+                    Err(e) => eprintln!("stoop: sync: could not publish ({e}); continuing"),
+                }
             }
         }
         Err(why) => {

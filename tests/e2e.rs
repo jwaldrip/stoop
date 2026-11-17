@@ -433,6 +433,176 @@ fn mkdir_over_existing_ancestors_does_not_hide_the_inputs() {
     );
 }
 
+// ---- sharing proofs through a git remote --------------------------------------------
+
+fn git(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// A bare repository standing in for GitHub, GitLab or any other remote.
+fn bare(name: &str) -> PathBuf {
+    let p = std::env::temp_dir().join(format!(
+        "stoop-e2e-{}-{name}-remote.git",
+        std::process::id()
+    ));
+    let _ = fs::remove_dir_all(&p);
+    fs::create_dir_all(&p).unwrap();
+    git(&p, &["init", "--bare", "-q", "."]);
+    p
+}
+
+impl Ws {
+    /// Make the workspace a git checkout whose `origin` is `remote`.
+    fn with_remote(self, remote: &Path) -> Ws {
+        git(&self.root, &["init", "-q", "."]);
+        git(
+            &self.root,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        self
+    }
+}
+
+fn published(remote: &Path) -> Vec<String> {
+    git(
+        remote,
+        &["for-each-ref", "--format=%(refname)", "refs/stoop/"],
+    )
+    .lines()
+    .map(String::from)
+    .collect()
+}
+
+const SCRIPT: &str = "cat in.txt > /dev/null";
+
+fn run_sync(w: &Ws, extra: &[&str]) -> (i32, String) {
+    let mut args = vec!["run", "--root", ".", "--key", "s"];
+    args.extend(extra);
+    args.extend(["--", "sh", "-c", SCRIPT]);
+    w.stoop(&args)
+}
+
+#[test]
+fn a_proof_published_by_one_checkout_lets_another_skip() {
+    let remote = bare("share");
+    let a = Ws::new("sync-a").with_remote(&remote);
+    let b = Ws::new("sync-b").with_remote(&remote);
+    let (_, e) = run_sync(&a, &["--sync", "git", "--sync-write"]);
+    assert!(e.contains("published"), "{e}");
+    assert_eq!(published(&remote), vec!["refs/stoop/s".to_string()]);
+    // B has no local proof and does not write; it reads A's.
+    let (c, e) = run_sync(&b, &["--sync", "git"]);
+    assert_eq!(c, 0, "{e}");
+    assert!(skipped(&e), "B should skip on A's proof: {e}");
+}
+
+#[test]
+fn a_published_proof_does_not_hide_a_changed_input() {
+    let remote = bare("changed");
+    let a = Ws::new("syncc-a").with_remote(&remote);
+    let b = Ws::new("syncc-b").with_remote(&remote);
+    run_sync(&a, &["--sync", "git", "--sync-write"]);
+    b.write("in.txt", "different");
+    let (_, e) = run_sync(&b, &["--sync", "git"]);
+    assert!(!skipped(&e) && e.contains("in.txt changed"), "{e}");
+}
+
+#[test]
+fn sync_only_reads_unless_write_is_asked_for() {
+    let remote = bare("readonly");
+    let a = Ws::new("syncr-a").with_remote(&remote);
+    let (_, e) = run_sync(&a, &["--sync", "git"]);
+    assert!(e.contains("recorded") && !e.contains("published"), "{e}");
+    assert!(
+        published(&remote).is_empty(),
+        "nothing may be published without --sync-write"
+    );
+}
+
+#[test]
+fn an_unreachable_remote_never_fails_the_step() {
+    let a = Ws::new("syncu-a").with_remote(Path::new("/nonexistent/remote.git"));
+    let (c, e) = run_sync(&a, &["--sync", "git", "--sync-write"]);
+    assert_eq!(c, 0, "the command's own exit status must pass through: {e}");
+    assert!(e.contains("sync:") && e.contains("continuing"), "{e}");
+    assert!(
+        e.contains("recorded"),
+        "the local proof is still recorded: {e}"
+    );
+    // and the local proof works
+    assert!(skipped(&run_sync(&a, &[]).1));
+}
+
+#[test]
+fn pull_fetches_every_published_proof_so_steps_never_wait_on_the_network() {
+    let remote = bare("pull");
+    let a = Ws::new("syncp-a").with_remote(&remote);
+    let b = Ws::new("syncp-b").with_remote(&remote);
+    run_sync(&a, &["--sync", "git", "--sync-write"]);
+    let (c, e) = b.stoop(&["pull", "--sync", "git", "--root", "."]);
+    assert_eq!(c, 0, "{e}");
+    assert!(e.contains("pulled 1"), "{e}");
+    // No --sync here: the proof is already in B's local store.
+    assert!(skipped(&run_sync(&b, &[]).1));
+}
+
+#[test]
+fn prune_removes_expired_published_proofs() {
+    let remote = bare("prune");
+    let a = Ws::new("syncx-a").with_remote(&remote);
+    run_sync(&a, &["--sync", "git", "--sync-write"]);
+    assert_eq!(published(&remote).len(), 1);
+    std::thread::sleep(std::time::Duration::from_millis(2100));
+    let (c, e) = a.stoop(&[
+        "prune",
+        "--sync",
+        "git",
+        "--sync-write",
+        "--max-age",
+        "1s",
+        "--root",
+        ".",
+    ]);
+    assert_eq!(c, 0, "{e}");
+    assert!(published(&remote).is_empty(), "{e}");
+    // Without write it refuses rather than deleting.
+    a.stoop(&["forget", "s", "--root", "."]);
+    run_sync(&a, &["--sync", "git", "--sync-write"]);
+    assert_eq!(
+        published(&remote).len(),
+        1,
+        "republished after forgetting the local proof"
+    );
+    let (c, _) = a.stoop(&["prune", "--sync", "git", "--max-age", "0", "--root", "."]);
+    assert_ne!(c, 0);
+    assert_eq!(published(&remote).len(), 1);
+}
+
+#[test]
+fn republishing_keeps_proofs_other_runs_published() {
+    let remote = bare("merge");
+    let a = Ws::new("syncm-a").with_remote(&remote);
+    let b = Ws::new("syncm-b").with_remote(&remote);
+    run_sync(&a, &["--sync", "git", "--sync-write"]);
+    b.write("in.txt", "variant");
+    run_sync(&b, &["--sync", "git", "--sync-write"]); // proof for a different input state
+                                                      // A third checkout sees both: it can skip for either variant.
+    let c = Ws::new("syncm-c").with_remote(&remote);
+    assert!(skipped(&run_sync(&c, &["--sync", "git"]).1), "variant one");
+    c.write("in.txt", "variant");
+    assert!(skipped(&run_sync(&c, &["--sync", "git"]).1), "variant two");
+}
+
 #[test]
 fn io_uring_is_refused_inside_a_traced_command_so_runtimes_fall_back() {
     let w = Ws::new("iouring");
