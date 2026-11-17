@@ -128,12 +128,31 @@ pub fn run_probes(probes: &[String], cwd: &Path, quiet: bool) -> Option<BTreeMap
     Some(out)
 }
 
-fn env_hashes(names: &[String]) -> BTreeMap<String, String> {
+/// A secret that keys the environment hashes stored in proofs. Proofs published to a
+/// git remote are readable by anyone who can read the repository, and an unsalted hash
+/// of a low-entropy value (a short token, a boolean flag) can be guessed offline. With
+/// the salt set, hashes are keyed with it and carry the `s:` prefix; whoever checks a
+/// proof needs the same salt, so runs without the secret (fork pull requests) simply
+/// cannot match and the command runs. The salt itself is never hashed in.
+pub const SALT_VAR: &str = "STOOP_ENV_SALT";
+
+fn env_hashes(names: &[String], salt: Option<&str>) -> BTreeMap<String, String> {
+    let key = salt.map(|s| blake3::derive_key("stoop env hash v1", s.as_bytes()));
     names
         .iter()
         .map(|n| {
             let v = std::env::var(n).unwrap_or_default();
-            (n.clone(), blake3::hash(v.as_bytes()).to_hex().to_string())
+            let h = match &key {
+                Some(k) => {
+                    let mut h = blake3::Hasher::new_keyed(k);
+                    h.update(n.as_bytes());
+                    h.update(&[0]);
+                    h.update(v.as_bytes());
+                    format!("s:{}", h.finalize().to_hex())
+                }
+                None => blake3::hash(v.as_bytes()).to_hex().to_string(),
+            };
+            (n.clone(), h)
         })
         .collect()
 }
@@ -246,7 +265,8 @@ pub fn run(o: Opts, explain: bool) -> i32 {
     env_names.extend(o.env.iter().cloned());
     env_names.sort();
     env_names.dedup();
-    let env_now = env_hashes(&env_names);
+    let salt = env_str(SALT_VAR);
+    let env_now = env_hashes(&env_names, salt.as_deref());
 
     let remote = o
         .sync
@@ -448,6 +468,13 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                 }
             };
             if let Some(r) = remote.as_ref().filter(|r| saved && r.write) {
+                if salt.is_none() {
+                    // Hashes of every variable go into a file other people can fetch. An
+                    // unsalted hash of a low-entropy secret can be guessed offline.
+                    eprintln!(
+                        "stoop: sync: publishing environment hashes without {SALT_VAR}. In a public repository set it from a repository secret so low-entropy values cannot be guessed offline."
+                    );
+                }
                 match r.push(&store, &key) {
                     Ok(()) if !o.quiet => eprintln!("stoop: published {key} to the remote"),
                     Ok(()) => {}
