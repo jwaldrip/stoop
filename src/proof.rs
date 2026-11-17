@@ -15,17 +15,39 @@ const MAX_PROOFS: usize = 8;
 pub struct Proof {
     pub created: u64,
     pub argv: Vec<String>,
-    /// Hashes of the environment variables the user declared with `--env`.
+    /// Hashes of the effective environment captured for the run.
     pub env: BTreeMap<String, String>,
     pub inputs: Vec<Input>,
     /// Files the run produced inside the repository. A skip needs them still in
     /// place, because skipping does not run the command that makes them.
     #[serde(default)]
     pub outputs: Vec<Input>,
+    /// Repository paths written by the run that were absent when it finished.
+    #[serde(default)]
+    pub removed: Vec<String>,
+    /// Effective ignore patterns, or None for proofs recorded before planning.
+    #[serde(default)]
+    pub ignore: Option<Vec<String>>,
     /// External state the user vouched for with `--probe`: command text to the hash
     /// of its output when the run happened. A skip needs every probe to match again.
     #[serde(default)]
     pub probes: BTreeMap<String, String>,
+}
+
+impl Proof {
+    #[allow(dead_code)]
+    pub fn digest(&self) -> String {
+        let bytes = serde_json::to_vec(&(
+            &self.inputs,
+            &self.outputs,
+            &self.removed,
+            &self.env,
+            &self.probes,
+            &self.ignore,
+        ))
+        .expect("proof fields serialize");
+        format!("p-{}", &blake3::hash(&bytes).to_hex()[..32])
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -52,7 +74,12 @@ pub fn sanitize(key: &str) -> String {
 }
 
 fn same_proof(a: &Proof, b: &Proof) -> bool {
-    a.inputs == b.inputs && a.env == b.env && a.outputs == b.outputs && a.probes == b.probes
+    a.inputs == b.inputs
+        && a.outputs == b.outputs
+        && a.removed == b.removed
+        && a.env == b.env
+        && a.probes == b.probes
+        && a.ignore == b.ignore
 }
 
 pub fn now() -> u64 {
@@ -200,6 +227,95 @@ mod tests {
             }],
             outputs: vec![],
             probes: BTreeMap::new(),
+            removed: vec![],
+            ignore: None,
+        }
+    }
+
+    #[test]
+    fn old_files_load_with_defaults() {
+        let s = store("old-defaults");
+        fs::create_dir_all(s.file("k").parent().unwrap()).unwrap();
+        fs::write(
+            s.file("k"),
+            br#"{"v":1,"key":"k","proofs":[{"created":1,"argv":["x"],"env":{},"inputs":[]}]}"#,
+        )
+        .unwrap();
+        let loaded = s.load("k");
+        assert_eq!(loaded.len(), 1);
+        assert!(loaded[0].removed.is_empty());
+        assert_eq!(loaded[0].ignore, None);
+        assert!(loaded[0].outputs.is_empty());
+        assert!(loaded[0].probes.is_empty());
+    }
+
+    #[test]
+    fn digest_ignores_created_and_argv() {
+        let a = proof("f:1");
+        let mut b = a.clone();
+        b.created = 900;
+        b.argv = vec!["other".into()];
+        assert_eq!(a.digest(), b.digest());
+        assert!(same_proof(&a, &b));
+        b.removed.push("gone".into());
+        assert_ne!(a.digest(), b.digest());
+        assert!(!same_proof(&a, &b));
+        b = a.clone();
+        b.ignore = Some(vec![]);
+        assert_ne!(a.digest(), b.digest());
+        assert!(!same_proof(&a, &b));
+    }
+
+    #[test]
+    fn digest_and_equality_cover_the_same_fields() {
+        let mut base = proof("f:1");
+        base.inputs.push(Input {
+            path: "b".into(),
+            id: "f:2".into(),
+        });
+        let mut variants = vec![base.clone()];
+        let mut v = base.clone();
+        v.created += 1;
+        variants.push(v);
+        let mut v = base.clone();
+        v.argv.push("changed".into());
+        variants.push(v);
+        let mut v = base.clone();
+        v.inputs[0].id = "changed".into();
+        variants.push(v);
+        let mut v = base.clone();
+        v.inputs.reverse();
+        variants.push(v);
+        let mut v = base.clone();
+        v.outputs.push(Input {
+            path: "out".into(),
+            id: "f:3".into(),
+        });
+        variants.push(v);
+        let mut v = base.clone();
+        v.removed.push("gone".into());
+        variants.push(v);
+        let mut v = base.clone();
+        v.env.insert("ENV".into(), "hash".into());
+        variants.push(v);
+        let mut v = base.clone();
+        v.probes.insert("probe".into(), "hash".into());
+        variants.push(v);
+        let mut v = base.clone();
+        v.ignore = Some(vec![]);
+        variants.push(v);
+        let mut v = base;
+        v.ignore = Some(vec!["x".into()]);
+        variants.push(v);
+        for a in &variants {
+            for b in &variants {
+                assert_eq!(same_proof(a, b), a.digest() == b.digest());
+            }
+        }
+        assert_eq!(variants[0].digest(), variants[1].digest());
+        assert_eq!(variants[0].digest(), variants[2].digest());
+        for changed in &variants[3..] {
+            assert_ne!(variants[0].digest(), changed.digest());
         }
     }
 
