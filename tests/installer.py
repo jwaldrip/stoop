@@ -50,7 +50,7 @@ with tempfile.TemporaryDirectory(prefix='stoop-installer-test-') as temp:
         try:
             tools = root / 'tools'
             tools.mkdir()
-            for tool in ('curl', 'sha256sum', 'shasum', 'grep', 'awk', 'tar', 'mkdir', 'mktemp', 'cat', 'chmod', 'mv', 'rm', 'sed', 'head', 'touch'):
+            for tool in ('curl', 'sha256sum', 'shasum', 'grep', 'awk', 'tar', 'gzip', 'mkdir', 'mktemp', 'cat', 'chmod', 'mv', 'rm', 'sed', 'head', 'touch'):
                 path = shutil.which(tool)
                 if path:
                     (tools / tool).symlink_to(path)
