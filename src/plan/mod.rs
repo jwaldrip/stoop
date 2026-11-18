@@ -238,14 +238,6 @@ pub fn cmd(args: &[String]) -> i32 {
     }
     0
 }
-fn references_needs(value: &Value) -> bool {
-    match value {
-        Value::String(text) => text.contains("${{") && text.to_ascii_lowercase().contains("needs"),
-        Value::Array(values) => values.iter().any(references_needs),
-        Value::Object(values) => values.values().any(references_needs),
-        _ => false,
-    }
-}
 
 fn build<S: attest::KeySource>(
     o: &Options,
@@ -306,11 +298,7 @@ fn build<S: attest::KeySource>(
                 .needs
                 .iter()
                 .any(|n| n.eq_ignore_ascii_case(&o.plan_job));
-            if (needs_plan && job.get("uses").is_some())
-                || ["with", "secrets"]
-                    .iter()
-                    .any(|field| job.get(*field).is_some_and(references_needs))
-            {
+            if needs_plan && job.get("uses").is_some() {
                 graph_error = true;
                 global_error = Some(format!(
                     "job {} may relay planner output through a reusable workflow",

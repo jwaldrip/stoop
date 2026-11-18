@@ -1007,6 +1007,8 @@ fn only_run_invariant_github_context_is_accepted() {
         "contains(toJSON(github), 'job')",
         "github['job'] == 'a'",
         "github.actor == 'a'",
+        "GITHUB.JOB == 'a'",
+        "GitHub.Job == 'a'",
         "github",
         "github.event_name == 'push' && github.job == 'a'",
     ] {
@@ -1026,7 +1028,7 @@ fn only_run_invariant_github_context_is_accepted() {
 #[test]
 fn plan_environment_cannot_shadow_workflow_vars_or_secrets() {
     let now = proof::now();
-    for context in ["vars", "secrets"] {
+    for context in ["vars", "VARS", "Vars", "secrets", "SECRETS"] {
         let without_environment = workflow(
             &format!("env:\n  STOOP_FULL: ${{{{ {context}.FULL }}}}\n"),
             "",
@@ -1073,8 +1075,7 @@ fn reusable_workflow_cannot_relay_plan_output() {
     for relay in [
         "  relay:\n    needs: [stoop-plan]\n    if: ${{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',relay,') }}\n    uses: ./.github/workflows/called.yml\n",
         "  relay:\n    needs: [stoop-plan]\n    if: ${{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',relay,') }}\n    uses: ./.github/workflows/called.yml\n    with: {skip: '${{ needs.stoop-plan.outputs.skip }}'}\n",
-        "  relay:\n    uses: ./.github/workflows/called.yml\n    with: {skip: '${{ needs.stoop-plan.outputs.skip }}'}\n",
-        "  relay:\n    uses: ./.github/workflows/called.yml\n    secrets: {skip: '${{ needs.stoop-plan.outputs.skip }}'}\n",
+        "  relay:\n    needs: [Stoop-Plan]\n    if: ${{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',relay,') }}\n    uses: ./.github/workflows/called.yml\n    secrets: inherit\n",
     ] {
         let w = workflow("", "", relay);
         let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
@@ -1082,6 +1083,26 @@ fn reusable_workflow_cannot_relay_plan_output() {
         let o = plan(&r, &["--format", "json"], &[]);
         assert_eq!(code(&o, "a"), "error", "{relay}");
         assert_eq!(o.plan["skip"], json!([]));
+    }
+}
+
+#[test]
+fn unrelated_reusable_calls_do_not_block_planning() {
+    let build = "  build:\n    runs-on: ubuntu-latest\n    outputs: {v: '${{ steps.v.outputs.v }}'}\n    steps: []\n";
+    let variants = [
+        format!("{build}  deploy:\n    needs: [build]\n    uses: ./.github/workflows/deploy.yml\n    with: {{v: '${{{{ needs.build.outputs.v }}}}'}}\n"),
+        "  deploy:\n    uses: ./.github/workflows/deploy.yml\n    with: {v: 'static'}\n".to_string(),
+        "  deploy:\n    uses: ./.github/workflows/deploy.yml\n    secrets: inherit\n".to_string(),
+        "  deploy:\n    uses: ./.github/workflows/deploy.yml\n    with: {sha: '${{ github.sha }}'}\n".to_string(),
+    ];
+    let now = proof::now();
+    for extra in variants {
+        let w = workflow("", "", &extra);
+        let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+        record(&r, rec(&w, now, now)).unwrap();
+        let o = plan(&r, &["--format", "json"], &[]);
+        assert_eq!(code(&o, "a"), "proved", "{extra}");
+        assert_eq!(o.plan["skip"], json!(["a"]));
     }
 }
 
