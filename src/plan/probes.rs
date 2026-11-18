@@ -3,6 +3,7 @@ use super::*;
 use crate::attest::tests as a;
 use crate::job::{JobRecord, RecordStatus, StepHow, StepRecord};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,6 +17,13 @@ fn git(root: &Path, args: &[&str]) {
         .current_dir(root)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_ATTR_SOURCE")
         .args([
             "-c",
             "user.name=t",
@@ -55,6 +63,15 @@ impl Repo {
         let sha = String::from_utf8(
             Command::new("git")
                 .current_dir(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_ALLOW_PROTOCOL", "file")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_ATTR_SOURCE")
                 .args(["rev-parse", "HEAD"])
                 .output()
                 .unwrap()
@@ -207,7 +224,31 @@ fn probe_child() {
         );
         return;
     }
-    let result = build(&o, &root, &path, &mut plan, |policy, now, age| {
+    let mut limits = sync::Limits::PLAN;
+    if let Some(value) = std::env::var_os("PROBE_SYNC_LIMITS") {
+        let value: Value = serde_json::from_str(value.to_str().unwrap()).unwrap();
+        let number = |field: &str| {
+            value
+                .get(field)
+                .map(|v| v.as_u64().expect("limit must be an unsigned integer"))
+        };
+        if let Some(n) = number("deadline_ms") {
+            limits.deadline = std::time::Duration::from_millis(n);
+        }
+        if let Some(n) = number("listing_bytes") {
+            limits.listing_bytes = n;
+        }
+        if let Some(n) = number("refs") {
+            limits.refs = usize::try_from(n).expect("refs limit does not fit usize");
+        }
+        if let Some(n) = number("blob_bytes") {
+            limits.blob_bytes = n;
+        }
+        if let Some(n) = number("total_bytes") {
+            limits.total_bytes = n;
+        }
+    }
+    let result = build(&o, &root, &path, &mut plan, limits, |policy, now, age| {
         attest::Verifier::new(policy, a::Fixed(a::published()), now, age)
     });
     let warning = result.err();
@@ -245,6 +286,14 @@ fn plan(r: &Repo, args: &[&str], env: &[(&str, &str)]) -> Out {
     .current_dir(&r.root)
     .env("PROBE_ROOT", &r.root)
     .env("PROBE_ARGS", serde_json::to_string(args).unwrap())
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env_remove("GIT_CONFIG_COUNT")
+    .env_remove("GIT_CONFIG_PARAMETERS")
+    .env_remove("GIT_DIR")
+    .env_remove("GIT_WORK_TREE")
+    .env_remove("GIT_INDEX_FILE")
+    .env_remove("GIT_ATTR_SOURCE")
     .env("GITHUB_JOB", "stoop-plan")
     .env("GITHUB_ACTIONS", "true")
     .env("GITHUB_REPOSITORY", a::REPO)
@@ -263,6 +312,8 @@ fn plan(r: &Repo, args: &[&str], env: &[(&str, &str)]) -> Out {
     for k in [
         "GITHUB_OUTPUT",
         "GITHUB_STEP_SUMMARY",
+        "PROBE_SYNC_LIMITS",
+        "PROBE_WARNING",
         "STOOP_SYNC",
         "STOOP_FULL",
         "STOOP_OFF",
@@ -519,6 +570,31 @@ fn two_attested_jobs_plan_only_the_unchanged_input() {
 }
 
 #[test]
+fn workflow_show_ignores_replaced_blob() {
+    let original = workflow("", "", "");
+    let replacement = "name: replaced workflow\njobs: {}\n";
+    let r = Repo::new(&[(CI, &original), ("replacement.yml", replacement)]);
+    let oid = |path: &str| {
+        let out = Command::new("git")
+            .current_dir(&r.root)
+            .args(["rev-parse", &format!("HEAD:{path}")])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&r.root, &["replace", &oid(CI), &oid("replacement.yml")]);
+    let unguarded = Command::new("git")
+        .current_dir(&r.root)
+        .args(["show", &format!("{}:{CI}", r.sha)])
+        .output()
+        .unwrap();
+    assert!(unguarded.status.success());
+    assert_eq!(String::from_utf8(unguarded.stdout).unwrap(), replacement);
+    assert_eq!(show(&r.root, &r.sha, CI).unwrap(), original);
+}
+
+#[test]
 fn ungated_job_never_enters_skip_output() {
     let w = workflow(
         "",
@@ -565,6 +641,185 @@ fn sync_failure_refuses_a_provable_record() {
     assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
     let o = plan(&r, &["--format", "json", "--sync", "git:missing"], &[]);
     assert_eq!(code(&o, "a"), "error");
+}
+
+struct SyncFixture {
+    repo: Repo,
+    job_keys: Vec<String>,
+    proof_keys: Vec<String>,
+    job_bytes: u64,
+}
+
+fn put_remote_ref(remote: &Path, key: &str, bytes: &[u8]) {
+    let mut child = Command::new("git")
+        .current_dir(remote)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_ATTR_SOURCE")
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let oid = std::str::from_utf8(&output.stdout).unwrap().trim();
+    git(remote, &["update-ref", &sync::ref_name(key), oid]);
+}
+
+fn sync_fixture() -> SyncFixture {
+    let b = format!("  b:\n    needs: [stoop-plan]\n    if: ${{{{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',b,') }}}}\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@{PIN}\n      - run: cat b.txt > /dev/null\n");
+    let w = workflow("", "", &b);
+    let repo = Repo::new(&[(CI, &w), ("a.txt", "a\n"), ("b.txt", "b\n")]);
+    let now = proof::now();
+    let a_key = record(&repo, rec(&w, now, now)).unwrap();
+    let mut b_record = rec(&w, now, now);
+    b_record.job = "b";
+    b_record.inputs = vec![file("b.txt", b"b\n")];
+    let b_key = record(&repo, b_record).unwrap();
+    let job_keys = vec![a_key, b_key];
+    let jobs = job::JobStore::new(repo.store());
+    let proofs = proof::Store::new(repo.store());
+    let remote = repo.base.join("origin.git");
+    git(
+        &repo.root,
+        &["init", "--bare", "-q", remote.to_str().unwrap()],
+    );
+    git(
+        &repo.root,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    let mut job_bytes = 0;
+    let mut proof_keys = Vec::new();
+    for key in &job_keys {
+        let bytes = jobs.export(key).unwrap();
+        job_bytes += bytes.len() as u64;
+        put_remote_ref(&remote, key, &bytes);
+        for step in &jobs.load(key)[0].steps {
+            let bytes = proofs.export(&step.key).unwrap();
+            put_remote_ref(&remote, &step.key, &bytes);
+            proof_keys.push(step.key.clone());
+        }
+    }
+    std::fs::remove_dir_all(repo.store()).unwrap();
+    SyncFixture {
+        repo,
+        job_keys,
+        proof_keys,
+        job_bytes,
+    }
+}
+
+fn assert_sync_error(out: &Out, detail: &str) {
+    assert_eq!(out.plan["skip"], json!([]), "{}", out.stderr);
+    let jobs = out.plan["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 2, "{}", out.plan);
+    for job in jobs {
+        assert_eq!(job["decision"], "run", "{job}");
+        assert_eq!(job["code"], "error", "{job}");
+        assert_eq!(job["detail"], detail, "{job}");
+    }
+}
+
+#[test]
+fn sync_snapshot_proves_signed_records_from_bare_remote() {
+    let f = sync_fixture();
+    let out = plan(&f.repo, &["--format", "json", "--sync", "git"], &[]);
+    assert_eq!(out.plan["skip"], json!(["a", "b"]), "{}", out.stderr);
+    assert_eq!(code(&out, "a"), "proved");
+    assert_eq!(code(&out, "b"), "proved");
+}
+
+#[test]
+fn sync_snapshot_limits_fail_every_job() {
+    for limit in ["refs", "listing_bytes", "blob_bytes", "total_bytes"] {
+        let f = sync_fixture();
+        let (value, detail) = match limit {
+            "refs" => (
+                json!({"refs": 1}),
+                "sync: ref listing exceeds 1 refs".to_string(),
+            ),
+            "listing_bytes" => (
+                json!({"listing_bytes": 64}),
+                "sync: ref listing exceeds 64 bytes".to_string(),
+            ),
+            "blob_bytes" => (
+                json!({"blob_bytes": 16}),
+                "sync: a stoop ref exceeds 16 bytes".to_string(),
+            ),
+            "total_bytes" => (
+                json!({"total_bytes": f.job_bytes}),
+                format!("sync: stoop refs exceed {} bytes in total", f.job_bytes),
+            ),
+            _ => unreachable!(),
+        };
+        let limit_json = value.to_string();
+        let out = plan(
+            &f.repo,
+            &["--format", "json", "--sync", "git"],
+            &[("PROBE_SYNC_LIMITS", &limit_json)],
+        );
+        assert_sync_error(&out, &detail);
+        if limit == "total_bytes" {
+            let jobs = job::JobStore::new(f.repo.store());
+            let proofs = proof::Store::new(f.repo.store());
+            assert!(f.job_keys.iter().all(|key| !jobs.load(key).is_empty()));
+            assert!(f.proof_keys.iter().all(|key| proofs.load(key).is_empty()));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_snapshot_deadline_kills_stalled_upload_pack() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let f = sync_fixture();
+    let helper = f.repo.base.join("stall-upload-pack");
+    let pid_file = f.repo.base.join("stall.pid");
+    std::fs::write(
+        &helper,
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$PROBE_STALL_PID\"\nexec sleep 8\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let upload_pack = format!("'{}'", helper.to_str().unwrap().replace('\'', "'\\''"));
+    git(
+        &f.repo.root,
+        &["config", "remote.origin.uploadpack", &upload_pack],
+    );
+    let started = Instant::now();
+    let out = plan(
+        &f.repo,
+        &["--format", "json", "--sync", "git"],
+        &[
+            ("PROBE_SYNC_LIMITS", r#"{"deadline_ms":1000}"#),
+            ("PROBE_STALL_PID", pid_file.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "deadline did not stop the transport"
+    );
+    assert_sync_error(&out, "sync: remote did not finish within 1s");
+    let pid = std::fs::read_to_string(pid_file).unwrap();
+    let status = Command::new("ps")
+        .args(["-o", "stat=", "-p", pid.trim()])
+        .output()
+        .unwrap();
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.trim().is_empty() || status.trim().starts_with('Z'),
+        "transport still alive: {status}"
+    );
 }
 
 #[test]

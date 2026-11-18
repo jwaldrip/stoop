@@ -11,8 +11,13 @@
 use crate::job::JobStore;
 use crate::proof::{now, Store};
 use std::io::Write;
+use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+
+mod bounded;
+#[allow(unused_imports)]
+pub use bounded::{Failure, Limits, Operation, Snapshot};
 
 pub struct Remote {
     remote: String,
@@ -23,8 +28,18 @@ pub struct Remote {
 }
 
 /// `refs/stoop/<key>`. Dots become underscores so the name is always a valid ref.
-fn ref_name(key: &str) -> String {
+pub fn ref_name(key: &str) -> String {
     format!("refs/stoop/{}", key.replace('.', "_"))
+}
+
+fn legacy_exit(op: &str, status: std::process::ExitStatus) -> String {
+    if let Some(code) = status.code() {
+        format!("git {op} failed with exit status {code}")
+    } else if let Some(signal) = status.signal() {
+        format!("git {op} ended by signal {signal}")
+    } else {
+        format!("unexpected output from git {op}")
+    }
 }
 
 impl Remote {
@@ -35,9 +50,7 @@ impl Remote {
             None => (spec, None),
         };
         if kind != "git" {
-            return Err(format!(
-                "unknown sync backend {spec:?}; use `git` or `git:<remote>`"
-            ));
+            return Err("unknown sync backend; use `git` or `git:<remote>`".into());
         }
         Ok(Remote {
             remote: rest
@@ -69,11 +82,22 @@ impl Remote {
             })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        let mut child = c.spawn().map_err(|e| format!("cannot run git: {e}"))?;
+        #[cfg(test)]
+        c.env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ALLOW_PROTOCOL", "file");
+        let op = args.first().copied().unwrap_or("operation");
+        let mut child = c.spawn().map_err(|_| format!("cannot run git {op}"))?;
         if let (Some(bytes), Some(mut si)) = (stdin, child.stdin.take()) {
-            si.write_all(bytes).map_err(|e| e.to_string())?;
+            if si.write_all(bytes).is_err() {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("unexpected output from git {op}"));
+            }
         }
-        child.wait_with_output().map_err(|e| e.to_string())
+        child
+            .wait_with_output()
+            .map_err(|_| format!("cannot wait for git {op}"))
     }
 
     fn ok(&self, args: &[&str], stdin: Option<&[u8]>) -> Result<Vec<u8>, String> {
@@ -81,13 +105,10 @@ impl Remote {
         if out.status.success() {
             Ok(out.stdout)
         } else {
-            let err = String::from_utf8_lossy(&out.stderr);
-            Err(err
-                .lines()
-                .next()
-                .unwrap_or("git failed")
-                .trim()
-                .to_string())
+            Err(legacy_exit(
+                args.first().copied().unwrap_or("operation"),
+                out.status,
+            ))
         }
     }
 
@@ -123,14 +144,7 @@ impl Remote {
                 "+refs/stoop/*:refs/stoop/*",
             ],
             None,
-        )
-        .or_else(|e| {
-            if e.contains("couldn't find remote ref") {
-                Ok(Vec::new())
-            } else {
-                Err(e)
-            }
-        })?;
+        )?;
         let refs = self.ok(
             &["for-each-ref", "--format=%(refname)", "refs/stoop/"],
             None,
@@ -159,7 +173,7 @@ impl Remote {
             if error.contains("couldn't find remote ref") {
                 return Ok(None);
             }
-            return Err(error.lines().next().unwrap_or("fetch failed").to_string());
+            return Err(legacy_exit("fetch", out.status));
         }
         let oid = String::from_utf8(self.ok(&["rev-parse", "--verify", &r], None)?)
             .map_err(|e| e.to_string())?
@@ -290,5 +304,92 @@ mod tests {
     fn ref_names_are_valid_refs() {
         assert_eq!(ref_name("sh-abc.def"), "refs/stoop/sh-abc_def");
         assert!(!ref_name("a..b").contains(".."));
+    }
+
+    #[test]
+    fn targeted_fetch_refuses_unlisted_and_deleted_refs() {
+        let base = std::env::temp_dir().join(format!("stoop-b7-refs-{}", std::process::id()));
+        let local = base.join("local");
+        let remote = base.join("remote.git");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_ALLOW_PROTOCOL", "file")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&local, &["init", "-q"]);
+        git(&remote, &["init", "--bare", "-q"]);
+        git(
+            &local,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        let blob = base.join("blob");
+        std::fs::write(&blob, b"fixture").unwrap();
+        let oid = git(&remote, &["hash-object", "-w", blob.to_str().unwrap()]);
+        let name = "refs/stoop/job-test";
+        git(&remote, &["update-ref", name, &oid]);
+        let client = Remote::from_spec("git", &local, false).unwrap();
+        let snapshot = client.snapshot(Limits::PLAN).unwrap();
+        assert!(snapshot.contains(name));
+        git(&remote, &["update-ref", "refs/stoop/job-other", &oid]);
+        assert_eq!(
+            snapshot.fetch(&["refs/stoop/job-other".into()], |_, _| Ok(())),
+            Err(Failure::NotListed.to_string())
+        );
+        let local_other = Command::new("git")
+            .current_dir(&local)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_ALLOW_PROTOCOL", "file")
+            .args(["rev-parse", "--verify", "refs/stoop/job-other"])
+            .output()
+            .unwrap();
+        assert!(!local_other.status.success(), "unlisted ref was fetched");
+        git(&remote, &["update-ref", "-d", name]);
+        assert_eq!(
+            snapshot.fetch(&[name.into()], |_, _| Ok(())),
+            Err(Failure::Exit(Operation::Fetch, 128).to_string())
+        );
+        let raced = Remote::from_spec("git", &local, false).unwrap();
+        let raced_snapshot = raced.snapshot(Limits::PLAN).unwrap();
+        assert!(raced_snapshot.contains("refs/stoop/job-other"));
+        std::fs::write(&blob, b"changed").unwrap();
+        let changed = git(&remote, &["hash-object", "-w", blob.to_str().unwrap()]);
+        git(&remote, &["update-ref", "refs/stoop/job-other", &changed]);
+        assert_eq!(
+            raced_snapshot.fetch(&["refs/stoop/job-other".into()], |_, _| Ok(())),
+            Err(Failure::Changed.to_string())
+        );
+        let dotted_key = "sh-name.with.dot";
+        let dotted_ref = ref_name(dotted_key);
+        std::fs::write(&blob, r#"{"v":2,"key":"sh-name.with.dot","proofs":[]}"#).unwrap();
+        let dotted_oid = git(&remote, &["hash-object", "-w", blob.to_str().unwrap()]);
+        git(&remote, &["update-ref", &dotted_ref, &dotted_oid]);
+        let dotted = Remote::from_spec("git", &local, false).unwrap();
+        let dotted_snapshot = dotted.snapshot(Limits::PLAN).unwrap();
+        assert!(dotted_snapshot.contains(&dotted_ref));
+        let mut seen = false;
+        dotted_snapshot
+            .fetch(std::slice::from_ref(&dotted_ref), |name, bytes| {
+                assert_eq!(name, dotted_ref);
+                assert_eq!(Store::key_of(bytes).as_deref(), Some(dotted_key));
+                seen = true;
+                Ok(())
+            })
+            .unwrap();
+        assert!(seen);
+        std::fs::remove_dir_all(base).unwrap();
     }
 }
