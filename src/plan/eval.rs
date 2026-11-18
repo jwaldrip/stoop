@@ -1715,6 +1715,12 @@ mod tests {
         p.priors = Some(vec![input("build/out", "a"), input("build", "fk")]);
         replace_first(&mut f, p);
         assert_eq!(f.decide(BTreeMap::new()).code, Code::PriorChanged);
+        let mut virtual_tree = VirtualTree {
+            tree: &mut f.tree,
+            overlay: BTreeMap::from([("build/out".into(), Some(file_id(b"ok")))]),
+            erased: BTreeSet::new(),
+        };
+        assert!(matches!(virtual_tree.state("build/out"), Ok(State::Absent)));
     }
     #[test]
     fn k_n06_order_is_by_start_and_equal_failure_wins() {
