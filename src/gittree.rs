@@ -36,7 +36,9 @@ impl Drop for TempDir {
 static NEXT: AtomicU64 = AtomicU64::new(0);
 fn git(root: &Path) -> Command {
     let mut command = Command::new("git");
-    command.env("GIT_NO_LAZY_FETCH", "1");
+    command
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1");
     command
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
@@ -120,6 +122,9 @@ impl GitTree {
             let oid = fields
                 .next()
                 .ok_or_else(|| GitError("missing object".into()))?;
+            if fields.next().is_some() {
+                return Err(GitError("unexpected tree metadata field".into()));
+            }
             let entry = match (mode, kind) {
                 ("040000", "tree") => Entry::Tree,
                 ("160000", "commit") => Entry::Gitlink,
@@ -672,12 +677,29 @@ mod partial_tests {
             std::fs::create_dir_all(source.join("sub")).unwrap();
             std::fs::write(source.join(".github/workflows/ci.yml"), "name: test\n").unwrap();
             std::fs::write(source.join("root.txt"), "root\n").unwrap();
+            std::fs::write(source.join(".gitattributes"), "# root attributes\n").unwrap();
             std::fs::write(source.join("sub/.gitattributes"), "*.sh text eol=crlf\n").unwrap();
             std::fs::write(source.join("sub/run.sh"), "echo test\n").unwrap();
             std::fs::write(source.join("sub/other.txt"), "other\n").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{symlink, PermissionsExt};
+                std::fs::set_permissions(
+                    source.join("sub/run.sh"),
+                    std::fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+                symlink("run.sh", source.join("sub/link.sh")).unwrap();
+            }
             ok(&source, &["init", "-q"]);
             ok(&source, &["add", "."]);
             ok(&source, &["commit", "-qm", "fixture"]);
+            std::fs::write(source.join("root.txt"), "older\n").unwrap();
+            ok(&source, &["add", "root.txt"]);
+            ok(&source, &["commit", "-qm", "second"]);
+            std::fs::write(source.join("root.txt"), "root\n").unwrap();
+            ok(&source, &["add", "root.txt"]);
+            ok(&source, &["commit", "-qm", "third"]);
             std::fs::create_dir_all(&server).unwrap();
             ok(&server, &["init", "--bare", "-q"]);
             ok(&server, &["config", "uploadpack.allowFilter", "true"]);
@@ -767,19 +789,63 @@ mod partial_tests {
         let before = f.object_count(&f.blobless);
         let partial = GitTree::load(&f.blobless, "HEAD").unwrap();
         let full = GitTree::load(&f.full, "HEAD").unwrap();
-        for path in [
-            "root.txt",
-            "sub/.gitattributes",
-            "sub/run.sh",
-            "sub/other.txt",
-        ] {
-            assert_eq!(
-                format!("{:?}", partial.entry(path)),
-                format!("{:?}", full.entry(path))
-            );
-        }
+        assert_eq!(
+            format!("{:?}", partial.entries),
+            format!("{:?}", full.entries)
+        );
+        assert!(matches!(
+            partial.entry("sub/run.sh"),
+            Some(Entry::Blob { exec: true, .. })
+        ));
+        #[cfg(unix)]
+        assert!(matches!(
+            partial.entry("sub/link.sh"),
+            Some(Entry::Link { .. })
+        ));
         assert_eq!(before, f.object_count(&f.blobless));
         assert!(!f.present(&f.blobless, &f.oid("sub/run.sh")));
+    }
+
+    #[test]
+    fn replaced_objects_cannot_change_blob_or_attributes() {
+        let f = Fixture::new();
+        let file = f.oid("sub/run.sh");
+        let attrs = f.oid("sub/.gitattributes");
+        let replacement = f.oid("root.txt");
+        ok(&f.full, &["replace", &file, &replacement]);
+        ok(&f.full, &["replace", &attrs, &replacement]);
+        let mut tree = GitTree::load(&f.full, "HEAD").unwrap();
+        assert_eq!(
+            tree.file_id(&file, true).unwrap(),
+            format!("x:{}", blake3::hash(b"echo test\n").to_hex())
+        );
+        assert_eq!(
+            tree.conversion("sub/run.sh").unwrap().as_deref(),
+            Some("eol=crlf")
+        );
+    }
+
+    #[test]
+    fn fetched_older_commit_has_the_same_tree_as_the_source() {
+        let f = Fixture::new();
+        let older = ok(&f.source, &["rev-parse", "HEAD~2"]);
+        ok(
+            &f.full,
+            &[
+                "fetch",
+                "--quiet",
+                "--no-tags",
+                "--depth=1",
+                "origin",
+                &older,
+            ],
+        );
+        let clone = GitTree::load(&f.full, &older).unwrap();
+        let source = GitTree::load(&f.source, &older).unwrap();
+        assert_eq!(
+            format!("{:?}", clone.entries),
+            format!("{:?}", source.entries)
+        );
     }
     #[test]
     fn nested_attributes_are_fetched_before_check_attr() {
@@ -856,6 +922,106 @@ mod partial_tests {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn long_tree_listing_is_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(root) = std::env::var_os("STOOP_P1_LONG_CHILD") {
+            let error = match GitTree::load(Path::new(&root), "HEAD") {
+                Ok(_) => panic!("long tree listing was accepted"),
+                Err(error) => error,
+            };
+            assert!(
+                error.0.contains("unexpected tree metadata field"),
+                "{error:?}"
+            );
+            return;
+        }
+        let f = Fixture::new();
+        let bin = f.base.join("long-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let actual = Command::new("which").arg("git").output().unwrap();
+        assert!(actual.status.success());
+        let quoted = String::from_utf8(actual.stdout)
+            .unwrap()
+            .trim()
+            .replace('\'', "'\\''");
+        let wrapper = bin.join("git");
+        std::fs::write(&wrapper, format!("#!/bin/sh\nif [ \"$1\" = ls-tree ]; then shift; exec '{quoted}' ls-tree --long \"$@\"; fi\nexec '{quoted}' \"$@\"\n")).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "gittree::partial_tests::long_tree_listing_is_rejected",
+                "--nocapture",
+            ])
+            .env("STOOP_P1_LONG_CHILD", &f.full)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn successful_fetch_without_objects_is_an_error() {
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(root) = std::env::var_os("STOOP_P1_EMPTY_FETCH_CHILD") {
+            let mut tree = GitTree::load(Path::new(&root), "HEAD").unwrap();
+            assert!(tree.conversion("sub/run.sh").is_err());
+            assert_eq!(tree.fetched_objects(), 0);
+            return;
+        }
+        let f = Fixture::new();
+        assert!(!f.present(&f.sparse, &f.oid("sub/.gitattributes")));
+        let bin = f.base.join("empty-fetch-bin");
+        std::fs::create_dir(&bin).unwrap();
+        let actual = Command::new("which").arg("git").output().unwrap();
+        assert!(actual.status.success());
+        let quoted = String::from_utf8(actual.stdout)
+            .unwrap()
+            .trim()
+            .replace('\'', "'\\''");
+        let wrapper = bin.join("git");
+        std::fs::write(&wrapper, format!("#!/bin/sh\nfor arg in \"$@\"; do\n  if [ \"$arg\" = fetch ]; then cat >/dev/null; exit 0; fi\ndone\nexec '{quoted}' \"$@\"\n")).unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "gittree::partial_tests::successful_fetch_without_objects_is_an_error",
+                "--nocapture",
+            ])
+            .env("STOOP_P1_EMPTY_FETCH_CHILD", &f.sparse)
+            .env(
+                "PATH",
+                format!(
+                    "{}:{}",
+                    bin.display(),
+                    std::env::var("PATH").unwrap_or_default()
+                ),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
     #[test]
     fn ensure_present_batches_missing_and_restarts_the_reader() {
         let f = Fixture::new();
@@ -886,6 +1052,94 @@ mod partial_tests {
             format!("f:{}", blake3::hash(b"other\n").to_hex())
         );
         assert!(f.present(&f.sparse, &second));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn explicit_object_fetch_does_not_contact_initialized_submodules() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        let subsource = f.base.join("subsource");
+        std::fs::create_dir(&subsource).unwrap();
+        ok(&subsource, &["init", "-q"]);
+        std::fs::write(subsource.join("file"), "submodule\n").unwrap();
+        ok(&subsource, &["add", "."]);
+        ok(&subsource, &["commit", "-qm", "submodule"]);
+        ok(
+            &f.source,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                "-q",
+                subsource.to_str().unwrap(),
+                "deps/project",
+            ],
+        );
+        ok(&f.source, &["commit", "-qm", "add submodule"]);
+        ok(
+            &f.source,
+            &[
+                "push",
+                "-q",
+                f.server.to_str().unwrap(),
+                "HEAD:refs/heads/main",
+            ],
+        );
+        let clone = f.base.join("with-submodule");
+        let url = format!("file://{}", f.server.display());
+        ok(
+            &f.base,
+            &[
+                "clone",
+                "-q",
+                "--no-checkout",
+                "--filter=blob:none",
+                "--depth=1",
+                &url,
+                clone.to_str().unwrap(),
+            ],
+        );
+        ok(&clone, &["sparse-checkout", "init", "--cone"]);
+        ok(&clone, &["sparse-checkout", "set", ".github", "deps"]);
+        ok(&clone, &["checkout", "-q"]);
+        ok(
+            &clone,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "update",
+                "--init",
+                "--",
+                "deps/project",
+            ],
+        );
+        let submodule = clone.join("deps/project");
+        let contact = f.base.join("submodule-contact");
+        let hook = f.base.join("submodule-upload-pack");
+        std::fs::write(
+            &hook,
+            format!(
+                "#!/bin/sh\nprintf contact >> '{}'\nexit 1\n",
+                contact.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ok(
+            &submodule,
+            &["config", "remote.origin.uploadpack", hook.to_str().unwrap()],
+        );
+        ok(&clone, &["config", "fetch.recurseSubmodules", "true"]);
+        let missing = f.oid("sub/other.txt");
+        assert!(!f.present(&clone, &missing));
+        let mut tree = GitTree::load(&clone, "HEAD").unwrap();
+        assert_eq!(
+            tree.file_id(&missing, false).unwrap(),
+            format!("f:{}", blake3::hash(b"other\n").to_hex())
+        );
+        assert!(!contact.exists(), "submodule remote was contacted");
     }
     #[test]
     fn unreachable_promisor_is_an_error() {
