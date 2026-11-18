@@ -245,7 +245,7 @@ fn build<S: attest::KeySource>(
     if o.explain {
         eprintln!("stoop: STOOP_ALLOW_USES actions are assumed side-effect free by the workflow author's assertion");
         if !o.allowed.is_empty() {
-            eprintln!("stoop: --allow-uses is a local dry-run list and cannot match records made with different actions");
+            eprintln!("stoop: --allow-uses is a local dry-run list; records made with a different effective list may not match");
         }
     }
     let mut global_error = plan_override(&workflow, &o.plan_job).err();

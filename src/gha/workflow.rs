@@ -434,6 +434,13 @@ pub fn parse_allow_uses(raw: &str) -> Result<Vec<String>, String> {
 
 fn workflow_allow_uses(w: &Workflow, id: &str) -> Result<Vec<String>, String> {
     let workflow = object(w.root.get("env"), "workflow env")?;
+    if workflow
+        .get("STOOP_ALLOW_USES")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.contains("${{"))
+    {
+        return Err("STOOP_ALLOW_USES is an expression".into());
+    }
     let job = object(w.root["jobs"].get(id).and_then(|j| j.get("env")), "job env")?;
     match job
         .get("STOOP_ALLOW_USES")
