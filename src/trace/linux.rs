@@ -9,7 +9,7 @@
 //! except for priors: what a path held before the run first wrote it is read at the
 //! same stop, because the write is about to change it.
 
-use super::{Scope, Trace};
+use super::{ExecEvent, Scope, Trace};
 use crate::ignore::Ignore;
 use crate::input::{file_id, hash_file};
 use crate::pathutil::{absolutize, to_key, without_dots, Physical};
@@ -20,6 +20,7 @@ use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[cfg(target_arch = "x86_64")]
 const AUDIT_ARCH: u32 = 0xC000_003E;
@@ -50,6 +51,14 @@ const MAX_FILE_BYTES: u64 = 8 << 20;
 const MAX_RUN_BYTES: u64 = 256 << 20;
 /// Same cap as the tracer's other reasons.
 const MAX_REASONS: usize = 16;
+
+// Observation is informational, so an unreadable or oversized chain is discarded without
+// affecting the legacy trace or the command. Bounds include live tasks as well as execs.
+const MAX_EXEC_EVENTS: usize = 1024;
+const MAX_EXEC_TASKS: usize = 1024;
+const MAX_EXEC_ARGS: usize = 128;
+const MAX_EXEC_ARG_BYTES: usize = 16 * 1024;
+const MAX_EXEC_HOLD: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -519,6 +528,7 @@ struct Tracer<'a> {
     allow_network: bool,
     /// Present when priors are recorded (not with `--no-record`).
     rec: Option<Rec<'a>>,
+    execs: Option<ExecObserver>,
     t: Trace,
 }
 
@@ -527,6 +537,7 @@ pub fn run<'a>(
     cwd: &Path,
     allow_network: bool,
     scope: Option<&Scope<'a>>,
+    observe_execs: bool,
 ) -> io::Result<Trace> {
     if argv.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty command"));
@@ -582,6 +593,7 @@ pub fn run<'a>(
         magic_cache: HashMap::new(),
         pending_topology: HashSet::new(),
         syscall: 0,
+        execs: observe_execs.then(|| ExecObserver::new(pid)),
         rec: scope.map(|s| Rec {
             phys: Physical::new(s.root, &s.real_root),
             ignore: s.ignore,
@@ -630,19 +642,44 @@ pub fn run<'a>(
     let mut wait_failed = false;
 
     loop {
-        let p = unsafe { libc::waitpid(-1, &mut st, libc::__WALL) };
+        // A missing parent notification must not leave a child stopped forever.
+        // Poll only while a child is held, and discard the diagnostic on expiry.
+        let remaining = tr
+            .execs
+            .as_ref()
+            .and_then(|execs| execs.hold_remaining(Instant::now()));
+        if remaining.is_some_and(|duration| duration.is_zero()) {
+            if let Some(execs) = &mut tr.execs {
+                execs.invalidate();
+            }
+        }
+        let polling = remaining.is_some_and(|duration| !duration.is_zero());
+        let options = libc::__WALL | if polling { libc::WNOHANG } else { 0 };
+        let p = unsafe { libc::waitpid(-1, &mut st, options) };
+        if p == 0 {
+            if let Some(remaining) = remaining {
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+            continue;
+        }
         if p < 0 {
             let err = io::Error::last_os_error();
             match err.raw_os_error() {
                 Some(libc::ECHILD) => {
                     if !root_finished {
                         tr.flag("tracer wait ended before the command exit status was observed");
+                        if let Some(execs) = &mut tr.execs {
+                            execs.invalidate();
+                        }
                     }
                     break;
                 }
                 Some(libc::EINTR) => continue,
                 _ => {
                     tr.flag(&format!("tracer wait failed: {err}"));
+                    if let Some(execs) = &mut tr.execs {
+                        execs.invalidate();
+                    }
                     if wait_failed {
                         if !root_finished {
                             tr.t.status = kill_and_reap(pid).unwrap_or(1);
@@ -667,6 +704,9 @@ pub fn run<'a>(
                 root_finished = true;
             }
             tr.cwds.remove(&p);
+            if let Some(execs) = &mut tr.execs {
+                execs.exit(p);
+            }
             continue;
         }
         if libc::WIFSIGNALED(st) {
@@ -675,6 +715,9 @@ pub fn run<'a>(
                 root_finished = true;
             }
             tr.cwds.remove(&p);
+            if let Some(execs) = &mut tr.execs {
+                execs.exit(p);
+            }
             continue;
         }
         if !libc::WIFSTOPPED(st) {
@@ -683,6 +726,17 @@ pub fn run<'a>(
         let sig = libc::WSTOPSIG(st);
         match (st >> 16) & 0xff {
             0 => {
+                // A child can report its initial stop before waitpid delivers its
+                // parent's fork event. Hold that already-stopped child until its
+                // inherited image is known; it has not executed user code yet.
+                if sig == libc::SIGSTOP
+                    && tr
+                        .execs
+                        .as_mut()
+                        .is_some_and(|execs| execs.defer(p, Instant::now()))
+                {
+                    continue;
+                }
                 // A fresh tracee announces itself with SIGSTOP; swallow that one.
                 let pass = if sig == libc::SIGSTOP || sig == libc::SIGTRAP || syscall_exit {
                     0
@@ -695,9 +749,22 @@ pub fn run<'a>(
                 tr.on_syscall(p);
                 resume(p, 0, tr.pending_topology.contains(&p));
             }
+            libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
+                if let Some(execs) = &mut tr.execs {
+                    execs.fork(p);
+                }
+                cont(p, 0);
+            }
+            e if e == libc::PTRACE_EVENT_EXEC => {
+                if let Some(execs) = &mut tr.execs {
+                    execs.exec(p);
+                }
+                cont(p, 0);
+            }
             _ => cont(p, 0),
         }
     }
+    tr.t.execs = tr.execs.and_then(ExecObserver::finish);
     Ok(tr.t)
 }
 
@@ -787,6 +854,302 @@ fn read_cstr(pid: i32, addr: u64) -> Option<Vec<u8>> {
     let end = buf.iter().position(|&b| b == 0)?;
     buf.truncate(end);
     Some(buf)
+}
+struct PendingExec {
+    requested: PathBuf,
+    argv: Vec<OsString>,
+}
+
+struct ExecObserver {
+    // The current image for each traced task; a fork inherits its parent's image.
+    tasks: HashMap<i32, Option<usize>>,
+    pending: HashMap<i32, Option<PendingExec>>,
+    deferred: HashMap<i32, Instant>,
+    events: Vec<ExecEvent>,
+    valid: bool,
+    collecting: bool,
+}
+
+impl ExecObserver {
+    fn new(root: i32) -> Self {
+        Self {
+            tasks: HashMap::from([(root, None)]),
+            deferred: HashMap::new(),
+            pending: HashMap::new(),
+            events: Vec::new(),
+            valid: true,
+            collecting: true,
+        }
+    }
+
+    fn stop_collecting(&mut self) {
+        self.collecting = false;
+        self.tasks.clear();
+        self.pending.clear();
+        // Never leave a tracee stopped solely for diagnostic collection.
+        for (pid, _) in self.deferred.drain() {
+            cont(pid, 0);
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.stop_collecting();
+        self.valid = false;
+        self.events.clear();
+    }
+
+    fn defer(&mut self, pid: i32, now: Instant) -> bool {
+        if !self.collecting || self.tasks.contains_key(&pid) {
+            return false;
+        }
+        if self.deferred.len() >= MAX_EXEC_TASKS {
+            self.stop_collecting();
+            return false;
+        }
+        self.deferred.entry(pid).or_insert(now);
+        true
+    }
+
+    fn hold_remaining(&self, now: Instant) -> Option<Duration> {
+        self.deferred
+            .values()
+            .min()
+            .map(|oldest| MAX_EXEC_HOLD.saturating_sub(now.saturating_duration_since(*oldest)))
+    }
+
+    fn enter(&mut self, pid: i32, nr: i64, args: &[u64; 6]) {
+        if !self.collecting {
+            return;
+        }
+        if !self.tasks.contains_key(&pid) {
+            self.stop_collecting();
+            return;
+        }
+        let (path, argv) = if nr == libc::SYS_execve {
+            (args[0], args[1])
+        } else {
+            (args[1], args[2])
+        };
+        let raw_path = if path == 0 {
+            Some(Vec::new())
+        } else {
+            read_cstr(pid, path)
+        };
+        let candidate = raw_path.and_then(|path| {
+            let requested = if nr == libc::SYS_execveat
+                && args[4] as i32 & AT_EMPTY_PATH != 0
+                && path.is_empty()
+            {
+                fs::read_link(format!("/proc/{pid}/fd/{}", args[0] as i32)).ok()?
+            } else {
+                PathBuf::from(OsString::from_vec(path))
+            };
+            read_exec_argv(pid, argv).map(|argv| PendingExec { requested, argv })
+        });
+        // A failed PATH lookup never gets an exec event. Only the candidate associated
+        // with a successful PTRACE_EVENT_EXEC is promoted into the observation.
+        self.pending.insert(pid, candidate);
+    }
+
+    fn fork(&mut self, parent: i32) {
+        if !self.collecting {
+            return;
+        }
+        let Some(child) = event_message(parent) else {
+            self.stop_collecting();
+            return;
+        };
+        if self.register_child(parent, child) {
+            cont(child, 0);
+        }
+    }
+
+    // Returns whether this child stopped before the fork event and must now resume.
+    fn register_child(&mut self, parent: i32, child: i32) -> bool {
+        let Some(image) = self.tasks.get(&parent).copied() else {
+            self.stop_collecting();
+            return false;
+        };
+        if self.tasks.len() >= MAX_EXEC_TASKS {
+            self.stop_collecting();
+            return false;
+        }
+        self.tasks.insert(child, image);
+        self.pending.remove(&child);
+        self.deferred.remove(&child).is_some()
+    }
+
+    fn exec(&mut self, pid: i32) {
+        if !self.collecting {
+            return;
+        }
+        // A non-leader thread takes the leader's TID at exec. Linux reports its former
+        // TID in the event message, which identifies the pending entry and ancestry.
+        let Some(former) = event_message(pid) else {
+            self.stop_collecting();
+            return;
+        };
+        let Some(parent) = self.tasks.remove(&former) else {
+            self.stop_collecting();
+            return;
+        };
+        let Some(Some(pending)) = self.pending.remove(&former) else {
+            self.stop_collecting();
+            return;
+        };
+        if former != pid {
+            self.tasks.remove(&pid);
+            self.pending.remove(&pid);
+        }
+        let Some((executable, effective_argv, cwd)) = exec_image(pid) else {
+            self.stop_collecting();
+            return;
+        };
+        if !self.reserve_event() {
+            return;
+        }
+        let index = self.events.len();
+        self.events.push(ExecEvent {
+            parent,
+            requested: pending.requested,
+            argv: pending.argv,
+            executable,
+            effective_argv,
+            cwd,
+        });
+        self.tasks.insert(pid, Some(index));
+    }
+
+    fn reserve_event(&mut self) -> bool {
+        if self.events.len() >= MAX_EXEC_EVENTS {
+            self.stop_collecting();
+            return false;
+        }
+        true
+    }
+
+    fn exit(&mut self, pid: i32) {
+        self.tasks.remove(&pid);
+        self.pending.remove(&pid);
+        self.deferred.remove(&pid);
+    }
+
+    fn finish(self) -> Option<Vec<ExecEvent>> {
+        self.valid.then_some(self.events)
+    }
+}
+
+fn event_message(pid: i32) -> Option<i32> {
+    let mut value = 0u64;
+    let result = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETEVENTMSG as _,
+            pid,
+            0,
+            &mut value as *mut u64,
+        )
+    };
+    if result < 0 {
+        None
+    } else {
+        i32::try_from(value).ok()
+    }
+}
+
+fn read_exec_argv(pid: i32, address: u64) -> Option<Vec<OsString>> {
+    if address == 0 {
+        return Some(Vec::new());
+    }
+    let pointers = read_mem(pid, address, (MAX_EXEC_ARGS + 1) * 8)?;
+    let mut argv = Vec::new();
+    let mut bytes = 0;
+    let mut mem = None;
+    for raw in pointers.as_chunks::<8>().0.iter().take(MAX_EXEC_ARGS + 1) {
+        let pointer = u64::from_ne_bytes(*raw);
+        if pointer == 0 {
+            return Some(argv);
+        }
+        if argv.len() == MAX_EXEC_ARGS {
+            return None;
+        }
+        let arg = read_exec_arg(
+            pid,
+            pointer,
+            MAX_EXEC_ARG_BYTES.checked_sub(bytes)?,
+            &mut mem,
+        )?;
+        bytes += arg.len() + 1;
+        argv.push(OsString::from_vec(arg));
+    }
+    None
+}
+
+// Read short arguments into a stack buffer instead of allocating and copying the
+// entire remaining argv budget for each one.
+fn read_exec_arg(
+    pid: i32,
+    mut address: u64,
+    mut remaining: usize,
+    mem: &mut Option<fs::File>,
+) -> Option<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+
+    let mut arg = Vec::new();
+    let mut buffer = [0u8; 256];
+    while remaining > 0 {
+        let len = remaining.min(buffer.len());
+        let local = libc::iovec {
+            iov_base: buffer.as_mut_ptr().cast(),
+            iov_len: len,
+        };
+        let remote = libc::iovec {
+            iov_base: address as *mut libc::c_void,
+            iov_len: len,
+        };
+        let result = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+        let n = if result > 0 {
+            result as usize
+        } else {
+            if mem.is_none() {
+                *mem = Some(fs::File::open(format!("/proc/{pid}/mem")).ok()?);
+            }
+            mem.as_ref()?.read_at(&mut buffer[..len], address).ok()?
+        };
+        if n == 0 {
+            return None;
+        }
+        if let Some(end) = buffer[..n].iter().position(|byte| *byte == 0) {
+            arg.extend_from_slice(&buffer[..end]);
+            return Some(arg);
+        }
+        arg.extend_from_slice(&buffer[..n]);
+        remaining -= n;
+        address = address.checked_add(n as u64)?;
+    }
+    None
+}
+
+fn exec_image(pid: i32) -> Option<(PathBuf, Vec<OsString>, PathBuf)> {
+    use std::io::Read;
+
+    let proc = format!("/proc/{pid}");
+    let executable = fs::read_link(format!("{proc}/exe")).ok()?;
+    let cwd = fs::read_link(format!("{proc}/cwd")).ok()?;
+    let mut raw = Vec::new();
+    fs::File::open(format!("{proc}/cmdline"))
+        .ok()?
+        .take((MAX_EXEC_ARG_BYTES + 1) as u64)
+        .read_to_end(&mut raw)
+        .ok()?;
+    if raw.len() > MAX_EXEC_ARG_BYTES || raw.last() != Some(&0) {
+        return None;
+    }
+    raw.pop();
+    let argv: Vec<OsString> = raw
+        .split(|byte| *byte == 0)
+        .map(|arg| OsString::from_vec(arg.to_vec()))
+        .collect();
+    (argv.len() <= MAX_EXEC_ARGS).then_some((executable, argv, cwd))
 }
 
 /// `ip:port` for an IPv4 or IPv6 sockaddr, so a refusal says what the step talked to.
@@ -1667,9 +2030,17 @@ impl Tracer<'_> {
     fn on_syscall(&mut self, pid: i32) {
         let Some(regs) = get_regs(pid) else {
             self.flag("could not read registers");
+            if let Some(execs) = &mut self.execs {
+                execs.invalidate();
+            }
             return;
         };
         let (nr, args) = decode(&regs);
+        if matches!(nr, libc::SYS_execve | libc::SYS_execveat) {
+            if let Some(execs) = &mut self.execs {
+                execs.enter(pid, nr, &args);
+            }
+        }
         self.syscall = nr;
         let Some(ops) = self.ops.get(&nr).cloned() else {
             self.flag(
@@ -1797,6 +2168,7 @@ mod tests {
             syscall: 0,
             allow_network: false,
             rec: None,
+            execs: None,
             t: Trace::default(),
         };
         tracer.topology_changed(42);
@@ -1807,5 +2179,96 @@ mod tests {
         assert_eq!(tracer.magic_epoch, 2);
         tracer.after_topology_stop(42);
         assert_eq!(tracer.magic_epoch, 2);
+    }
+
+    fn sample_exec() -> ExecEvent {
+        ExecEvent {
+            parent: None,
+            requested: PathBuf::from("/bin/pytest"),
+            argv: vec![OsString::from("pytest")],
+            executable: PathBuf::from("/bin/sh"),
+            effective_argv: vec![OsString::from("sh")],
+            cwd: PathBuf::from("/"),
+        }
+    }
+
+    #[test]
+    fn child_stop_before_fork_preserves_its_inherited_image() {
+        let mut observer = ExecObserver::new(10);
+        observer.events.push(sample_exec());
+        observer.tasks.insert(10, Some(0));
+        assert!(observer.defer(11, Instant::now()));
+        assert!(observer.register_child(10, 11));
+        assert_eq!(observer.tasks.get(&11), Some(&Some(0)));
+        assert!(!observer.defer(11, Instant::now()));
+        assert!(!observer.deferred.contains_key(&11));
+    }
+
+    #[test]
+    fn oldest_deferred_child_controls_the_deadline() {
+        let mut observer = ExecObserver::new(10);
+        let start = Instant::now();
+        let later = start + Duration::from_millis(250);
+        assert!(observer.defer(11, start));
+        assert!(observer.defer(12, later));
+        assert_eq!(
+            observer.hold_remaining(later),
+            Some(Duration::from_millis(750))
+        );
+        assert!(observer.register_child(10, 11));
+        assert_eq!(observer.hold_remaining(later), Some(MAX_EXEC_HOLD));
+        observer.exit(12);
+        assert_eq!(observer.hold_remaining(later), None);
+    }
+
+    #[test]
+    fn argument_reads_stop_at_nul_across_chunk_boundaries() {
+        let pid = unsafe { libc::getpid() };
+        let mut bytes = vec![b'x'; 257];
+        bytes[256] = 0;
+        let address = bytes.as_ptr() as u64;
+        assert_eq!(
+            read_exec_arg(pid, address, 257, &mut None).unwrap(),
+            vec![b'x'; 256]
+        );
+        assert!(read_exec_arg(pid, address, 256, &mut None).is_none());
+        bytes[4] = 0;
+        assert_eq!(
+            read_exec_arg(pid, address, 257, &mut None).unwrap(),
+            vec![b'x'; 4]
+        );
+    }
+
+    #[test]
+    fn exec_event_cap_keeps_the_completed_prefix() {
+        let mut observer = ExecObserver::new(10);
+        observer
+            .events
+            .extend((1..MAX_EXEC_EVENTS).map(|_| sample_exec()));
+        assert!(observer.reserve_event());
+        observer.events.push(sample_exec());
+        assert!(!observer.reserve_event());
+        assert!(!observer.collecting);
+        assert_eq!(observer.finish().unwrap().len(), MAX_EXEC_EVENTS);
+    }
+
+    #[test]
+    fn live_task_cap_and_exit_cleanup_are_bounded() {
+        let mut observer = ExecObserver::new(10);
+        for child in 11..(10 + MAX_EXEC_TASKS as i32) {
+            assert!(!observer.register_child(10, child));
+            assert!(observer.collecting);
+        }
+        assert_eq!(observer.tasks.len(), MAX_EXEC_TASKS);
+        assert!(!observer.register_child(10, 100_000));
+        assert!(!observer.collecting);
+
+        let mut observer = ExecObserver::new(10);
+        for child in 11..(11 + MAX_EXEC_TASKS as i32 * 2) {
+            assert!(!observer.register_child(10, child));
+            observer.exit(child);
+        }
+        assert!(observer.collecting);
+        assert_eq!(observer.tasks.len(), 1);
     }
 }

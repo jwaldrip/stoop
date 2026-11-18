@@ -1,5 +1,8 @@
 //! The decision: skip, or run and learn.
 
+#[path = "units/mod.rs"]
+mod units;
+
 use crate::ignore::Ignore;
 use crate::input::{identify, par_map, verify, Input};
 use crate::pathutil::{absolutize, cwd_key, to_key, Physical};
@@ -325,10 +328,14 @@ pub struct Outcome {
 }
 
 pub fn run(o: Opts, explain: bool) -> i32 {
-    run_outcome(o, explain).status
+    run_internal(o, explain, true).status
 }
 
 pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
+    run_internal(o, explain, false)
+}
+
+fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     let key = o.key.clone().unwrap_or_default();
     if o.argv.is_empty() {
         eprintln!("stoop: no command given");
@@ -570,6 +577,7 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
         &cwd,
         o.allow_network || !o.probes.is_empty(),
         trace_scope.as_ref(),
+        observe_runners && !o.no_record && !o.quiet,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -583,6 +591,9 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
             };
         }
     };
+    if let Some(line) = trace.execs.as_deref().and_then(units::diagnostic) {
+        eprintln!("{line}");
+    }
     let status = trace.status;
     if status != 0 {
         return Outcome {

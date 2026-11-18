@@ -14,6 +14,9 @@
   </tbody>
 </table>
 
+<p>On a traced <code>stoop run</code>, recognized test, lint and build launches can produce one diagnostic line, for example <code>stoop: observed jest via npm (diagnostic only)</code>. The original command still runs unchanged; the observation is not saved in its proof. Warm skips, <code>--quiet</code>, <code>--no-record</code>, <code>stoop sh</code> and <code>stoop explain</code> omit the line.</p>
+<p>Observation stops at 1,024 captured execs, 1,024 tracked tasks or 1,024 pending child stops, or if an exec has more than 128 arguments or 16 KiB of arguments. Runners observed before a limit can still be reported; the command continues unchanged.</p>
+
 <h2 id="options">Options</h2>
 <p>Options go before <code>--</code>. Everything after it is the command.</p>
 <dl>
