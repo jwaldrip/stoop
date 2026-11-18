@@ -1,3 +1,5 @@
+use crate::job::JobRecord;
+
 #[derive(Clone, Debug)]
 pub struct JobSpec {
     pub workflow: String,
@@ -28,7 +30,8 @@ pub struct Blocker {
     pub step: Option<usize>,
     pub detail: String,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Code {
     Proved,
     Full,
@@ -43,6 +46,8 @@ pub enum Code {
     Expired,
     Probe,
     InputChanged,
+    PriorChanged,
+    Unplannable,
     EnvChanged,
     Stale,
     ImageChanged,
@@ -65,9 +70,25 @@ pub struct Evidence {
     pub commit: Option<String>,
     pub steps: usize,
     pub inputs: usize,
+    pub priors: usize,
     pub hashed: usize,
     pub by_diff: usize,
     pub overlay: usize,
     pub assumed_outside: usize,
     pub assumed_env: Vec<String>,
+}
+
+pub trait RecordCheck {
+    fn check(&self, spec: &JobSpec, record: &JobRecord) -> Result<(), (Code, String)>;
+}
+
+pub struct Unverified;
+
+impl RecordCheck for Unverified {
+    fn check(&self, _spec: &JobSpec, _record: &JobRecord) -> Result<(), (Code, String)> {
+        Err((
+            Code::Unattested,
+            "no attestation verifier is configured".into(),
+        ))
+    }
 }

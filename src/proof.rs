@@ -28,6 +28,12 @@ pub struct Proof {
     /// Effective ignore patterns, or None for proofs recorded before planning.
     #[serde(default)]
     pub ignore: Option<Vec<String>>,
+    /// State of each written path before the run, or None for older proofs.
+    #[serde(default)]
+    pub priors: Option<Vec<Input>>,
+    /// Reasons this proof cannot be replayed by the planner.
+    #[serde(default)]
+    pub unplannable: Vec<String>,
     /// External state the user vouched for with `--probe`: command text to the hash
     /// of its output when the run happened. A skip needs every probe to match again.
     #[serde(default)]
@@ -44,6 +50,8 @@ impl Proof {
             &self.env,
             &self.probes,
             &self.ignore,
+            &self.priors,
+            &self.unplannable,
         ))
         .expect("proof fields serialize");
         format!("p-{}", &blake3::hash(&bytes).to_hex()[..32])
@@ -80,6 +88,8 @@ fn same_proof(a: &Proof, b: &Proof) -> bool {
         && a.env == b.env
         && a.probes == b.probes
         && a.ignore == b.ignore
+        && a.priors == b.priors
+        && a.unplannable == b.unplannable
 }
 
 pub fn now() -> u64 {
@@ -229,6 +239,8 @@ mod tests {
             probes: BTreeMap::new(),
             removed: vec![],
             ignore: None,
+            priors: None,
+            unplannable: vec![],
         }
     }
 
@@ -247,6 +259,38 @@ mod tests {
         assert_eq!(loaded[0].ignore, None);
         assert!(loaded[0].outputs.is_empty());
         assert!(loaded[0].probes.is_empty());
+    }
+
+    #[test]
+    fn old_files_load_with_no_priors() {
+        let s = store("old-priors");
+        fs::create_dir_all(s.file("k").parent().unwrap()).unwrap();
+        fs::write(
+            s.file("k"),
+            br#"{"v":1,"key":"k","proofs":[{"created":1,"argv":[],"env":{},"inputs":[]}]}"#,
+        )
+        .unwrap();
+        let p = &s.load("k")[0];
+        assert_eq!(p.priors, None);
+        assert!(p.unplannable.is_empty());
+    }
+
+    #[test]
+    fn digest_covers_priors_and_unplannable() {
+        let base = proof("f:1");
+        let mut prior = base.clone();
+        prior.priors = Some(vec![Input {
+            path: "out".into(),
+            id: "a".into(),
+        }]);
+        let mut reason = base.clone();
+        reason.unplannable.push("renamed a directory".into());
+        for changed in [&prior, &reason] {
+            assert_ne!(base.digest(), changed.digest());
+            assert!(!same_proof(&base, changed));
+        }
+        assert_ne!(prior.digest(), reason.digest());
+        assert!(!same_proof(&prior, &reason));
     }
 
     #[test]
