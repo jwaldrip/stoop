@@ -123,6 +123,7 @@
   <li>With <code>--sync-write</code> (or <code>STOOP_SYNC_WRITE=1</code>), a recorded run publishes its proofs, merged with what is already there.</li>
   <li><code>stoop prune</code> deletes published proofs older than <code>--max-age</code> (default 7 days). It needs write access; a scheduled job on main is the place for it.</li>
   <li>Shallow checkouts are fine: the proof refs are fetched on their own.</li>
+  <li>Proofs record a hash of every environment variable, and published proofs are readable by anyone who can read the repository. An unsalted hash of a low-entropy value (a short token, a flag) can be guessed offline. Set <code>STOOP_ENV_SALT</code> from a repository secret on every job that records or checks proofs: the hashes are then keyed with it (they start with <code>s:</code>) and stoop warns when it publishes without one. A run without the secret, such as a pull request from a fork, cannot match a salted proof and simply runs the command. Proofs published before you set it keep their unsalted hashes until they expire or you remove them with <code>stoop prune --max-age 0</code>.</li>
 </ul>
 <p class="status">Tested: the sync suite runs against a bare git remote, and the ref mechanics (push, shallow fetch, delete) were checked against GitHub. Not yet verified: a full authenticated sync run inside a hosted CI provider.</p>
 

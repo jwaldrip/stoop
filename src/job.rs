@@ -15,9 +15,24 @@ pub struct StepRecord {
     pub proof: String,
     pub how: StepHow,
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RecordStatus {
+    Running,
+    Passed,
+    Failed,
+}
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRecord {
     pub created: u64,
+    #[serde(default)]
+    pub started: u64,
+    #[serde(default)]
+    pub status: Option<RecordStatus>,
+    #[serde(default)]
+    pub failed: Option<String>,
+    #[serde(default)]
+    pub actions: BTreeMap<String, String>,
     #[serde(default)]
     pub commit: Option<String>,
     #[serde(default)]
@@ -162,6 +177,10 @@ mod tests {
     fn record(i: u64) -> JobRecord {
         JobRecord {
             created: i,
+            started: 0,
+            status: None,
+            failed: None,
+            actions: BTreeMap::new(),
             commit: Some("sha".into()),
             host: BTreeMap::new(),
             event_path: None,
@@ -173,6 +192,14 @@ mod tests {
             }],
             attest: None,
         }
+    }
+    #[test]
+    fn old_records_load_with_defaults() {
+        let record: JobRecord = serde_json::from_str(r#"{"created":1,"steps":[]}"#).unwrap();
+        assert_eq!(record.started, 0);
+        assert_eq!(record.status, None);
+        assert_eq!(record.failed, None);
+        assert!(record.actions.is_empty());
     }
     #[test]
     fn round_trip() {

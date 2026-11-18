@@ -54,6 +54,7 @@
     <tr><td><code>STOOP_STORE=DIR</code></td><td>Default for <code>--store</code>.</td></tr>
     <tr><td><code>STOOP_SYNC=git[:REMOTE]</code></td><td>Default for <code>--sync</code>.</td></tr>
     <tr><td><code>STOOP_SYNC_WRITE=1</code></td><td>Same as <code>--sync-write</code>.</td></tr>
+    <tr><td><code>STOOP_ENV_SALT</code></td><td>A secret that keys the environment hashes stored in proofs. Set it from a repository secret wherever proofs are published. See <a href="ci.html#sync">How git sync works</a>.</td></tr>
   </tbody>
 </table>
 <p class="note">These are switches. A variable that is empty, or set to <code>0</code>, <code>false</code>, <code>no</code> or <code>off</code>, is off; anything else is on. That makes the common CI idiom <code>STOOP_SYNC_WRITE: ${{ github.ref == 'refs/heads/main' &amp;&amp; '1' || '' }}</code> safe: the empty string on a pull request does not turn publishing on. An empty <code>STOOP_SYNC</code> or <code>STOOP_STORE</code> counts as unset.</p>
