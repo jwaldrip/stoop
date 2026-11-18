@@ -866,11 +866,21 @@ impl ExecObserver {
         } else {
             (args[1], args[2])
         };
-        let candidate = read_cstr(pid, path).and_then(|path| {
-            read_exec_argv(pid, argv).map(|argv| PendingExec {
-                requested: PathBuf::from(OsString::from_vec(path)),
-                argv,
-            })
+        let raw_path = if path == 0 {
+            Some(Vec::new())
+        } else {
+            read_cstr(pid, path)
+        };
+        let candidate = raw_path.and_then(|path| {
+            let requested = if nr == libc::SYS_execveat
+                && args[4] as i32 & AT_EMPTY_PATH != 0
+                && path.is_empty()
+            {
+                fs::read_link(format!("/proc/{pid}/fd/{}", args[0] as i32)).ok()?
+            } else {
+                PathBuf::from(OsString::from_vec(path))
+            };
+            read_exec_argv(pid, argv).map(|argv| PendingExec { requested, argv })
         });
         // A failed PATH lookup never gets an exec event. Only the candidate associated
         // with a successful PTRACE_EVENT_EXEC is promoted into the observation.

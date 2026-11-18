@@ -260,6 +260,37 @@ int main(void) {
     }
 
     #[test]
+    fn execveat_with_an_empty_path_observes_the_executed_file() {
+        let f = Fixture::new();
+        f.write(
+            "bin/pytest",
+            "#!/bin/sh\nprintf 'pytest\\n' >> \"$LOG\"\n",
+            true,
+        );
+        let helper = compile(
+            &f,
+            r#"
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <unistd.h>
+extern char **environ;
+int main(void) {
+    int fd = open("bin/pytest", O_RDONLY);
+    if (fd < 0) return 1;
+    char *args[] = { "pytest", 0 };
+    execveat(fd, "", args, environ, AT_EMPTY_PATH);
+    return 1;
+}
+"#,
+            "exec-fd",
+            &[],
+        );
+        let output = f.run(&["run", "--root", ".", "--", helper.to_str().unwrap()]);
+        one_observation(&output, "stoop: observed pytest (diagnostic only)");
+        assert_eq!(f.log(), "pytest\n");
+    }
+
+    #[test]
     fn oversized_arguments_discard_only_the_diagnostic() {
         let f = Fixture::new();
         f.write(
