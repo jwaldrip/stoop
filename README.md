@@ -1,9 +1,7 @@
 <p align="center">
   <a href="https://jwaldrip.github.io/stoop/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/stoop-logo-on-dark.svg">
-      <img alt="stoop" src="assets/stoop-logo-on-light.svg" width="300">
-    </picture>
+    <img alt="stoop" src="assets/stoop-logo-on-light.svg#gh-light-mode-only" width="300">
+    <img alt="stoop" src="assets/stoop-logo-on-dark.svg#gh-dark-mode-only" width="300">
   </a>
 </p>
 
@@ -28,10 +26,8 @@
 </p>
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/readme-hero-dark.jpg">
-    <img src="assets/readme-hero-light.jpg" alt="A murmuration of thousands of starlings over a frosted marsh, and one peregrine diving at a single bird at its edge." width="100%">
-  </picture>
+  <img src="assets/readme-hero-light.jpg#gh-light-mode-only" alt="A murmuration of thousands of starlings over a frosted marsh, and one peregrine diving at a single bird at its edge." width="100%">
+  <img src="assets/readme-hero-dark.jpg#gh-dark-mode-only" alt="A murmuration of thousands of starlings over a frosted marsh, and one peregrine diving at a single bird at its edge." width="100%">
 </p>
 
 ## Most of a pipeline has nothing new to say
@@ -41,10 +37,8 @@ CI reruns every step on every push. Most of those steps read the same files they
 A stoop is a peregrine's hunting dive: it folds in, ignores the rest of the sky, and drops on the one thing that matters. **stoop** does that for CI. It picks out the step whose inputs moved and skips the rest.
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="assets/demo-terminal-dark.png">
-    <img src="assets/demo-terminal-light.png" alt="Terminal: stoop runs cargo build and records 668 inputs, skips the same build in 289 ms, then explains that an edit to src/ignore.rs means the build would run." width="760">
-  </picture>
+  <img src="assets/demo-terminal-light.png#gh-light-mode-only" alt="Terminal: stoop runs cargo build and records 668 inputs, skips the same build in 289 ms, then explains that an edit to src/ignore.rs means the build would run." width="760">
+  <img src="assets/demo-terminal-dark.png#gh-dark-mode-only" alt="Terminal: stoop runs cargo build and records 668 inputs, skips the same build in 289 ms, then explains that an edit to src/ignore.rs means the build would run." width="760">
 </p>
 
 <p align="center"><sub>Captured, not typed: a fresh clone of stoop building itself, Linux arm64 in a throwaway container, stoop at <code>c9082e1</code>. Only cargo's progress lines are cut.</sub></p>

@@ -15,13 +15,13 @@ The mark is a peregrine in its stoop: wings folded, head down, the yellow eye-ri
 | `readme-hero-light.jpg`, `readme-hero-dark.jpg` | README hero, daylight and blue hour. The dark one is a tonal grade of the light one (exposure about half, cold blue cast, a faint warm band at the horizon), not a separate scene |
 | `demo-terminal-light.png`, `demo-terminal-dark.png` | README terminal capture, one theme each, rendered from the same template. The transcript is a captured run, with only cargo's progress lines cut |
 
-In Markdown that renders on both themes, pair the light and dark files:
+On GitHub, pair the light and dark files with the theme fragments. They follow the theme chosen in GitHub's own settings; `<picture>` with `prefers-color-scheme` follows the browser's setting instead and shows the dark logo on a dark page whenever the two differ:
 
 ```html
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/stoop-logo-on-dark.svg">
-  <img alt="stoop" src="assets/stoop-logo-on-light.svg" width="300">
-</picture>
+<img alt="stoop" src="assets/stoop-logo-on-light.svg#gh-light-mode-only" width="300">
+<img alt="stoop" src="assets/stoop-logo-on-dark.svg#gh-dark-mode-only" width="300">
 ```
+
+Anywhere else (a site, a docs page), use `<picture>` with `prefers-color-scheme`, or set the file per theme in CSS.
 
 Colors, taken from the bird: malar black `#15181c`, barred-breast pale `#e9eef2`, slate `#4b5868`, morning sky `#eef2f5`, and cere yellow `#f0c419`, used only as a mark, never for text.
