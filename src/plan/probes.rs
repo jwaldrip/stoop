@@ -987,3 +987,147 @@ fn strict_actions_rejects_a_resolvable_floating_ref() {
     );
     assert_eq!(code(&strict, "a"), "unresolved-action");
 }
+
+#[test]
+fn only_run_invariant_github_context_is_accepted() {
+    let now = proof::now();
+    let good = workflow(
+        "env:\n  STOOP_FULL: ${{ github.event_name == 'push' && '1' || '' }}\n",
+        "",
+        "",
+    );
+    let r = Repo::new(&[(CI, &good), ("a.txt", "a\n")]);
+    record(&r, rec(&good, now, now)).unwrap();
+    assert_eq!(
+        code(&plan(&r, &["--format", "json"], &[("STOOP_FULL", "")]), "a"),
+        "proved"
+    );
+    for expr in [
+        "contains(github.*, 'a')",
+        "contains(toJSON(github), 'job')",
+        "github['job'] == 'a'",
+        "github.actor == 'a'",
+        "github",
+        "github.event_name == 'push' && github.job == 'a'",
+    ] {
+        let w = workflow(
+            &format!("env:\n  STOOP_FULL: ${{{{ {expr} && '1' || '' }}}}\n"),
+            "",
+            "",
+        );
+        let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+        record(&r, rec(&good, now, now)).unwrap();
+        let o = plan(&r, &["--format", "json"], &[("STOOP_FULL", "")]);
+        assert_ne!(code(&o, "a"), "proved", "{expr}");
+        assert!(o.plan["skip"].as_array().unwrap().is_empty(), "{expr}");
+    }
+}
+
+#[test]
+fn plan_environment_cannot_shadow_workflow_vars_or_secrets() {
+    let now = proof::now();
+    for context in ["vars", "secrets"] {
+        let without_environment = workflow(
+            &format!("env:\n  STOOP_FULL: ${{{{ {context}.FULL }}}}\n"),
+            "",
+            "",
+        );
+        let control = Repo::new(&[(CI, &without_environment), ("a.txt", "a\n")]);
+        record(&control, rec(&without_environment, now, now)).unwrap();
+        assert_eq!(
+            code(
+                &plan(&control, &["--format", "json"], &[("STOOP_FULL", "")]),
+                "a"
+            ),
+            "proved",
+            "{context}"
+        );
+        let w = workflow(
+            &format!("env:\n  STOOP_FULL: ${{{{ {context}.FULL }}}}\n"),
+            "",
+            "",
+        )
+        .replace(
+            "    steps: []",
+            "    environment: production\n    steps: []",
+        );
+        let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+        let safe = workflow("", "", "");
+        record(&r, rec(&safe, now, now)).unwrap();
+        let o = plan(&r, &["--format", "json"], &[("STOOP_FULL", "")]);
+        assert_ne!(code(&o, "a"), "proved", "{context}");
+        assert!(o.plan["skip"].as_array().unwrap().is_empty(), "{context}");
+    }
+}
+
+#[test]
+fn reusable_workflow_cannot_relay_plan_output() {
+    let now = proof::now();
+    let baseline = workflow("", "", "");
+    let control = Repo::new(&[(CI, &baseline), ("a.txt", "a\n")]);
+    record(&control, rec(&baseline, now, now)).unwrap();
+    assert_eq!(
+        code(&plan(&control, &["--format", "json"], &[]), "a"),
+        "proved"
+    );
+    for relay in [
+        "  relay:\n    needs: [stoop-plan]\n    if: ${{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',relay,') }}\n    uses: ./.github/workflows/called.yml\n",
+        "  relay:\n    needs: [stoop-plan]\n    if: ${{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',relay,') }}\n    uses: ./.github/workflows/called.yml\n    with: {skip: '${{ needs.stoop-plan.outputs.skip }}'}\n",
+        "  relay:\n    uses: ./.github/workflows/called.yml\n    with: {skip: '${{ needs.stoop-plan.outputs.skip }}'}\n",
+        "  relay:\n    uses: ./.github/workflows/called.yml\n    secrets: {skip: '${{ needs.stoop-plan.outputs.skip }}'}\n",
+    ] {
+        let w = workflow("", "", relay);
+        let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+        record(&r, rec(&w, now, now)).unwrap();
+        let o = plan(&r, &["--format", "json"], &[]);
+        assert_eq!(code(&o, "a"), "error", "{relay}");
+        assert_eq!(o.plan["skip"], json!([]));
+    }
+}
+
+#[test]
+fn malformed_workflow_ref_is_refused_even_when_both_refs_match() {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+    let mut failures = Vec::new();
+    for value in [
+        "other/repo/.github/workflows/ci.yml@refs/heads/main",
+        "owner/repo/.github/workflows/ci.yml",
+        "OWNER/REPO/.github/workflows/ci.yml@refs/heads/main",
+    ] {
+        let o = plan(
+            &r,
+            &["--format", "json", "--workflow", CI],
+            &[
+                ("GITHUB_WORKFLOW_REF", value),
+                ("STOOP_JOB_WORKFLOW_REF", value),
+            ],
+        );
+        if code(&o, "a") != "error" {
+            failures.push(value);
+        }
+    }
+    assert!(failures.is_empty(), "accepted malformed refs: {failures:?}");
+}
+
+#[test]
+fn markdown_backtick_cannot_escape_summary_code_span() {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    let mut x = rec(&w, now, now);
+    x.inputs = vec![file("x`[click](https:/example.invalid)", b"x")];
+    record(&r, x).unwrap();
+    let summary = r.base.join("summary");
+    let _ = plan(
+        &r,
+        &["--format", "github"],
+        &[("GITHUB_STEP_SUMMARY", summary.to_str().unwrap())],
+    );
+    let rendered = std::fs::read_to_string(summary).unwrap();
+    assert!(rendered.contains("&#96;[click]"), "{rendered}");
+    assert!(!rendered.contains("`[click]"), "{rendered}");
+}

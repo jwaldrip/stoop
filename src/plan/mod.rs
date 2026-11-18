@@ -238,6 +238,15 @@ pub fn cmd(args: &[String]) -> i32 {
     }
     0
 }
+fn references_needs(value: &Value) -> bool {
+    match value {
+        Value::String(text) => text.contains("${{") && text.to_ascii_lowercase().contains("needs"),
+        Value::Array(values) => values.iter().any(references_needs),
+        Value::Object(values) => values.values().any(references_needs),
+        _ => false,
+    }
+}
+
 fn build<S: attest::KeySource>(
     o: &Options,
     root: &Path,
@@ -258,7 +267,9 @@ fn build<S: attest::KeySource>(
             eprintln!("stoop: --allow-uses is a local dry-run list; records made with a different effective list may not match");
         }
     }
-    let mut global_error = plan_override(&workflow, &o.plan_job).err();
+    let mut global_error = plan_override(&workflow, &o.plan_job)
+        .and_then(|()| gha::workflow::validate_plan_environment(&workflow, &o.plan_job))
+        .err();
     if run::env_flag("GITHUB_ACTIONS")
         && std::env::var("GITHUB_JOB").ok().as_deref() != Some(o.plan_job.as_str())
     {
@@ -290,6 +301,23 @@ fn build<S: attest::KeySource>(
     }
     let mut graph_error = false;
     for spec in &specs {
+        if let Some(job) = workflow.root["jobs"].get(&spec.job) {
+            let needs_plan = spec
+                .needs
+                .iter()
+                .any(|n| n.eq_ignore_ascii_case(&o.plan_job));
+            if (needs_plan && job.get("uses").is_some())
+                || ["with", "secrets"]
+                    .iter()
+                    .any(|field| job.get(*field).is_some_and(references_needs))
+            {
+                graph_error = true;
+                global_error = Some(format!(
+                    "job {} may relay planner output through a reusable workflow",
+                    spec.job
+                ));
+            }
+        }
         if spec
             .needs
             .iter()

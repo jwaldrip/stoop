@@ -179,22 +179,147 @@ fn stoop_settings(layers: &[Option<&Value>]) -> Result<Option<u64>, String> {
     }
 }
 
+/// Validate context references without evaluating workflow expressions.
+/// A workflow-level STOOP setting must evaluate alike in each job.
+fn validate_stoop_expression(text: &str, reject_environment_context: bool) -> Result<(), String> {
+    const SAFE_GITHUB: &[&str] = &[
+        "event_name",
+        "ref",
+        "ref_name",
+        "ref_type",
+        "base_ref",
+        "head_ref",
+        "sha",
+        "repository",
+        "event",
+        "run_id",
+        "run_attempt",
+        "workflow",
+        "workflow_ref",
+    ];
+    let bytes = text.as_bytes();
+    let mut offset = 0;
+    while let Some(start) = text[offset..].find("${{") {
+        let mut i = offset + start + 3;
+        let mut closed = false;
+        while i < bytes.len() {
+            if bytes[i] == b'\'' {
+                i += 1;
+                let mut terminated = false;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if bytes.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        terminated = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !terminated {
+                    return Err("unterminated string in STOOP expression".into());
+                }
+                continue;
+            }
+            if bytes[i..].starts_with(b"}}") {
+                offset = i + 2;
+                closed = true;
+                break;
+            }
+            if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+                let begin = i;
+                i += 1;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
+                {
+                    i += 1;
+                }
+                let ident = &text[begin..i];
+                if reject_environment_context
+                    && (ident.eq_ignore_ascii_case("vars") || ident.eq_ignore_ascii_case("secrets"))
+                {
+                    return Err(
+                        "plan job environment can change vars or secrets used by STOOP settings"
+                            .into(),
+                    );
+                }
+                if ident.eq_ignore_ascii_case("github") {
+                    let mut j = i;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if bytes.get(j) != Some(&b'.') {
+                        return Err("STOOP expression uses an unknown github context".into());
+                    }
+                    j += 1;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    let property = j;
+                    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                    {
+                        j += 1;
+                    }
+                    if !SAFE_GITHUB
+                        .iter()
+                        .any(|safe| text[property..j].eq_ignore_ascii_case(safe))
+                    {
+                        return Err("STOOP expression uses an unknown github property".into());
+                    }
+                    i = j;
+                }
+                continue;
+            }
+            i += 1;
+        }
+        if !closed {
+            return Err("unterminated STOOP expression".into());
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_plan_environment(w: &Workflow, plan_job: &str) -> Result<(), String> {
+    if w.root["jobs"]
+        .get(plan_job)
+        .and_then(Value::as_object)
+        .is_none_or(|job| !job.contains_key("environment"))
+    {
+        return Ok(());
+    }
+    fn scan(value: &Value) -> Result<(), String> {
+        match value {
+            Value::Object(map) => {
+                for (name, value) in map {
+                    if name.starts_with("STOOP_") {
+                        if let Some(text) = value.as_str().filter(|s| s.contains("${{")) {
+                            validate_stoop_expression(text, true)
+                                .map_err(|e| format!("{name}: {e}"))?;
+                        }
+                    }
+                    scan(value)?;
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    scan(item)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    scan(&w.root)
+}
+
 fn static_workflow_settings(w: &Workflow) -> Result<Value, String> {
     let mut settings = Map::new();
     for (name, value) in object(w.root.get("env"), "workflow env")? {
         if name.starts_with("STOOP_") {
             if let Some(text) = value.as_str().filter(|s| s.contains("${{")) {
-                let normalized: String = text
-                    .chars()
-                    .filter(|c| c.is_ascii_alphanumeric())
-                    .flat_map(char::to_lowercase)
-                    .collect();
-                if normalized.contains("githubjob")
-                    || normalized.contains("githubaction")
-                    || (text.to_ascii_lowercase().contains("github") && text.contains('['))
-                {
-                    return Err(format!("{name} depends on job or action context"));
-                }
+                validate_stoop_expression(text, false).map_err(|e| format!("{name}: {e}"))?;
             }
         }
         if ["STOOP_FULL", "STOOP_OFF", "STOOP_MAX_AGE"].contains(&name.as_str())
@@ -1433,5 +1558,47 @@ mod tests {
             wf_key,
             &crate::stepkey::sh_key(b"npm test", "fixture", "test", "a", None)
         );
+    }
+    #[test]
+    fn stoop_workflow_expression_allows_only_run_invariant_github_properties() {
+        for property in [
+            "event_name",
+            "ref",
+            "ref_name",
+            "ref_type",
+            "base_ref",
+            "head_ref",
+            "sha",
+            "repository",
+            "event",
+            "run_id",
+            "run_attempt",
+            "workflow",
+            "workflow_ref",
+        ] {
+            assert!(
+                validate_stoop_expression(&format!("${{{{ github.{property} }}}}"), false).is_ok(),
+                "{property}"
+            );
+        }
+        for expression in [
+            "${{ github.* }}",
+            "${{ github['event_name'] }}",
+            "${{ github }}",
+            "${{ toJSON(github) }}",
+            "${{ github.actor }}",
+            "${{ github.ref_protected }}",
+            "${{ github.job }}",
+            "${{ github.action_path }}",
+        ] {
+            assert!(
+                validate_stoop_expression(expression, false).is_err(),
+                "{expression}"
+            );
+        }
+        assert!(validate_stoop_expression("${{ github.event.action }}", false).is_ok());
+        assert!(validate_stoop_expression("${{ format('{0}', 'github.job') }}", false).is_ok());
+        assert!(validate_stoop_expression("${{ vars.NAME }}", true).is_err());
+        assert!(validate_stoop_expression("${{ secrets.NAME }}", true).is_err());
     }
 }
