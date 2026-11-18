@@ -6,6 +6,7 @@ mod ignore;
 mod input;
 #[allow(dead_code)]
 mod job;
+mod journal;
 mod pathutil;
 #[allow(dead_code)]
 mod plan;
@@ -113,6 +114,9 @@ fn real_main(mut args: Vec<String>) -> i32 {
             for (key, n, created, inputs) in store.list() {
                 println!("{key}\t{n} proofs\t{inputs} inputs\tcreated {created}");
             }
+            for (key, n, created, steps) in jobs_for(&o).list() {
+                println!("{key}\t{n} records\t{steps} steps\tcreated {created}");
+            }
             0
         }
         "forget" => {
@@ -120,7 +124,12 @@ fn real_main(mut args: Vec<String>) -> i32 {
                 eprintln!("stoop: forget needs a key");
                 return 2;
             };
-            match store_for(&o).forget(&proof::sanitize(key)) {
+            let result = if key.starts_with("job-") {
+                jobs_for(&o).forget(&proof::sanitize(key))
+            } else {
+                store_for(&o).forget(&proof::sanitize(key))
+            };
+            match result {
                 Ok(true) => 0,
                 Ok(false) => {
                     eprintln!("stoop: no proof named {key}");
@@ -137,7 +146,7 @@ fn real_main(mut args: Vec<String>) -> i32 {
                 eprintln!("stoop: {e}");
                 2
             }
-            Ok(r) => match r.pull_all(&store_for(&o)) {
+            Ok(r) => match r.pull_all(&store_for(&o), &jobs_for(&o)) {
                 Ok(n) => {
                     if !o.quiet {
                         eprintln!("stoop: pulled {n} new proofs");
@@ -207,6 +216,17 @@ fn store_for(o: &Opts) -> proof::Store {
     )
 }
 
+fn jobs_for(o: &Opts) -> job::JobStore {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let root = o.root.clone().unwrap_or_else(|| run::find_root(&cwd));
+    job::JobStore::new(
+        o.store
+            .clone()
+            .or_else(|| run::env_str("STOOP_STORE").map(PathBuf::from))
+            .unwrap_or_else(|| root.join(".stoop")),
+    )
+}
+
 fn parse(args: &[String]) -> Result<(Opts, Vec<String>), String> {
     let mut o = Opts::default();
     let mut i = 0;
@@ -259,12 +279,20 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
     };
     let cwd = std::env::current_dir().unwrap_or_default();
     let root = o.root.clone().unwrap_or_else(|| run::find_root(&cwd));
+    let matrix = match stepkey::canonical_matrix(&std::env::var("STOOP_MATRIX").unwrap_or_default())
+    {
+        Ok(matrix) => matrix,
+        Err(error) => {
+            eprintln!("stoop: invalid STOOP_MATRIX: {error}");
+            None
+        }
+    };
     o.key = Some(stepkey::sh_key(
         &body,
         &std::env::var("GITHUB_WORKFLOW").unwrap_or_default(),
         &std::env::var("GITHUB_JOB").unwrap_or_default(),
         &pathutil::to_key(&root, &cwd),
-        None,
+        matrix.as_deref(),
     ));
     o.ignore.push(script.to_string());
     o.ignore
@@ -280,6 +308,43 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
     ];
     argv.extend(rest.iter().cloned());
     o.argv = argv;
+    let blocked =
+        run::env_str("RUNNER_TEMP").map(|t| PathBuf::from(t).join("stoop/journal.blocked"));
+    let mut journal = if blocked.as_ref().is_some_and(|p| p.exists()) {
+        None
+    } else {
+        match journal::Journal::open(&root, matrix.as_deref()) {
+            Ok(journal) => journal,
+            Err(error) => {
+                eprintln!("stoop: job record not written: {error}");
+                if let Some(path) = &blocked {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                        let _ = std::fs::write(path, b"blocked");
+                    }
+                }
+                None
+            }
+        }
+    };
+    let journal_error = journal
+        .as_mut()
+        .and_then(|j| j.before(o.key.as_deref().unwrap_or_default()).err());
+    if let Some(error) = journal_error {
+        eprintln!("stoop: journal: {error}; continuing");
+        journal = None;
+    }
+    let remote = sync_for(o).ok();
+    let proofs = store_for(o);
+    let jobs = jobs_for(o);
+    o.defer_push =
+        journal.as_ref().is_some_and(|j| j.eligible()) && remote.as_ref().is_some_and(|r| r.write);
     let o = std::mem::take(o);
-    run::run(o, false)
+    let outcome = run::run_outcome(o, false);
+    if let Some(journal) = &mut journal {
+        if let Err(error) = journal.after(&outcome, &jobs, &proofs, remote.as_ref()) {
+            eprintln!("stoop: journal: {error}; continuing");
+        }
+    }
+    outcome.status
 }
