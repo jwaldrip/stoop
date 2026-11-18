@@ -28,6 +28,7 @@
     <span class="k">runs-on</span>: ubuntu-latest
     <span class="k">permissions</span>:
       <span class="k">contents</span>: write          <span class="c"># main pushes refs/stoop/*</span>
+      <span class="k">id-token</span>: write          <span class="c"># attests the records this job publishes</span>
     <span class="k">env</span>:
       <span class="k">STOOP_SYNC</span>: git
     <span class="k">steps</span>:
@@ -50,6 +51,9 @@
   <li>Steps that use an action (<code>uses:</code>) are not shell steps and run as usual.</li>
   <li>Set <code>STOOP_SYNC_WRITE</code> only on the default branch. An empty value or <code>0</code> is off, so <code>STOOP_SYNC_WRITE: ${{ github.ref == 'refs/heads/main' &amp;&amp; '1' || '' }}</code> works; setting it from a step guarded by <code>if:</code>, as above, is just as good.</li>
   <li>Sync never fails a step. If the remote is unreachable or refuses a push, stoop warns and the step runs as it would have without sync.</li>
+  <li>Records are attested. Give the job that publishes <code>id-token: write</code>, as above, and stoop attaches a GitHub OIDC token to each record it publishes. The token names the repository, the branch, the commit, the run and the workflow file, and it is tied to that record's contents. Without the permission a record is published unattested. Nothing reads attestations until <code>stoop plan</code> is released; a planner will refuse any record without a valid one. Planning needs only <code>contents: read</code> and outbound HTTPS to <code>token.actions.githubusercontent.com</code>.</li>
+  <li>Tokens identify the workflow and run, not an individual job. Every publishing job, and every action, build script, dependency and test it runs, can request a token for records of any job in that workflow. A separate writer can publish such a token later. The signed issue time limits its usable age to the planner's ceiling. Restrict publishing permissions and use an ephemeral GitHub-hosted planner runner.</li>
+  <li>The planner accepts only protected branches and GitHub-hosted recording runners. The planned workflow file must be the same file that recorded the job. A separate main-only workflow with the same name cannot supply its records. GitHub Enterprise Server and GitHub Enterprise Cloud custom OIDC issuers are not supported and fail closed.</li>
 </ul>
 
 <h3 id="github-cache">Or with the Actions cache</h3>

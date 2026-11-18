@@ -1,4 +1,6 @@
 #[allow(dead_code)]
+mod attest;
+#[allow(dead_code)]
 mod gha;
 #[allow(dead_code)]
 mod gittree;
