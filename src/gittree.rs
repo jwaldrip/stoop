@@ -1,4 +1,6 @@
 //! Read repository state from git objects without executing repository code.
+//! A1 assumes the plan runner and job runner have equivalent global and system
+//! attributes and checkout settings, as covered by the job's runner identity.
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -57,6 +59,8 @@ pub struct GitTree {
     reads: usize,
     conversions: Option<BTreeMap<Vec<u8>, String>>,
     attr_error: Option<String>,
+    #[cfg(test)]
+    test_global_config: Option<PathBuf>,
 }
 impl GitTree {
     pub fn load(root: &Path, rev: &str) -> Result<Self, GitError> {
@@ -139,7 +143,13 @@ impl GitTree {
             reads: 0,
             conversions: None,
             attr_error: None,
+            #[cfg(test)]
+            test_global_config: None,
         })
+    }
+    #[cfg(test)]
+    pub fn set_test_global_config(&mut self, path: PathBuf) {
+        self.test_global_config = Some(path);
     }
     pub fn commit(&self) -> &str {
         &self.commit
@@ -343,13 +353,16 @@ impl GitTree {
                 .filter(|(_, e)| matches!(e, Entry::Blob { .. }))
                 .flat_map(|(p, _)| p.iter().copied().chain(std::iter::once(0)))
                 .collect();
-            let mut child = git()
+            let mut command = git();
+            #[cfg(test)]
+            if let Some(config) = &self.test_global_config {
+                command.env("GIT_CONFIG_GLOBAL", config);
+            }
+            let mut child = command
                 .current_dir(&self.root)
                 .env("GIT_NO_LAZY_FETCH", "1")
                 .env("GIT_INDEX_FILE", &index)
                 .args([
-                    "-c",
-                    "core.attributesFile=/dev/null",
                     "-c",
                     "core.ignorecase=false",
                     "check-attr",
