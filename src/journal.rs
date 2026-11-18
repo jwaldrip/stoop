@@ -1,5 +1,5 @@
 use crate::attest;
-use crate::gha::{context::GhCtx, workflow};
+use crate::gha::{context::GhCtx, resolve, workflow};
 use crate::job::{JobRecord, JobStore, RecordStatus, StepHow, StepRecord};
 use crate::plan::spec::StepSpec;
 use crate::proof::{now, Store};
@@ -20,7 +20,11 @@ pub struct Journal {
 }
 
 impl Journal {
-    pub fn open(root: &Path, matrix: Option<&str>) -> Result<Option<Self>, String> {
+    pub fn open(
+        root: &Path,
+        matrix: Option<&str>,
+        publishing: bool,
+    ) -> Result<Option<Self>, String> {
         if !run::env_flag("GITHUB_ACTIONS") {
             return Ok(None);
         }
@@ -77,6 +81,16 @@ impl Journal {
             return Err(blocked.detail);
         }
         let key = spec.key.ok_or("job has no key")?;
+        let refs = spec.actions.clone();
+        let actions = if publishing {
+            record_actions(
+                &refs,
+                &resolve::Git::from_env(root),
+                run::env_flag("STOOP_STRICT_ACTIONS"),
+            )
+        } else {
+            BTreeMap::new()
+        };
         let expected = spec
             .steps
             .into_iter()
@@ -131,7 +145,7 @@ impl Journal {
                 started,
                 status: Some(RecordStatus::Running),
                 failed: None,
-                actions: BTreeMap::new(),
+                actions,
                 commit,
                 host,
                 event_path: run::env_str("GITHUB_EVENT_PATH"),
@@ -273,5 +287,51 @@ impl Journal {
             self.save()?;
         }
         Ok(())
+    }
+}
+
+fn record_actions(
+    refs: &[String],
+    resolver: &dyn resolve::Resolver,
+    strict: bool,
+) -> BTreeMap<String, String> {
+    let eligible: Vec<String> = refs
+        .iter()
+        .filter(|raw| !strict || resolve::require_pinned(std::slice::from_ref(*raw)).is_ok())
+        .cloned()
+        .collect();
+    let (actions, failures) = resolve::resolve_all(&eligible, resolver);
+    for failure in failures {
+        eprintln!("stoop: action unresolved at journal open: {failure}");
+    }
+    actions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gha::resolve::fake::Fake;
+    const A: &str = "1111111111111111111111111111111111111111";
+    #[test]
+    fn open_records_resolved_actions_and_omits_failures() {
+        let fake = Fake::new();
+        fake.set("actions/checkout@v4", Ok(A));
+        fake.set("x/y@v9", Err("unavailable"));
+        let refs = vec!["actions/checkout@v4".into(), "x/y@v9".into()];
+        let actions = record_actions(&refs, &fake, false);
+        assert_eq!(
+            actions.get("actions/checkout@v4").map(String::as_str),
+            Some(A)
+        );
+        assert!(!actions.contains_key("x/y@v9"));
+        assert_eq!(fake.calls(), 2);
+    }
+    #[test]
+    fn strict_recording_omits_floating_refs_without_network() {
+        let fake = Fake::new();
+        let pin = format!("actions/checkout@{A}");
+        let actions = record_actions(&["actions/checkout@v4".into(), pin.clone()], &fake, true);
+        assert_eq!(actions.get(&pin).map(String::as_str), Some(A));
+        assert_eq!(fake.calls(), 0);
     }
 }
