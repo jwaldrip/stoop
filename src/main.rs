@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 mod attest;
 #[allow(dead_code)]
 mod gha;
@@ -14,7 +13,6 @@ mod pathutil;
 mod plan;
 mod proof;
 mod run;
-#[allow(dead_code)]
 mod stepkey;
 mod sync;
 mod trace;
@@ -34,6 +32,7 @@ USAGE
   stoop sh <script> [args...]                   shell mode for CI (see below)
   stoop ls [--store DIR]                        list recorded proofs
   stoop forget <key> [--store DIR]              drop a proof
+  stoop plan [options]                          plan experimental job skips
   stoop pull | prune [--sync git[:remote]]       fetch or expire shared proofs
 
 OPTIONS
@@ -96,13 +95,16 @@ fn real_main(mut args: Vec<String>) -> i32 {
             println!("stoop {}", env!("CARGO_PKG_VERSION"));
             return 0;
         }
-        Some(c @ ("run" | "explain" | "sh" | "ls" | "forget" | "pull" | "prune")) => {
+        Some(c @ ("run" | "explain" | "sh" | "ls" | "forget" | "pull" | "prune" | "plan")) => {
             let c = c.to_string();
             args.remove(0);
             c
         }
         Some(_) => "run".to_string(),
     };
+    if cmd == "plan" {
+        return plan::cmd(&args);
+    }
     let (mut o, rest) = match parse(&args) {
         Ok(x) => x,
         Err(e) => {

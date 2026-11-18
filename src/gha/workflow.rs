@@ -179,9 +179,149 @@ fn stoop_settings(layers: &[Option<&Value>]) -> Result<Option<u64>, String> {
     }
 }
 
+/// Validate context references without evaluating workflow expressions.
+/// A workflow-level STOOP setting must evaluate alike in each job.
+fn validate_stoop_expression(text: &str, reject_environment_context: bool) -> Result<(), String> {
+    const SAFE_GITHUB: &[&str] = &[
+        "event_name",
+        "ref",
+        "ref_name",
+        "ref_type",
+        "base_ref",
+        "head_ref",
+        "sha",
+        "repository",
+        "event",
+        "run_id",
+        "run_attempt",
+        "workflow",
+        "workflow_ref",
+    ];
+    let bytes = text.as_bytes();
+    let mut offset = 0;
+    while let Some(start) = text[offset..].find("${{") {
+        let mut i = offset + start + 3;
+        let mut closed = false;
+        while i < bytes.len() {
+            if bytes[i] == b'\'' {
+                i += 1;
+                let mut terminated = false;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if bytes.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        terminated = true;
+                        break;
+                    }
+                    i += 1;
+                }
+                if !terminated {
+                    return Err("unterminated string in STOOP expression".into());
+                }
+                continue;
+            }
+            if bytes[i..].starts_with(b"}}") {
+                offset = i + 2;
+                closed = true;
+                break;
+            }
+            if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+                let begin = i;
+                i += 1;
+                while i < bytes.len()
+                    && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_' || bytes[i] == b'-')
+                {
+                    i += 1;
+                }
+                let ident = &text[begin..i];
+                if reject_environment_context
+                    && (ident.eq_ignore_ascii_case("vars") || ident.eq_ignore_ascii_case("secrets"))
+                {
+                    return Err(
+                        "plan job environment can change vars or secrets used by STOOP settings"
+                            .into(),
+                    );
+                }
+                if ident.eq_ignore_ascii_case("github") {
+                    let mut j = i;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    if bytes.get(j) != Some(&b'.') {
+                        return Err("STOOP expression uses an unknown github context".into());
+                    }
+                    j += 1;
+                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                        j += 1;
+                    }
+                    let property = j;
+                    while j < bytes.len() && (bytes[j].is_ascii_alphanumeric() || bytes[j] == b'_')
+                    {
+                        j += 1;
+                    }
+                    if !SAFE_GITHUB
+                        .iter()
+                        .any(|safe| text[property..j].eq_ignore_ascii_case(safe))
+                    {
+                        return Err("STOOP expression uses an unknown github property".into());
+                    }
+                    i = j;
+                }
+                continue;
+            }
+            i += 1;
+        }
+        if !closed {
+            return Err("unterminated STOOP expression".into());
+        }
+    }
+    Ok(())
+}
+
+pub fn validate_plan_environment(w: &Workflow, plan_job: &str) -> Result<(), String> {
+    if w.root["jobs"]
+        .get(plan_job)
+        .and_then(Value::as_object)
+        .is_none_or(|job| !job.contains_key("environment"))
+    {
+        return Ok(());
+    }
+    fn scan(value: &Value) -> Result<(), String> {
+        match value {
+            Value::Object(map) => {
+                for (name, value) in map {
+                    if name.starts_with("STOOP_") {
+                        if let Some(text) = value.as_str().filter(|s| s.contains("${{")) {
+                            validate_stoop_expression(text, true)
+                                .map_err(|e| format!("{name}: {e}"))?;
+                        }
+                    }
+                    scan(value)?;
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    scan(item)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    scan(&w.root)
+}
+
 fn static_workflow_settings(w: &Workflow) -> Result<Value, String> {
     let mut settings = Map::new();
     for (name, value) in object(w.root.get("env"), "workflow env")? {
+        if name.starts_with("STOOP_") {
+            if let Some(text) = value.as_str().filter(|s| s.contains("${{")) {
+                validate_stoop_expression(text, false).map_err(|e| format!("{name}: {e}"))?;
+            }
+        }
         if ["STOOP_FULL", "STOOP_OFF", "STOOP_MAX_AGE"].contains(&name.as_str())
             && !value.as_str().is_some_and(|s| s.contains("${{"))
         {
@@ -196,7 +336,10 @@ fn plan_job_override(w: &Workflow, plan_job: &str) -> Result<Option<String>, Str
         return Ok(None);
     };
     let job = job.as_object().ok_or("plan job must be an object")?;
-    let mut envs = vec![job.get("env")];
+    let mut envs = vec![
+        job.get("env"),
+        job.get("container").and_then(|c| c.get("env")),
+    ];
     if let Some(steps) = job.get("steps") {
         for step in steps.as_array().ok_or("plan job steps must be an array")? {
             envs.push(
@@ -208,7 +351,12 @@ fn plan_job_override(w: &Workflow, plan_job: &str) -> Result<Option<String>, Str
     }
     for layer in envs {
         let map = object(layer, "plan job env")?;
-        for name in ["STOOP_FULL", "STOOP_OFF", "STOOP_MAX_AGE"] {
+        for name in [
+            "STOOP_FULL",
+            "STOOP_OFF",
+            "STOOP_MAX_AGE",
+            "STOOP_STRICT_ACTIONS",
+        ] {
             if map.contains_key(name) {
                 return Ok(Some(format!("plan job overrides {name}")));
             }
@@ -409,8 +557,59 @@ fn action_with(class: &str, name: &str, fields: &Map<String, Value>) -> Result<V
     }
     Ok(Value::Object(result))
 }
+pub fn parse_allow_uses(raw: &str) -> Result<Vec<String>, String> {
+    if raw.contains("${{") {
+        return Err("STOOP_ALLOW_USES is an expression".into());
+    }
+    raw.split([',', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|entry| {
+            let (name, reference) = entry
+                .rsplit_once('@')
+                .map_or((entry, "v1"), |(n, r)| (n, r));
+            let parts: Vec<_> = name.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+            if parts.len() != 2
+                || crate::gha::resolve::classify(&format!("{}@{reference}", parts.join("/")))
+                    .is_err()
+            {
+                return Err(format!("invalid STOOP_ALLOW_USES entry {entry}"));
+            }
+            Ok(entry.to_string())
+        })
+        .collect()
+}
+
+fn workflow_allow_uses(w: &Workflow, id: &str) -> Result<Vec<String>, String> {
+    let workflow = object(w.root.get("env"), "workflow env")?;
+    if workflow
+        .get("STOOP_ALLOW_USES")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.contains("${{"))
+    {
+        return Err("STOOP_ALLOW_USES is an expression".into());
+    }
+    let job = object(w.root["jobs"].get(id).and_then(|j| j.get("env")), "job env")?;
+    match job
+        .get("STOOP_ALLOW_USES")
+        .or_else(|| workflow.get("STOOP_ALLOW_USES"))
+    {
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(Value::String(raw)) => parse_allow_uses(raw),
+        _ => Err("STOOP_ALLOW_USES must be a string".into()),
+    }
+}
 
 pub fn job_specs(w: &Workflow, cx: &GhCtx, plan_job: &str) -> Vec<JobSpec> {
+    job_specs_with_allow(w, cx, plan_job, &[])
+}
+
+pub fn job_specs_with_allow(
+    w: &Workflow,
+    cx: &GhCtx,
+    plan_job: &str,
+    allowed: &[String],
+) -> Vec<JobSpec> {
     let reason = match plan_job_override(w, plan_job) {
         Ok(reason) => reason,
         Err(error) => Some(error),
@@ -421,7 +620,14 @@ pub fn job_specs(w: &Workflow, cx: &GhCtx, plan_job: &str) -> Vec<JobSpec> {
         .flat_map(|m| m.keys())
         .filter(|id| id.as_str() != plan_job)
         .map(|id| {
-            let mut spec = job_spec(w, cx, id, None);
+            let list = workflow_allow_uses(w, id);
+            let mut combined = list.clone().unwrap_or_default();
+            combined.extend_from_slice(allowed);
+            let mut spec = job_spec_with_allow(w, cx, id, None, &combined);
+            if let Err(detail) = list {
+                spec.key = None;
+                spec.blocked = Some(Blocker { step: None, detail });
+            }
             if let Some(detail) = &reason {
                 spec.key = None;
                 spec.blocked = Some(Blocker {
@@ -435,6 +641,16 @@ pub fn job_specs(w: &Workflow, cx: &GhCtx, plan_job: &str) -> Vec<JobSpec> {
 }
 
 pub fn job_spec(w: &Workflow, cx: &GhCtx, job: &str, leg: Option<&str>) -> JobSpec {
+    job_spec_with_allow(w, cx, job, leg, &[])
+}
+
+pub fn job_spec_with_allow(
+    w: &Workflow,
+    cx: &GhCtx,
+    job: &str,
+    leg: Option<&str>,
+    allowed: &[String],
+) -> JobSpec {
     let mut spec = JobSpec {
         workflow: w.name.clone(),
         path: w.path.clone(),
@@ -449,7 +665,7 @@ pub fn job_spec(w: &Workflow, cx: &GhCtx, job: &str, leg: Option<&str>) -> JobSp
         actions: vec![],
         images: vec![],
     };
-    let result = build(w, cx, job, leg, &mut spec);
+    let result = build(w, cx, job, leg, &mut spec, allowed);
     if let Err((step, detail)) = result {
         spec.blocked = Some(Blocker { step, detail });
     }
@@ -461,12 +677,31 @@ fn build(
     job: &str,
     leg: Option<&str>,
     spec: &mut JobSpec,
+    allowed: &[String],
 ) -> Result<(), (Option<usize>, String)> {
     let mut work = || -> Result<(), String> {
         let j = w.root["jobs"]
             .get(job)
             .and_then(Value::as_object)
             .ok_or("job missing or not an object")?;
+        let needs = match j.get("needs") {
+            None => vec![],
+            Some(Value::String(s)) => vec![s.clone()],
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or("needs must contain strings".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => return Err("invalid needs".into()),
+        };
+        spec.needs = needs;
+        spec.if_text = j.get("if").map(|v| match v {
+            Value::String(s) => s.clone(),
+            _ => v.to_string(),
+        });
         if let Some(k) = j.keys().find(|k| {
             ![
                 "runs-on",
@@ -501,26 +736,21 @@ fn build(
             }
         }
         let workflow_settings = static_workflow_settings(w)?;
+        if let Some(options) = j.get("container").and_then(|c| c.get("options")) {
+            match options {
+                Value::Null => {}
+                Value::String(s) if s.trim().is_empty() => {}
+                _ => {
+                    return Err(
+                        "container options may set environment variables and are not plannable"
+                            .into(),
+                    )
+                }
+            }
+        }
         stoop_settings(&[Some(&workflow_settings)])?;
-        stoop_settings(&[Some(&workflow_settings), j.get("env")])?;
-        let needs = match j.get("needs") {
-            None => vec![],
-            Some(Value::String(s)) => vec![s.clone()],
-            Some(Value::Array(a)) => a
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_string)
-                        .ok_or("needs must contain strings".to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            _ => return Err("invalid needs".into()),
-        };
-        spec.needs = needs;
-        spec.if_text = j.get("if").map(|v| match v {
-            Value::String(s) => s.clone(),
-            _ => v.to_string(),
-        });
+        let container_env = j.get("container").and_then(|c| c.get("env"));
+        stoop_settings(&[Some(&workflow_settings), container_env, j.get("env")])?;
         spec.images = images_of(j)?;
         if j.contains_key("uses") {
             return Err("reusable uses is not supported".into());
@@ -565,7 +795,10 @@ fn build(
                 &defaults,
                 (&w.name, job),
                 leg.as_deref(),
-                &[Some(&workflow_settings), j.get("env")],
+                (
+                    &[Some(&workflow_settings), container_env, j.get("env")],
+                    allowed,
+                ),
                 seen_traced,
             );
             match result {
@@ -649,7 +882,7 @@ fn step_key(
     defaults: &Map<String, Value>,
     identity: (&str, &str),
     leg: Option<&str>,
-    env_layers: &[Option<&Value>],
+    (env_layers, allowed): (&[Option<&Value>], &[String]),
     seen_traced: bool,
 ) -> Result<Option<(Value, StepSpec)>, String> {
     let s = step.as_object().ok_or("step must be an object")?;
@@ -723,6 +956,9 @@ fn step_key(
         if seen_traced {
             return Err("neutral marker after traced step".into());
         }
+        if run.to_ascii_uppercase().contains("GITHUB_ENV") {
+            return Err("neutral run references GITHUB_ENV and may change planner controls".into());
+        }
         return Ok(Some((
             json!({"neutral":{"run":run,"env":e,"if":true,"shell":shell_text,"working-directory":wd}}),
             StepSpec::Neutral {
@@ -745,7 +981,18 @@ fn step_key(
         return Err("action has no ref".into());
     }
     let class = action_class(&name);
-    if class.is_none() && !marker {
+    let user_allowed = allowed.iter().any(|entry| {
+        let (path, r) = entry
+            .rsplit_once('@')
+            .map_or((entry.as_str(), None), |(p, r)| (p, Some(r)));
+        let normalized = path
+            .split(['/', '\\'])
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        normalized.eq_ignore_ascii_case(&name) && r.is_none_or(|r| r == reference)
+    });
+    if class.is_none() && !marker && !user_allowed {
         return Err(format!("action {uses} is not allowlisted"));
     }
     if marker && seen_traced {
@@ -765,13 +1012,13 @@ fn step_key(
     if class == Some("checkout") {
         action_with("checkout", &name, with)?;
     }
-    if class == Some("setup") {
+    if class == Some("setup") || (class.is_none() && user_allowed) {
         check_setup(&name, with)?;
     }
     let fields = if marker {
         static_value(&Value::Object(with.clone()))?
     } else {
-        action_with(class.unwrap(), &name, with)?
+        action_with(class.unwrap_or("user"), &name, with)?
     };
     let is_cache = class == Some("cache") && !marker;
     let mut value = json!({"uses":uses,"with":fields,"env":e});
@@ -896,6 +1143,8 @@ mod tests {
         assert!(matches!(s.steps.get(1), Some(StepSpec::Traced { .. })));
         let s = spec(&fixture("", "      - uses: actions/checkout@v4\n        with: {ref: other}\n        env: {STOOP_PLAN: neutral}\n      - run: cargo test\n"));
         assert!(s.blocked.unwrap().detail.contains("checkout ref"));
+        let s = spec(&fixture("", "      - shell: bash\n        run: echo STOOP_FULL=1 >> \"$GITHUB_ENV\"\n        env: {STOOP_PLAN: neutral}\n      - run: cargo test\n"));
+        assert!(s.blocked.unwrap().detail.contains("GITHUB_ENV"));
     }
     #[test]
     fn review_blockers_and_checkout_safety() {
@@ -1169,5 +1418,193 @@ mod tests {
         assert_eq!(s.images, vec!["node:20".to_string(), "redis:7".to_string()]);
         let plain = spec(&fixture("", RUN));
         assert!(plain.images.is_empty());
+    }
+    #[test]
+    fn user_allowlist_is_exact_and_preserves_action_inputs() {
+        let make = |action: &str, extra: &str, allowed: &[String]| {
+            let steps = format!("      - uses: {action}\n{extra}{RUN}");
+            let w = parse("ci.yml", &fixture("", &steps)).unwrap();
+            job_spec_with_allow(
+                &w,
+                &GhCtx::from_parts(BTreeMap::new(), Value::Null),
+                "test",
+                None,
+                allowed,
+            )
+        };
+        let allowed = vec!["EXAMPLE/tool".to_string()];
+        assert!(make("example/tool@v1", "", &[]).blocked.is_some());
+        let ok = make("example/tool@v1", "", &allowed);
+        assert!(ok.blocked.is_none());
+        assert!(make("example/tool-extra@v1", "", &allowed)
+            .blocked
+            .is_some());
+        assert!(make(
+            "example/tool@v1",
+            "        with: {node-version-file: .nvmrc}\n",
+            &allowed
+        )
+        .blocked
+        .is_some());
+        assert_ne!(ok.key, make("example/tool@v2", "", &allowed).key);
+        assert_ne!(
+            make("example/tool@v1", "        with: {mode: alpha}\n", &allowed).key,
+            make("example/tool@v1", "        with: {mode: beta}\n", &allowed).key
+        );
+        assert!(make("example/tool@v2", "", &["example/tool@v1".into()])
+            .blocked
+            .is_some());
+        assert!(make(
+            "actions/setup-python@v4",
+            "",
+            &["actions/setup-python".into()]
+        )
+        .blocked
+        .is_some());
+    }
+    #[test]
+    fn yaml_and_recorder_allowlists_make_the_same_key() {
+        let text = fixture(
+            "    env: {STOOP_ALLOW_USES: 'example/tool, unused/tool'}\n",
+            &format!("      - uses: example/tool@v1\n{RUN}"),
+        );
+        let workflow = parse("ci.yml", &text).unwrap();
+        let cx = GhCtx::from_parts(BTreeMap::new(), Value::Null);
+        let planned = job_specs(&workflow, &cx, "plan").remove(0);
+        let allowed = parse_allow_uses("example/tool").unwrap();
+        let recorded = job_spec_with_allow(&workflow, &cx, "test", None, &allowed);
+        assert!(planned.blocked.is_none());
+        assert_eq!(planned.key, recorded.key);
+        let dynamic = text.replace("example/tool, unused/tool", "${{ vars.ACTIONS }}");
+        let dynamic = parse("ci.yml", &dynamic).unwrap();
+        assert!(job_specs(&dynamic, &cx, "plan")[0]
+            .blocked
+            .as_ref()
+            .unwrap()
+            .detail
+            .contains("STOOP_ALLOW_USES"));
+    }
+
+    #[test]
+    fn working_directories_separate_traced_keys_and_match_recorder() {
+        let text = fixture(
+            "    defaults: {run: {working-directory: a}}\n",
+            "      - run: 'npm test'\n      - run: 'npm test'\n        working-directory: b\n",
+        );
+        let s = spec(&text);
+        assert!(s.blocked.is_none(), "{:?}", s.blocked);
+        let keys: Vec<_> = s
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                StepSpec::Traced { key, .. } => Some(key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+        let dir = std::env::temp_dir().join(format!("stoop-cwd-keys-{}", std::process::id()));
+        let store = crate::proof::Store::new(dir.clone());
+        let proof = crate::proof::Proof {
+            created: crate::proof::now(),
+            argv: vec![],
+            env: BTreeMap::new(),
+            inputs: vec![],
+            outputs: vec![],
+            removed: vec![],
+            ignore: Some(vec![]),
+            priors: Some(vec![]),
+            unplannable: vec![],
+            probes: BTreeMap::new(),
+        };
+        store.save(keys[0], proof).unwrap();
+        assert_eq!(store.load(keys[0]).len(), 1);
+        assert!(store.load(keys[1]).is_empty());
+        assert_ne!(
+            crate::stepkey::sh_key(b"cd a && npm test", "fixture", "test", "", None),
+            crate::stepkey::sh_key(b"cd b && npm test", "fixture", "test", "", None)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        let root = Path::new("/repo");
+        for (key, dir) in keys.iter().zip(["a", "b"]) {
+            let actual_cwd = root.join(dir);
+            let recorder_cwd = crate::pathutil::to_key(root, &actual_cwd);
+            assert_eq!(
+                *key,
+                crate::stepkey::sh_key(b"npm test", "fixture", "test", &recorder_cwd, None)
+            );
+        }
+        let root_default = spec(&fixture("", "      - run: 'npm test'\n"));
+        let key = root_default
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                StepSpec::Traced { key, .. } => Some(key),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            key,
+            &crate::stepkey::sh_key(b"npm test", "fixture", "test", "", None)
+        );
+        let workflow_default = fixture("", "      - run: 'npm test'\n").replace(
+            "    shell: stoop sh {0}\n",
+            "    shell: stoop sh {0}\n    working-directory: a\n",
+        );
+        let wf_spec = spec(&workflow_default);
+        let wf_key = wf_spec
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                StepSpec::Traced { key, .. } => Some(key),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            wf_key,
+            &crate::stepkey::sh_key(b"npm test", "fixture", "test", "a", None)
+        );
+    }
+    #[test]
+    fn stoop_workflow_expression_allows_only_run_invariant_github_properties() {
+        for property in [
+            "event_name",
+            "ref",
+            "ref_name",
+            "ref_type",
+            "base_ref",
+            "head_ref",
+            "sha",
+            "repository",
+            "event",
+            "run_id",
+            "run_attempt",
+            "workflow",
+            "workflow_ref",
+        ] {
+            assert!(
+                validate_stoop_expression(&format!("${{{{ github.{property} }}}}"), false).is_ok(),
+                "{property}"
+            );
+        }
+        for expression in [
+            "${{ github.* }}",
+            "${{ github['event_name'] }}",
+            "${{ github }}",
+            "${{ toJSON(github) }}",
+            "${{ github.actor }}",
+            "${{ github.ref_protected }}",
+            "${{ github.job }}",
+            "${{ github.action_path }}",
+        ] {
+            assert!(
+                validate_stoop_expression(expression, false).is_err(),
+                "{expression}"
+            );
+        }
+        assert!(validate_stoop_expression("${{ github.event.action }}", false).is_ok());
+        assert!(validate_stoop_expression("${{ format('{0}', 'github.job') }}", false).is_ok());
+        assert!(validate_stoop_expression("${{ vars.NAME }}", true).is_err());
+        assert!(validate_stoop_expression("${{ secrets.NAME }}", true).is_err());
     }
 }

@@ -279,8 +279,9 @@ pub fn parse_age(s: &str) -> Result<u64, String> {
         _ => (s, 1),
     };
     num.parse::<u64>()
-        .map(|n| n * mult)
-        .map_err(|_| format!("cannot read {s:?} as a duration (try 90s, 30m, 12h, 7d)"))
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .ok_or_else(|| format!("cannot read {s:?} as a duration (try 90s, 30m, 12h, 7d)"))
 }
 
 fn ago(created: u64) -> String {
