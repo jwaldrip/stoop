@@ -146,6 +146,53 @@ mod linux {
     }
 
     #[test]
+    fn parallel_spawn_observes_children_without_changing_their_count() {
+        let f = Fixture::new();
+        f.write(
+            "bin/pytest",
+            "#!/bin/sh\nprintf 'pytest\\n' >> \"$LOG\"\n",
+            true,
+        );
+        let script = r#"python3 -c 'import os; ps=[os.posix_spawnp("pytest", ["pytest"], os.environ) for _ in range(8)]; [os.waitpid(p, 0) for p in ps]'; true"#;
+        for run in 0..12 {
+            let output = f
+                .command()
+                .env("STOOP_STORE", f.root.join(format!(".stoop-{run}")))
+                .args(["run", "--root", ".", "--", "sh", "-c", script])
+                .output()
+                .unwrap();
+            one_observation(&output, "stoop: observed pytest via sh (diagnostic only)");
+        }
+        assert_eq!(f.log().lines().count(), 12 * 8);
+    }
+
+    #[test]
+    fn shell_wrapper_uses_actual_command_flag_grammar() {
+        let f = Fixture::new();
+        f.write(
+            "bin/pytest",
+            "#!/bin/sh\nprintf 'pytest\\n' >> \"$LOG\"\n",
+            true,
+        );
+        f.write("script.sh", "pytest\n", false);
+        let script = f.run(&["run", "--root", ".", "--", "bash", "--norc", "script.sh"]);
+        one_observation(&script, "stoop: observed pytest (diagnostic only)");
+        let command = f.run(&[
+            "run",
+            "--root",
+            ".",
+            "--",
+            "bash",
+            "-o",
+            "pipefail",
+            "-c",
+            "exec pytest",
+        ]);
+        one_observation(&command, "stoop: observed pytest via sh (diagnostic only)");
+        assert_eq!(f.log(), "pytest\npytest\n");
+    }
+
+    #[test]
     fn failed_exec_attempt_is_not_reported_as_a_runner() {
         let f = Fixture::new();
         f.write(
@@ -318,6 +365,48 @@ int main(void) {
         assert!(output.status.success(), "{}", stderr(&output));
         assert!(!stderr(&output).contains("stoop: observed "));
         assert_eq!(f.log(), "pytest\n");
+    }
+
+    #[test]
+    fn oversized_argument_count_keeps_previously_observed_runners() {
+        let f = Fixture::new();
+        f.write(
+            "bin/jest",
+            "#!/bin/sh\nprintf 'jest\\n' >> \"$LOG\"\n",
+            true,
+        );
+        f.write(
+            "bin/pytest",
+            "#!/bin/sh\nprintf 'pytest\\n' >> \"$LOG\"\n",
+            true,
+        );
+        compile(
+            &f,
+            r#"
+#include <unistd.h>
+int main(void) {
+    char *args[132];
+    args[0] = "pytest";
+    for (int i = 1; i < 131; i++) args[i] = "x";
+    args[131] = 0;
+    execv("bin/pytest", args);
+    return 1;
+}
+"#,
+            "large-argc",
+            &[],
+        );
+        let output = f.run(&[
+            "run",
+            "--root",
+            ".",
+            "--",
+            "sh",
+            "-c",
+            "jest; exec ./large-argc",
+        ]);
+        one_observation(&output, "stoop: observed jest via sh (diagnostic only)");
+        assert_eq!(f.log(), "jest\npytest\n");
     }
 
     #[test]
