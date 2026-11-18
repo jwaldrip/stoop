@@ -442,6 +442,10 @@ mod tests {
             identify_recorded(&d.join("missing"), false, false, true),
             None
         );
+        let socket = d.join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert_eq!(identify_recorded(&socket, true, false, true), None);
+        drop(listener);
         fs::remove_dir_all(d).unwrap();
     }
 

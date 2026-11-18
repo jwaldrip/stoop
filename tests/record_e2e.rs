@@ -640,6 +640,10 @@ fn changing_attribute_sources_drops_previously_captured_oids() {
             "mv nested/.gitattributes nested/attributes.old",
         ),
         ("rename-directory", "mv nested moved"),
+        (
+            "remove-nonempty-directory",
+            "rmdir nested 2>/dev/null || true",
+        ),
         ("git-config", "printf '\\n# changed\\n' >> .git/config"),
     ] {
         let w = Ws::new(&format!("oid-changed-attributes-{name}"));
