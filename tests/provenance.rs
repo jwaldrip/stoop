@@ -144,7 +144,7 @@ fn a_different_tracer_or_version_cannot_use_the_proof() {
     p["tracer"] = "another-tracer".into();
     assert_cold(Some(p), "provenance changed");
     let mut p = current();
-    p["version"] = 2.into();
+    p["version"] = 3.into();
     assert_cold(Some(p), "provenance changed");
 }
 
