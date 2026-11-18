@@ -163,8 +163,8 @@ impl Fixture {
             .as_secs();
         let sha = git(&self.source, &["rev-parse", "HEAD"]);
         let provenance =
-            json!({"os":"linux", "arch":"x86_64", "tracer":"ptrace-seccomp", "version":4});
-        let digest_bytes = b"[[],[],[],{},{},[],[],[],\"\",null,{\"os\":\"linux\",\"arch\":\"x86_64\",\"tracer\":\"ptrace-seccomp\",\"version\":4}]";
+            json!({"os":"linux", "arch":"x86_64", "tracer":"ptrace-seccomp", "version":5});
+        let digest_bytes = b"[[],[],[],{},{},[],[],[],\"\",null,{\"os\":\"linux\",\"arch\":\"x86_64\",\"tracer\":\"ptrace-seccomp\",\"version\":5}]";
         let digest = format!("p-{}", &blake3::hash(digest_bytes).to_hex()[..32]);
         let mut selected = Vec::new();
         for j in plan["jobs"].as_array().unwrap() {
@@ -178,7 +178,7 @@ impl Fixture {
                 put_ref(
                     &self.remote,
                     &key,
-                    &json!({"v":2,"key":key,"proofs":[proof]}),
+                    &json!({"v":3,"key":key,"proofs":[proof]}),
                 );
                 selected.push(format!("refs/stoop/{key}"));
                 steps.push(json!({"key":key,"proof":digest,"how":"ran"}));
