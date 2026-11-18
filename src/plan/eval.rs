@@ -230,8 +230,25 @@ fn known_github(name: &str) -> bool {
 }
 
 fn sort_records(records: &mut [JobRecord]) {
-    records.sort_by_key(|r| {
-        std::cmp::Reverse((r.started, r.status == Some(RecordStatus::Failed), r.created))
+    records.sort_by(|a, b| {
+        let (_, arun, aattempt, acreated, araw) = a.order_key();
+        let (_, brun, battempt, bcreated, braw) = b.order_key();
+        (
+            b.started,
+            b.status == Some(RecordStatus::Failed),
+            brun,
+            battempt,
+            bcreated,
+            braw,
+        )
+            .cmp(&(
+                a.started,
+                a.status == Some(RecordStatus::Failed),
+                arun,
+                aattempt,
+                acreated,
+                araw,
+            ))
     });
 }
 
@@ -857,6 +874,8 @@ mod tests {
                         run: Some("1/1".into()),
                         steps: records,
                         attest: None,
+                        workflow_ref: None,
+                        job_workflow_ref: None,
                     },
                 )
                 .unwrap();
