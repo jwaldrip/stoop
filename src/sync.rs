@@ -94,26 +94,21 @@ impl Remote {
     /// Fetch this key's proofs from the remote and merge them into the local store.
     /// Returns how many proofs were new. A key the remote does not have is not an error.
     pub fn pull(&self, store: &Store, key: &str) -> Result<usize, String> {
-        let r = ref_name(key);
-        let spec = format!("+{r}:{r}");
-        let out = self.git(
-            &["fetch", "--quiet", "--no-tags", &self.remote, &spec],
-            None,
-        )?;
-        if !out.status.success() {
-            let err = String::from_utf8_lossy(&out.stderr);
-            if err.contains("couldn't find remote ref") {
-                return Ok(0);
+        Ok(self.pull_proof_snapshot(store, key)?.1)
+    }
+
+    pub fn pull_proof_snapshot(
+        &self,
+        store: &Store,
+        key: &str,
+    ) -> Result<(Option<String>, usize), String> {
+        match self.pull_job(key)? {
+            Some((oid, blob)) => {
+                let added = store.import(key, &blob).map_err(|e| e.to_string())?;
+                Ok((Some(oid), added))
             }
-            return Err(err
-                .lines()
-                .next()
-                .unwrap_or("fetch failed")
-                .trim()
-                .to_string());
+            None => Ok((None, 0)),
         }
-        let blob = self.ok(&["cat-file", "blob", &r], None)?;
-        store.import(key, &blob).map_err(|e| e.to_string())
     }
 
     /// Fetch every proof the remote has. Run once at the start of a job so that each
@@ -179,13 +174,13 @@ impl Remote {
         key: &str,
         bytes: &[u8],
         expected: Option<&str>,
-        proof: Option<(&Store, &str)>,
+        proof: Option<(&Store, &str, Option<&str>)>,
     ) -> Result<(), String> {
         if !self.write {
             return Ok(());
         }
         let mut objects = vec![(key, bytes.to_vec())];
-        if let Some((store, proof_key)) = proof {
+        if let Some((store, proof_key, _)) = proof {
             objects.push((
                 proof_key,
                 store.export(proof_key).ok_or("no local proof to publish")?,
@@ -197,15 +192,25 @@ impl Remote {
                 String::from_utf8_lossy(&self.ok(&["hash-object", "-w", "--stdin"], Some(&bytes))?)
                     .trim()
                     .to_string();
-            let force = if key.starts_with("job-") { "" } else { "+" };
-            specs.push(format!("{force}{sha}:{}", ref_name(key)));
+            specs.push(format!("{sha}:{}", ref_name(key)));
         }
         let lease = format!(
             "--force-with-lease={}:{}",
             ref_name(key),
             expected.unwrap_or("")
         );
-        let mut args = vec!["push", "--quiet", "--atomic", &lease, &self.remote];
+        let proof_lease = proof.map(|(_, proof_key, expected)| {
+            format!(
+                "--force-with-lease={}:{}",
+                ref_name(proof_key),
+                expected.unwrap_or("")
+            )
+        });
+        let mut args = vec!["push", "--quiet", "--atomic", &lease];
+        if let Some(lease) = &proof_lease {
+            args.push(lease);
+        }
+        args.push(&self.remote);
         args.extend(specs.iter().map(String::as_str));
         self.ok(&args, None)?;
         Ok(())

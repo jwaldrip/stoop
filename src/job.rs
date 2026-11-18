@@ -26,7 +26,7 @@ pub enum RecordStatus {
 pub struct JobRecord {
     /// Unix seconds of the latest publication.
     pub created: u64,
-    /// Unix milliseconds of first publication. Ordering key only, not an age.
+    /// Unix milliseconds when the journal opened. Ordering key only, not an age.
     #[serde(default)]
     pub started: u64,
     #[serde(default)]
@@ -62,6 +62,17 @@ impl JobRecord {
             id.parse().unwrap_or(0),
             attempt.parse().unwrap_or(0),
             self.created,
+            raw,
+        )
+    }
+    fn retention_key(&self) -> (u64, bool, u64, u64, u64, &str) {
+        let (started, run, attempt, created, raw) = self.order_key();
+        (
+            started,
+            self.status == Some(RecordStatus::Failed),
+            run,
+            attempt,
+            created,
             raw,
         )
     }
@@ -105,8 +116,9 @@ impl JobStore {
         }
     }
     fn write(&self, key: &str, mut records: Vec<JobRecord>) -> io::Result<()> {
-        records.sort_by(|a, b| b.order_key().cmp(&a.order_key()));
+        records.sort_by(|a, b| b.retention_key().cmp(&a.retention_key()));
         records.truncate(MAX_RECORDS);
+        records.sort_by(|a, b| b.order_key().cmp(&a.order_key()));
         let path = self.file(key);
         fs::create_dir_all(path.parent().unwrap())?;
         let ignore = self.dir.join(".gitignore");
@@ -148,8 +160,9 @@ impl JobStore {
         };
         records.retain(|old| !Self::same(old, &record));
         records.push(record);
-        records.sort_by(|a, b| b.order_key().cmp(&a.order_key()));
+        records.sort_by(|a, b| b.retention_key().cmp(&a.retention_key()));
         records.truncate(MAX_RECORDS);
+        records.sort_by(|a, b| b.order_key().cmp(&a.order_key()));
         serde_json::to_vec(&JobFile {
             v: 1,
             kind: "job".into(),
@@ -360,5 +373,77 @@ mod tests {
             .map(|r| r.run.unwrap())
             .collect();
         assert_eq!(runs, ["10/2", "10/1", "9/1"]);
+    }
+    #[test]
+    fn merge_remote_caps_nine_records_by_order() {
+        let mut records: Vec<_> = (1..=8).map(record).collect();
+        for r in &mut records {
+            r.started = r.created;
+        }
+        let snapshot = serde_json::to_vec(&JobFile {
+            v: 1,
+            kind: "job".into(),
+            key: "job-a".into(),
+            records,
+        })
+        .unwrap();
+        let mut newest = record(9);
+        newest.started = 9;
+        let bytes = JobStore::merge_remote("job-a", Some(&snapshot), newest).unwrap();
+        let records = JobStore::parse(&bytes).unwrap().records;
+        assert_eq!(records.len(), 8);
+        assert!(records.iter().all(|r| r.started != 1));
+        assert!(records.iter().any(|r| r.started == 9));
+    }
+
+    #[test]
+    fn merge_remote_replaces_same_run() {
+        let old = record(1);
+        let snapshot = serde_json::to_vec(&JobFile {
+            v: 1,
+            kind: "job".into(),
+            key: "job-a".into(),
+            records: vec![old.clone()],
+        })
+        .unwrap();
+        let mut updated = old;
+        updated.created = 2;
+        let bytes = JobStore::merge_remote("job-a", Some(&snapshot), updated.clone()).unwrap();
+        assert_eq!(JobStore::parse(&bytes).unwrap().records, vec![updated]);
+    }
+
+    #[test]
+    fn retention_prefers_failure_at_equal_start() {
+        let mut failed = record(9);
+        failed.started = 1000;
+        failed.run = Some("9/1".into());
+        failed.status = Some(RecordStatus::Failed);
+        let mut passed = record(10);
+        passed.started = 1000;
+        passed.run = Some("10/1".into());
+        passed.status = Some(RecordStatus::Passed);
+        let mut records = vec![failed, passed];
+        for i in 2000..2007 {
+            let mut r = record(i);
+            r.started = i;
+            r.status = Some(RecordStatus::Running);
+            records.push(r);
+        }
+        let snapshot = serde_json::to_vec(&JobFile {
+            v: 1,
+            kind: "job".into(),
+            key: "job-a".into(),
+            records,
+        })
+        .unwrap();
+        let mut latest = record(2006);
+        latest.started = 2006;
+        let result = JobStore::merge_remote("job-a", Some(&snapshot), latest).unwrap();
+        let records = JobStore::parse(&result).unwrap().records;
+        assert_eq!(records.len(), 8);
+        assert!(records
+            .iter()
+            .any(|r| r.run.as_deref() == Some("9/1") && r.status == Some(RecordStatus::Failed)));
+        assert!(!records.iter().any(|r| r.run.as_deref() == Some("10/1")));
     }
 }

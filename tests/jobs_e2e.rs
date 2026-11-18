@@ -148,11 +148,20 @@ fn git(dir: &Path, args: &[&str]) -> String {
 #[test]
 fn a_trusted_job_publishes_a_passed_record() {
     let w = Ws::new("passed", &["cat in.txt > /dev/null\n", "true\n"]);
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     let o = w.run("cat in.txt > /dev/null\n", "1");
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     let a = w.records();
     assert_eq!(a[0]["records"][0]["status"], "running");
     let started = a[0]["records"][0]["started"].as_u64().unwrap();
+    assert!((before..=after).contains(&started));
     let created = a[0]["records"][0]["created"].as_u64().unwrap();
     let o = w.run("true\n", "1");
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -566,4 +575,139 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
             step["proof"] == format!("p-{}", &blake3::hash(&bytes).to_hex()[..32])
         }));
     }
+}
+
+#[test]
+fn concurrent_same_step_publications_keep_both_proofs() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct Input {
+        path: String,
+        id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Proof {
+        inputs: Vec<Input>,
+        outputs: Vec<Input>,
+        removed: Vec<String>,
+        env: std::collections::BTreeMap<String, String>,
+        probes: std::collections::BTreeMap<String, String>,
+        ignore: Option<Vec<String>>,
+        priors: Option<Vec<Input>>,
+        unplannable: Vec<String>,
+    }
+    let script = "cat in.txt > /dev/null\n";
+    let old = Ws::new("proof-race", &[script]);
+    let newer = old.second_runner();
+    fs::write(newer.root.join("in.txt"), "different input\n").unwrap();
+    let bin = old.temp.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let marker = old.temp.join("push-waiting");
+    let release = old.temp.join("push-release");
+    let wrapper = bin.join("git");
+    fs::write(&wrapper, "#!/bin/sh\nfor arg in \"$@\"; do if [ \"$arg\" = push ]; then touch \"$WAIT_MARKER\"; while [ ! -e \"$RELEASE_MARKER\" ]; do sleep 0.02; done; break; fi; done\nexec /usr/bin/git \"$@\"\n").unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut child = old
+        .command(script, "1")
+        .env("GITHUB_RUN_ID", "100")
+        .env("PATH", path)
+        .env("WAIT_MARKER", &marker)
+        .env("RELEASE_MARKER", &release)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !marker.exists() {
+        let _ = child.kill();
+        panic!("old push did not reach the barrier");
+    }
+    let out = newer
+        .command(script, "1")
+        .env("GITHUB_RUN_ID", "200")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::write(release, "go").unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let files = old.records();
+    let records = files[0]["records"].as_array().unwrap();
+    assert_eq!(records.len(), 2);
+    let key = records[0]["steps"][0]["key"].as_str().unwrap();
+    let raw = git(
+        &old.remote,
+        &["cat-file", "blob", &format!("refs/stoop/{key}")],
+    );
+    let file: Value = serde_json::from_str(&raw).unwrap();
+    let proofs: Vec<Proof> = serde_json::from_value(file["proofs"].clone()).unwrap();
+    let digests: Vec<String> = proofs
+        .iter()
+        .map(|p| {
+            let bytes = serde_json::to_vec(&(
+                &p.inputs,
+                &p.outputs,
+                &p.removed,
+                &p.env,
+                &p.probes,
+                &p.ignore,
+                &p.priors,
+                &p.unplannable,
+            ))
+            .unwrap();
+            format!("p-{}", &blake3::hash(&bytes).to_hex()[..32])
+        })
+        .collect();
+    let first = records[0]["steps"][0]["proof"].as_str().unwrap();
+    let second = records[1]["steps"][0]["proof"].as_str().unwrap();
+    assert_ne!(first, second);
+    assert!(digests.iter().any(|d| d == first));
+    assert!(digests.iter().any(|d| d == second));
+}
+
+#[test]
+fn atomic_push_does_not_publish_job_if_proof_is_rejected() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = Ws::new("atomic-reject", &["true\n", "echo second\n"]);
+    assert!(w.run("true\n", "1").status.success());
+    let original = w.records();
+    let hook = w.remote.join("hooks/update");
+    fs::write(
+        &hook,
+        "#!/bin/sh\ncase \"$1\" in refs/stoop/sh-*) exit 1;; esac\nexit 0\n",
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = w.run("echo second\n", "1");
+    assert!(out.status.success());
+    assert_eq!(w.records(), original);
+}
+
+#[test]
+fn blocked_job_reports_initialization_error_only_once() {
+    let w = Ws::new("blocked-once", &["true\n", "echo second\n"]);
+    let mut errors = String::new();
+    for script in ["true\n", "echo second\n"] {
+        let out = w
+            .command(script, "1")
+            .env("STOOP_JOB_WORKFLOW_REF", "different")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        errors.push_str(&String::from_utf8_lossy(&out.stderr));
+    }
+    assert_eq!(errors.matches("job record not written").count(), 1);
 }

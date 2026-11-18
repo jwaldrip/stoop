@@ -26,6 +26,10 @@ impl Journal {
         let Some(temp) = run::env_str("RUNNER_TEMP") else {
             return Ok(None);
         };
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+            .unwrap_or_else(|_| now().saturating_mul(1000));
         let path = PathBuf::from(temp).join("stoop/journal.json");
         if path.exists() {
             let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
@@ -123,7 +127,7 @@ impl Journal {
             blocked: false,
             record: JobRecord {
                 created: 0,
-                started: 0,
+                started,
                 status: Some(RecordStatus::Running),
                 failed: None,
                 actions: BTreeMap::new(),
@@ -217,14 +221,6 @@ impl Journal {
         };
         if let Some(remote) = remote.filter(|r| r.write) {
             let timestamp = now().max(self.record.created.saturating_add(1));
-            if self.record.started == 0 {
-                // The planner orders runs by start. Seconds can tie for two runs and
-                // let an older late update sort ahead of a newer failure.
-                self.record.started = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
-                    .unwrap_or(timestamp.saturating_mul(1000));
-            }
             self.record.created = timestamp;
             if publish_proof && run::env_str(run::SALT_VAR).is_none() {
                 eprintln!("stoop: sync: publishing environment hashes without {}. In a public repository set it from a repository secret so low-entropy values cannot be guessed offline.", run::SALT_VAR);
@@ -238,6 +234,17 @@ impl Journal {
                         break;
                     }
                 };
+                let proof_oid = if publish_proof {
+                    match remote.pull_proof_snapshot(proofs, &outcome.key) {
+                        Ok((oid, _)) => oid,
+                        Err(error) => {
+                            last_error = error;
+                            break;
+                        }
+                    }
+                } else {
+                    None
+                };
                 let bytes = JobStore::merge_remote(
                     &self.key,
                     snapshot.as_ref().map(|(_, bytes)| bytes.as_slice()),
@@ -248,7 +255,7 @@ impl Journal {
                     &self.key,
                     &bytes,
                     snapshot.as_ref().map(|(oid, _)| oid.as_str()),
-                    publish_proof.then_some((proofs, outcome.key.as_str())),
+                    publish_proof.then_some((proofs, outcome.key.as_str(), proof_oid.as_deref())),
                 ) {
                     Ok(()) => {
                         jobs.import(&self.key, &bytes).map_err(|e| e.to_string())?;
