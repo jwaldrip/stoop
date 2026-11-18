@@ -341,10 +341,13 @@ p { margin: 0 0 1em; }
 .maker:hover .seal, .maker:focus-visible .seal { opacity: 0.85; }
 .maker:focus-visible { outline: 2px solid currentColor; outline-offset: 4px; border-radius: 2px; }
 .made { border-top: 1px solid var(--line); padding: 1.5rem clamp(1.25rem, 4vw, 4rem) 2rem; color: var(--soft); }
-/* Under the dusk photograph the seal sits at the end of the foot, on the photograph's own ink,
-   a little brighter so it still reads on the picture. */
+/* Under the dusk photograph the seal sits at the end of the foot, on the photograph's own ink.
+   Here it is the page's sign-off, so it is pressed large enough to read as a mark (56px on a
+   phone, 64px on a wide screen) and a little brighter so it holds on the picture; it lifts to
+   full ink on hover and focus. The docs footer keeps the small seal above. */
 .dusk .maker { margin-left: auto; }
-.dusk .maker .seal { width: 2rem; height: 2rem; opacity: 0.7; }
+.dusk .maker .seal { width: clamp(3.5rem, 2.75rem + 2vw, 4rem); height: clamp(3.5rem, 2.75rem + 2vw, 4rem); opacity: 0.85; }
+.dusk .maker:hover .seal, .dusk .maker:focus-visible .seal { opacity: 1; }
 
 /* ---------- Docs ---------- */
 .docs { display: grid; grid-template-columns: 17rem minmax(0, 1fr); min-height: 100vh; }
