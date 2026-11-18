@@ -100,8 +100,13 @@ fn real_main(mut args: Vec<String>) -> i32 {
     match cmd.as_str() {
         "ls" => {
             let store = store_for(&o);
-            for (key, n, created, inputs) in store.list() {
-                println!("{key}\t{n} proofs\t{inputs} inputs\tcreated {created}");
+            for (key, n, created, inputs, dirs) in store.list() {
+                let dirs = dirs
+                    .iter()
+                    .map(|dir| format!("{dir:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("{key}\t{n} proofs\t{inputs} inputs\tcreated {created}\tdir {dirs}");
             }
             0
         }
@@ -176,7 +181,7 @@ fn real_main(mut args: Vec<String>) -> i32 {
 
 fn sync_for(o: &Opts) -> Result<sync::Remote, String> {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let root = o.root.clone().unwrap_or_else(|| run::find_root(&cwd));
+    let root = run::root_for(o, &cwd);
     let spec = o
         .sync
         .clone()
@@ -188,13 +193,8 @@ fn sync_for(o: &Opts) -> Result<sync::Remote, String> {
 
 fn store_for(o: &Opts) -> proof::Store {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let root = o.root.clone().unwrap_or_else(|| run::find_root(&cwd));
-    proof::Store::new(
-        o.store
-            .clone()
-            .or_else(|| run::env_str("STOOP_STORE").map(PathBuf::from))
-            .unwrap_or_else(|| root.join(".stoop")),
-    )
+    let root = run::root_for(o, &cwd);
+    proof::Store::new(run::store_for(o, &cwd, &root))
 }
 
 fn parse(args: &[String]) -> Result<(Opts, Vec<String>), String> {
@@ -248,15 +248,24 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
         }
     };
     let cwd = std::env::current_dir().unwrap_or_default();
-    let root = o.root.clone().unwrap_or_else(|| run::find_root(&cwd));
+    let root = run::root_for(o, &cwd);
     let mut h = blake3::Hasher::new();
+    h.update(&(body.len() as u64).to_le_bytes());
     h.update(&body);
     for v in ["GITHUB_WORKFLOW", "GITHUB_JOB"] {
-        h.update(std::env::var(v).unwrap_or_default().as_bytes());
-        h.update(&[0]);
+        let value = std::env::var(v).unwrap_or_default();
+        h.update(&(value.len() as u64).to_le_bytes());
+        h.update(value.as_bytes());
     }
-    h.update(pathutil::to_key(&root, &cwd).as_bytes());
+    let rel_cwd = pathutil::cwd_key(&root, &cwd);
+    h.update(&(rel_cwd.len() as u64).to_le_bytes());
+    h.update(rel_cwd.as_bytes());
+    for arg in rest {
+        h.update(&(arg.len() as u64).to_le_bytes());
+        h.update(arg.as_bytes());
+    }
     o.key = Some(format!("sh-{}", &h.finalize().to_hex()[..20]));
+    o.shell_key = true;
     o.ignore.push(script.to_string());
     o.ignore
         .push(pathutil::to_key(&root, std::path::Path::new(script)));

@@ -15,6 +15,12 @@ const MAX_PROOFS: usize = 8;
 pub struct Proof {
     pub created: u64,
     pub argv: Vec<String>,
+    /// Working directory relative to the selected root. Missing on old proofs.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Repository identity when proofs can share a store across roots.
+    #[serde(default)]
+    pub scope: Option<String>,
     /// Hashes of the environment variables the user declared with `--env`.
     pub env: BTreeMap<String, String>,
     pub inputs: Vec<Input>,
@@ -52,7 +58,12 @@ pub fn sanitize(key: &str) -> String {
 }
 
 fn same_proof(a: &Proof, b: &Proof) -> bool {
-    a.inputs == b.inputs && a.env == b.env && a.outputs == b.outputs && a.probes == b.probes
+    a.cwd == b.cwd
+        && a.scope == b.scope
+        && a.inputs == b.inputs
+        && a.env == b.env
+        && a.outputs == b.outputs
+        && a.probes == b.probes
 }
 
 pub fn now() -> u64 {
@@ -158,8 +169,8 @@ impl Store {
         }
     }
 
-    /// (key, proof count, newest created, newest input count)
-    pub fn list(&self) -> Vec<(String, usize, u64, usize)> {
+    /// (key, proof count, newest created, newest input count, working directories)
+    pub fn list(&self) -> Vec<(String, usize, u64, usize, Vec<String>)> {
         let mut out = Vec::new();
         let Ok(rd) = fs::read_dir(self.dir.join("proofs")) else {
             return out;
@@ -170,7 +181,24 @@ impl Store {
             };
             if let Ok(f) = serde_json::from_slice::<ProofFile>(&bytes) {
                 if let Some(p) = f.proofs.first() {
-                    out.push((f.key.clone(), f.proofs.len(), p.created, p.inputs.len()));
+                    let dirs = f
+                        .proofs
+                        .iter()
+                        .map(|proof| match proof.cwd.as_deref() {
+                            Some("") => ".".to_string(),
+                            Some(dir) => dir.to_string(),
+                            None => "?".to_string(),
+                        })
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    out.push((
+                        f.key.clone(),
+                        f.proofs.len(),
+                        p.created,
+                        p.inputs.len(),
+                        dirs,
+                    ));
                 }
             }
         }
@@ -193,6 +221,8 @@ mod tests {
         Proof {
             created: 1,
             argv: vec!["x".into()],
+            cwd: Some(String::new()),
+            scope: None,
             env: BTreeMap::new(),
             inputs: vec![Input {
                 path: "a".into(),
