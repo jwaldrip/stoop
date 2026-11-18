@@ -29,7 +29,7 @@ impl Ws {
             &["remote", "add", "origin", remote.to_str().unwrap()],
         );
         fs::create_dir_all(work.join(".github/workflows")).unwrap();
-        let mut yaml = String::from("name: fixture\non: push\ndefaults:\n  run:\n    shell: stoop sh {0}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n");
+        let mut yaml = String::from("name: fixture\non: push\ndefaults:\n  run:\n    shell: stoop sh {0}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@1111111111111111111111111111111111111111\n");
         for step in steps {
             yaml.push_str(&format!("      - run: |\n          {}\n", step.trim_end()));
         }
