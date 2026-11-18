@@ -1072,7 +1072,7 @@ impl Tracer<'_> {
             if special
                 && (!target.is_absolute() || target.as_os_str().as_bytes().ends_with(b" (deleted)"))
             {
-                if self.syscall == libc::SYS_linkat as i64
+                if self.syscall == libc::SYS_linkat
                     && target.as_os_str().as_bytes().ends_with(b" (deleted)")
                 {
                     self.flag("it accessed an unkeyable descriptor alias");
