@@ -14,7 +14,7 @@ pub fn job(id: &str, gated: bool, decision: &Decision, key: Option<&str>) -> Val
     let evidence = decision.evidence.as_ref();
     let leg = json!({"matrix": null, "key": key, "decision": if decision.skip {"skip"} else {"run"},
         "code": decision.code, "detail": decision.detail,
-        "record": evidence.map(|e| json!({"run": e.run, "created": e.created, "commit": e.commit})),
+        "record": evidence.filter(|_| decision.skip).map(|e| json!({"run": e.run, "created": e.created, "commit": e.commit, "digest": e.record_digest, "proofs": e.proofs})),
         "checked": evidence.map(|e| json!({"steps":e.steps,"inputs":e.inputs,"priors":e.priors,"hashed":e.hashed,"by_diff":e.by_diff,"overlay":e.overlay})),
         "assumed": evidence.map(|e| json!({"outside_inputs":e.assumed_outside,"env":e.assumed_env})),
         "mismatch": decision.mismatches.first().map(|(step,path,why)| json!({"step":step,"path":path,"why":why}))});

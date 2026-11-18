@@ -467,6 +467,8 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
         run: record.run.clone(),
         created: record.created,
         commit: record.commit.clone(),
+        record_digest: None,
+        proofs: Vec::new(),
         steps: steps.len(),
         inputs: 0,
         priors: 0,
@@ -754,6 +756,11 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
         }
     }
     evidence.assumed_env = assumed_env.into_iter().collect();
+    evidence.record_digest = spec
+        .key
+        .as_deref()
+        .and_then(|key| crate::attest::digest(key, record).ok());
+    evidence.proofs = record.steps.iter().map(|step| step.proof.clone()).collect();
     Decision {
         skip: true,
         code: Code::Proved,
@@ -1188,6 +1195,31 @@ mod tests {
         let mut f = Fixture::new();
         f.install(vec![proof(vec![input("dir/a", &file_id(b"tracked"))])]);
         assert_eq!(f.decide(BTreeMap::new()).code, Code::Proved);
+    }
+    #[test]
+    fn proved_evidence_binds_record_and_proofs_in_step_order() {
+        let mut f = Fixture::new();
+        f.install(vec![
+            proof(vec![input("absent", "a")]),
+            proof(vec![input("dir/a", &file_id(b"tracked"))]),
+        ]);
+        let record = f.jobs.load("job-test").remove(0);
+        let expected: Vec<_> = record.steps.iter().map(|step| step.proof.clone()).collect();
+        assert!(
+            expected[0] > expected[1],
+            "fixture must distinguish step order from sorted order"
+        );
+        let mut decision = f.decide(BTreeMap::new());
+        let evidence = decision.evidence.as_ref().unwrap();
+        assert_eq!(
+            evidence.record_digest.as_deref(),
+            Some(crate::attest::digest("job-test", &record).unwrap().as_str())
+        );
+        assert_eq!(evidence.proofs, expected);
+        decision.skip = false;
+        decision.code = Code::InputChanged;
+        let json = crate::plan::output::job("test", true, &decision, Some("job-test"));
+        assert!(json["legs"][0]["record"].is_null());
     }
     #[test]
     fn names_the_changed_path() {

@@ -112,6 +112,16 @@ stoop explain -- cargo test    # say what would run and why (exit 1 if it would 
 stoop ls                       # list proofs
 ```
 
+On a traced `stoop run`, a recognized test, lint or build runner may produce a
+line such as `stoop: observed jest via npm (diagnostic only)`. This names
+successful launches seen through wrappers. It does not change the command or
+split its tests, and the observation is not saved in the proof. Warm skips,
+`--quiet`, `--no-record`, `stoop sh`, and `stoop explain` omit the line.
+Observation stops after 1,024 captured execs, 1,024 tracked tasks or 1,024
+pending child stops, or when an exec has more than 128 arguments or 16 KiB of
+argument bytes. Runners observed before a limit can still be reported; the
+command continues unchanged.
+
 ## What it sees, and what it can't
 
 | Counts as an input | How |
@@ -171,8 +181,6 @@ cargo test        # the end-to-end tests need Linux
 MIT licensed.
 
 <p align="center">
-  <img alt="The Bushido Collective seal" src="assets/bushido-seal-on-light.svg#gh-light-mode-only" width="72">
-  <img alt="The Bushido Collective seal" src="assets/bushido-seal-on-dark.svg#gh-dark-mode-only" width="72">
-  <br>
-  <sub>A <a href="https://withbushido.ai">Bushido Collective</a> project</sub>
+  <img alt="The Bushido Collective seal" src="assets/bushido-seal-on-light.svg#gh-light-mode-only" width="32">
+  <img alt="The Bushido Collective seal" src="assets/bushido-seal-on-dark.svg#gh-dark-mode-only" width="32">
 </p>

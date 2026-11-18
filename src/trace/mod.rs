@@ -2,6 +2,7 @@
 
 use crate::ignore::Ignore;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 /// Where the tracer records what the run's writes replace: repository paths under `root`.
@@ -63,6 +64,17 @@ impl Provenance {
             && self.version == TRACER_VERSION
     }
 }
+/// One successful exec, linked to the process image that launched it.
+/// This bounded, in-memory observation is diagnostic only and is never part of a proof.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct ExecEvent {
+    pub parent: Option<usize>,
+    pub requested: PathBuf,
+    pub argv: Vec<OsString>,
+    pub executable: PathBuf,
+    pub effective_argv: Vec<OsString>,
+    pub cwd: PathBuf,
+}
 
 #[derive(Default)]
 pub struct Trace {
@@ -85,6 +97,8 @@ pub struct Trace {
     pub priors: BTreeMap<String, String>,
     /// Reasons the planner cannot replay this run (at most 16, deduplicated). Not fatal.
     pub unplannable: Vec<String>,
+    /// Successful execs, present only for an ordinary, traced `stoop run`.
+    pub execs: Option<Vec<ExecEvent>>,
 }
 
 impl Trace {
@@ -113,6 +127,7 @@ pub fn run(
     _cwd: &Path,
     _allow_network: bool,
     _scope: Option<&Scope<'_>>,
+    _observe_execs: bool,
 ) -> std::io::Result<Trace> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,

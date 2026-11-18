@@ -677,6 +677,61 @@ fn control_baseline_proves() {
     assert_eq!(o.plan["skip"], json!(["a"]));
     let o = plan(&r, &["--format", "github"], &[]);
     assert!(o.stdout.contains("skip=,a,\n"), "{}", o.stdout);
+    let o = plan(
+        &r,
+        &["--format", "json", "--explain"],
+        &[("STOOP_DEBUG", "1")],
+    );
+    assert!(o.stderr.contains("stoop: time: tree "), "{}", o.stderr);
+    assert!(o.stderr.contains("fetched objects 0"), "{}", o.stderr);
+}
+
+#[test]
+fn skip_json_names_exact_record_and_ordered_proofs() {
+    let w = workflow("", "", "").replace(
+        "      - run: cat a.txt > /dev/null\n",
+        "      - run: cat a.txt > /dev/null\n      - run: cat a.txt > /dev/null; true\n",
+    );
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    let key = record(&r, rec(&w, now, now)).unwrap();
+    let jobs = job::JobStore::new(r.store());
+    let mut saved = jobs.load(&key).remove(0);
+    let store = proof::Store::new(r.store());
+    let second_key = saved.steps[1].key.clone();
+    let mut second = store.load(&second_key).remove(0);
+    second.inputs.push(input::Input {
+        path: "missing.txt".into(),
+        id: "a".into(),
+    });
+    store.save(&second_key, second.clone()).unwrap();
+    saved.steps[1].proof = second.digest();
+    let mut claims = a::claims(&saved);
+    claims["aud"] = json!(attest::audience(&key, &saved).unwrap());
+    claims["sha"] = json!(r.sha);
+    claims["iat"] = json!(now);
+    claims["nbf"] = json!(now);
+    saved.attest = Some(a::token(
+        &a::header("test-key-1"),
+        &claims,
+        &a::pair(a::KEY_1),
+    ));
+    assert!(jobs.forget(&key).unwrap());
+    jobs.save(&key, saved.clone()).unwrap();
+    let expected_proofs: Vec<_> = saved.steps.iter().map(|s| s.proof.clone()).collect();
+    assert_ne!(expected_proofs[0], expected_proofs[1]);
+    let o = plan(&r, &["--format", "json"], &[]);
+    assert_eq!(o.plan["skip"], json!(["a"]));
+    let record = &o.plan["jobs"][0]["legs"][0]["record"];
+    assert_eq!(
+        record["digest"],
+        json!(attest::digest(&key, &saved).unwrap())
+    );
+    assert_eq!(record["proofs"], json!(expected_proofs));
+    assert!(jobs.forget(&key).unwrap());
+    let missing = plan(&r, &["--format", "json"], &[]);
+    assert_eq!(code(&missing, "a"), "no-record");
+    assert!(missing.plan["jobs"][0]["legs"][0]["record"].is_null());
 }
 
 #[test]
@@ -1417,7 +1472,7 @@ fn only_run_invariant_github_context_is_accepted() {
         let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
         record(&r, rec(&good, now, now)).unwrap();
         let o = plan(&r, &["--format", "json"], &[("STOOP_FULL", "")]);
-        assert_ne!(code(&o, "a"), "proved", "{expr}");
+        assert_eq!(code(&o, "a"), "blocked", "{expr}");
         assert!(o.plan["skip"].as_array().unwrap().is_empty(), "{expr}");
     }
 }
@@ -1454,7 +1509,7 @@ fn plan_environment_cannot_shadow_workflow_vars_or_secrets() {
         let safe = workflow("", "", "");
         record(&r, rec(&safe, now, now)).unwrap();
         let o = plan(&r, &["--format", "json"], &[("STOOP_FULL", "")]);
-        assert_ne!(code(&o, "a"), "proved", "{context}");
+        assert_eq!(code(&o, "a"), "error", "{context}");
         assert!(o.plan["skip"].as_array().unwrap().is_empty(), "{context}");
     }
 }
