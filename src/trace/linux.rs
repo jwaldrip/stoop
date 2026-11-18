@@ -717,11 +717,7 @@ pub fn run<'a>(
                 tr.on_syscall(p);
                 resume(p, 0, tr.pending_topology.contains(&p));
             }
-            e if matches!(
-                e,
-                libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE
-            ) =>
-            {
+            libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
                 if let Some(execs) = &mut tr.execs {
                     execs.fork(p);
                 }
@@ -972,8 +968,8 @@ fn read_exec_argv(pid: i32, address: u64) -> Option<Vec<OsString>> {
     let pointers = read_mem(pid, address, (MAX_EXEC_ARGS + 1) * 8)?;
     let mut argv = Vec::new();
     let mut bytes = 0;
-    for raw in pointers.chunks_exact(8).take(MAX_EXEC_ARGS + 1) {
-        let pointer = u64::from_ne_bytes(raw.try_into().ok()?);
+    for raw in pointers.as_chunks::<8>().0.iter().take(MAX_EXEC_ARGS + 1) {
+        let pointer = u64::from_ne_bytes(*raw);
         if pointer == 0 {
             return Some(argv);
         }
