@@ -1,8 +1,6 @@
 <p align="center">
-  <a href="https://jwaldrip.github.io/stoop/">
-    <img alt="stoop" src="assets/stoop-logo-on-light.svg#gh-light-mode-only" width="300">
-    <img alt="stoop" src="assets/stoop-logo-on-dark.svg#gh-dark-mode-only" width="300">
-  </a>
+  <img alt="stoop" src="assets/stoop-logo-on-light.svg#gh-light-mode-only" width="300">
+  <img alt="stoop" src="assets/stoop-logo-on-dark.svg#gh-dark-mode-only" width="300">
 </p>
 
 <h3 align="center">Run only what matters.</h3>
@@ -137,3 +135,10 @@ cargo test        # the end-to-end tests need Linux
 ```
 
 MIT licensed.
+
+<p align="center">
+  <img alt="The Bushido Collective seal" src="assets/bushido-seal-on-light.svg#gh-light-mode-only" width="72">
+  <img alt="The Bushido Collective seal" src="assets/bushido-seal-on-dark.svg#gh-dark-mode-only" width="72">
+  <br>
+  <sub>A <a href="https://withbushido.ai">Bushido Collective</a> project</sub>
+</p>
