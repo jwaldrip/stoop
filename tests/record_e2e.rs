@@ -919,3 +919,14 @@ fn read_only_proc_self_cwd_is_an_input() {
         pairs(&p, "inputs")
     );
 }
+
+#[test]
+fn unresolved_numeric_process_alias_refuses_recording() {
+    let w = Ws::new("missing-proc-alias");
+    let (status, err) = w.sh("cat /proc/99999999/cwd/in.txt >/dev/null 2>&1 || true");
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        err.contains("not recorded") && err.contains("process path alias"),
+        "{err}"
+    );
+}

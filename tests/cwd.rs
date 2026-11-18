@@ -5,6 +5,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[path = "../src/trace/version.rs"]
+mod tracer_version;
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct Workspace(PathBuf);
@@ -86,7 +89,7 @@ fn write_proof(store: &Path, key: &str, cwd: Option<&str>) {
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
             "tracer": "ptrace-seccomp",
-            "version": 2
+            "version": tracer_version::TRACER_VERSION
         },
         "env": {"PATH": blake3::hash(b"/usr/bin:/bin").to_hex().to_string()},
         "inputs": [],

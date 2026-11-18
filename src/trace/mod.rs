@@ -27,8 +27,8 @@ use serde::{Deserialize, Serialize};
 
 pub const UNAVAILABLE: &str = "tracing needs Linux x86-64 or arm64 (ptrace and seccomp)";
 const TRACER: &str = "ptrace-seccomp";
-// Increment when a change to the tracer invalidates existing observations.
-const TRACER_VERSION: u32 = 2;
+mod version;
+use version::TRACER_VERSION;
 
 pub fn supported() -> bool {
     cfg!(all(

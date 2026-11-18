@@ -3,6 +3,8 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Output};
+#[path = "../src/trace/version.rs"]
+mod tracer_version;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
@@ -70,7 +72,7 @@ fn current() -> serde_json::Value {
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "tracer": "ptrace-seccomp",
-        "version": 2
+        "version": tracer_version::TRACER_VERSION
     })
 }
 
@@ -144,7 +146,7 @@ fn a_different_tracer_or_version_cannot_use_the_proof() {
     p["tracer"] = "another-tracer".into();
     assert_cold(Some(p), "provenance changed");
     let mut p = current();
-    p["version"] = 3.into();
+    p["version"] = (tracer_version::TRACER_VERSION + 1).into();
     assert_cold(Some(p), "provenance changed");
 }
 
