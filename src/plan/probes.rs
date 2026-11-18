@@ -403,6 +403,43 @@ fn legacy_action_witness_is_cold_next_to_a_witnessed_positive_control() {
 }
 
 #[test]
+fn tampered_action_archive_is_reported_by_the_plan() {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut archive = tar::Builder::new(gz);
+    for (name, bytes) in [
+        (
+            "action.yml",
+            &b"runs:\n  using: node20\n  main: index.js\n"[..],
+        ),
+        ("index.js", &b"tampered\n"[..]),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, format!("repo-sha/{name}"), bytes)
+            .unwrap();
+    }
+    let bytes = archive.into_inner().unwrap().finish().unwrap();
+    std::fs::write(
+        r.base
+            .join(format!("api/repos/actions/checkout/tarball/{PIN}")),
+        bytes,
+    )
+    .unwrap();
+    let plan = plan(&r, &["--format", "json"], &[]);
+    assert_eq!(code(&plan, "a"), "action-content-changed");
+    assert!(plan.plan["skip"].as_array().unwrap().is_empty());
+}
+
+#[test]
 fn local_action_uses_the_requested_revision_instead_of_head() {
     let w = workflow("", "", "").replace(
         "      - run: cat a.txt",
