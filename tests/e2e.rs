@@ -580,7 +580,7 @@ fn prune_removes_expired_published_proofs() {
     let a = Ws::new("syncx-a").with_remote(&remote);
     run_sync(&a, &["--sync", "git", "--sync-write"]);
     assert_eq!(published(&remote).len(), 1);
-    std::thread::sleep(std::time::Duration::from_millis(2100));
+    std::thread::sleep(std::time::Duration::from_millis(3100));
     let (c, e) = a.stoop(&[
         "prune",
         "--sync",
@@ -847,7 +847,7 @@ fn an_expired_proof_no_longer_skips() {
     };
     run("1h");
     assert!(skipped(&run("1h")));
-    std::thread::sleep(std::time::Duration::from_millis(2100));
+    std::thread::sleep(std::time::Duration::from_millis(3100));
     let e = run("1s");
     assert!(!skipped(&e) && e.contains("proof expired"), "{e}");
 }
