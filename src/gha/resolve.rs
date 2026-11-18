@@ -1,8 +1,8 @@
 //! Resolves `uses:` references and container images to what they name now.
 //!
 //! A floating reference (`@v4`, `@main`) names a commit that can move. A record
-//! stores the commit each reference named when the job ran, and the planner
-//! resolves again. A different commit means the action changed, so the job runs.
+//! stores the commit the ref named at journal open, not necessarily the commit
+//! downloaded by the runner at Set up job. The planner resolves again.
 //! A reference that cannot be resolved also makes the job run: no answer, no proof.
 //!
 //! Resolution uses `git ls-remote`, not the REST API. The smart HTTP endpoint is
@@ -1012,5 +1012,46 @@ mod tests {
         assert!(require_pinned(std::slice::from_ref(&pin)).is_ok());
         assert!(require_pinned(&["actions/checkout@v4".into()]).is_err());
         assert!(ActionCheck::with_strict(&fake, true).check(&spec(&[&pin], &[]), &record(&[(&pin, A)])).is_ok());
+    }
+    #[test]
+    fn second_action_change_and_second_image_are_checked() {
+        let fake = Fake::new();
+        fake.set("actions/checkout@v4", Ok(A));
+        fake.set("actions/setup-node@v4", Ok(B));
+        let rec = record(&[("actions/checkout@v4", A), ("actions/setup-node@v4", A)]);
+        let check = ActionCheck::with_strict(&fake, false);
+        assert_eq!(
+            check
+                .check(
+                    &spec(&["actions/checkout@v4", "actions/setup-node@v4"], &[]),
+                    &rec
+                )
+                .unwrap_err()
+                .0,
+            Code::InputChanged
+        );
+        let pinned = format!("node@{DIGEST}");
+        assert_eq!(
+            check
+                .check(&spec(&[], &[&pinned, "redis:7"]), &rec)
+                .unwrap_err()
+                .0,
+            Code::UnresolvedAction
+        );
+    }
+
+    #[test]
+    fn failed_lookups_are_cached_across_records() {
+        let fake = Fake::new();
+        fake.set("actions/checkout@v4", Err("unavailable"));
+        let check = ActionCheck::with_strict(&fake, false);
+        let s = spec(&["actions/checkout@v4"], &[]);
+        for _ in 0..3 {
+            assert_eq!(
+                check.check(&s, &record(&[])).unwrap_err().0,
+                Code::UnresolvedAction
+            );
+        }
+        assert_eq!(fake.calls(), 1);
     }
 }

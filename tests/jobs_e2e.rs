@@ -29,7 +29,7 @@ impl Ws {
             &["remote", "add", "origin", remote.to_str().unwrap()],
         );
         fs::create_dir_all(work.join(".github/workflows")).unwrap();
-        let mut yaml = String::from("name: fixture\non: push\ndefaults:\n  run:\n    shell: stoop sh {0}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@1111111111111111111111111111111111111111\n");
+        let mut yaml = String::from("name: fixture\non: push\ndefaults:\n  run:\n    shell: stoop sh {0}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n");
         for step in steps {
             yaml.push_str(&format!("      - run: |\n          {}\n", step.trim_end()));
         }
@@ -51,6 +51,20 @@ impl Ws {
             ],
         );
         let sha = git(&work, &["rev-parse", "HEAD"]);
+        let action_dir = root.join("actions");
+        fs::create_dir(&action_dir).unwrap();
+        let action_remote = action_dir.join("checkout.git");
+        git(
+            &root,
+            &[
+                "clone",
+                "--bare",
+                "-q",
+                work.to_str().unwrap(),
+                action_remote.to_str().unwrap(),
+            ],
+        );
+        git(&action_remote, &["update-ref", "refs/tags/v4", &sha]);
         let temp = root.join("runner");
         fs::create_dir(&temp).unwrap();
         fs::write(temp.join("event.json"), "{}").unwrap();
@@ -73,6 +87,11 @@ impl Ws {
             .arg(path)
             .current_dir(&self.root)
             .env("GITHUB_ACTIONS", "true")
+            .env(
+                "GITHUB_SERVER_URL",
+                format!("file://{}", self.root.parent().unwrap().display()),
+            )
+            .env_remove("STOOP_STRICT_ACTIONS")
             .env("GITHUB_REPOSITORY", "owner/repo")
             .env(
                 "GITHUB_WORKFLOW_REF",
@@ -172,6 +191,7 @@ fn a_trusted_job_publishes_a_passed_record() {
     assert_eq!(record["started"], started);
     assert!(record["created"].as_u64().unwrap() > created);
     assert_eq!(record["commit"], w.sha);
+    assert_eq!(record["actions"]["actions/checkout@v4"], w.sha);
     assert_eq!(
         record["workflow_ref"],
         "owner/repo/.github/workflows/ci.yml@refs/heads/main"

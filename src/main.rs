@@ -306,12 +306,17 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
     ];
     argv.extend(rest.iter().cloned());
     o.argv = argv;
+    let remote = sync_for(o).ok();
     let blocked =
         run::env_str("RUNNER_TEMP").map(|t| PathBuf::from(t).join("stoop/journal.blocked"));
     let mut journal = if blocked.as_ref().is_some_and(|p| p.exists()) {
         None
     } else {
-        match journal::Journal::open(&root, matrix.as_deref()) {
+        match journal::Journal::open(
+            &root,
+            matrix.as_deref(),
+            remote.as_ref().is_some_and(|r| r.write),
+        ) {
             Ok(journal) => journal,
             Err(error) => {
                 eprintln!("stoop: job record not written: {error}");
@@ -332,7 +337,6 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
         eprintln!("stoop: journal: {error}; continuing");
         journal = None;
     }
-    let remote = sync_for(o).ok();
     let proofs = store_for(o);
     let jobs = jobs_for(o);
     o.defer_push =

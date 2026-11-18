@@ -16,18 +16,14 @@ pub struct Journal {
     expected: Vec<String>,
     record: JobRecord,
     blocked: bool,
-    /// Workspace the action lookups run in, so git reads its credentials.
-    #[serde(default)]
-    root: PathBuf,
-    /// `uses:` references checked at journal creation and before each publication.
-    #[serde(default)]
-    refs: Vec<String>,
-    #[serde(default)]
-    resolved: bool,
 }
 
 impl Journal {
-    pub fn open(root: &Path, matrix: Option<&str>) -> Result<Option<Self>, String> {
+    pub fn open(
+        root: &Path,
+        matrix: Option<&str>,
+        publishing: bool,
+    ) -> Result<Option<Self>, String> {
         if !run::env_flag("GITHUB_ACTIONS") {
             return Ok(None);
         }
@@ -85,13 +81,15 @@ impl Journal {
         }
         let key = spec.key.ok_or("job has no key")?;
         let refs = spec.actions.clone();
-        if run::env_flag("STOOP_STRICT_ACTIONS") {
-            resolve::require_pinned(&refs)?;
-        }
-        let (actions, failures) = resolve::resolve_all(&refs, &resolve::Git::from_env(root));
-        if !failures.is_empty() {
-            return Err(format!("action resolution at journal open failed: {}", failures.join("; ")));
-        }
+        let actions = if publishing {
+            record_actions(
+                &refs,
+                &resolve::Git::from_env(root),
+                run::env_flag("STOOP_STRICT_ACTIONS"),
+            )
+        } else {
+            BTreeMap::new()
+        };
         let expected = spec
             .steps
             .into_iter()
@@ -141,9 +139,6 @@ impl Journal {
             key,
             expected,
             blocked: false,
-            root: root.to_path_buf(),
-            refs,
-            resolved: true,
             record: JobRecord {
                 created: 0,
                 started,
@@ -186,24 +181,6 @@ impl Journal {
     }
     pub fn eligible(&self) -> bool {
         !self.blocked
-    }
-    /// Recheck the open-time evidence before every publication. Missing or failed
-    /// lookups cannot establish equality, including journals from older versions.
-    fn check_actions(&self, resolver: &dyn resolve::Resolver) -> Result<(), String> {
-        if !self.resolved {
-            return Err("action resolution at journal open is missing".into());
-        }
-        if run::env_flag("STOOP_STRICT_ACTIONS") {
-            resolve::require_pinned(&self.refs)?;
-        }
-        let (actions, failures) = resolve::resolve_all(&self.refs, resolver);
-        if !failures.is_empty() {
-            return Err(format!("action resolution before publication failed: {}", failures.join("; ")));
-        }
-        if actions != self.record.actions {
-            return Err("action resolution changed between journal open and publication".into());
-        }
-        Ok(())
     }
 
     pub fn after(
@@ -257,12 +234,6 @@ impl Journal {
             }
         };
         if let Some(remote) = remote.filter(|r| r.write) {
-            let git = resolve::Git::from_env(&self.root);
-            if let Err(reason) = self.check_actions(&git) {
-                self.blocked = true;
-                self.save()?;
-                return Err(reason);
-            }
             let timestamp = now().max(self.record.created.saturating_add(1));
             self.record.created = timestamp;
             if publish_proof && run::env_str(run::SALT_VAR).is_none() {
@@ -317,62 +288,48 @@ impl Journal {
     }
 }
 
+fn record_actions(
+    refs: &[String],
+    resolver: &dyn resolve::Resolver,
+    strict: bool,
+) -> BTreeMap<String, String> {
+    let eligible: Vec<String> = refs
+        .iter()
+        .filter(|raw| !strict || resolve::require_pinned(std::slice::from_ref(*raw)).is_ok())
+        .cloned()
+        .collect();
+    let (actions, failures) = resolve::resolve_all(&eligible, resolver);
+    for failure in failures {
+        eprintln!("stoop: action unresolved at journal open: {failure}");
+    }
+    actions
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::gha::resolve::fake::Fake;
-
     const A: &str = "1111111111111111111111111111111111111111";
-
-    fn journal(refs: &[&str]) -> Journal {
-        Journal {
-            path: PathBuf::from("unused.json"),
-            key: "job-x".into(),
-            expected: vec![],
-            blocked: false,
-            root: PathBuf::new(),
-            refs: refs.iter().map(|s| s.to_string()).collect(),
-            resolved: false,
-            record: JobRecord {
-                created: 0,
-                started: 0,
-                status: None,
-                failed: None,
-                actions: BTreeMap::new(),
-                commit: None,
-                host: BTreeMap::new(),
-                event_path: None,
-                run: None,
-                steps: vec![],
-                attest: None,
-                workflow_ref: None,
-                job_workflow_ref: None,
-            },
-        }
-    }
-
     #[test]
-    fn publication_requires_open_and_publish_resolutions_to_match() {
+    fn open_records_resolved_actions_and_omits_failures() {
         let fake = Fake::new();
         fake.set("actions/checkout@v4", Ok(A));
-        let mut j = journal(&["actions/checkout@v4"]);
-        let (actions, failures) = resolve::resolve_all(&j.refs, &fake);
-        assert!(failures.is_empty());
-        j.record.actions = actions;
-        j.resolved = true;
-        let j: Journal = serde_json::from_str(&serde_json::to_string(&j).unwrap()).unwrap();
-        assert!(j.check_actions(&fake).is_ok());
-        fake.set("actions/checkout@v4", Ok("2222222222222222222222222222222222222222"));
-        assert!(j.check_actions(&fake).unwrap_err().contains("changed"));
-        fake.set("actions/checkout@v4", Err("unavailable"));
-        assert!(j.check_actions(&fake).unwrap_err().contains("failed"));
+        fake.set("x/y@v9", Err("unavailable"));
+        let refs = vec!["actions/checkout@v4".into(), "x/y@v9".into()];
+        let actions = record_actions(&refs, &fake, false);
+        assert_eq!(
+            actions.get("actions/checkout@v4").map(String::as_str),
+            Some(A)
+        );
+        assert!(!actions.contains_key("x/y@v9"));
+        assert_eq!(fake.calls(), 2);
     }
-
     #[test]
-    fn old_journal_without_open_evidence_cannot_publish() {
-        let j = journal(&["actions/checkout@v4"]);
+    fn strict_recording_omits_floating_refs_without_network() {
         let fake = Fake::new();
-        assert!(j.check_actions(&fake).unwrap_err().contains("missing"));
+        let pin = format!("actions/checkout@{A}");
+        let actions = record_actions(&["actions/checkout@v4".into(), pin.clone()], &fake, true);
+        assert_eq!(actions.get(&pin).map(String::as_str), Some(A));
         assert_eq!(fake.calls(), 0);
     }
 }
