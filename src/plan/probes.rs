@@ -362,6 +362,54 @@ fn control_baseline_proves() {
 }
 
 #[test]
+fn skip_json_names_exact_record_and_ordered_proofs() {
+    let w = workflow("", "", "").replace(
+        "      - run: cat a.txt > /dev/null\n",
+        "      - run: cat a.txt > /dev/null\n      - run: cat a.txt > /dev/null; true\n",
+    );
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    let key = record(&r, rec(&w, now, now)).unwrap();
+    let jobs = job::JobStore::new(r.store());
+    let mut saved = jobs.load(&key).remove(0);
+    let store = proof::Store::new(r.store());
+    let second_key = saved.steps[1].key.clone();
+    let mut second = store.load(&second_key).remove(0);
+    second.inputs.push(input::Input {
+        path: "missing.txt".into(),
+        id: "a".into(),
+    });
+    store.save(&second_key, second.clone()).unwrap();
+    saved.steps[1].proof = second.digest();
+    let mut claims = a::claims(&saved);
+    claims["aud"] = json!(attest::audience(&key, &saved).unwrap());
+    claims["sha"] = json!(r.sha);
+    claims["iat"] = json!(now);
+    claims["nbf"] = json!(now);
+    saved.attest = Some(a::token(
+        &a::header("test-key-1"),
+        &claims,
+        &a::pair(a::KEY_1),
+    ));
+    assert!(jobs.forget(&key).unwrap());
+    jobs.save(&key, saved.clone()).unwrap();
+    let expected_proofs: Vec<_> = saved.steps.iter().map(|s| s.proof.clone()).collect();
+    assert_ne!(expected_proofs[0], expected_proofs[1]);
+    let o = plan(&r, &["--format", "json"], &[]);
+    assert_eq!(o.plan["skip"], json!(["a"]));
+    let record = &o.plan["jobs"][0]["legs"][0]["record"];
+    assert_eq!(
+        record["digest"],
+        json!(attest::digest(&key, &saved).unwrap())
+    );
+    assert_eq!(record["proofs"], json!(expected_proofs));
+    assert!(jobs.forget(&key).unwrap());
+    let missing = plan(&r, &["--format", "json"], &[]);
+    assert_eq!(code(&missing, "a"), "no-record");
+    assert!(missing.plan["jobs"][0]["legs"][0]["record"].is_null());
+}
+
+#[test]
 fn external_store_scoped_record_can_prove_a_plan_skip() {
     let workflow = workflow("", "", "");
     let repo = Repo::new(&[(CI, &workflow), ("a.txt", "a\n")]);

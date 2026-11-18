@@ -73,6 +73,8 @@ pub struct Evidence {
     pub run: Option<String>,
     pub created: u64,
     pub commit: Option<String>,
+    pub record_digest: Option<String>,
+    pub proofs: Vec<String>,
     pub steps: usize,
     pub inputs: usize,
     pub priors: usize,
