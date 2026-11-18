@@ -178,6 +178,44 @@ fn stoop_settings(layers: &[Option<&Value>]) -> Result<Option<u64>, String> {
         }
     }
 }
+
+fn static_workflow_settings(w: &Workflow) -> Result<Value, String> {
+    let mut settings = Map::new();
+    for (name, value) in object(w.root.get("env"), "workflow env")? {
+        if ["STOOP_FULL", "STOOP_OFF", "STOOP_MAX_AGE"].contains(&name.as_str())
+            && !value.as_str().is_some_and(|s| s.contains("${{"))
+        {
+            settings.insert(name.clone(), value.clone());
+        }
+    }
+    Ok(Value::Object(settings))
+}
+
+fn plan_job_override(w: &Workflow, plan_job: &str) -> Result<Option<String>, String> {
+    let Some(job) = w.root["jobs"].get(plan_job) else {
+        return Ok(None);
+    };
+    let job = job.as_object().ok_or("plan job must be an object")?;
+    let mut envs = vec![job.get("env")];
+    if let Some(steps) = job.get("steps") {
+        for step in steps.as_array().ok_or("plan job steps must be an array")? {
+            envs.push(
+                step.as_object()
+                    .ok_or("plan step must be an object")?
+                    .get("env"),
+            );
+        }
+    }
+    for layer in envs {
+        let map = object(layer, "plan job env")?;
+        for name in ["STOOP_FULL", "STOOP_OFF", "STOOP_MAX_AGE"] {
+            if map.contains_key(name) {
+                return Ok(Some(format!("plan job overrides {name}")));
+            }
+        }
+    }
+    Ok(None)
+}
 fn run_defaults(v: Option<&Value>) -> Result<Map<String, Value>, String> {
     let outer = object(v, "defaults")?;
     if outer.keys().any(|k| k != "run") {
@@ -373,12 +411,26 @@ fn action_with(class: &str, name: &str, fields: &Map<String, Value>) -> Result<V
 }
 
 pub fn job_specs(w: &Workflow, cx: &GhCtx, plan_job: &str) -> Vec<JobSpec> {
+    let reason = match plan_job_override(w, plan_job) {
+        Ok(reason) => reason,
+        Err(error) => Some(error),
+    };
     w.root["jobs"]
         .as_object()
         .into_iter()
         .flat_map(|m| m.keys())
         .filter(|id| id.as_str() != plan_job)
-        .map(|id| job_spec(w, cx, id, None))
+        .map(|id| {
+            let mut spec = job_spec(w, cx, id, None);
+            if let Some(detail) = &reason {
+                spec.key = None;
+                spec.blocked = Some(Blocker {
+                    step: None,
+                    detail: detail.clone(),
+                });
+            }
+            spec
+        })
         .collect()
 }
 
@@ -446,7 +498,9 @@ fn build(
                 return Err(format!("unsupported strategy field {k}"));
             }
         }
-        stoop_settings(&[j.get("env")])?;
+        let workflow_settings = static_workflow_settings(w)?;
+        stoop_settings(&[Some(&workflow_settings)])?;
+        stoop_settings(&[Some(&workflow_settings), j.get("env")])?;
         let needs = match j.get("needs") {
             None => vec![],
             Some(Value::String(s)) => vec![s.clone()],
@@ -508,7 +562,7 @@ fn build(
                 &defaults,
                 (&w.name, job),
                 leg.as_deref(),
-                &[j.get("env")],
+                &[Some(&workflow_settings), j.get("env")],
                 seen_traced,
             );
             match result {
@@ -922,7 +976,11 @@ mod tests {
             ("Sparse-Checkout", "other"),
         ] {
             let text = fixture("", &format!("      - uses: actions/checkout@v4\n        with: {{{field}: '{value}'}}\n      - run: test\n"));
-            assert!(spec(&text).blocked.is_some(), "{field}");
+            let detail = spec(&text).blocked.expect(field).detail;
+            assert!(
+                detail.contains(&format!("checkout {}", field.to_ascii_lowercase())),
+                "{detail}"
+            );
         }
         for (action, field, value) in [
             ("actions/setup-node", "Node-Version-File", ".nvmrc"),
@@ -930,8 +988,19 @@ mod tests {
             ("erlef/setup-beam", "Version-File", "a"),
             ("ruby/setup-ruby", "Bundler-Cache", "true"),
         ] {
-            let text = fixture("", &format!("      - uses: {action}@v1\n        with: {{{field}: '{value}'}}\n      - run: test\n"));
-            assert!(spec(&text).blocked.is_some(), "{field}");
+            let extra = if action == "ruby/setup-ruby" {
+                ", ruby-version: '3.3'"
+            } else {
+                ""
+            };
+            let text = fixture("", &format!("      - uses: {action}@v1\n        with: {{{field}: '{value}'{extra}}}\n      - run: test\n"));
+            let detail = spec(&text).blocked.expect(field).detail;
+            assert!(
+                detail
+                    .to_ascii_lowercase()
+                    .contains(&field.to_ascii_lowercase()),
+                "{detail}"
+            );
         }
         for action in [
             "oven-sh/setup-bun",
@@ -1020,5 +1089,36 @@ mod tests {
                 ..
             })
         ));
+    }
+    #[test]
+    fn inherited_static_settings_and_plan_overrides_fail_wide() {
+        let base = fixture("", RUN);
+        let age = base.replace("on: push\n", "on: push\nenv: {STOOP_MAX_AGE: 1h}\n");
+        assert!(matches!(
+            spec(&age).steps.last(),
+            Some(StepSpec::Traced {
+                max_age: Some(3600),
+                ..
+            })
+        ));
+        for name in ["STOOP_FULL", "STOOP_OFF"] {
+            let text = base.replace("on: push\n", &format!("on: push\nenv: {{{name}: '1'}}\n"));
+            assert!(spec(&text).blocked.unwrap().detail.contains(name));
+        }
+        for name in ["STOOP_FULL", "STOOP_OFF", "STOOP_MAX_AGE"] {
+            for location in ["job", "step"] {
+                let plan = if location == "job" {
+                    format!("  plan:\n    env: {{{name}: ''}}\n    runs-on: ubuntu-latest\n    steps: []\n")
+                } else {
+                    format!("  plan:\n    runs-on: ubuntu-latest\n    steps:\n      - run: stoop plan\n        env: {{{name}: '0'}}\n")
+                };
+                let text = base.replace("jobs:\n", &format!("jobs:\n{plan}"));
+                let w = parse("ci.yml", &text).unwrap();
+                let specs = job_specs(&w, &GhCtx::from_parts(BTreeMap::new(), Value::Null), "plan");
+                assert_eq!(specs.len(), 1);
+                assert!(specs[0].blocked.as_ref().unwrap().detail.contains(name));
+                assert!(specs[0].key.is_none());
+            }
+        }
     }
 }
