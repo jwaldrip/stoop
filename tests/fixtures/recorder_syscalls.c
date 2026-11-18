@@ -16,6 +16,10 @@ int main(int argc, char **argv) {
         (void)syscall(SYS_unshare, 0);
         return 0;
     }
+    if (!strcmp(op, "open-by-handle")) {
+        (void)syscall(SYS_open_by_handle_at, -1, NULL, 0);
+        return 0;
+    }
     if (!strcmp(op, "namespace-call")) {
         struct { const char *name; long nr; } cases[] = {
             {"mount", SYS_mount}, {"umount2", SYS_umount2},

@@ -1470,3 +1470,100 @@ fn repository_root_symlink_does_not_create_empty_input_key() {
     let inputs = pairs(&p, "inputs");
     assert!(!inputs.iter().any(|(key, _)| key.is_empty()), "{inputs:?}");
 }
+
+#[test]
+fn coincident_parent_and_replaced_directory_reads_keep_call_time_targets() {
+    for case in ["coincident", "dirswap"] {
+        let w = Ws::new(&format!("call-time-{case}"));
+        w.write("a.txt", "a root\n");
+        w.write("f.txt", "f root\n");
+        w.write("d1/keep", "keep\n");
+        w.write("dx/keep", "keep\n");
+        w.write("sub/d2x/keep", "keep\n");
+        w.write("sub/a.txt", "a sub\n");
+        w.write("sub/f.txt", "f sub\n");
+        std::os::unix::fs::symlink("d1", w.root.join("dl")).unwrap();
+        let command = if case == "coincident" {
+            "cat dl/../a.txt dl/../f.txt > out.txt && ln -sfn sub/d2x dl"
+        } else {
+            "cat dx/../f.txt > out.txt && python3 -c 'import os; os.unlink(\"dx/keep\"); os.rmdir(\"dx\"); os.symlink(\"sub/d2x\", \"dx\")'"
+        };
+        let p = recorded(&w, command);
+        assert!(
+            pairs(&p, "inputs").contains(&("f.txt".into(), format!("f:{}", hash(b"f root\n")))),
+            "{case}: {:?}",
+            pairs(&p, "inputs")
+        );
+    }
+}
+
+#[test]
+fn direct_nonread_observations_keep_call_time_target() {
+    for op in ["chdir", "tmpfile", "mkdir", "chmod"] {
+        let w = Ws::new(&format!("observation-{op}"));
+        w.write("d1/a.txt", "a\n");
+        w.write("d1/sub/keep", "keep\n");
+        w.write("d2/sub/keep", "other\n");
+        std::os::unix::fs::symlink("d1", w.root.join("dl")).unwrap();
+        let action = match op {
+            "chdir" => "os.chdir(\"dl/../dl/sub\")",
+            "tmpfile" => "os.close(os.open(\"dl/../dl/sub\", os.O_TMPFILE | os.O_WRONLY, 0o600))",
+            "mkdir" => "exec(\"try:\\n os.mkdir(\\\"dl/../dl/sub\\\")\\n raise SystemExit(1)\\nexcept FileExistsError:\\n pass\")",
+            _ => "os.chmod(\"dl/../dl/sub\", 0o755)",
+        };
+        let command = format!(
+            "python3 -c 'import os; open(\"dl/../dl/a.txt\").read(); {action}' && ln -sfn d2 dl"
+        );
+        let p = recorded(&w, &command);
+        assert!(
+            pairs(&p, "inputs").iter().any(|(key, _)| key == "d1/sub"),
+            "{op}: {:?}",
+            pairs(&p, "inputs")
+        );
+    }
+}
+
+#[test]
+fn second_absence_probe_keeps_the_physical_missing_path() {
+    use std::os::unix::fs::symlink;
+    for case in ["dotdot", "outside"] {
+        let w = Ws::new(&format!("absence-{case}"));
+        w.write("sub/d1n/keep", "keep\n");
+        w.write("d1/keep", "keep\n");
+        symlink("sub/d1n", w.root.join("dln")).unwrap();
+        let outside = w.root.with_extension("absence");
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir(&outside).unwrap();
+        symlink(w.root.join("d1"), outside.join("dl")).unwrap();
+        let prefix = if case == "dotdot" {
+            "dln/../missing".to_owned()
+        } else {
+            format!("{}/dl/missing", outside.display())
+        };
+        let command = format!("python3 -c 'import os; os.path.exists(\"{prefix}/a.txt\"); assert not os.path.exists(\"{prefix}/x.txt\")'; echo ok > out.txt");
+        let p = recorded(&w, &command);
+        let key = if case == "dotdot" {
+            "sub/missing/x.txt"
+        } else {
+            "d1/missing/x.txt"
+        };
+        assert!(
+            pairs(&p, "inputs").contains(&(key.into(), "a".into())),
+            "{case}: {:?}",
+            pairs(&p, "inputs")
+        );
+        let _ = fs::remove_dir_all(outside);
+    }
+}
+
+#[test]
+fn open_by_handle_attempt_is_not_recorded() {
+    let w = Ws::new("open-by-handle");
+    w.syscall_probe();
+    let (status, err) = w.sh("./syscall-probe open-by-handle ignored");
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        err.contains("not recorded") && err.contains("file by handle"),
+        "{err}"
+    );
+}
