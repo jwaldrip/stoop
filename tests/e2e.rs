@@ -39,6 +39,12 @@ impl Ws {
             )
             .env_remove("STOOP_FULL")
             .env_remove("STOOP_OFF")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("RUNNER_TEMP")
+            .env_remove("STOOP_MATRIX")
+            .env_remove("STOOP_SYNC")
+            .env_remove("STOOP_SYNC_WRITE")
+            .env_remove("STOOP_ENV_SALT")
             .output()
             .unwrap();
         (
@@ -231,8 +237,14 @@ fn run_with_foo(w: &Ws, v: &str, extra: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_stoop"))
         .args(args)
         .current_dir(&w.root)
-        .env("STOOP_STORE", w.root.join("../env-store"))
+        .env("STOOP_STORE", w.root.with_extension("env-store"))
         .env("FOO", v)
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("RUNNER_TEMP")
+        .env_remove("STOOP_MATRIX")
+        .env_remove("STOOP_SYNC")
+        .env_remove("STOOP_SYNC_WRITE")
+        .env_remove("STOOP_ENV_SALT")
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stderr).into_owned()
@@ -382,6 +394,12 @@ fn full_mode_never_skips_but_still_records() {
             )),
         )
         .env("STOOP_FULL", "1")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("RUNNER_TEMP")
+        .env_remove("STOOP_MATRIX")
+        .env_remove("STOOP_SYNC")
+        .env_remove("STOOP_SYNC_WRITE")
+        .env_remove("STOOP_ENV_SALT")
         .output()
         .unwrap();
     let e = String::from_utf8_lossy(&out.stderr);

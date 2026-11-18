@@ -34,6 +34,7 @@ pub struct Opts {
     pub sync_write: bool,
     /// Seconds a proof stays valid; 0 means forever. Default: 7 days.
     pub max_age: Option<u64>,
+    pub defer_push: bool,
     pub argv: Vec<String>,
 }
 
@@ -226,15 +227,40 @@ fn plain(argv: &[String]) -> i32 {
     }
 }
 
-/// Exit code for `run` is the command's. For `explain` it is 0 when the
-/// command would be skipped and 1 when it would run.
+pub enum How {
+    Skipped { proof: String },
+    Recorded { proof: String },
+    Unrecorded(String),
+    Failed,
+    Untraced,
+}
+
+pub struct Outcome {
+    pub status: i32,
+    pub key: String,
+    pub how: How,
+}
+
 pub fn run(o: Opts, explain: bool) -> i32 {
+    run_outcome(o, explain).status
+}
+
+pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
+    let key = o.key.clone().unwrap_or_default();
     if o.argv.is_empty() {
         eprintln!("stoop: no command given");
-        return 2;
+        return Outcome {
+            status: 2,
+            key,
+            how: How::Untraced,
+        };
     }
     if env_flag("STOOP_OFF") && !explain {
-        return plain(&o.argv);
+        return Outcome {
+            status: plain(&o.argv),
+            key,
+            how: How::Untraced,
+        };
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = o
@@ -386,13 +412,21 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                     t0.elapsed().as_millis()
                 );
             }
-            return 0;
+            return Outcome {
+                status: 0,
+                key,
+                how: How::Skipped { proof: p.digest() },
+            };
         }
         why = "STOOP_FULL is set".into();
     }
     if explain {
         eprintln!("stoop: would run {key}: {why}");
-        return 1;
+        return Outcome {
+            status: 1,
+            key,
+            how: How::Untraced,
+        };
     }
     if !o.quiet {
         eprintln!("stoop: run {key}: {why}");
@@ -411,12 +445,27 @@ pub fn run(o: Opts, explain: bool) -> i32 {
             if !o.quiet {
                 eprintln!("stoop: not traced ({e}); running without a proof");
             }
-            return plain(&o.argv);
+            return Outcome {
+                status: plain(&o.argv),
+                key,
+                how: How::Untraced,
+            };
         }
     };
     let status = trace.status;
-    if status != 0 || o.no_record {
-        return status;
+    if status != 0 {
+        return Outcome {
+            status,
+            key,
+            how: How::Failed,
+        };
+    }
+    if o.no_record {
+        return Outcome {
+            status,
+            key,
+            how: How::Unrecorded("recording disabled".into()),
+        };
     }
     // The external state the command saw must still be what it was when it finished.
     let probes = match probes_before {
@@ -424,7 +473,11 @@ pub fn run(o: Opts, explain: bool) -> i32 {
             if !o.quiet {
                 eprintln!("stoop: not recorded: a probe failed before the run, so the external state is unknown");
             }
-            return status;
+            return Outcome {
+                status,
+                key,
+                how: How::Unrecorded("probe failed".into()),
+            };
         }
         Some(before) => {
             if !o.probes.is_empty()
@@ -433,7 +486,11 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                 if !o.quiet {
                     eprintln!("stoop: not recorded: a probe changed while the command ran");
                 }
-                return status;
+                return Outcome {
+                    status,
+                    key,
+                    how: How::Unrecorded("probe changed".into()),
+                };
             }
             before
         }
@@ -457,6 +514,7 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                 priors: None,
                 unplannable: Vec::new(),
             };
+            let digest = proof.digest();
             if let Some(r) = remote.as_ref().filter(|r| r.write) {
                 // Fold in anything other runs published since we looked, so a push never
                 // drops their proofs.
@@ -476,7 +534,10 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                     false
                 }
             };
-            if let Some(r) = remote.as_ref().filter(|r| saved && r.write) {
+            if let Some(r) = remote
+                .as_ref()
+                .filter(|r| saved && r.write && !o.defer_push)
+            {
                 if salt.is_none() {
                     // Hashes of every variable go into a file other people can fetch. An
                     // unsalted hash of a low-entropy secret can be guessed offline.
@@ -490,6 +551,15 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                     Err(e) => eprintln!("stoop: sync: could not publish ({e}); continuing"),
                 }
             }
+            return Outcome {
+                status,
+                key,
+                how: if saved {
+                    How::Recorded { proof: digest }
+                } else {
+                    How::Unrecorded("could not save proof".into())
+                },
+            };
         }
         Err(why) => {
             if !o.quiet {
@@ -497,7 +567,11 @@ pub fn run(o: Opts, explain: bool) -> i32 {
             }
         }
     }
-    status
+    Outcome {
+        status,
+        key,
+        how: How::Unrecorded("inputs could not be recorded".into()),
+    }
 }
 
 /// What the run left behind inside the repository: created or rewritten files and

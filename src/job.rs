@@ -24,7 +24,9 @@ pub enum RecordStatus {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRecord {
+    /// Unix seconds of the latest publication.
     pub created: u64,
+    /// Unix milliseconds when the journal opened. Ordering key only, not an age.
     #[serde(default)]
     pub started: u64,
     #[serde(default)]
@@ -45,6 +47,35 @@ pub struct JobRecord {
     /// Reserved for the signed job attestation payload; no trust is implied by its presence.
     #[serde(default)]
     pub attest: Option<String>,
+    #[serde(default)]
+    pub workflow_ref: Option<String>,
+    #[serde(default)]
+    pub job_workflow_ref: Option<String>,
+}
+impl JobRecord {
+    /// Higher keys sort first. GitHub run identifiers and attempts are numeric.
+    pub fn order_key(&self) -> (u64, u64, u64, u64, &str) {
+        let raw = self.run.as_deref().unwrap_or("");
+        let (id, attempt) = raw.split_once('/').unwrap_or(("", ""));
+        (
+            self.started,
+            id.parse().unwrap_or(0),
+            attempt.parse().unwrap_or(0),
+            self.created,
+            raw,
+        )
+    }
+    fn retention_key(&self) -> (u64, bool, u64, u64, u64, &str) {
+        let (started, run, attempt, created, raw) = self.order_key();
+        (
+            started,
+            self.status == Some(RecordStatus::Failed),
+            run,
+            attempt,
+            created,
+            raw,
+        )
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct JobFile {
@@ -85,8 +116,9 @@ impl JobStore {
         }
     }
     fn write(&self, key: &str, mut records: Vec<JobRecord>) -> io::Result<()> {
-        records.sort_by_key(|r| std::cmp::Reverse(r.created));
+        records.sort_by(|a, b| b.retention_key().cmp(&a.retention_key()));
         records.truncate(MAX_RECORDS);
+        records.sort_by(|a, b| b.order_key().cmp(&a.order_key()));
         let path = self.file(key);
         fs::create_dir_all(path.parent().unwrap())?;
         let ignore = self.dir.join(".gitignore");
@@ -113,6 +145,33 @@ impl JobStore {
         records.insert(0, record);
         self.write(key, records)
     }
+    /// Build a publication from the remote snapshot and this run only.
+    pub fn merge_remote(key: &str, bytes: Option<&[u8]>, record: JobRecord) -> io::Result<Vec<u8>> {
+        let mut records = match bytes {
+            Some(bytes) => {
+                Self::parse(bytes)
+                    .filter(|f| f.key == key)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "not a job file for this key")
+                    })?
+                    .records
+            }
+            None => Vec::new(),
+        };
+        records.retain(|old| !Self::same(old, &record));
+        records.push(record);
+        records.sort_by(|a, b| b.retention_key().cmp(&a.retention_key()));
+        records.truncate(MAX_RECORDS);
+        records.sort_by(|a, b| b.order_key().cmp(&a.order_key()));
+        serde_json::to_vec(&JobFile {
+            v: 1,
+            kind: "job".into(),
+            key: key.into(),
+            records,
+        })
+        .map_err(io::Error::other)
+    }
+
     pub fn export(&self, key: &str) -> Option<Vec<u8>> {
         fs::read(self.file(key)).ok()
     }
@@ -191,6 +250,8 @@ mod tests {
                 how: StepHow::Ran,
             }],
             attest: None,
+            workflow_ref: None,
+            job_workflow_ref: None,
         }
     }
     #[test]
@@ -254,5 +315,168 @@ mod tests {
         let proof = br#"{"v":1,"key":"job-a","proofs":[]}"#;
         assert!(s.import("job-a", proof).is_err());
         assert_eq!(JobStore::key_of(proof), None);
+    }
+    #[test]
+    fn retention_uses_started_before_created() {
+        let s = store("retention-started");
+        let mut passed = record(500);
+        passed.started = 100;
+        let mut failed = record(210);
+        failed.started = 200;
+        failed.status = Some(RecordStatus::Failed);
+        s.save("job-a", passed).unwrap();
+        s.save("job-a", failed).unwrap();
+        for i in 601..608 {
+            let mut r = record(i);
+            r.started = i;
+            r.status = Some(RecordStatus::Running);
+            s.save("job-a", r).unwrap();
+        }
+        let records = s.load("job-a");
+        assert_eq!(records.len(), 8);
+        assert!(records
+            .iter()
+            .any(|r| r.status == Some(RecordStatus::Failed)));
+        assert!(!records.iter().any(|r| r.started == 100));
+    }
+
+    #[test]
+    fn publish_merge_never_includes_local_records() {
+        let s = store("remote-merge-only");
+        let mut forged = record(999);
+        forged.started = 999;
+        s.save("job-a", forged).unwrap();
+        let mut actual = record(2);
+        actual.started = 2;
+        let bytes = JobStore::merge_remote("job-a", None, actual.clone()).unwrap();
+        let published = JobStore::parse(&bytes).unwrap();
+        assert_eq!(published.records, vec![actual]);
+    }
+    #[test]
+    fn equal_started_order_uses_numeric_run_then_attempt_before_created() {
+        let s = store("equal-started");
+        let mut older = record(500);
+        older.started = 1000;
+        older.run = Some("9/1".into());
+        let mut newer = record(200);
+        newer.started = 1000;
+        newer.run = Some("10/1".into());
+        let mut retry = newer.clone();
+        retry.run = Some("10/2".into());
+        retry.created = 100;
+        s.save("job-a", older).unwrap();
+        s.save("job-a", newer).unwrap();
+        s.save("job-a", retry).unwrap();
+        let runs: Vec<_> = s
+            .load("job-a")
+            .into_iter()
+            .map(|r| r.run.unwrap())
+            .collect();
+        assert_eq!(runs, ["10/2", "10/1", "9/1"]);
+    }
+    #[test]
+    fn merge_remote_caps_nine_records_by_order() {
+        let mut records: Vec<_> = (1..=8).map(record).collect();
+        for r in &mut records {
+            r.started = r.created;
+        }
+        let snapshot = serde_json::to_vec(&JobFile {
+            v: 1,
+            kind: "job".into(),
+            key: "job-a".into(),
+            records,
+        })
+        .unwrap();
+        let mut newest = record(9);
+        newest.started = 9;
+        let bytes = JobStore::merge_remote("job-a", Some(&snapshot), newest).unwrap();
+        let records = JobStore::parse(&bytes).unwrap().records;
+        assert_eq!(records.len(), 8);
+        assert!(records.iter().all(|r| r.started != 1));
+        assert!(records.iter().any(|r| r.started == 9));
+    }
+
+    #[test]
+    fn merge_remote_replaces_same_run() {
+        let old = record(1);
+        let snapshot = serde_json::to_vec(&JobFile {
+            v: 1,
+            kind: "job".into(),
+            key: "job-a".into(),
+            records: vec![old.clone()],
+        })
+        .unwrap();
+        let mut updated = old;
+        updated.created = 2;
+        let bytes = JobStore::merge_remote("job-a", Some(&snapshot), updated.clone()).unwrap();
+        assert_eq!(JobStore::parse(&bytes).unwrap().records, vec![updated]);
+    }
+
+    #[test]
+    fn retention_prefers_failure_at_equal_start() {
+        let mut failed = record(9);
+        failed.started = 1000;
+        failed.run = Some("9/1".into());
+        failed.status = Some(RecordStatus::Failed);
+        let mut passed = record(10);
+        passed.started = 1000;
+        passed.run = Some("10/1".into());
+        passed.status = Some(RecordStatus::Passed);
+        let mut records = vec![failed, passed];
+        for i in 2000..2007 {
+            let mut r = record(i);
+            r.started = i;
+            r.status = Some(RecordStatus::Running);
+            records.push(r);
+        }
+        let snapshot = serde_json::to_vec(&JobFile {
+            v: 1,
+            kind: "job".into(),
+            key: "job-a".into(),
+            records,
+        })
+        .unwrap();
+        let mut latest = record(2006);
+        latest.started = 2006;
+        let result = JobStore::merge_remote("job-a", Some(&snapshot), latest).unwrap();
+        let records = JobStore::parse(&result).unwrap().records;
+        assert_eq!(records.len(), 8);
+        assert!(records
+            .iter()
+            .any(|r| r.run.as_deref() == Some("9/1") && r.status == Some(RecordStatus::Failed)));
+        assert!(!records.iter().any(|r| r.run.as_deref() == Some("10/1")));
+    }
+    #[test]
+    fn import_retains_failure_at_equal_start() {
+        let store = store("import-equal-start");
+        let mut failed = record(9);
+        failed.started = 1000;
+        failed.run = Some("9/1".into());
+        failed.status = Some(RecordStatus::Failed);
+        let mut passed = record(10);
+        passed.started = 1000;
+        passed.run = Some("10/1".into());
+        passed.status = Some(RecordStatus::Passed);
+        let mut records = vec![failed, passed];
+        for i in 2000..2007 {
+            let mut r = record(i);
+            r.started = i;
+            r.status = Some(RecordStatus::Running);
+            records.push(r);
+        }
+        let snapshot = serde_json::to_vec(&JobFile {
+            v: 1,
+            kind: "job".into(),
+            key: "job-a".into(),
+            records,
+        })
+        .unwrap();
+        store.import("job-a", &snapshot).unwrap();
+        let records = store.load("job-a");
+        assert_eq!(records.len(), 8);
+        assert!(records
+            .iter()
+            .any(|r| r.run.as_deref() == Some("9/1") && r.status == Some(RecordStatus::Failed)));
+        assert!(!records.iter().any(|r| r.run.as_deref() == Some("10/1")));
     }
 }
