@@ -1,0 +1,461 @@
+//! What the recorder writes down: priors, removals and reasons, read from the stored
+//! proof JSON of a real run. Linux only, because tracing is.
+#![cfg(target_os = "linux")]
+
+use serde_json::Value;
+use std::fs;
+use std::path::PathBuf;
+use std::process::Command;
+
+struct Ws {
+    root: PathBuf,
+}
+
+impl Ws {
+    fn new(name: &str) -> Ws {
+        let root = std::env::temp_dir().join(format!("stoop-record-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(root.with_file_name(format!(
+            "{}-store",
+            root.file_name().unwrap().to_string_lossy()
+        )));
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("in.txt"), "one").unwrap();
+        Ws { root }
+    }
+
+    fn write(&self, rel: &str, body: &str) {
+        let p = self.root.join(rel);
+        fs::create_dir_all(p.parent().unwrap()).unwrap();
+        fs::write(p, body).unwrap();
+    }
+
+    fn store(&self) -> PathBuf {
+        self.root.with_file_name(format!(
+            "{}-store",
+            self.root.file_name().unwrap().to_string_lossy()
+        ))
+    }
+
+    /// `stoop run` in the workspace, as a CI step would, with key `t`. Returns (exit, stderr).
+    fn sh(&self, script: &str) -> (i32, String) {
+        let out = Command::new(env!("CARGO_BIN_EXE_stoop"))
+            .args(["run", "--root", ".", "--key", "t", "--", "sh", "-c", script])
+            .current_dir(&self.root)
+            .env("STOOP_STORE", self.store())
+            .env_remove("STOOP_FULL")
+            .env_remove("STOOP_OFF")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("RUNNER_TEMP")
+            .env_remove("STOOP_MATRIX")
+            .env_remove("STOOP_SYNC")
+            .env_remove("STOOP_SYNC_WRITE")
+            .env_remove("STOOP_ENV_SALT")
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    }
+
+    /// The newest proof stored under key `t`. Panics when the run recorded nothing.
+    fn proof(&self) -> Value {
+        let file = self.store().join("proofs").join("t.json");
+        let v: Value = serde_json::from_slice(&fs::read(&file).expect("a proof was recorded"))
+            .expect("the proof file is JSON");
+        v["proofs"][0].clone()
+    }
+}
+
+/// Run `script` and return the newest proof, asserting the run passed and was recorded.
+fn recorded(w: &Ws, script: &str) -> Value {
+    let (code, err) = w.sh(script);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("recorded"), "not recorded: {err}");
+    w.proof()
+}
+
+/// (path, id) pairs of a proof array field (`inputs`, `outputs`, `priors`).
+fn pairs(p: &Value, field: &str) -> Vec<(String, String)> {
+    p[field]
+        .as_array()
+        .unwrap_or_else(|| panic!("{field} is missing"))
+        .iter()
+        .map(|e| {
+            (
+                e["path"].as_str().unwrap().to_string(),
+                e["id"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+fn prior(p: &Value, path: &str) -> Option<String> {
+    pairs(p, "priors")
+        .into_iter()
+        .find(|(k, _)| k == path)
+        .map(|(_, id)| id)
+}
+
+fn reasons(p: &Value) -> Vec<String> {
+    p["unplannable"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap().to_string())
+        .collect()
+}
+
+fn has_reason(p: &Value, needle: &str) -> bool {
+    reasons(p).iter().any(|r| r.contains(needle))
+}
+
+fn removed(p: &Value) -> Vec<String> {
+    p["removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r.as_str().unwrap().to_string())
+        .collect()
+}
+
+fn hash(bytes: &[u8]) -> String {
+    blake3::hash(bytes).to_hex().to_string()
+}
+
+#[test]
+fn sed_in_place_records_the_old_bytes_and_the_temp_file() {
+    let w = Ws::new("sed");
+    w.write("config.txt", "foo\n");
+    let p = recorded(&w, "sed -i s/foo/bar/ config.txt");
+    assert_eq!(
+        prior(&p, "config.txt"),
+        Some(format!("f:{}", hash(b"foo\n")))
+    );
+    assert!(reasons(&p).is_empty(), "{:?}", reasons(&p));
+    let outputs = pairs(&p, "outputs");
+    assert!(outputs.contains(&("config.txt".into(), format!("f:{}", hash(b"bar\n")))));
+    // sed's temp file was created and renamed away: it is a removal that began absent.
+    let temp: Vec<String> = removed(&p);
+    assert_eq!(temp.len(), 1, "{temp:?}");
+    assert_eq!(prior(&p, &temp[0]), Some("a".into()));
+}
+
+#[test]
+fn mkdir_then_write_records_both_as_absent_before() {
+    let w = Ws::new("mkdir");
+    let p = recorded(&w, "mkdir build && echo ok > build/out");
+    assert_eq!(prior(&p, "build"), Some("a".into()));
+    assert_eq!(prior(&p, "build/out"), Some("a".into()));
+    assert!(reasons(&p).is_empty(), "{:?}", reasons(&p));
+}
+
+#[test]
+fn mkdir_p_on_a_tracked_directory_is_an_input_not_a_prior() {
+    let w = Ws::new("mkdirp");
+    w.write("src/lib.rs", "x");
+    let p = recorded(&w, "mkdir -p src");
+    assert_eq!(prior(&p, "src"), None);
+    assert!(pairs(&p, "inputs").contains(&("src".into(), "d".into())));
+}
+
+#[test]
+fn renaming_directories_is_unplannable() {
+    let w = Ws::new("dirrename");
+    w.write("x/f", "x");
+    w.write("y/f", "y");
+    let p = recorded(&w, "mv y yold && mv x y");
+    assert!(
+        has_reason(&p, "renamed the directory y to yold"),
+        "{:?}",
+        reasons(&p)
+    );
+}
+
+#[test]
+fn removing_a_tree_names_every_entry_it_removed() {
+    let w = Ws::new("rmrf");
+    w.write("d/a", "a");
+    w.write("d/b", "b");
+    let p = recorded(&w, "rm -rf d");
+    for path in ["d/a", "d/b", "d"] {
+        assert!(
+            removed(&p).contains(&path.to_string()),
+            "{path} in {:?}",
+            removed(&p)
+        );
+        assert!(prior(&p, path).is_some(), "prior for {path}");
+    }
+    assert_eq!(prior(&p, "d"), Some("d".into()));
+}
+
+#[test]
+fn rmdir_of_a_non_empty_directory_is_unplannable() {
+    let w = Ws::new("rmdir");
+    w.write("d/keep", "k");
+    let p = recorded(&w, "rmdir d || true");
+    assert!(
+        has_reason(&p, "removed the non-empty directory d"),
+        "{:?}",
+        reasons(&p)
+    );
+}
+
+#[test]
+fn writing_through_a_symlink_is_unplannable() {
+    let w = Ws::new("symlink");
+    w.write("t.txt", "t");
+    let p = recorded(&w, "ln -s t.txt l && echo x > l");
+    assert!(
+        has_reason(&p, "wrote through the symlink l"),
+        "{:?}",
+        reasons(&p)
+    );
+}
+
+#[test]
+fn a_file_over_eight_mebibytes_is_too_large_to_record() {
+    let w = Ws::new("big");
+    let big = fs::File::create(w.root.join("big")).unwrap();
+    big.set_len(9 << 20).unwrap();
+    drop(big);
+    let p = recorded(&w, "cat big >/dev/null && echo x >> big");
+    assert!(has_reason(&p, "too large"), "{:?}", reasons(&p));
+}
+
+#[test]
+fn the_run_budget_for_prior_content_is_enforced() {
+    let w = Ws::new("budget");
+    let mut script = String::from("for i in $(seq 40); do echo x >> f$i; done");
+    for i in 1..=40 {
+        let f = fs::File::create(w.root.join(format!("f{i}"))).unwrap();
+        f.set_len(7 << 20).unwrap();
+    }
+    script.push_str(" ; true");
+    let p = recorded(&w, &script);
+    assert!(has_reason(&p, "too large"), "{:?}", reasons(&p));
+}
+
+#[test]
+fn writes_under_an_ignored_directory_cost_nothing() {
+    let w = Ws::new("ignored");
+    w.write(".stoopignore", "target\n");
+    let p = recorded(
+        &w,
+        "mkdir -p target/a && echo x > target/a/f && mv target/a target/b",
+    );
+    assert!(pairs(&p, "priors")
+        .iter()
+        .all(|(k, _)| !k.starts_with("target")));
+    assert!(reasons(&p).is_empty(), "{:?}", reasons(&p));
+}
+
+#[test]
+fn a_read_through_an_outside_alias_is_recorded_under_the_in_repo_key() {
+    let w = Ws::new("alias");
+    let alias = std::env::temp_dir().join(format!("stoop-record-alias-{}", std::process::id()));
+    let _ = fs::remove_file(&alias);
+    std::os::unix::fs::symlink(w.root.join("in.txt"), &alias).unwrap();
+    let p = recorded(&w, &format!("cat {}", alias.display()));
+    let _ = fs::remove_file(&alias);
+    assert!(
+        pairs(&p, "inputs").contains(&("in.txt".into(), format!("f:{}", hash(b"one")))),
+        "{:?}",
+        pairs(&p, "inputs")
+    );
+}
+
+#[test]
+fn chmod_plus_x_is_an_output_with_an_executable_id() {
+    let w = Ws::new("chmod");
+    w.write("s.sh", "echo hi\n");
+    let p = recorded(&w, "chmod +x s.sh");
+    assert!(
+        pairs(&p, "outputs").contains(&("s.sh".into(), format!("x:{}", hash(b"echo hi\n")))),
+        "{:?}",
+        pairs(&p, "outputs")
+    );
+    // A mode change keeps the bytes, so the prior records them, not just the mode.
+    assert_eq!(prior(&p, "s.sh"), Some(format!("f:{}", hash(b"echo hi\n"))));
+    assert!(reasons(&p).is_empty(), "{:?}", reasons(&p));
+}
+
+#[test]
+fn a_read_only_step_has_empty_priors_and_no_reason() {
+    let w = Ws::new("readonly");
+    let p = recorded(&w, "cat in.txt > /dev/null");
+    assert_eq!(p["priors"].as_array().map(Vec::len), Some(0));
+    assert!(reasons(&p).is_empty());
+    assert!(removed(&p).is_empty());
+}
+
+#[test]
+fn a_failed_create_records_the_missing_parent() {
+    let w = Ws::new("failed");
+    let p = recorded(&w, "echo x > nodir/file || true");
+    assert_eq!(prior(&p, "nodir"), Some("a".into()));
+    assert_eq!(prior(&p, "nodir/file"), Some("a".into()));
+}
+
+#[test]
+fn a_failed_create_under_a_file_records_the_file() {
+    let w = Ws::new("notdir");
+    let p = recorded(&w, "echo x > in.txt/x || true");
+    assert_eq!(prior(&p, "in.txt"), Some("fk".into()));
+    assert_eq!(prior(&p, "in.txt/x"), Some("a".into()));
+}
+
+#[test]
+fn a_non_utf8_name_in_the_repository_is_unplannable_and_unkeyed() {
+    let w = Ws::new("nonutf8");
+    let p = recorded(&w, "printf x > \"$(printf 'bad\\377name')\"");
+    assert!(has_reason(&p, "not valid UTF-8"), "{:?}", reasons(&p));
+    assert!(
+        !pairs(&p, "outputs")
+            .iter()
+            .any(|(k, _)| k.contains('\u{FFFD}')),
+        "no lossy keys: {:?}",
+        pairs(&p, "outputs")
+    );
+}
+
+#[test]
+fn an_append_keeps_the_old_bytes_so_the_prior_records_them() {
+    let w = Ws::new("append");
+    w.write("config.txt", "foo\n");
+    let p = recorded(&w, "echo y >> config.txt");
+    assert_eq!(
+        prior(&p, "config.txt"),
+        Some(format!("f:{}", hash(b"foo\n")))
+    );
+}
+
+#[test]
+fn a_truncating_write_records_only_the_kind() {
+    let w = Ws::new("truncate");
+    w.write("config.txt", "foo\n");
+    let p = recorded(&w, "echo y > config.txt");
+    assert_eq!(prior(&p, "config.txt"), Some("fk".into()));
+}
+
+#[test]
+fn a_truncated_executable_records_its_executable_kind() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = Ws::new("truncexec");
+    w.write("run.sh", "echo hi\n");
+    fs::set_permissions(w.root.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+    let p = recorded(&w, "echo y > run.sh");
+    assert_eq!(prior(&p, "run.sh"), Some("xk".into()));
+}
+
+#[test]
+fn a_write_through_a_symlinked_directory_is_recorded_under_the_real_key() {
+    let w = Ws::new("symdir");
+    w.write("sub/keep", "k");
+    let p = recorded(&w, "ln -s sub d && echo x > d/f");
+    assert!(
+        has_reason(&p, "wrote through the symlink d"),
+        "{:?}",
+        reasons(&p)
+    );
+    assert!(
+        pairs(&p, "outputs").iter().any(|(k, _)| k == "sub/f"),
+        "{:?}",
+        pairs(&p, "outputs")
+    );
+}
+
+#[test]
+fn a_read_through_an_outside_directory_alias_is_recorded_under_the_in_repo_key() {
+    let w = Ws::new("diralias");
+    w.write("sub/f", "inside");
+    let alias = std::env::temp_dir().join(format!("stoop-record-dir-{}", std::process::id()));
+    let _ = fs::remove_file(&alias);
+    std::os::unix::fs::symlink(w.root.join("sub"), &alias).unwrap();
+    let p = recorded(&w, &format!("cat {}/f", alias.display()));
+    let _ = fs::remove_file(&alias);
+    assert!(
+        pairs(&p, "inputs").contains(&("sub/f".into(), format!("f:{}", hash(b"inside")))),
+        "{:?}",
+        pairs(&p, "inputs")
+    );
+}
+
+#[test]
+fn a_read_through_an_alias_of_a_written_path_is_unplannable() {
+    let w = Ws::new("aliaswritten");
+    let alias = std::env::temp_dir().join(format!("stoop-record-written-{}", std::process::id()));
+    let _ = fs::remove_file(&alias);
+    std::os::unix::fs::symlink(w.root.join("in.txt"), &alias).unwrap();
+    let p = recorded(&w, &format!("echo y > in.txt && cat {}", alias.display()));
+    let _ = fs::remove_file(&alias);
+    assert!(has_reason(&p, "and also wrote it"), "{:?}", reasons(&p));
+}
+
+#[test]
+fn a_cached_parent_is_not_reused_after_a_symlink_replaces_it() {
+    let w = Ws::new("cache");
+    w.write("sub/keep", "k");
+    let p = recorded(
+        &w,
+        "mkdir d && echo a > d/f && rm -r d && ln -s sub d && echo b > d/g",
+    );
+    assert!(
+        has_reason(&p, "wrote through the symlink d"),
+        "{:?}",
+        reasons(&p)
+    );
+    assert!(
+        pairs(&p, "outputs").iter().any(|(k, _)| k == "sub/g"),
+        "{:?}",
+        pairs(&p, "outputs")
+    );
+}
+
+#[test]
+fn a_write_through_a_link_wholly_outside_the_repository_records_nothing() {
+    let w = Ws::new("outsidelink");
+    let pid = std::process::id();
+    let target = std::env::temp_dir().join(format!("stoop-record-out-target-{pid}"));
+    let alias = std::env::temp_dir().join(format!("stoop-record-out-{pid}"));
+    fs::write(&target, "t").unwrap();
+    let _ = fs::remove_file(&alias);
+    std::os::unix::fs::symlink(&target, &alias).unwrap();
+    let p = recorded(
+        &w,
+        &format!("echo x > {} && echo y > /dev/stdout", alias.display()),
+    );
+    let _ = fs::remove_file(&alias);
+    let _ = fs::remove_file(&target);
+    assert!(reasons(&p).is_empty(), "{:?}", reasons(&p));
+    assert!(
+        pairs(&p, "outputs").is_empty(),
+        "{:?}",
+        pairs(&p, "outputs")
+    );
+}
+
+#[test]
+fn a_write_through_a_dangling_link_in_the_repository_is_unplannable() {
+    let w = Ws::new("dangling");
+    let p = recorded(&w, "ln -s nowhere d && echo x > d");
+    assert!(
+        has_reason(&p, "wrote through the symlink d"),
+        "{:?}",
+        reasons(&p)
+    );
+}
+
+#[test]
+fn reading_a_link_after_writing_through_it_keeps_the_link_as_an_input() {
+    let w = Ws::new("linkread");
+    w.write("t.txt", "t");
+    std::os::unix::fs::symlink(w.root.join("t.txt"), w.root.join("l")).unwrap();
+    let p = recorded(&w, "echo x > l && cat l > /dev/null");
+    assert!(
+        pairs(&p, "inputs").contains(&("l".into(), format!("l:{}", w.root.join("t.txt").display()))),
+        "{:?}",
+        pairs(&p, "inputs")
+    );
+}

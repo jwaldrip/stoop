@@ -4,15 +4,21 @@
 //! files (open, stat, exec, rename and so on). Every other syscall runs at
 //! full speed, which keeps the overhead to one stop per file touched.
 //!
-//! Paths are read from the tracee at syscall entry. Whether a path existed is
-//! decided later, by looking at the tree after the command exits.
+//! Paths are read from the tracee at syscall entry, before the call runs. Whether a
+//! path existed is decided later, by looking at the tree after the command exits,
+//! except for priors: what a path held before the run first wrote it is read at the
+//! same stop, because the write is about to change it.
 
-use super::Trace;
-use crate::pathutil::absolutize;
+use super::{Scope, Trace};
+use crate::ignore::Ignore;
+use crate::input::{file_id, hash_file};
+use crate::pathutil::{absolutize, to_key, Physical};
 use std::collections::HashMap;
 use std::ffi::{CString, OsString};
+use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStringExt;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 #[cfg(target_arch = "x86_64")]
@@ -30,15 +36,29 @@ const NT_PRSTATUS: usize = 1;
 const AT_FDCWD: i32 = -100;
 const PATH_MAX: usize = 4096;
 
+/// Linux ABI flags, the same on every architecture.
+const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
+const AT_REMOVEDIR: i32 = 0x200;
+const RENAME_EXCHANGE: u32 = 2;
+
+/// `fchmodat2` is missing from the libc crate on these targets; the number is 452 on both.
+const SYS_FCHMODAT2: i64 = 452;
+
+/// Prior content is hashed up to this size per file, and this total per run.
+const MAX_FILE_BYTES: u64 = 8 << 20;
+const MAX_RUN_BYTES: u64 = 256 << 20;
+/// Same cap as the tracer's other reasons.
+const MAX_REASONS: usize = 16;
+
 #[derive(Clone, Copy)]
 enum Op {
-    /// open-family call; the flags argument decides read or write.
+    /// open-family call. `flags` is the open-flags argument; None is `creat`.
     Open {
         dirfd: Option<usize>,
         path: usize,
         flags: Option<usize>,
     },
-    /// stat, access, readlink, link source: a read of the name.
+    /// stat, access, readlink, link source: a look at the name.
     Look {
         dirfd: Option<usize>,
         path: usize,
@@ -53,11 +73,42 @@ enum Op {
         path: usize,
     },
     Fchdir,
-    /// A path the call creates, removes or replaces.
-    Write {
+    /// mkdir, symlink, link: creates a name (`dir` for mkdir).
+    Create {
         dirfd: Option<usize>,
         path: usize,
         dir: bool,
+    },
+    /// unlink, unlinkat, rmdir: removes a name. `flags` carries AT_REMOVEDIR for unlinkat;
+    /// `dir` marks rmdir.
+    Remove {
+        dirfd: Option<usize>,
+        path: usize,
+        flags: Option<usize>,
+        dir: bool,
+    },
+    /// rename family. `flags` carries RENAME_EXCHANGE for renameat2.
+    Rename {
+        from_dirfd: Option<usize>,
+        from: usize,
+        to_dirfd: Option<usize>,
+        to: usize,
+        flags: Option<usize>,
+    },
+    /// truncate. `len` is the length argument.
+    Truncate {
+        path: usize,
+        len: usize,
+    },
+    /// chmod family. Calls follow links unless `flags` carries AT_SYMLINK_NOFOLLOW.
+    Chmod {
+        dirfd: Option<usize>,
+        path: usize,
+        flags: Option<usize>,
+    },
+    /// fchmod: the file is named by its fd.
+    Fchmod {
+        fd: usize,
     },
     /// Something this tracer cannot see through.
     Unsound(&'static str),
@@ -136,15 +187,16 @@ fn table() -> Vec<(i64, Vec<Op>)> {
         (s(libc::SYS_fchdir), vec![Fchdir]),
         (
             s(libc::SYS_unlinkat),
-            vec![Write {
+            vec![Remove {
                 dirfd: Some(0),
                 path: 1,
+                flags: Some(2),
                 dir: false,
             }],
         ),
         (
             s(libc::SYS_mkdirat),
-            vec![Write {
+            vec![Create {
                 dirfd: Some(0),
                 path: 1,
                 dir: true,
@@ -152,22 +204,17 @@ fn table() -> Vec<(i64, Vec<Op>)> {
         ),
         (
             s(libc::SYS_renameat2),
-            vec![
-                Write {
-                    dirfd: Some(0),
-                    path: 1,
-                    dir: false,
-                },
-                Write {
-                    dirfd: Some(2),
-                    path: 3,
-                    dir: false,
-                },
-            ],
+            vec![Rename {
+                from_dirfd: Some(0),
+                from: 1,
+                to_dirfd: Some(2),
+                to: 3,
+                flags: Some(4),
+            }],
         ),
         (
             s(libc::SYS_symlinkat),
-            vec![Write {
+            vec![Create {
                 dirfd: Some(1),
                 path: 2,
                 dir: false,
@@ -180,22 +227,32 @@ fn table() -> Vec<(i64, Vec<Op>)> {
                     dirfd: Some(0),
                     path: 1,
                 },
-                Write {
+                Create {
                     dirfd: Some(2),
                     path: 3,
                     dir: false,
                 },
             ],
         ),
+        (s(libc::SYS_truncate), vec![Truncate { path: 0, len: 1 }]),
+        (s(libc::SYS_connect), vec![Connect]),
         (
-            s(libc::SYS_truncate),
-            vec![Write {
-                dirfd: None,
-                path: 0,
-                dir: false,
+            s(libc::SYS_fchmodat),
+            vec![Chmod {
+                dirfd: Some(0),
+                path: 1,
+                flags: None,
             }],
         ),
-        (s(libc::SYS_connect), vec![Connect]),
+        (
+            SYS_FCHMODAT2,
+            vec![Chmod {
+                dirfd: Some(0),
+                path: 1,
+                flags: Some(3),
+            }],
+        ),
+        (s(libc::SYS_fchmod), vec![Fchmod { fd: 0 }]),
     ];
     #[cfg(target_arch = "x86_64")]
     t.extend([
@@ -246,15 +303,16 @@ fn table() -> Vec<(i64, Vec<Op>)> {
         (s(libc::SYS_getdents), vec![List]),
         (
             s(libc::SYS_unlink),
-            vec![Write {
+            vec![Remove {
                 dirfd: None,
                 path: 0,
+                flags: None,
                 dir: false,
             }],
         ),
         (
             s(libc::SYS_mkdir),
-            vec![Write {
+            vec![Create {
                 dirfd: None,
                 path: 0,
                 dir: true,
@@ -262,30 +320,26 @@ fn table() -> Vec<(i64, Vec<Op>)> {
         ),
         (
             s(libc::SYS_rmdir),
-            vec![Write {
+            vec![Remove {
                 dirfd: None,
                 path: 0,
-                dir: false,
+                flags: None,
+                dir: true,
             }],
         ),
         (
             s(libc::SYS_rename),
-            vec![
-                Write {
-                    dirfd: None,
-                    path: 0,
-                    dir: false,
-                },
-                Write {
-                    dirfd: None,
-                    path: 1,
-                    dir: false,
-                },
-            ],
+            vec![Rename {
+                from_dirfd: None,
+                from: 0,
+                to_dirfd: None,
+                to: 1,
+                flags: None,
+            }],
         ),
         (
             s(libc::SYS_symlink),
-            vec![Write {
+            vec![Create {
                 dirfd: None,
                 path: 1,
                 dir: false,
@@ -298,29 +352,32 @@ fn table() -> Vec<(i64, Vec<Op>)> {
                     dirfd: None,
                     path: 0,
                 },
-                Write {
+                Create {
                     dirfd: None,
                     path: 1,
                     dir: false,
                 },
             ],
         ),
+        (
+            s(libc::SYS_chmod),
+            vec![Chmod {
+                dirfd: None,
+                path: 0,
+                flags: None,
+            }],
+        ),
     ]);
     // renameat (no flags) exists on both; it takes the same argument positions.
     t.push((
         s(libc::SYS_renameat),
-        vec![
-            Write {
-                dirfd: Some(0),
-                path: 1,
-                dir: false,
-            },
-            Write {
-                dirfd: Some(2),
-                path: 3,
-                dir: false,
-            },
-        ],
+        vec![Rename {
+            from_dirfd: Some(0),
+            from: 1,
+            to_dirfd: Some(2),
+            to: 3,
+            flags: None,
+        }],
     ));
     t
 }
@@ -376,14 +433,31 @@ fn decode(r: &libc::user_regs_struct) -> (i64, [u64; 6]) {
     )
 }
 
-struct Tracer {
+/// What priors need beyond the trace: where paths live, what is excluded, and how much
+/// content has been read so far.
+struct Rec<'a> {
+    phys: Physical,
+    ignore: &'a Ignore,
+    /// The root as the user spelled it; keys in reasons are relative to it.
+    root: PathBuf,
+    hashed: u64,
+}
+
+struct Tracer<'a> {
     ops: HashMap<i64, Vec<Op>>,
     cwds: HashMap<i32, PathBuf>,
     allow_network: bool,
+    /// Present when priors are recorded (not with `--no-record`).
+    rec: Option<Rec<'a>>,
     t: Trace,
 }
 
-pub fn run(argv: &[String], cwd: &Path, allow_network: bool) -> io::Result<Trace> {
+pub fn run<'a>(
+    argv: &[String],
+    cwd: &Path,
+    allow_network: bool,
+    scope: Option<&Scope<'a>>,
+) -> io::Result<Trace> {
     if argv.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty command"));
     }
@@ -432,6 +506,12 @@ pub fn run(argv: &[String], cwd: &Path, allow_network: bool) -> io::Result<Trace
         ops: tbl.into_iter().collect(),
         cwds: HashMap::new(),
         allow_network,
+        rec: scope.map(|s| Rec {
+            phys: Physical::new(s.root, &s.real_root),
+            ignore: s.ignore,
+            root: s.root.to_path_buf(),
+            hashed: 0,
+        }),
         t: Trace {
             status: 1,
             ..Trace::default()
@@ -586,7 +666,219 @@ fn describe_dest(sa: &[u8]) -> String {
     }
 }
 
-impl Tracer {
+/// Whether `e` says the path, or one of its parents, is not there.
+fn is_absent(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ENOTDIR)
+}
+
+fn is_dir(p: &Path) -> bool {
+    fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
+}
+
+/// A reason the planner cannot replay the run. The first one also stops content hashing.
+fn push_reason(t: &mut Trace, why: String) {
+    if t.unplannable.len() < MAX_REASONS && !t.unplannable.contains(&why) {
+        t.unplannable.push(why);
+    }
+}
+
+/// The id of a regular file whose content is not needed, by its executable bit.
+fn kind_id(exec: bool) -> String {
+    String::from(if exec { "xk" } else { "fk" })
+}
+
+/// The run looked at this path (lexical or physical) before its first write.
+fn read_before(t: &Trace, lex: &Path, phys: &Path) -> bool {
+    [lex, phys]
+        .iter()
+        .any(|p| t.touched.get(*p).is_some_and(|x| x.read))
+}
+
+impl Rec<'_> {
+    fn key_text(&self, lex: &Path) -> String {
+        to_key(&self.root, lex)
+    }
+
+    /// The repository key of a physical path, when the path is recordable: inside the
+    /// root, not under `.git`, not ignored. A non-UTF-8 name is refused with a reason.
+    fn key_of(&self, phys: &Path, t: &mut Trace) -> Option<String> {
+        let rel = self.phys.repo_rel(phys)?;
+        if rel.components().any(|c| c.as_os_str() == ".git") {
+            return None;
+        }
+        let text = rel.to_string_lossy();
+        if self.ignore.is_ignored(&text) {
+            return None;
+        }
+        match rel.to_str() {
+            Some(k) => Some(k.to_string()),
+            None => {
+                push_reason(
+                    t,
+                    format!("it used a path in the repository that is not valid UTF-8 ({text})"),
+                );
+                None
+            }
+        }
+    }
+
+    /// The first symlink on the spelled path below the root, as a key. A parent that moved
+    /// only because the root itself is reached through a link is not a repository symlink.
+    fn link_below_root(&self, lex: &Path) -> Option<String> {
+        let rel = lex.parent()?.strip_prefix(&self.root).ok()?;
+        let mut cur = self.root.clone();
+        for c in rel.components() {
+            cur.push(c);
+            if fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
+                return Some(to_key(&self.root, &cur));
+            }
+        }
+        None
+    }
+
+    /// Record a write to `raw` (absolute, possibly with `..`). `keeps`: the write keeps the
+    /// old bytes. `follows`: a symlink at `raw` is followed. Returns the key, when in scope.
+    fn write(&mut self, t: &mut Trace, raw: &Path, keeps: bool, follows: bool) -> Option<String> {
+        let lex = absolutize(Path::new("/"), raw);
+        // The write may change what cached parents resolve to.
+        self.phys.forget(&lex);
+        self.phys.forget(raw);
+        let mut target = raw.to_path_buf();
+        if follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink()) {
+            // The write lands on the link's target, which is not named here. A link whose
+            // link and target are both outside the repository is nothing to record.
+            let resolved = fs::canonicalize(raw).ok();
+            let link_path = self.phys.locate(raw)?.path;
+            let link_in_scope = self.key_of(&link_path, t).is_some();
+            let target_in_scope = match &resolved {
+                Some(r) => {
+                    let target_path = self.phys.locate(r)?.path;
+                    self.key_of(&target_path, t).is_some()
+                }
+                None => false,
+            };
+            if !link_in_scope && !target_in_scope {
+                return None;
+            }
+            let link = self.key_text(&lex);
+            push_reason(t, format!("it wrote through the symlink {link}"));
+            target = resolved?;
+        }
+        let loc = self.phys.locate(&target)?;
+        let key = self.key_of(&loc.path, t)?;
+        if loc.redirected {
+            if let Some(link) = self.link_below_root(&lex) {
+                push_reason(t, format!("it wrote through the symlink {link}"));
+            }
+        }
+        if !t.priors.contains_key(&key) {
+            // A create fails when its parent is missing or is not a directory. A later commit
+            // that adds the parent would change that outcome, so the parent's state is recorded.
+            self.parent_prior(t, &loc.path);
+            let lex_target = absolutize(Path::new("/"), &target);
+            if let Some(id) = self.prior_id(t, &loc.path, &key, &lex_target, keeps) {
+                t.priors.insert(key.clone(), id);
+            }
+        }
+        t.keys.insert(loc.path, key.clone());
+        Some(key)
+    }
+
+    fn parent_prior(&mut self, t: &mut Trace, phys: &Path) {
+        let Some(parent) = phys.parent() else { return };
+        let Some(pkey) = self.key_of(parent, t) else {
+            return;
+        };
+        if t.priors.contains_key(&pkey) {
+            return;
+        }
+        match fs::symlink_metadata(parent) {
+            Err(e) if is_absent(&e) => {
+                t.priors.insert(pkey, "a".to_string());
+            }
+            Ok(m) if m.is_file() => {
+                if let Some(id) = self.prior_id(t, parent, &pkey, parent, false) {
+                    t.priors.insert(pkey, id);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// What `phys` holds right now, in the id form a proof uses. `None` when it cannot be
+    /// stated (and the run is then unplannable with a reason).
+    fn prior_id(
+        &mut self,
+        t: &mut Trace,
+        phys: &Path,
+        key: &str,
+        lex: &Path,
+        keeps: bool,
+    ) -> Option<String> {
+        let m = match fs::symlink_metadata(phys) {
+            Ok(m) => m,
+            Err(e) if is_absent(&e) => return Some("a".to_string()),
+            Err(_) => {
+                push_reason(
+                    t,
+                    format!("could not read what {key} held before the run wrote it"),
+                );
+                return None;
+            }
+        };
+        let ft = m.file_type();
+        if ft.is_symlink() {
+            return match fs::read_link(phys)
+                .ok()
+                .and_then(|p| p.into_os_string().into_string().ok())
+            {
+                Some(target) => Some(format!("l:{target}")),
+                None => {
+                    push_reason(
+                        t,
+                        format!("the link {key} points to a path that is not valid UTF-8"),
+                    );
+                    None
+                }
+            };
+        }
+        if ft.is_dir() {
+            return Some("d".to_string());
+        }
+        if !ft.is_file() {
+            push_reason(t, format!("{key} is a special file"));
+            return None;
+        }
+        let exec = m.mode() & 0o111 != 0;
+        if !(keeps || read_before(t, lex, phys)) {
+            return Some(kind_id(exec));
+        }
+        let size = m.len();
+        if size > MAX_FILE_BYTES || self.hashed + size > MAX_RUN_BYTES {
+            push_reason(
+                t,
+                format!("{key} is too large to record before the run wrote it ({size} bytes)"),
+            );
+            return Some(kind_id(exec));
+        }
+        if !t.unplannable.is_empty() {
+            // The proof cannot replay anyway: record kinds only.
+            return Some(kind_id(exec));
+        }
+        match hash_file(phys) {
+            Ok(h) => {
+                self.hashed += size;
+                Some(file_id(exec, &h))
+            }
+            Err(_) => {
+                push_reason(t, format!("could not read {key} before the run wrote it"));
+                None
+            }
+        }
+    }
+}
+
+impl Tracer<'_> {
     fn flag(&mut self, why: &str) {
         if self.t.unsound.len() < 16 && !self.t.unsound.iter().any(|u| u == why) {
             self.t.unsound.push(why.to_string());
@@ -602,6 +894,8 @@ impl Tracer {
         Some(c)
     }
 
+    /// The path a call names, joined onto its directory. Not normalized: the kernel
+    /// resolves `..` through symlinks, and so must the physical lookups.
     fn resolve(
         &mut self,
         pid: i32,
@@ -629,19 +923,35 @@ impl Tracer {
         }
         let p = PathBuf::from(OsString::from_vec(raw));
         if p.is_absolute() {
-            return Some(absolutize(Path::new("/"), &p));
+            return Some(p);
         }
         let base = match dirfd.map(|i| args[i] as i32) {
             None | Some(AT_FDCWD) => self.cwd(pid),
             Some(fd) => std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok(),
         };
         match base {
-            Some(b) => Some(absolutize(&b, &p)),
+            Some(b) => Some(b.join(&p)),
             None => {
                 self.flag("could not resolve a relative path");
                 None
             }
         }
+    }
+
+    fn touch(&mut self, lex: PathBuf, read: bool) {
+        self.t.touched.entry(lex).or_default().read |= read;
+    }
+
+    /// Record a write, and what the path held before the first one. Returns the key when in scope.
+    fn write(&mut self, raw: &Path, keeps: bool, follows: bool) -> Option<String> {
+        // A write through a link changes what the link points to, not the link itself.
+        let through_link =
+            follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink());
+        if !through_link {
+            self.t.written.insert(absolutize(Path::new("/"), raw));
+        }
+        let rec = self.rec.as_mut()?;
+        rec.write(&mut self.t, raw, keeps, follows)
     }
 
     /// Sockets that name services use. A shell or libc touches these on startup, and
@@ -688,6 +998,135 @@ impl Tracer {
         }
     }
 
+    fn open(
+        &mut self,
+        pid: i32,
+        args: &[u64; 6],
+        dirfd: Option<usize>,
+        path: usize,
+        flags: Option<usize>,
+    ) {
+        let Some(p) = self.resolve(pid, args, dirfd, path) else {
+            return;
+        };
+        match flags.map(|i| args[i] as i32) {
+            // An O_TMPFILE open writes nothing; the later linkat names the file.
+            Some(f) if f & libc::O_TMPFILE == libc::O_TMPFILE => {
+                self.touch(absolutize(Path::new("/"), &p), false);
+            }
+            // creat truncates, so the old bytes do not survive.
+            None => {
+                self.write(&p, false, true);
+            }
+            Some(f) => {
+                let writes = f
+                    & (libc::O_WRONLY
+                        | libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_TRUNC
+                        | libc::O_APPEND)
+                    != 0;
+                if writes {
+                    let keeps = f & libc::O_TRUNC == 0;
+                    let creates_exclusively = f & libc::O_CREAT != 0 && f & libc::O_EXCL != 0;
+                    let follows = f & libc::O_NOFOLLOW == 0 && !creates_exclusively;
+                    self.write(&p, keeps, follows);
+                } else {
+                    self.touch(absolutize(Path::new("/"), &p), true);
+                }
+            }
+        }
+    }
+
+    fn create(&mut self, pid: i32, args: &[u64; 6], dirfd: Option<usize>, path: usize, dir: bool) {
+        let Some(p) = self.resolve(pid, args, dirfd, path) else {
+            return;
+        };
+        if dir {
+            // mkdir on a path that exists fails with EEXIST and creates nothing: `mkdir -p`
+            // and `create_dir_all` do this for every ancestor. The existence is an input.
+            if fs::symlink_metadata(&p).is_ok() {
+                self.touch(absolutize(Path::new("/"), &p), false);
+                return;
+            }
+            self.t.created_dirs.push(absolutize(Path::new("/"), &p));
+        }
+        self.write(&p, false, false);
+    }
+
+    fn remove(
+        &mut self,
+        pid: i32,
+        args: &[u64; 6],
+        dirfd: Option<usize>,
+        path: usize,
+        flags: Option<usize>,
+        dir: bool,
+    ) {
+        let Some(p) = self.resolve(pid, args, dirfd, path) else {
+            return;
+        };
+        let removes_dir = dir || flags.is_some_and(|i| args[i] as i32 & AT_REMOVEDIR != 0);
+        // Read the directory's contents before the call, while they are still there.
+        let key = self.write(&p, false, false);
+        if let Some(key) = key.filter(|_| removes_dir && is_dir(&p)) {
+            if let Ok(mut entries) = fs::read_dir(&p) {
+                if entries.next().is_some() {
+                    push_reason(
+                        &mut self.t,
+                        format!("it removed the non-empty directory {key}"),
+                    );
+                }
+            }
+        }
+    }
+
+    fn rename(
+        &mut self,
+        pid: i32,
+        args: &[u64; 6],
+        from: (Option<usize>, usize),
+        to: (Option<usize>, usize),
+        flags: Option<usize>,
+    ) {
+        let (Some(a), Some(b)) = (
+            self.resolve(pid, args, from.0, from.1),
+            self.resolve(pid, args, to.0, to.1),
+        ) else {
+            return;
+        };
+        let exchange = flags.is_some_and(|i| args[i] as u32 & RENAME_EXCHANGE != 0);
+        let directory = is_dir(&a) || (exchange && is_dir(&b));
+        // The source's bytes move with it; the destination's survive only an exchange.
+        let ka = self.write(&a, true, false);
+        let kb = self.write(&b, exchange, false);
+        if directory && (ka.is_some() || kb.is_some()) {
+            let name = |k: Option<String>, p: &Path| {
+                k.unwrap_or_else(|| absolutize(Path::new("/"), p).to_string_lossy().into_owned())
+            };
+            let (from_s, to_s) = (name(ka, &a), name(kb, &b));
+            push_reason(
+                &mut self.t,
+                format!("it renamed the directory {from_s} to {to_s}"),
+            );
+        }
+    }
+
+    /// A chmod or fchmod. Mode changes are writes: the executable bit is part of a file's id.
+    /// The bytes survive a mode change, so the content is recorded too.
+    fn chmod(&mut self, raw: &Path, follows: bool) {
+        if !raw.is_absolute() {
+            return;
+        }
+        match fs::symlink_metadata(raw) {
+            Ok(m) if m.is_dir() => self.touch(absolutize(Path::new("/"), raw), false),
+            Ok(_) => {
+                self.write(raw, true, follows);
+            }
+            Err(_) => {}
+        }
+    }
+
     fn on_syscall(&mut self, pid: i32) {
         let Some(regs) = get_regs(pid) else {
             self.flag("could not read registers");
@@ -702,60 +1141,60 @@ impl Tracer {
         };
         for op in ops {
             match op {
-                Op::Open { dirfd, path, flags } => {
-                    let Some(p) = self.resolve(pid, &args, dirfd, path) else {
-                        continue;
-                    };
-                    let write = match flags {
-                        None => true, // creat
-                        Some(i) => {
-                            let f = args[i] as i32;
-                            f & (libc::O_WRONLY
-                                | libc::O_RDWR
-                                | libc::O_CREAT
-                                | libc::O_TRUNC
-                                | libc::O_APPEND)
-                                != 0
-                        }
-                    };
-                    if write {
-                        self.t.written.insert(p);
-                    } else {
-                        self.t.touched.entry(p).or_insert(false);
-                    }
-                }
+                Op::Open { dirfd, path, flags } => self.open(pid, &args, dirfd, path, flags),
                 Op::Look { dirfd, path } | Op::Exec { dirfd, path } => {
                     if let Some(p) = self.resolve(pid, &args, dirfd, path) {
-                        self.t.touched.entry(p).or_insert(false);
+                        self.touch(absolutize(Path::new("/"), &p), true);
                     }
                 }
                 Op::List => {
                     let fd = args[0] as i32;
                     if let Ok(p) = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
-                        self.t.touched.insert(p, true);
+                        self.t.touched.entry(p).or_default().listed = true;
                     }
                 }
                 Op::Chdir { path } => {
                     if let Some(p) = self.resolve(pid, &args, None, path) {
-                        self.t.touched.entry(p).or_insert(false);
+                        self.touch(absolutize(Path::new("/"), &p), false);
                     }
                     // Threads can share a cwd, so any chdir drops every cached value.
                     self.cwds.clear();
                 }
                 Op::Fchdir => self.cwds.clear(),
-                Op::Write { dirfd, path, dir } => {
+                Op::Create { dirfd, path, dir } => self.create(pid, &args, dirfd, path, dir),
+                Op::Remove {
+                    dirfd,
+                    path,
+                    flags,
+                    dir,
+                } => self.remove(pid, &args, dirfd, path, flags, dir),
+                Op::Rename {
+                    from_dirfd,
+                    from,
+                    to_dirfd,
+                    to,
+                    flags,
+                } => self.rename(pid, &args, (from_dirfd, from), (to_dirfd, to), flags),
+                Op::Truncate { path, len } => {
+                    if let Some(p) = self.resolve(pid, &args, None, path) {
+                        // Truncating to zero drops the old bytes; any other length keeps some.
+                        self.write(&p, (args[len] as i64) > 0, true);
+                    }
+                }
+                Op::Chmod { dirfd, path, flags } => {
                     if let Some(p) = self.resolve(pid, &args, dirfd, path) {
-                        if dir {
-                            // We see the call before it runs. mkdir on a path that already
-                            // exists fails with EEXIST and creates nothing: `create_dir_all`
-                            // and `mkdir -p` do this for every ancestor, and recording those
-                            // would turn the whole repository into "output".
-                            if std::fs::symlink_metadata(&p).is_ok() {
-                                continue;
-                            }
-                            self.t.created_dirs.push(p.clone());
+                        let nofollow =
+                            flags.is_some_and(|i| args[i] as i32 & AT_SYMLINK_NOFOLLOW != 0);
+                        self.chmod(&p, !nofollow);
+                    }
+                }
+                Op::Fchmod { fd } => {
+                    // The fd was opened by name; its path is the file's physical location.
+                    if let Ok(p) = std::fs::read_link(format!("/proc/{pid}/fd/{}", args[fd] as i32))
+                    {
+                        if !p.to_string_lossy().ends_with(" (deleted)") {
+                            self.chmod(&p, false);
                         }
-                        self.t.written.insert(p);
                     }
                 }
                 Op::Unsound(why) => self.flag(why),

@@ -292,8 +292,9 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
         &pathutil::to_key(&root, &cwd),
         matrix.as_deref(),
     ));
-    o.ignore.push(script.to_string());
-    o.ignore
+    // The script's name changes with every run; it excludes, but a proof never stores it.
+    o.transient.push(script.to_string());
+    o.transient
         .push(pathutil::to_key(&root, std::path::Path::new(script)));
     o.mention = String::from_utf8_lossy(&body).into_owned();
     let mut argv = vec![

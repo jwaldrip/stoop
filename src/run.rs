@@ -2,11 +2,11 @@
 
 use crate::ignore::Ignore;
 use crate::input::{identify, par_map, verify, Input};
-use crate::pathutil::{absolutize, to_key};
+use crate::pathutil::{absolutize, to_key, Physical};
 use crate::proof::{now, sanitize, Proof, Store};
 use crate::sync::Remote;
 use crate::trace::{self, Trace};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Instant;
@@ -18,6 +18,9 @@ pub struct Opts {
     pub store: Option<PathBuf>,
     pub env: Vec<String>,
     pub ignore: Vec<String>,
+    /// Patterns for paths that exist for one run only, such as a CI step's script file. They
+    /// exclude like any other pattern, but a proof never stores them.
+    pub transient: Vec<String>,
     pub no_record: bool,
     pub quiet: bool,
     /// Environment variables exempted from the whole-environment input.
@@ -439,7 +442,20 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
         run_probes(&o.probes, &cwd, o.quiet)
     };
     // Declaring a probe is declaring the external dependency, so network use is accepted.
-    let trace = match trace::run(&o.argv, &cwd, o.allow_network || !o.probes.is_empty()) {
+    // The ignore set and the scope are fixed before the run: priors are recorded against them.
+    let ignore = Ignore::new(&o.ignore, Some(&root.join(".stoopignore")), &o.transient);
+    let real_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+    let scope = (!o.no_record).then(|| trace::Scope {
+        root: &root,
+        real_root: real_root.clone(),
+        ignore: &ignore,
+    });
+    let trace = match trace::run(
+        &o.argv,
+        &cwd,
+        o.allow_network || !o.probes.is_empty(),
+        scope.as_ref(),
+    ) {
         Ok(t) => t,
         Err(e) => {
             if !o.quiet {
@@ -496,12 +512,13 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
         }
     };
 
-    // 3. It passed: write down what it read.
-    let ignore = Ignore::new(&o.ignore, Some(&root.join(".stoopignore")));
-    match build_inputs(&root, &trace, &ignore) {
-        Ok(inputs) => {
+    // 3. It passed: write down what it read, what it wrote, and what each written path held before.
+    let mut phys = Physical::new(&root, &real_root);
+    let written: BTreeSet<String> = trace.keys.values().cloned().collect();
+    match build_inputs(&root, &mut phys, &trace, &ignore, &written) {
+        Ok((inputs, read_reasons)) => {
             let n = inputs.len();
-            let outputs = build_outputs(&root, &trace, &ignore);
+            let (outputs, removed, write_reasons) = build_outputs(&real_root, &written);
             let proof = Proof {
                 created: now(),
                 argv: o.argv.clone(),
@@ -509,10 +526,13 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
                 inputs,
                 outputs,
                 probes,
-                removed: Vec::new(),
-                ignore: None,
-                priors: None,
-                unplannable: Vec::new(),
+                removed,
+                ignore: Some(ignore.patterns()),
+                priors: Some(build_priors(&trace)),
+                unplannable: merge_reasons(
+                    &trace.unplannable,
+                    read_reasons.into_iter().chain(write_reasons).collect(),
+                ),
             };
             let digest = proof.digest();
             if let Some(r) = remote.as_ref().filter(|r| r.write) {
@@ -574,69 +594,148 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
     }
 }
 
-/// What the run left behind inside the repository: created or rewritten files and
-/// directories that still exist. Ignored paths are exempt, which is how a report
-/// file nobody needs is kept from blocking skips.
-pub fn build_outputs(root: &Path, trace: &Trace, ignore: &Ignore) -> Vec<Input> {
-    let mut paths: Vec<(PathBuf, String)> = trace
-        .written
+/// What the run left behind inside the repository, read once it finished: one entry for each
+/// in-scope path it wrote. Still there is an output. Gone again is removed, and the planner
+/// removes it with the step. Unreadable or special is a reason the planner cannot replay.
+pub fn build_outputs(
+    real_root: &Path,
+    written: &BTreeSet<String>,
+) -> (Vec<Input>, Vec<String>, Vec<String>) {
+    let keys: Vec<&String> = written.iter().collect();
+    let ids = par_map(&keys, |k| {
+        identify(&real_root.join(k.as_str()), true, false)
+    });
+    let mut outputs = Vec::new();
+    let mut removed = Vec::new();
+    let mut reasons = Vec::new();
+    for (key, id) in keys.into_iter().zip(ids) {
+        match id {
+            None => reasons.push(format!("it left {key} unreadable")),
+            Some(id) if id == "u" => reasons.push(format!("it left {key} unreadable")),
+            Some(id) if id == "a" => removed.push(key.clone()),
+            Some(id) => outputs.push(Input {
+                path: key.clone(),
+                id,
+            }),
+        }
+    }
+    if written.contains(".stoopignore") {
+        reasons.push("it wrote .stoopignore, which the proof's ignore set was read from".into());
+    }
+    (outputs, removed, reasons)
+}
+
+/// The state of each in-scope path before the run first wrote it, sorted by path.
+pub fn build_priors(trace: &Trace) -> Vec<Input> {
+    trace
+        .priors
         .iter()
-        .filter(|p| p.starts_with(root))
-        .map(|p| (p.clone(), to_key(root, p)))
-        .filter(|(_, k)| {
-            !k.is_empty() && !ignore.is_ignored(k) && !k.split('/').any(|c| c == ".git")
-        })
-        .collect();
-    paths.sort();
-    let ids = par_map(&paths, |(p, _)| identify(p, true, false));
-    paths
-        .into_iter()
-        .zip(ids)
-        .filter_map(|((_, key), id)| match id {
-            // Gone again (a temp file): not an output. Unreadable: leave it out.
-            Some(id) if id != "a" && id != "u" => Some(Input { path: key, id }),
-            _ => None,
+        .map(|(path, id)| Input {
+            path: path.clone(),
+            id: id.clone(),
         })
         .collect()
 }
 
-/// Turn what the tracer saw into comparable inputs, or say why it cannot be trusted.
-pub fn build_inputs(root: &Path, trace: &Trace, ignore: &Ignore) -> Result<Vec<Input>, String> {
+/// The proof's reasons: the tracer's first, then the rest, deduplicated and capped at 16.
+fn merge_reasons(first: &[String], more: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for why in first.iter().cloned().chain(more) {
+        if out.len() < 16 && !out.contains(&why) {
+            out.push(why);
+        }
+    }
+    out
+}
+
+/// What the run read, as comparable inputs, or why it cannot be trusted. A read of a path the
+/// run wrote is not an input: it reads the run's own output. A read through a link or a
+/// symlinked directory is also recorded under the key of the file it reached, so a change to
+/// that file is seen. The second value holds reasons the planner cannot replay the run.
+pub fn build_inputs(
+    root: &Path,
+    phys: &mut Physical,
+    trace: &Trace,
+    ignore: &Ignore,
+    written: &BTreeSet<String>,
+) -> Result<(Vec<Input>, Vec<String>), String> {
     if let Some(u) = trace.unsound.first() {
         return Err(u.clone());
     }
-    let mut cands: Vec<(PathBuf, String, bool, bool)> = Vec::new(); // (path, key, listed, inside)
+    let real_root = phys.real().to_path_buf();
+    phys.prefetch(
+        trace
+            .touched
+            .keys()
+            .filter_map(|p| p.parent().map(Path::to_path_buf)),
+    );
+    let mut reasons: Vec<String> = Vec::new();
     let mut reads_git = false;
-    for (path, &listed) in &trace.touched {
-        let inside = path.starts_with(root);
-        let key = to_key(root, path);
-        if key.is_empty() || ignore.is_ignored(&key) || trace.is_output(path) {
+    // (path to identify, key, inside the root, entries listed)
+    let mut cands: Vec<(PathBuf, String, bool, bool)> = Vec::new();
+    for (lex, touch) in &trace.touched {
+        let inside = lex.starts_with(root);
+        let key = to_key(root, lex);
+        let physical = phys.locate(lex).map(|l| l.path);
+        // The same entry reached under its physical name, when that differs from the spelled one.
+        if let Some(pp) = &physical {
+            if let Some(rel) = phys.repo_rel(pp) {
+                match rel.to_str() {
+                    None => reasons.push(format!(
+                        "it used a path in the repository that is not valid UTF-8 ({})",
+                        rel.to_string_lossy()
+                    )),
+                    Some(pkey) if pkey != key => {
+                        if rel.components().any(|c| c.as_os_str() == ".git") {
+                            if !ignore.is_ignored(pkey) {
+                                reads_git = true;
+                            }
+                        } else if ignore.is_ignored(pkey) {
+                        } else if written.contains(pkey) {
+                            reasons.push(format!("it read {pkey} through {key} and also wrote it"));
+                        } else {
+                            cands.push((pp.clone(), pkey.to_string(), true, touch.listed));
+                        }
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        if key.is_empty() || ignore.is_ignored(&key) {
+            continue;
+        }
+        if inside
+            && lex
+                .strip_prefix(root)
+                .ok()
+                .and_then(|r| r.to_str())
+                .is_none()
+        {
+            reasons.push(format!(
+                "it used a path in the repository that is not valid UTF-8 ({key})"
+            ));
+            continue;
+        }
+        let written_physically = physical
+            .as_deref()
+            .and_then(|pp| phys.repo_rel(pp))
+            .and_then(|r| r.to_str())
+            .is_some_and(|k| written.contains(k));
+        if trace.is_output(lex) || written_physically {
             continue;
         }
         if inside && key.split('/').any(|c| c == ".git") {
             reads_git = true;
             continue;
         }
-        cands.push((path.clone(), key, listed, inside));
+        cands.push((lex.clone(), key, inside, touch.listed));
     }
-    if reads_git {
-        return Err("it reads .git, so a skip could hide a history change (add `.git` to .stoopignore if that read cannot change the result)".into());
-    }
-    let ids = par_map(&cands, |(p, _, listed, inside)| {
-        let id = identify(p, *inside, *listed);
-        // A symlink hides a second file; record where it points too.
-        let target = match id.as_deref() {
-            Some(s) if s.starts_with("l:") => std::fs::canonicalize(p).ok(),
-            _ => None,
-        };
-        let tid = target
-            .as_ref()
-            .and_then(|t| identify(t, t.starts_with(root), false));
-        (id, target, tid)
-    });
     let mut out: Vec<Input> = Vec::with_capacity(cands.len());
-    let mut seen = std::collections::HashSet::new();
-    for ((_, key, _, _), (id, target, tid)) in cands.iter().zip(ids) {
+    let mut seen: HashSet<String> = HashSet::new();
+    let ids = par_map(&cands, |(p, _, inside, listed)| {
+        identify(p, *inside, *listed)
+    });
+    for ((_, key, _, _), id) in cands.iter().zip(ids) {
         if let Some(id) = id {
             if seen.insert(key.clone()) {
                 out.push(Input {
@@ -645,15 +744,68 @@ pub fn build_inputs(root: &Path, trace: &Trace, ignore: &Ignore) -> Result<Vec<I
                 });
             }
         }
-        if let (Some(t), Some(tid)) = (target, tid) {
-            let tk = to_key(root, &t);
-            if !ignore.is_ignored(&tk) && !trace.is_output(&t) && seen.insert(tk.clone()) {
-                out.push(Input { path: tk, id: tid });
+    }
+    // A symlink hides a second file: record where it points, whether or not the link is
+    // ignored (an alias under an ignored /tmp can point into the repository).
+    for lex in trace.touched.keys() {
+        if !std::fs::symlink_metadata(lex).is_ok_and(|m| m.file_type().is_symlink()) {
+            continue;
+        }
+        let Ok(target) = std::fs::canonicalize(lex) else {
+            continue;
+        };
+        let link_key = to_key(root, lex);
+        match target.strip_prefix(&real_root) {
+            Ok(rel) if !rel.as_os_str().is_empty() => {
+                let Some(tkey) = rel.to_str() else {
+                    reasons.push(format!(
+                        "it used a path in the repository that is not valid UTF-8 ({})",
+                        rel.to_string_lossy()
+                    ));
+                    continue;
+                };
+                if rel.components().any(|c| c.as_os_str() == ".git") {
+                    if !ignore.is_ignored(tkey) {
+                        reads_git = true;
+                    }
+                    continue;
+                }
+                if ignore.is_ignored(tkey) {
+                    continue;
+                }
+                if written.contains(tkey) {
+                    reasons.push(format!(
+                        "it read {tkey} through {link_key} and also wrote it"
+                    ));
+                    continue;
+                }
+                if let Some(id) = identify(&target, true, false) {
+                    if seen.insert(tkey.to_string()) {
+                        out.push(Input {
+                            path: tkey.to_string(),
+                            id,
+                        });
+                    }
+                }
+            }
+            _ => {
+                let tk = to_key(root, &target);
+                if ignore.is_ignored(&link_key) || ignore.is_ignored(&tk) {
+                    continue;
+                }
+                if let Some(id) = identify(&target, false, false) {
+                    if seen.insert(tk.clone()) {
+                        out.push(Input { path: tk, id });
+                    }
+                }
             }
         }
     }
+    if reads_git {
+        return Err("it reads .git, so a skip could hide a history change (add `.git` to .stoopignore if that read cannot change the result)".into());
+    }
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(out)
+    Ok((out, reasons))
 }
 
 #[cfg(test)]

@@ -882,5 +882,72 @@ fn no_record_checks_but_never_writes() {
     assert!(!skipped(&e), "{e}");
 }
 
+// ---- the executable bit is part of a file's identity ----------------------------------
+
+fn set_exec(p: &Path, exec: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if exec { 0o755 } else { 0o644 };
+    fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[test]
+fn chmod_minus_x_on_an_input_reruns() {
+    let w = Ws::new("chmodinput");
+    w.write("s.sh", "echo hi\n");
+    set_exec(&w.root.join("s.sh"), true);
+    let script = "cat s.sh > /dev/null";
+    let (c, e) = w.sh(script);
+    assert_eq!(c, 0, "{e}");
+    assert!(skipped(&w.sh(script).1));
+    set_exec(&w.root.join("s.sh"), false);
+    let (_, e) = w.sh(script);
+    assert!(!skipped(&e) && e.contains("s.sh changed"), "{e}");
+}
+
+#[test]
+fn a_step_that_chmods_reruns_in_a_fresh_checkout() {
+    let w = Ws::new("chmodfresh");
+    w.write("s.sh", "echo hi\n");
+    let script = "chmod +x s.sh";
+    let (c, e) = w.sh(script);
+    assert_eq!(c, 0, "{e}");
+    // A fresh checkout has the same bytes, without the mode the step produced.
+    set_exec(&w.root.join("s.sh"), false);
+    let (_, e) = w.sh(script);
+    assert!(!skipped(&e) && e.contains("output s.sh changed"), "{e}");
+}
+
+#[test]
+fn upgrading_reruns_executables_once() {
+    let w = Ws::new("upgrade");
+    w.write("s.sh", "echo hi\n");
+    set_exec(&w.root.join("s.sh"), true);
+    let script = "cat s.sh > /dev/null";
+    assert_eq!(w.sh(script).0, 0);
+    assert!(skipped(&w.sh(script).1));
+    // A proof written before the bit was part of the id holds `f:` for this executable.
+    let store = w.root.with_file_name(format!(
+        "{}-store",
+        w.root.file_name().unwrap().to_string_lossy()
+    ));
+    let file = store.join("proofs").join("t.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    for p in v["proofs"].as_array_mut().unwrap() {
+        for input in p["inputs"].as_array_mut().unwrap() {
+            if input["path"] == "s.sh" {
+                let id = input["id"].as_str().unwrap().replacen("x:", "f:", 1);
+                input["id"] = id.into();
+            }
+        }
+    }
+    fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
+    let (_, e) = w.sh(script);
+    assert!(
+        !skipped(&e) && e.contains("s.sh changed"),
+        "it reruns once: {e}"
+    );
+    assert!(skipped(&w.sh(script).1), "and then skips");
+}
+
 #[allow(dead_code)]
 fn _unused(_: &Path) {}

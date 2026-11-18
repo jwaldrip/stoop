@@ -1,7 +1,8 @@
 //! What a command read, as comparable fingerprints.
 //!
 //! An input is a path plus an id describing its state:
-//! - `f:<hash>`  regular file (hash of every byte)
+//! - `f:<hash>`  regular file with no execute bit (hash of every byte)
+//! - `x:<hash>`  regular file with an execute bit set (the same hash; the bit is part of the identity)
 //! - `a`         does not exist (recorded only inside the root)
 //! - `d`         directory that was looked at, not listed
 //! - `dl:<hash>` directory whose entries were listed
@@ -11,6 +12,7 @@ use crate::pathutil::from_key;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -20,7 +22,8 @@ pub struct Input {
     pub id: String,
 }
 
-#[allow(dead_code)] // Used by the recorder and planner in the next slices.
+/// Identity of a regular file: a hash of its bytes, and whether any execute bit is set.
+/// The bit is part of the identity, so `chmod +x` changes the id of a file a run read.
 pub fn file_id(exec: bool, hex: &str) -> String {
     format!("{}:{hex}", if exec { "x" } else { "f" })
 }
@@ -58,7 +61,7 @@ pub fn identify(path: &Path, inside: bool, listed: bool) -> Option<String> {
                 }
             } else if ft.is_file() {
                 match hash_file(path) {
-                    Ok(h) => Some(format!("f:{h}")),
+                    Ok(h) => Some(file_id(m.mode() & 0o111 != 0, &h)),
                     Err(_) => inside.then(|| "u".to_string()),
                 }
             } else {
@@ -84,7 +87,7 @@ fn list_hash(dir: &Path) -> Option<String> {
 }
 
 /// Every byte counts, whatever the file is: source, binary, archive, model weights.
-fn hash_file(path: &Path) -> io::Result<String> {
+pub fn hash_file(path: &Path) -> io::Result<String> {
     let mut f = fs::File::open(path)?;
     let mut h = blake3::Hasher::new();
     h.update_reader(&mut f)?;
