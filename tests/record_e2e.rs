@@ -1098,6 +1098,94 @@ fn reads_before_final_symlink_changes_keep_call_time_target() {
 }
 
 #[test]
+fn every_read_through_a_retargeted_directory_keeps_its_call_time_target() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    for spelling in ["plain", "dotdot", "outside", "exec"] {
+        for position in ["first", "second"] {
+            let w = Ws::new(&format!("directory-target-{spelling}-{position}"));
+            for dir in ["d1", "d2"] {
+                w.write(&format!("{dir}/a.txt"), &format!("a {dir}\n"));
+                w.write(&format!("{dir}/f.txt"), &format!("f {dir}\n"));
+                w.write(
+                    &format!("{dir}/run.sh"),
+                    &format!("#!/bin/sh\necho {dir}\n"),
+                );
+                fs::set_permissions(
+                    w.root.join(dir).join("run.sh"),
+                    fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+            }
+            symlink("d1", w.root.join("dl")).unwrap();
+            let outside = w.root.with_extension("outside");
+            let _ = fs::remove_dir_all(&outside);
+            fs::create_dir(&outside).unwrap();
+            symlink(w.root.join("d1"), outside.join("dl")).unwrap();
+            let prefix = match spelling {
+                "dotdot" => "dl/../dl".to_owned(),
+                "outside" => outside.join("dl").display().to_string(),
+                _ => "dl".to_owned(),
+            };
+            let target = if spelling == "exec" {
+                "run.sh"
+            } else {
+                "f.txt"
+            };
+            let read = if spelling == "exec" {
+                format!("{prefix}/{target} >/dev/null")
+            } else {
+                format!("cat {prefix}/{target} >/dev/null")
+            };
+            let setup = format!("test -e {prefix}/a.txt");
+            let ordered = if position == "first" {
+                format!("{read}; {setup}")
+            } else {
+                format!("{setup}; {read}")
+            };
+            let retarget = if spelling == "outside" {
+                format!("ln -sfn \"$PWD/d2\" {prefix}")
+            } else {
+                "ln -sfn d2 dl".to_owned()
+            };
+            let p = recorded(&w, &format!("{ordered}; {retarget}"));
+            let key = format!("d1/{target}");
+            assert!(
+                pairs(&p, "inputs").iter().any(|(path, _)| path == &key),
+                "{spelling} {position}: {:?}",
+                pairs(&p, "inputs")
+            );
+            let _ = fs::remove_dir_all(outside);
+        }
+    }
+}
+
+#[test]
+fn execve_through_unkeyable_proc_fd_is_not_recorded() {
+    use std::os::unix::fs::PermissionsExt;
+    for method in ["memfd", "deleted"] {
+        let w = Ws::new(&format!("procfd-{method}"));
+        w.write("interp", "#!/bin/sh\nexit 0\n");
+        w.write("prog.sh", "#!./interp\n");
+        for f in ["interp", "prog.sh"] {
+            fs::set_permissions(w.root.join(f), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let setup = if method == "memfd" {
+            "f=os.memfd_create(\"x\", 0); os.write(f, open(\"prog.sh\", \"rb\").read())"
+        } else {
+            "f=os.open(\"prog.sh\", os.O_RDONLY); os.unlink(\"prog.sh\")"
+        };
+        let (status, err) = w.sh(&format!(
+            "python3 -c 'import os; {setup}; os.execv(\"/proc/self/fd/%d\" % f, [\"x\"])'"
+        ));
+        assert_eq!(status, 0, "{method}: {err}");
+        assert!(
+            err.contains("not recorded") && err.contains("unkeyable file descriptor"),
+            "{method}: {err}"
+        );
+    }
+}
+
+#[test]
 fn removing_alias_target_invalidates_other_spelling() {
     let w = Ws::new("topology-remove");
     w.write("sub1/keep", "one");
@@ -1218,6 +1306,33 @@ fn namespace_change_attempt_is_not_recorded() {
         "{err}"
     );
     assert!(!w.store().join("proofs/t.json").exists());
+}
+
+#[test]
+fn mount_api_and_namespace_clone_attempts_are_not_recorded() {
+    for op in [
+        "mount",
+        "umount2",
+        "chroot",
+        "pivot_root",
+        "setns",
+        "open_tree",
+        "move_mount",
+        "fsopen",
+        "fsconfig",
+        "fsmount",
+        "fspick",
+        "mount_setattr",
+        "clone",
+        "clone3",
+    ] {
+        let w = Ws::new(&format!("namespace-{op}"));
+        w.syscall_probe();
+        let (status, err) = w.sh(&format!("./syscall-probe namespace-call {op}"));
+        assert_eq!(status, 0, "{op}: {err}");
+        assert!(err.contains("not recorded"), "{op}: {err}");
+        assert!(!w.store().join("proofs/t.json").exists(), "{op}: {err}");
+    }
 }
 
 #[test]

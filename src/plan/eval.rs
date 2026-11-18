@@ -1127,6 +1127,30 @@ mod tests {
     }
 
     #[test]
+    fn older_recorder_is_blocked_on_custom_runner_host_fallback() {
+        for (version, expected) in [(2, Code::ProofPlatform), (3, Code::Proved)] {
+            let mut f = Fixture::new();
+            f.spec.runs_on = serde_json::json!("custom-runner");
+            let mut p = proof(vec![]);
+            p.provenance.as_mut().unwrap().version = version;
+            f.install(vec![p]);
+            let mut record = f.jobs.load("job-test").remove(0);
+            record.host.insert("os".into(), "Linux".into());
+            record.host.insert("arch".into(), "X64".into());
+            f.jobs.save("job-test", record).unwrap();
+            let result = f.decide(BTreeMap::new());
+            assert_eq!(
+                result.code, expected,
+                "version {version}: {}",
+                result.detail
+            );
+            if version == 2 {
+                assert!(result.detail.contains("recorder too old: re-record"));
+            }
+        }
+    }
+
+    #[test]
     fn recorder_semantics_floor_tracks_the_production_tracer_version() {
         assert_eq!(
             MIN_PLANNABLE_RECORDER_VERSION,

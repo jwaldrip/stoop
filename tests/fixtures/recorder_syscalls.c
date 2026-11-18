@@ -3,6 +3,7 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <linux/sched.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -14,6 +15,32 @@ int main(int argc, char **argv) {
     if (!strcmp(op, "unshare")) {
         (void)syscall(SYS_unshare, 0);
         return 0;
+    }
+    if (!strcmp(op, "namespace-call")) {
+        struct { const char *name; long nr; } cases[] = {
+            {"mount", SYS_mount}, {"umount2", SYS_umount2},
+            {"chroot", SYS_chroot}, {"pivot_root", SYS_pivot_root}, {"setns", SYS_setns},
+            {"open_tree", SYS_open_tree}, {"move_mount", SYS_move_mount},
+            {"fsopen", SYS_fsopen}, {"fsconfig", SYS_fsconfig},
+            {"fsmount", SYS_fsmount}, {"fspick", SYS_fspick},
+            {"mount_setattr", SYS_mount_setattr},
+        };
+        for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+            if (!strcmp(argv[2], cases[i].name)) {
+                (void)syscall(cases[i].nr, -1, NULL, -1, NULL, -1, NULL);
+                return 0;
+            }
+        }
+        if (!strcmp(argv[2], "clone")) {
+            (void)syscall(SYS_clone, CLONE_NEWUSER | CLONE_THREAD, NULL, NULL, NULL, 0);
+            return 0;
+        }
+        if (!strcmp(argv[2], "clone3")) {
+            struct clone_args args = { .flags = CLONE_NEWUSER | CLONE_THREAD };
+            (void)syscall(SYS_clone3, &args, sizeof(args));
+            return 0;
+        }
+        return 2;
     }
     if (!strcmp(op, "pipe-fd")) {
         int pipefds[2];
