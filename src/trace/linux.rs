@@ -12,7 +12,7 @@
 use super::{Scope, Trace};
 use crate::ignore::Ignore;
 use crate::input::{file_id, hash_file};
-use crate::pathutil::{absolutize, to_key, Physical};
+use crate::pathutil::{absolutize, to_key, without_dots, Physical};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CString, OsString};
 use std::fs;
@@ -733,6 +733,99 @@ fn is_dir(p: &Path) -> bool {
     fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
 }
 
+/// Read an ELF PT_INTERP pathname without loading the executable into memory.
+fn elf_interpreter(file: &mut fs::File, header: &[u8]) -> io::Result<Option<PathBuf>> {
+    use std::io::{Read, Seek, SeekFrom};
+    if !header.starts_with(b"\x7fELF") {
+        return Ok(None);
+    }
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid ELF header");
+    if header.len() < 64 || !matches!(header[4], 1 | 2) || !matches!(header[5], 1 | 2) {
+        return Err(invalid());
+    }
+    let little = header[5] == 1;
+    let u16_at = |b: &[u8], i| {
+        let x: [u8; 2] = b[i..i + 2].try_into().unwrap();
+        if little {
+            u16::from_le_bytes(x)
+        } else {
+            u16::from_be_bytes(x)
+        }
+    };
+    let u32_at = |b: &[u8], i| {
+        let x: [u8; 4] = b[i..i + 4].try_into().unwrap();
+        if little {
+            u32::from_le_bytes(x)
+        } else {
+            u32::from_be_bytes(x)
+        }
+    };
+    let u64_at = |b: &[u8], i| {
+        let x: [u8; 8] = b[i..i + 8].try_into().unwrap();
+        if little {
+            u64::from_le_bytes(x)
+        } else {
+            u64::from_be_bytes(x)
+        }
+    };
+    let wide = header[4] == 2;
+    let (phoff, entsize, count, need) = if wide {
+        (
+            u64_at(header, 32),
+            u16_at(header, 54) as u64,
+            u16_at(header, 56) as u64,
+            56usize,
+        )
+    } else {
+        (
+            u32_at(header, 28) as u64,
+            u16_at(header, 42) as u64,
+            u16_at(header, 44) as u64,
+            32usize,
+        )
+    };
+    if count == 0 {
+        return Ok(None);
+    }
+    let length = file.metadata()?.len();
+    let total = entsize.checked_mul(count).ok_or_else(invalid)?;
+    if entsize < need as u64
+        || total > 65536
+        || phoff.checked_add(total).is_none_or(|end| end > length)
+    {
+        return Err(invalid());
+    }
+    let mut program = [0u8; 56];
+    for i in 0..count {
+        file.seek(SeekFrom::Start(phoff + i * entsize))?;
+        file.read_exact(&mut program[..need])?;
+        if u32_at(&program, 0) != 3 {
+            continue;
+        }
+        let (offset, size) = if wide {
+            (u64_at(&program, 8), u64_at(&program, 32))
+        } else {
+            (u32_at(&program, 4) as u64, u32_at(&program, 16) as u64)
+        };
+        if size < 2
+            || size > PATH_MAX as u64
+            || offset.checked_add(size).is_none_or(|end| end > length)
+        {
+            return Err(invalid());
+        }
+        let mut target = [0u8; PATH_MAX];
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(&mut target[..size as usize])?;
+        if target[size as usize - 1] != 0 || target[..size as usize - 1].contains(&0) {
+            return Err(invalid());
+        }
+        return Ok(Some(PathBuf::from(OsString::from_vec(
+            target[..size as usize - 1].to_vec(),
+        ))));
+    }
+    Ok(None)
+}
+
 fn proc_magic_link(path: &Path) -> bool {
     let parts: Vec<&str> = path.iter().filter_map(|part| part.to_str()).collect();
     if parts.len() < 4 || parts[1] != "proc" || !parts[2].bytes().all(|b| b.is_ascii_digit()) {
@@ -1131,7 +1224,7 @@ impl Tracer<'_> {
         }
         let p = PathBuf::from(OsString::from_vec(raw));
         if p.is_absolute() {
-            return self.map_magic_path(pid, p);
+            return self.map_magic_path(pid, without_dots(&p));
         }
         let base = match dirfd.map(|i| args[i] as i32) {
             None | Some(AT_FDCWD) => self.cwd(pid),
@@ -1142,7 +1235,7 @@ impl Tracer<'_> {
                 self.flag("it accessed a deleted directory through a file descriptor");
                 None
             }
-            Some(b) => self.map_magic_path(pid, b.join(&p)),
+            Some(b) => self.map_magic_path(pid, without_dots(&b.join(&p))),
             None => {
                 self.flag("could not resolve a relative path");
                 None
@@ -1159,46 +1252,71 @@ impl Tracer<'_> {
         self.t.touched.entry(lex).or_default().read |= read;
     }
 
-    /// Linux opens a shebang interpreter in the kernel, without a traceable open syscall.
-    fn exec_path(&mut self, pid: i32, path: PathBuf) {
+    /// The kernel loads shebang and ELF interpreters without a traceable open syscall.
+    fn exec_path(&mut self, pid: i32, mut path: PathBuf) {
         use std::io::Read;
-        self.touch(path.clone(), true);
-        let mut bytes = [0u8; 256];
-        let Ok(mut file) = fs::File::open(&path) else {
-            return;
-        };
-        let Ok(n) = file.read(&mut bytes) else { return };
-        let Some(rest) = bytes[..n].strip_prefix(b"#!") else {
-            return;
-        };
-        let rest = rest.split(|b| *b == b'\n').next().unwrap_or_default();
-        let start = rest.iter().position(|b| !matches!(*b, b' ' | b'\t'));
-        let Some(start) = start else { return };
-        let name = rest[start..]
-            .split(|b| matches!(*b, b' ' | b'\t' | b'\r'))
-            .next()
-            .unwrap_or_default();
-        if name.is_empty() {
+        if self.rec.is_none() {
             return;
         }
-        let interpreter = PathBuf::from(OsString::from_vec(name.to_vec()));
-        let absolute = if interpreter.is_absolute() {
-            interpreter
-        } else if let Some(cwd) = self.cwd(pid) {
-            cwd.join(interpreter)
-        } else {
-            self.flag("could not resolve a shebang interpreter");
+        // Linux permits at most four recursive script interpreters.
+        for _ in 0..=4 {
+            self.touch(path.clone(), true);
+            let mut bytes = [0u8; 256];
+            let Ok(mut file) = fs::File::open(&path) else {
+                return;
+            };
+            let Ok(n) = file.read(&mut bytes) else { return };
+            if let Some(rest) = bytes[..n].strip_prefix(b"#!") {
+                let rest = rest.split(|b| *b == b'\n').next().unwrap_or_default();
+                let Some(start) = rest.iter().position(|b| !matches!(*b, b' ' | b'\t')) else {
+                    return;
+                };
+                let name = rest[start..]
+                    .split(|b| matches!(*b, b' ' | b'\t'))
+                    .next()
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    return;
+                }
+                let interpreter = PathBuf::from(OsString::from_vec(name.to_vec()));
+                let absolute = if interpreter.is_absolute() {
+                    interpreter
+                } else if let Some(cwd) = self.cwd(pid) {
+                    without_dots(&cwd.join(interpreter))
+                } else {
+                    self.flag("could not resolve a shebang interpreter");
+                    return;
+                };
+                let Some(next) = self.map_magic_path(pid, absolute) else {
+                    return;
+                };
+                path = next;
+                continue;
+            }
+            match elf_interpreter(&mut file, &bytes[..n]) {
+                Ok(Some(interpreter)) => {
+                    let absolute = if interpreter.is_absolute() {
+                        interpreter
+                    } else if let Some(cwd) = self.cwd(pid) {
+                        without_dots(&cwd.join(interpreter))
+                    } else {
+                        self.flag("could not resolve an ELF interpreter");
+                        return;
+                    };
+                    if let Some(interpreter) = self.map_magic_path(pid, absolute) {
+                        self.touch(interpreter, true);
+                    }
+                }
+                Ok(None) => {}
+                Err(_) => self.flag("could not inspect an ELF interpreter"),
+            }
             return;
-        };
-        if let Some(interpreter) = self.map_magic_path(pid, absolute) {
-            self.touch(interpreter, true);
         }
     }
 
     /// Record a write, and what the path held before the first one. Returns the key when in scope.
     fn write(&mut self, raw: &Path, follows: bool) -> Option<String> {
         self.rec.as_ref()?;
-        self.magic_epoch = self.magic_epoch.wrapping_add(1);
         // A write through a link changes what the link points to, not the link itself.
         let through_link =
             follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink());
@@ -1209,6 +1327,15 @@ impl Tracer<'_> {
         }
         let rec = self.rec.as_mut()?;
         rec.write(&mut self.t, raw, follows)
+    }
+
+    /// An alias topology change invalidates cache entries under every spelling.
+    fn topology_changed(&mut self) {
+        self.magic_epoch = self.magic_epoch.wrapping_add(1);
+        if let Some(rec) = &mut self.rec {
+            rec.phys.clear();
+            rec.link_walks.clear();
+        }
     }
 
     /// Sockets that name services use. A shell or libc touches these on startup, and
@@ -1306,6 +1433,9 @@ impl Tracer<'_> {
                 return;
             }
         }
+        if !dir {
+            self.topology_changed();
+        }
         self.write(&p, false);
         if dir {
             if let Some(loc) = self.rec.as_mut().and_then(|r| r.phys.locate(&p)) {
@@ -1327,6 +1457,9 @@ impl Tracer<'_> {
             return;
         };
         let removes_dir = dir || flags.is_some_and(|i| args[i] as i32 & AT_REMOVEDIR != 0);
+        if fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir() || m.file_type().is_symlink()) {
+            self.topology_changed();
+        }
         // Read the directory's contents before the call, while they are still there.
         let key = self.write(&p, false);
         if let Some(key) = key.filter(|_| removes_dir && is_dir(&p)) {
@@ -1357,6 +1490,11 @@ impl Tracer<'_> {
         };
         let exchange = flags.is_some_and(|i| args[i] as u32 & RENAME_EXCHANGE != 0);
         let directory = is_dir(&a) || (exchange && is_dir(&b));
+        if [&a, &b].iter().any(|p| {
+            fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() || m.file_type().is_symlink())
+        }) {
+            self.topology_changed();
+        }
         let ka = self.write(&a, false);
         let kb = self.write(&b, false);
         if directory && (ka.is_some() || kb.is_some()) {

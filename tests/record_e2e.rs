@@ -51,9 +51,23 @@ impl Ws {
 
     /// `stoop run` in the workspace, as a CI step would, with key `t`. Returns (exit, stderr).
     fn sh(&self, script: &str) -> (i32, String) {
+        self.sh_in(script, &self.root)
+    }
+
+    fn sh_in(&self, script: &str, cwd: &std::path::Path) -> (i32, String) {
         let out = Command::new(env!("CARGO_BIN_EXE_stoop"))
-            .args(["run", "--root", ".", "--key", "t", "--", "sh", "-c", script])
-            .current_dir(&self.root)
+            .args([
+                "run",
+                "--root",
+                self.root.to_str().unwrap(),
+                "--key",
+                "t",
+                "--",
+                "sh",
+                "-c",
+                script,
+            ])
+            .current_dir(cwd)
             .env("STOOP_STORE", self.store())
             .env_remove("STOOP_FULL")
             .env_remove("STOOP_OFF")
@@ -753,7 +767,7 @@ fn regenerate_planner_recorder_fixtures() {
     let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recorder");
     fs::create_dir_all(&out).unwrap();
     for case in [
-        "sed", "mkdir", "rename", "eol", "chmod", "parent", "failed", "symlink", "proc",
+        "sed", "mkdir", "rename", "eol", "chmod", "parent", "failed", "symlink", "proc", "app",
     ] {
         let w = Ws::new(&format!("fixture-{case}"));
         let script = match case {
@@ -790,9 +804,25 @@ fn regenerate_planner_recorder_fixtures() {
                 w.write("config.txt", "old content");
                 "cat /proc/self/cwd/config.txt >/dev/null; echo new > config.txt"
             }
+            "app" => {
+                w.write("app/build.sh", "#!/bin/sh\ncat input.txt >/dev/null\n");
+                w.write("app/input.txt", "app input");
+                fs::set_permissions(
+                    w.root.join("app/build.sh"),
+                    fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+                "./build.sh"
+            }
             _ => unreachable!(),
         };
-        let _ = recorded(&w, script);
+        if case == "app" {
+            let (status, err) = w.sh_in(script, &w.root.join("app"));
+            assert_eq!(status, 0, "{err}");
+            assert!(err.contains("stoop: recorded"), "{err}");
+        } else {
+            let _ = recorded(&w, script);
+        }
         let fixture = out.join(case);
         fs::create_dir_all(&fixture).unwrap();
         fs::copy(w.store().join("proofs/t.json"), fixture.join("proof.json")).unwrap();
@@ -928,5 +958,54 @@ fn unresolved_numeric_process_alias_refuses_recording() {
     assert!(
         err.contains("not recorded") && err.contains("process path alias"),
         "{err}"
+    );
+}
+
+#[test]
+fn retargeting_an_alias_via_a_different_spelling_clears_parent_cache() {
+    let w = Ws::new("nested-outside-alias");
+    w.write("sub/keep", "keep");
+    let outside = std::env::temp_dir().join(format!("stoop-nested-alias-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&outside);
+    fs::create_dir(&outside).unwrap();
+    let x = outside.join("x");
+    let y = outside.join("y");
+    fs::create_dir(&y).unwrap();
+    std::os::unix::fs::symlink(&y, &x).unwrap();
+    std::os::unix::fs::symlink(&w.root, y.join("alias")).unwrap();
+    let script = format!(
+        "echo a > {}/alias/f; rm {}/alias; ln -s {}/sub {}/alias; echo b > {}/alias/g",
+        x.display(),
+        y.display(),
+        w.root.display(),
+        y.display(),
+        x.display()
+    );
+    let p = recorded(&w, &script);
+    let _ = fs::remove_dir_all(outside);
+    assert!(
+        pairs(&p, "outputs").iter().any(|(key, _)| key == "sub/g"),
+        "{:?}",
+        pairs(&p, "outputs")
+    );
+}
+
+#[test]
+fn retargeting_a_release_link_via_another_alias_records_the_new_target() {
+    let w = Ws::new("nested-release-alias");
+    w.write("build/build-1/keep", "one");
+    w.write("build/build-2/keep", "two");
+    std::os::unix::fs::symlink("build/current", w.root.join("out")).unwrap();
+    std::os::unix::fs::symlink("build-1", w.root.join("build/current")).unwrap();
+    let p = recorded(
+        &w,
+        "echo a > out/f; ln -sfn build-2 build/current; echo b > out/g",
+    );
+    assert!(
+        pairs(&p, "outputs")
+            .iter()
+            .any(|(key, _)| key == "build/build-2/g"),
+        "{:?}",
+        pairs(&p, "outputs")
     );
 }

@@ -1058,6 +1058,24 @@ mod tests {
                 None,
                 Code::ProofPlatform,
             ),
+            (
+                "custom-runner",
+                Some(("linux", "x86_64", "ptrace-seccomp")),
+                Some(("Windows", "X64")),
+                Code::ProofPlatform,
+            ),
+            (
+                "custom-runner",
+                Some(("linux", "riscv64", "ptrace-seccomp")),
+                Some(("Linux", "riscv64")),
+                Code::ProofPlatform,
+            ),
+            (
+                "custom-runner",
+                Some(("windows", "x86_64", "ptrace-seccomp")),
+                Some(("Windows", "X64")),
+                Code::ProofPlatform,
+            ),
         ];
         for (label, provenance, host, expected) in cases {
             let mut f = Fixture::new();
@@ -1079,6 +1097,32 @@ mod tests {
             let result = f.decide(BTreeMap::new());
             assert_eq!(result.code, expected, "{label}: {}", result.detail);
         }
+    }
+
+    #[test]
+    fn legacy_proof_with_old_digest_reports_missing_provenance() {
+        let mut f = Fixture::new();
+        let mut p = proof(vec![]);
+        p.provenance = None;
+        f.install(vec![p.clone()]);
+        let mut raw = serde_json::to_value(&p).unwrap();
+        raw.as_object_mut().unwrap().remove("provenance");
+        let file = serde_json::json!({"v": 1, "key": "sh-0", "proofs": [raw]});
+        fs::write(
+            f.root.join("store/proofs/sh-0.json"),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        let mut record = f.jobs.load("job-test").remove(0);
+        record.steps[0].proof = "p-old-digest".into();
+        f.jobs.save("job-test", record).unwrap();
+        let result = f.decide(BTreeMap::new());
+        assert_eq!(result.code, Code::ProofPlatform, "{}", result.detail);
+        assert!(
+            result.detail.contains("proof lacks provenance"),
+            "{}",
+            result.detail
+        );
     }
     #[test]
     fn skips_when_every_input_matches() {

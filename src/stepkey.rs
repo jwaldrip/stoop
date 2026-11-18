@@ -26,6 +26,18 @@ pub fn sh_key(
     format!("sh-{}", &h.finalize().to_hex()[..20])
 }
 
+/// Apply the repository identity used when a proof store is shared across roots.
+pub fn scoped(key: &str, scope: Option<&str>) -> String {
+    let Some(scope) = scope else {
+        return key.to_string();
+    };
+    let mut h = blake3::Hasher::new();
+    h.update(key.as_bytes());
+    h.update(&[0]);
+    h.update(scope.as_bytes());
+    format!("sh-{}", &h.finalize().to_hex()[..20])
+}
+
 pub fn canonical_matrix(raw: &str) -> Result<Option<String>, String> {
     if raw.trim().is_empty() {
         return Ok(None);

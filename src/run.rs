@@ -85,7 +85,7 @@ pub fn store_for(o: &Opts, cwd: &Path, root: &Path) -> PathBuf {
 
 /// Scope a shared store to a repository. A configured origin identifies checkouts
 /// of the same repository; without one the physical root is the safe fallback.
-fn shared_scope(root: &Path, store: &Path) -> Option<String> {
+pub(crate) fn shared_scope(root: &Path, store: &Path) -> Option<String> {
     if store == root.join(".stoop") {
         return None;
     }
@@ -355,13 +355,7 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
         .as_deref()
         .map(|key| {
             if o.shell_key {
-                if let Some(scope) = &scope {
-                    let mut h = blake3::Hasher::new();
-                    h.update(key.as_bytes());
-                    h.update(&[0]);
-                    h.update(scope.as_bytes());
-                    return format!("sh-{}", &h.finalize().to_hex()[..20]);
-                }
+                return crate::stepkey::scoped(key, scope.as_deref());
             }
             sanitize(key)
         })
@@ -901,9 +895,19 @@ pub fn build_inputs(
         if !std::fs::symlink_metadata(lex).is_ok_and(|m| m.file_type().is_symlink()) {
             continue;
         }
+        // Proc magic links are resolved while the tracee is stopped. Resolving them
+        // here would instead use the recorder's own process and working directory.
+        if std::fs::read_link(lex)
+            .is_ok_and(|target| target.starts_with("/proc") || target.starts_with("/dev/fd"))
+        {
+            continue;
+        }
         let Ok(target) = std::fs::canonicalize(lex) else {
             continue;
         };
+        if target == real_root {
+            continue;
+        }
         let link_key = to_key(root, lex);
         match target.strip_prefix(&real_root) {
             Ok(rel) if !rel.as_os_str().is_empty() => {

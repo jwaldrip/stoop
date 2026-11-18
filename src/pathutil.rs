@@ -27,6 +27,12 @@ pub fn absolutize(base: &Path, p: &Path) -> PathBuf {
     out
 }
 
+/// Remove `.` components without collapsing `..` across symlinks.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn without_dots(path: &Path) -> PathBuf {
+    path.components().collect()
+}
+
 /// Root-relative text for paths under `root`, absolute text otherwise.
 /// A relative result never starts with `/`, so the two cannot collide.
 pub fn to_key(root: &Path, p: &Path) -> String {
@@ -176,6 +182,12 @@ impl Physical {
             self.parents.remove(&key);
         }
     }
+
+    /// A topology change can invalidate aliases under unrelated spellings.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn clear(&mut self) {
+        self.parents.clear();
+    }
 }
 
 #[cfg(test)]
@@ -192,6 +204,14 @@ mod tests {
         assert_eq!(
             absolutize(b, Path::new("/etc/../usr")),
             PathBuf::from("/usr")
+        );
+    }
+
+    #[test]
+    fn removes_dot_components_without_collapsing_parent_components() {
+        assert_eq!(
+            without_dots(Path::new("/repo/./link/../file")),
+            PathBuf::from("/repo/link/../file")
         );
     }
 

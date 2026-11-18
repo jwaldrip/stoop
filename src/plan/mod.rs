@@ -254,7 +254,25 @@ fn build<S: attest::KeySource>(
     let workflow = gha::workflow::parse(path, &text)?;
     out["workflow"] = json!(workflow.name);
     let cx = gha::context::GhCtx::from_env()?;
-    let specs = gha::workflow::job_specs_with_allow(&workflow, &cx, &o.plan_job, &o.allowed);
+    let cwd = std::env::current_dir().map_err(|e| format!("cannot read working directory: {e}"))?;
+    let physical_root =
+        std::fs::canonicalize(root).map_err(|e| format!("cannot resolve root: {e}"))?;
+    let store_opts = run::Opts {
+        store: o.store.clone(),
+        ..Default::default()
+    };
+    let dir = run::store_for(&store_opts, &cwd, &physical_root);
+    let scope = run::shared_scope(&physical_root, &dir);
+    let mut specs = gha::workflow::job_specs_with_allow(&workflow, &cx, &o.plan_job, &o.allowed);
+    if scope.is_some() {
+        for spec in &mut specs {
+            for step in &mut spec.steps {
+                if let StepSpec::Traced { key, .. } = step {
+                    *key = crate::stepkey::scoped(key, scope.as_deref());
+                }
+            }
+        }
+    }
     if o.explain {
         eprintln!("stoop: STOOP_ALLOW_USES actions are assumed side-effect free by the workflow author's assertion");
         if !o.allowed.is_empty() {
@@ -349,11 +367,6 @@ fn build<S: attest::KeySource>(
         },
         None => o.max_age,
     };
-    let dir = o
-        .store
-        .clone()
-        .or_else(|| run::env_str("STOOP_STORE").map(PathBuf::from))
-        .unwrap_or_else(|| root.join(".stoop"));
     let proofs = proof::Store::new(dir.clone());
     let jobs = job::JobStore::new(dir);
     if let Some(remote) = o.sync.clone().or_else(|| run::env_str("STOOP_SYNC")) {

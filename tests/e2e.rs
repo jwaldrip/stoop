@@ -1173,5 +1173,106 @@ fn outside_symlink_to_proc_self_cwd_uses_tracee_directory() {
     assert!(!skipped(&second), "{second}");
 }
 
+#[test]
+fn nested_shebang_interpreter_changes_rerun() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let w = Ws::new("nested-shebang");
+    fs::copy("/bin/sh", w.root.join("interp")).unwrap();
+    w.write("wrap", "#!./interp\necho wrapped\n");
+    w.write("script", "#!./wrap\n");
+    for name in ["wrap", "script"] {
+        fs::set_permissions(w.root.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(w.sh("./script").0, 0);
+    assert!(skipped(&w.sh("./script").1));
+    fs::OpenOptions::new()
+        .append(true)
+        .open(w.root.join("interp"))
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    assert!(!skipped(&w.sh("./script").1));
+}
+
+#[test]
+fn relative_shebang_interpreter_is_resolved_from_the_tracee_cwd() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let w = Ws::new("shebang-relative-cwd");
+    w.write("sub/keep", "keep");
+    fs::copy("/bin/sh", w.root.join("sub/interp")).unwrap();
+    w.write("script", "#!./interp\necho hello\n");
+    fs::set_permissions(w.root.join("script"), fs::Permissions::from_mode(0o755)).unwrap();
+    let command = "cd sub && ../script";
+    assert_eq!(w.sh(command).0, 0);
+    assert!(skipped(&w.sh(command).1));
+    fs::OpenOptions::new()
+        .append(true)
+        .open(w.root.join("sub/interp"))
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    assert!(!skipped(&w.sh(command).1));
+}
+
+#[test]
+fn changing_an_in_repository_elf_loader_reruns() {
+    use std::io::Write;
+    let w = Ws::new("elf-loader");
+    let loader = if cfg!(target_arch = "x86_64") {
+        "/lib64/ld-linux-x86-64.so.2"
+    } else {
+        "/lib/ld-linux-aarch64.so.1"
+    };
+    fs::copy(loader, w.root.join("myld.so")).unwrap();
+    w.write("main.c", "int main(void) { return 0; }\n");
+    let linker = format!("-Wl,--dynamic-linker={}", w.root.join("myld.so").display());
+    let build = Command::new("cc")
+        .current_dir(&w.root)
+        .args(["main.c", "-o", "program", &linker])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert_eq!(w.sh("./program").0, 0);
+    assert!(skipped(&w.sh("./program").1));
+    fs::OpenOptions::new()
+        .append(true)
+        .open(w.root.join("myld.so"))
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    assert!(!skipped(&w.sh("./program").1));
+}
+
+#[test]
+fn retargeting_a_directory_to_proc_cwd_invalidates_magic_epoch() {
+    let w = Ws::new("magic-epoch");
+    w.write("sub/config.txt", "old");
+    let script =
+        "cd sub && mkdir d && cat d/x; rm -r d && ln -s /proc/self/cwd d && cat d/config.txt";
+    let (status, first) = w.sh(script);
+    assert_eq!(status, 0, "{first}");
+    w.write("sub/config.txt", "new");
+    let (_, second) = w.sh(script);
+    assert!(!skipped(&second), "{second}");
+}
+
+#[test]
+fn final_component_symlink_to_proc_cwd_is_not_skipped_by_fast_path() {
+    let w = Ws::new("magic-final-link");
+    w.write("sub/config.txt", "old");
+    let script = "cd sub && ln -s /proc/self/cwd/config.txt x && test -e y; cat x";
+    let (status, first) = w.sh(script);
+    assert_eq!(status, 0, "{first}");
+    w.write("sub/config.txt", "new");
+    let (_, second) = w.sh(script);
+    assert!(!skipped(&second), "{second}");
+}
+
 #[allow(dead_code)]
 fn _unused(_: &Path) {}

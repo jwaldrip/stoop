@@ -82,6 +82,16 @@ impl Fixture {
                 std::os::unix::fs::symlink("sub/inner", root.join("link")).unwrap();
             }
             "proc" => put(&root, "config.txt", "old content"),
+            "app" => {
+                put(
+                    &root,
+                    "app/build.sh",
+                    "#!/bin/sh\ncat input.txt >/dev/null\n",
+                );
+                put(&root, "app/input.txt", "app input");
+                fs::set_permissions(root.join("app/build.sh"), fs::Permissions::from_mode(0o755))
+                    .unwrap();
+            }
             _ => panic!("unknown case"),
         }
         git(&root, &["init", "-q"]);
@@ -204,7 +214,9 @@ impl Drop for Fixture {
 #[test]
 fn real_recorded_proofs_reject_changed_input_and_prior_states() {
     use std::os::unix::fs::PermissionsExt;
-    for case in ["sed", "mkdir", "eol", "chmod", "parent", "failed", "proc"] {
+    for case in [
+        "sed", "mkdir", "eol", "chmod", "parent", "failed", "proc", "app",
+    ] {
         let f = Fixture::new(case);
         let control = f.decision();
         assert_eq!(control.code, Code::Proved, "{case}: {}", control.detail);
@@ -220,12 +232,13 @@ fn real_recorded_proofs_reject_changed_input_and_prior_states() {
             }
             "parent" => fs::remove_file(f.root.join("build/.keep")).unwrap(),
             "failed" => put(&f.root, "missing/.keep", "keep"),
+            "app" => put(&f.root, "app/input.txt", "changed"),
             _ => unreachable!(),
         }
         f.commit();
         let changed = f.decision();
         let expected = match case {
-            "mkdir" => Code::InputChanged,
+            "mkdir" | "app" => Code::InputChanged,
             "eol" => Code::Unplannable,
             _ => Code::PriorChanged,
         };
