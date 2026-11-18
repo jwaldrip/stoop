@@ -35,6 +35,7 @@ fn decision(code: Code, detail: String) -> Decision {
 fn valid_path(p: &str) -> bool {
     p == "."
         || (!p.is_empty()
+            && !p.contains('\u{fffd}')
             && !p.starts_with('/')
             && p.split('/').all(|s| !s.is_empty() && s != "." && s != ".."))
 }
@@ -59,6 +60,37 @@ struct VirtualTree<'a> {
     erased: BTreeSet<String>,
 }
 impl VirtualTree<'_> {
+    fn erased_at(&self, path: &str) -> bool {
+        self.erased.contains(path)
+            || path
+                .match_indices('/')
+                .any(|(i, _)| self.erased.contains(&path[..i]))
+    }
+    fn remove_descendants(&mut self, path: &str) {
+        let prefix = format!("{path}/");
+        let keys: Vec<_> = self
+            .overlay
+            .range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            self.overlay.remove(&key);
+        }
+    }
+    fn overlay_affects(&self, path: &str) -> bool {
+        self.overlay.contains_key(path)
+            || path
+                .match_indices('/')
+                .any(|(i, _)| self.overlay.contains_key(&path[..i]))
+            || {
+                let prefix = format!("{path}/");
+                self.overlay
+                    .range(prefix.clone()..)
+                    .next()
+                    .is_some_and(|(p, _)| p.starts_with(&prefix))
+            }
+    }
     fn direct(&mut self, p: &str, hidden: bool) -> Result<State, String> {
         if let Some(value) = self.overlay.get(p) {
             return match value {
@@ -71,12 +103,7 @@ impl VirtualTree<'_> {
                 _ => Err(format!("invalid output identity for {p}")),
             };
         }
-        if hidden
-            || self
-                .erased
-                .iter()
-                .any(|e| p == e || p.starts_with(&format!("{e}/")))
-        {
+        if hidden || self.erased_at(p) {
             return Ok(State::Absent);
         }
         if p == "." || p == ".git" {
@@ -163,13 +190,16 @@ impl VirtualTree<'_> {
                     format!("{p}/").into_bytes()
                 };
                 let mut names = self.tree.child_names_raw(if p == "." { "" } else { p });
-                for path in self.overlay.keys().map(|s| s.as_bytes()) {
-                    if let Some(rest) = path.strip_prefix(prefix.as_slice()) {
-                        if let Some(name) =
-                            rest.split(|b| *b == b'/').next().filter(|s| !s.is_empty())
-                        {
-                            names.insert(name.to_vec());
-                        }
+                let overlay_prefix = String::from_utf8(prefix.clone()).expect("UTF-8 path");
+                for (path, _) in self
+                    .overlay
+                    .range(overlay_prefix.clone()..)
+                    .take_while(|(path, _)| path.starts_with(&overlay_prefix))
+                {
+                    let rest = &path.as_bytes()[prefix.len()..];
+                    if let Some(name) = rest.split(|b| *b == b'/').next().filter(|s| !s.is_empty())
+                    {
+                        names.insert(name.to_vec());
                     }
                 }
                 if p == "." {
@@ -181,10 +211,7 @@ impl VirtualTree<'_> {
                     child.extend_from_slice(&name);
                     let present = match std::str::from_utf8(&child) {
                         Ok(child) => !matches!(self.state(child)?, State::Absent),
-                        Err(_) => !self
-                            .erased
-                            .iter()
-                            .any(|e| p == e || p.starts_with(&format!("{e}/"))),
+                        Err(_) => !self.erased_at(p),
                     };
                     if present {
                         hash.update(&(name.len() as u64).to_le_bytes());
@@ -202,6 +229,12 @@ fn known_github(name: &str) -> bool {
     name == "GITHUB_JOB" || crate::gha::context::VERIFIED_VARS.contains(&name)
 }
 
+fn sort_records(records: &mut [JobRecord]) {
+    records.sort_by_key(|r| {
+        std::cmp::Reverse((r.started, r.status == Some(RecordStatus::Failed), r.created))
+    });
+}
+
 pub fn decide(spec: &JobSpec, ctx: &mut PlanCtx<'_>) -> Decision {
     if let Some(blocked) = &spec.blocked {
         return decision(Code::Blocked, blocked.detail.clone());
@@ -210,12 +243,21 @@ pub fn decide(spec: &JobSpec, ctx: &mut PlanCtx<'_>) -> Decision {
         return decision(Code::Blocked, "job has no key".into());
     };
     let mut records = ctx.jobs.load(key);
-    records.sort_by_key(|r| std::cmp::Reverse((r.started, r.created)));
+    sort_records(&mut records);
     if records.is_empty() {
         return decision(Code::NoRecord, "no job record".into());
     }
     let mut newest = None;
     for record in &records {
+        if record.started == 0 {
+            if newest.is_none() {
+                newest = Some(decision(
+                    Code::Incomplete,
+                    "legacy record has no start time".into(),
+                ));
+            }
+            continue;
+        }
         let result = match record.status {
             Some(RecordStatus::Failed) => {
                 return decision(
@@ -242,6 +284,9 @@ pub fn decide(spec: &JobSpec, ctx: &mut PlanCtx<'_>) -> Decision {
             }
             _ => decision(Code::Incomplete, "record has not passed".into()),
         };
+        if result.code == Code::Error {
+            return result;
+        }
         if result.skip {
             return result;
         }
@@ -345,6 +390,19 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
     };
     for ((index, _, _), proof) in steps.iter().zip(&proofs) {
         for input in &proof.inputs {
+            if input.path.contains('\u{fffd}')
+                || !(input.id == "a"
+                    || input.id == "d"
+                    || input.id.starts_with("dl:")
+                    || input.id.starts_with("l:")
+                    || input.id.starts_with("f:")
+                    || input.id.starts_with("x:"))
+            {
+                return decision(
+                    Code::Unplannable,
+                    format!("step {index}: unsupported input {}", input.path),
+                );
+            }
             evidence.inputs += 1;
             if Path::new(&input.path).is_absolute() {
                 if record.event_path.as_deref() == Some(&input.path)
@@ -380,12 +438,7 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
                     )
                 }
             };
-            if tree.overlay.contains_key(&input.path)
-                || tree.overlay.keys().any(|p| {
-                    input.path.starts_with(&format!("{p}/"))
-                        || p.starts_with(&format!("{}/", input.path))
-                })
-            {
+            if tree.overlay_affects(&input.path) {
                 evidence.overlay += 1;
             } else if input.id.starts_with("f:") || input.id.starts_with("x:") {
                 evidence.hashed += 1;
@@ -443,14 +496,44 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
                 format!("recorded without prior states, and it wrote {path}"),
             );
         }
+        for out in &proof.outputs {
+            if !valid_path(&out.path)
+                || out.path == "."
+                || !(out.id == "d"
+                    || out.id.starts_with("f:")
+                    || out.id.starts_with("x:")
+                    || out.id.starts_with("l:")
+                    || out.id.starts_with("dl:"))
+            {
+                return decision(
+                    Code::Unplannable,
+                    format!("step {index}: invalid output {}", out.path),
+                );
+            }
+        }
+        for path in &proof.removed {
+            if !valid_path(path) || path == "." {
+                return decision(
+                    Code::Unplannable,
+                    format!("step {index}: invalid removal {path}"),
+                );
+            }
+        }
         if let Some(priors) = &proof.priors {
+            let prior_paths: BTreeSet<&str> = priors.iter().map(|p| p.path.as_str()).collect();
+            let changed_paths: BTreeSet<&str> = proof
+                .outputs
+                .iter()
+                .map(|p| p.path.as_str())
+                .chain(proof.removed.iter().map(String::as_str))
+                .collect();
             for path in proof
                 .outputs
                 .iter()
                 .map(|i| &i.path)
                 .chain(proof.removed.iter())
             {
-                if !priors.iter().any(|p| &p.path == path) {
+                if !prior_paths.contains(path.as_str()) {
                     return decision(
                         Code::Unplannable,
                         format!("output {path} has no prior state"),
@@ -458,6 +541,17 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
                 }
             }
             for prior in priors {
+                if prior.id == "a" && changed_paths.contains(prior.path.as_str()) {
+                    let parent = prior.path.rsplit_once('/').map_or(".", |(p, _)| p);
+                    if !prior_paths.contains(parent)
+                        && !matches!(tree.state(parent), Ok(State::Dir))
+                    {
+                        let why = format!("parent of {} is not a directory", prior.path);
+                        let mut result = decision(Code::PriorChanged, why.clone());
+                        result.mismatches.push((*index, prior.path.clone(), why));
+                        return result;
+                    }
+                }
                 evidence.priors += 1;
                 let actual = match tree.id(&prior.path, &prior.id) {
                     Ok(id) => id,
@@ -529,9 +623,9 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
                     let mut children = tree.tree.below(&prior.path);
                     children.extend(
                         tree.overlay
-                            .keys()
-                            .filter(|p| p.starts_with(&prefix))
-                            .cloned(),
+                            .range(prefix.clone()..)
+                            .take_while(|(p, _)| p.starts_with(&prefix))
+                            .map(|(p, _)| p.clone()),
                     );
                     children.sort();
                     children.dedup();
@@ -541,7 +635,7 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
                             Ok(_) => {}
                             Err(err) => return decision(Code::Unplannable, err),
                         }
-                        if !priors.iter().any(|p| p.path == child) {
+                        if !prior_paths.contains(child.as_str()) {
                             let why = "entry the run never saw".to_string();
                             let mut result =
                                 decision(Code::PriorChanged, format!("{child}: {why}"));
@@ -553,36 +647,15 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
             }
         }
         for out in &proof.outputs {
-            if !valid_path(&out.path)
-                || out.path == "."
-                || !(out.id == "d"
-                    || out.id.starts_with("f:")
-                    || out.id.starts_with("x:")
-                    || out.id.starts_with("l:")
-                    || out.id.starts_with("dl:"))
-            {
-                return decision(
-                    Code::InputChanged,
-                    format!("step {index}: invalid output {}", out.path),
-                );
-            }
             if out.id != "d" && !out.id.starts_with("dl:") {
                 tree.erased.insert(out.path.clone());
-                let prefix = format!("{}/", out.path);
-                tree.overlay.retain(|p, _| !p.starts_with(&prefix));
+                tree.remove_descendants(&out.path);
             }
             tree.overlay.insert(out.path.clone(), Some(out.id.clone()));
         }
         for path in &proof.removed {
-            if !valid_path(path) || path == "." {
-                return decision(
-                    Code::InputChanged,
-                    format!("step {index}: invalid removal {path}"),
-                );
-            }
             tree.erased.insert(path.clone());
-            let prefix = format!("{path}/");
-            tree.overlay.retain(|p, _| !p.starts_with(&prefix));
+            tree.remove_descendants(path);
             tree.overlay.insert(path.clone(), None);
         }
     }
@@ -607,7 +680,7 @@ mod tests {
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
     fn git(root: &Path, args: &[&str]) {
-        assert!(Command::new("git")
+        let output = Command::new("git")
             .current_dir(root)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -615,12 +688,16 @@ mod tests {
                 "-c",
                 "core.hooksPath=/dev/null",
                 "-c",
-                "commit.gpgsign=false"
+                "commit.gpgsign=false",
             ])
             .args(args)
-            .status()
-            .unwrap()
-            .success());
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
     struct Accept;
     impl RecordCheck for Accept {
@@ -694,11 +771,30 @@ mod tests {
         }
         fn install(&mut self, proofs: Vec<Proof>) {
             let mut records = vec![];
-            let mut virtual_tree = VirtualTree {
-                tree: &mut self.tree,
-                overlay: BTreeMap::new(),
-                erased: BTreeSet::new(),
-            };
+            let listed = Command::new("git")
+                .current_dir(&self.root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(["ls-tree", "-r", "-t", "-z", "HEAD"])
+                .output()
+                .unwrap();
+            assert!(listed.status.success());
+            let mut states: BTreeMap<String, String> = BTreeMap::new();
+            for entry in listed.stdout.split(|b| *b == 0).filter(|b| !b.is_empty()) {
+                let Some(tab) = entry.iter().position(|b| *b == b'\t') else {
+                    continue;
+                };
+                let Ok(path) = std::str::from_utf8(&entry[tab + 1..]) else {
+                    continue;
+                };
+                let id = match &entry[..6] {
+                    b"040000" => "d",
+                    b"100755" => "xk",
+                    b"100644" => "fk",
+                    _ => "l:unknown",
+                };
+                states.insert(path.into(), id.into());
+            }
             for (index, mut proof) in proofs.into_iter().enumerate() {
                 if proof.priors.as_ref().is_some_and(Vec::is_empty) {
                     let paths: Vec<String> = proof
@@ -709,15 +805,14 @@ mod tests {
                         .collect();
                     let mut priors = Vec::new();
                     for path in paths {
-                        let id = virtual_tree.id(&path, "fk").unwrap_or_else(|_| "a".into());
+                        let id = states.get(&path).cloned().unwrap_or_else(|| "a".into());
                         if id == "d" {
-                            for child in virtual_tree.tree.below(&path) {
-                                if !matches!(virtual_tree.state(&child), Ok(State::Absent)) {
-                                    priors.push(input(
-                                        &child,
-                                        &virtual_tree.id(&child, "fk").unwrap(),
-                                    ));
-                                }
+                            let prefix = format!("{path}/");
+                            for (child, child_id) in states
+                                .range(prefix.clone()..)
+                                .take_while(|(p, _)| p.starts_with(&prefix))
+                            {
+                                priors.push(input(child, child_id));
                             }
                         }
                         priors.push(input(&path, &id));
@@ -726,19 +821,14 @@ mod tests {
                 }
                 for out in &proof.outputs {
                     if out.id != "d" {
-                        virtual_tree.erased.insert(out.path.clone());
                         let pre = format!("{}/", out.path);
-                        virtual_tree.overlay.retain(|p, _| !p.starts_with(&pre));
+                        states.retain(|p, _| !p.starts_with(&pre));
                     }
-                    virtual_tree
-                        .overlay
-                        .insert(out.path.clone(), Some(out.id.clone()));
+                    states.insert(out.path.clone(), out.id.clone());
                 }
                 for path in &proof.removed {
-                    virtual_tree.erased.insert(path.clone());
                     let pre = format!("{path}/");
-                    virtual_tree.overlay.retain(|p, _| !p.starts_with(&pre));
-                    virtual_tree.overlay.insert(path.clone(), None);
+                    states.retain(|p, _| p != path && !p.starts_with(&pre));
                 }
                 let key = format!("sh-{index}");
                 self.spec.steps.push(StepSpec::Traced {
@@ -1228,10 +1318,12 @@ mod tests {
     #[test]
     fn implicit_overlay_directory_exists() {
         let mut f = Fixture::new();
-        let mut first = proof(vec![]);
-        first.outputs.push(input("gen/x", &file_id(b"x")));
-        f.install(vec![first, proof(vec![input("gen", "d")])]);
-        assert_eq!(f.decide(BTreeMap::new()).code, Code::Proved);
+        let mut virtual_tree = VirtualTree {
+            tree: &mut f.tree,
+            overlay: BTreeMap::from([("gen/x".into(), Some(file_id(b"x")))]),
+            erased: BTreeSet::new(),
+        };
+        assert!(matches!(virtual_tree.state("gen"), Ok(State::Dir)));
     }
     #[test]
     fn exact_age_limit_is_enforced() {
@@ -1574,5 +1666,342 @@ mod tests {
         f.install(vec![proof(vec![input("dir", &id)])]);
         assert_eq!(f.decide(BTreeMap::new()).code, Code::Proved);
         assert_eq!(f.tree.blob_reads(), 0);
+    }
+    #[test]
+    fn k_m12_output_under_a_file_ancestor() {
+        let mut f = Fixture::new();
+        fs::write(f.root.join("build"), b"file").unwrap();
+        git(&f.root, &["add", "build"]);
+        git(
+            &f.root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "-qm",
+                "file",
+            ],
+        );
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        let mut p = proof(vec![]);
+        p.outputs.push(input("build/out", &file_id(b"ok")));
+        p.priors = Some(vec![input("build/out", "a")]);
+        f.install(vec![p, proof(vec![input("build/out", &file_id(b"ok"))])]);
+        let d = f.decide(BTreeMap::new());
+        assert_eq!(d.code, Code::PriorChanged);
+        assert!(d.detail.contains("parent of build/out is not a directory"));
+    }
+    #[test]
+    fn k_n06_order_is_by_start_and_equal_failure_wins() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        let mut passed = f.jobs.load("job-test").remove(0);
+        passed.started = 100;
+        passed.created = 500;
+        f.jobs.save("job-test", passed.clone()).unwrap();
+        let mut failed = passed;
+        failed.started = 101;
+        failed.created = 200;
+        failed.run = Some("2/1".into());
+        failed.status = Some(RecordStatus::Failed);
+        f.jobs.save("job-test", failed.clone()).unwrap();
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Stale);
+        failed.started = 100;
+        f.jobs.save("job-test", failed).unwrap();
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Stale);
+    }
+    #[test]
+    fn a_passing_run_after_the_failure_proves() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        let mut failed = f.jobs.load("job-test").remove(0);
+        failed.started = 90;
+        failed.run = Some("2/1".into());
+        failed.status = Some(RecordStatus::Failed);
+        f.jobs.save("job-test", failed).unwrap();
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Proved);
+    }
+    #[test]
+    fn k_n10_missing_plan_payload_mismatches() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![input("/tmp/event.json", &file_id(b"{}"))])]);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::InputChanged);
+    }
+    #[test]
+    fn k_n15_interim_refuses_removals() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        let mut p = proof(vec![]);
+        p.removed.push("dir/a".into());
+        p.priors = None;
+        replace_first(&mut f, p);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Unplannable);
+    }
+    #[test]
+    fn k_n17_removal_needs_a_prior() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        let mut p = proof(vec![]);
+        p.removed.push("dir/a".into());
+        replace_first(&mut f, p);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Unplannable);
+    }
+    #[test]
+    fn k_n24_removed_dir_with_unnamed_overlay_entry() {
+        let mut f = Fixture::new();
+        let mut a = proof(vec![]);
+        a.outputs.push(input("dir/new", &file_id(b"x")));
+        a.priors = Some(vec![input("dir/new", "a")]);
+        let mut b = proof(vec![]);
+        b.removed = vec!["dir/a".into(), "dir".into()];
+        b.priors = Some(vec![input("dir", "d"), input("dir/a", "fk")]);
+        f.install(vec![a, b]);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::PriorChanged);
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn k_n26_non_utf8_below_removed_dir() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut f = Fixture::new();
+        fs::write(
+            f.root
+                .join("dir")
+                .join(std::ffi::OsString::from_vec(vec![b'z', 255])),
+            b"x",
+        )
+        .unwrap();
+        git(&f.root, &["add", "dir"]);
+        git(
+            &f.root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "-qm",
+                "raw",
+            ],
+        );
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        let mut p = proof(vec![]);
+        p.removed.push("dir".into());
+        p.priors = Some(vec![input("dir", "d"), input("dir/a", "fk")]);
+        f.install(vec![p]);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Unplannable);
+    }
+    #[test]
+    fn k_n30_kind_only_prior_keeps_the_exec_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = Fixture::new();
+        fs::set_permissions(f.root.join("dir/a"), fs::Permissions::from_mode(0o755)).unwrap();
+        git(&f.root, &["add", "dir/a"]);
+        git(
+            &f.root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "-qm",
+                "mode",
+            ],
+        );
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        let mut p = proof(vec![]);
+        p.outputs.push(input("dir/a", &file_id(b"new")));
+        p.priors = Some(vec![input("dir/a", "fk")]);
+        f.install(vec![p]);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::PriorChanged);
+    }
+    #[test]
+    fn k_g05_large_attributes_file() {
+        let mut f = Fixture::new();
+        let mut attrs = vec![b'#'; 1024 * 1024 + 1];
+        attrs.extend_from_slice(b"\n*.sh text eol=crlf\n");
+        fs::write(f.root.join(".gitattributes"), attrs).unwrap();
+        fs::write(f.root.join("test.sh"), b"echo ok\n").unwrap();
+        git(&f.root, &["add", ".gitattributes", "test.sh"]);
+        git(
+            &f.root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "-qm",
+                "attrs",
+            ],
+        );
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        f.install(vec![proof(vec![input("test.sh", &file_id(b"echo ok\n"))])]);
+        let d = f.decide(BTreeMap::new());
+        assert_eq!(d.code, Code::Unplannable);
+        assert!(d.detail.contains("eol=crlf"));
+    }
+    #[test]
+    fn k_m02c_step_age_zero_is_the_ceiling() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        f.spec.steps[0] = StepSpec::Traced {
+            index: 1,
+            key: "sh-0".into(),
+            max_age: Some(0),
+        };
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Proved);
+    }
+    #[test]
+    fn k_m23_root_listing_has_git() {
+        let mut f = Fixture::new();
+        let id = crate::input::identify(&f.root, true, true).unwrap();
+        f.install(vec![proof(vec![input(".", &id)])]);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Proved);
+    }
+    #[test]
+    fn k_m30_unreadable_input_is_unplannable() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![input("dir/a", "u")])]);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Unplannable);
+    }
+    #[test]
+    fn parent_deleted_after_recording_cannot_prove() {
+        let mut f = Fixture::new();
+        let mut p = proof(vec![]);
+        p.outputs.push(input("build/out", &file_id(b"ok")));
+        p.priors = Some(vec![input("build/out", "a")]);
+        f.install(vec![p, proof(vec![input("build/out", &file_id(b"ok"))])]);
+        let d = f.decide(BTreeMap::new());
+        assert_eq!(d.code, Code::PriorChanged);
+        assert!(d.detail.contains("parent of build/out is not a directory"));
+    }
+    #[test]
+    fn attributes_use_runner_macro_and_case_sensitive_patterns() {
+        let mut f = Fixture::new();
+        fs::write(
+            f.root.join(".git/info/attributes"),
+            b"[attr]winscript text eol=crlf\n",
+        )
+        .unwrap();
+        fs::write(f.root.join(".gitattributes"), b"dir/a winscript\n").unwrap();
+        git(&f.root, &["add", ".gitattributes"]);
+        git(
+            &f.root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "-qm",
+                "attrs",
+            ],
+        );
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        f.install(vec![proof(vec![input("dir/a", &file_id(b"tracked"))])]);
+        let d = f.decide(BTreeMap::new());
+        assert_eq!(d.code, Code::Unplannable);
+        assert!(d.detail.contains("eol=crlf"));
+        fs::write(f.root.join(".git/info/attributes"), b"").unwrap();
+        fs::write(
+            f.root.join(".gitattributes"),
+            b"dir/a text eol=crlf\ndir/A !eol\n",
+        )
+        .unwrap();
+        git(&f.root, &["config", "core.ignorecase", "true"]);
+        git(&f.root, &["add", ".gitattributes"]);
+        git(
+            &f.root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "-qm",
+                "case",
+            ],
+        );
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        let d = f.decide(BTreeMap::new());
+        assert_eq!(d.code, Code::Unplannable);
+        assert!(d.detail.contains("eol=crlf"));
+    }
+    #[test]
+    fn invalid_input_identifiers_and_lossy_keys_are_rejected() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        for (path, id) in [
+            ("dir/a", "file"),
+            ("dir/\u{fffd}", "a"),
+            ("/outside", "unknown"),
+        ] {
+            replace_first(&mut f, proof(vec![input(path, id)]));
+            assert_eq!(f.decide(BTreeMap::new()).code, Code::Unplannable);
+        }
+    }
+    #[test]
+    fn unverified_detail_reports_would_otherwise_prove() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        let mut ctx = PlanCtx {
+            tree: &mut f.tree,
+            proofs: &f.proofs,
+            jobs: &f.jobs,
+            check: &super::super::spec::Unverified,
+            now: 100,
+            max_age: 50,
+            github_vars: BTreeMap::new(),
+            salt: None,
+            event_path: None,
+            event: None,
+            explain: false,
+        };
+        let d = decide(&f.spec, &mut ctx);
+        assert_eq!(d.code, Code::Unattested);
+        assert!(d.detail.contains("would otherwise prove"));
+        ctx.max_age = 0;
+        assert_eq!(decide(&f.spec, &mut ctx).code, Code::Error);
+    }
+    #[test]
+    fn ten_thousand_outputs_and_removals_are_linear() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        let mut p = proof(vec![]);
+        for i in 0..5000 {
+            let out = format!("out-{i:05}");
+            let removed = format!("removed-{i:05}");
+            p.outputs.push(input(&out, &file_id(b"x")));
+            p.removed.push(removed.clone());
+            p.priors
+                .as_mut()
+                .unwrap()
+                .extend([input(&out, "a"), input(&removed, "a")]);
+        }
+        replace_first(&mut f, p);
+        let start = std::time::Instant::now();
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Proved);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+    #[test]
+    fn git_error_does_not_fall_through_to_older_record() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        let mut newer = f.jobs.load("job-test").remove(0);
+        let p = proof(vec![input("dir/a", &file_id(b"tracked"))]);
+        f.proofs.save("sh-0", p.clone()).unwrap();
+        newer.started = 101;
+        newer.created = 101;
+        newer.run = Some("2/1".into());
+        newer.steps[0].proof = p.digest();
+        f.jobs.save("job-test", newer).unwrap();
+        let Entry::Blob { oid, .. } = f.tree.entry("dir/a").unwrap().clone() else {
+            panic!("missing blob")
+        };
+        fs::remove_file(f.root.join(".git/objects").join(&oid[..2]).join(&oid[2..])).unwrap();
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Error);
     }
 }

@@ -35,6 +35,11 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 fn git() -> Command {
     let mut command = Command::new("git");
     command.env("GIT_NO_LAZY_FETCH", "1");
+    command
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_ATTR_SOURCE")
+        .env_remove("GIT_INDEX_FILE");
     #[cfg(test)]
     command
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -193,6 +198,17 @@ impl GitTree {
         oid: &str,
         read: impl FnOnce(&mut dyn Read) -> Result<T, GitError>,
     ) -> Result<T, GitError> {
+        let result = self.consume_inner(oid, read);
+        if result.is_err() {
+            self.batch.take();
+        }
+        result
+    }
+    fn consume_inner<T>(
+        &mut self,
+        oid: &str,
+        read: impl FnOnce(&mut dyn Read) -> Result<T, GitError>,
+    ) -> Result<T, GitError> {
         if self.batch.is_none() {
             let mut child = git()
                 .current_dir(&self.root)
@@ -289,9 +305,9 @@ impl GitTree {
             })
             .map(|(p, e)| (p.clone(), e.clone()))
             .collect();
-        let mut hit = false;
+        let hit = !attrs.is_empty();
         for (path, entry) in attrs {
-            let Entry::Blob { oid, size, .. } = entry else {
+            let Entry::Blob { .. } = entry else {
                 self.attr_error = Some(format!(
                     "{} is not a regular file",
                     String::from_utf8_lossy(&path)
@@ -299,26 +315,6 @@ impl GitTree {
                 self.conversions = Some(BTreeMap::new());
                 return Ok(());
             };
-            if size > 1024 * 1024 {
-                hit = true;
-                continue;
-            }
-            let data = self.consume(&oid, |r| {
-                let mut b = Vec::new();
-                r.read_to_end(&mut b).map_err(|e| GitError(e.to_string()))?;
-                Ok(b)
-            })?;
-            if [
-                b"eol=crlf".as_slice(),
-                b"ident",
-                b"filter",
-                b"working-tree-encoding",
-            ]
-            .iter()
-            .any(|needle| data.windows(needle.len()).any(|w| w == *needle))
-            {
-                hit = true;
-            }
         }
         let mut conversions = BTreeMap::new();
         if hit {
@@ -335,6 +331,7 @@ impl GitTree {
                 .env("GIT_NO_LAZY_FETCH", "1")
                 .env("GIT_INDEX_FILE", &index)
                 .args(["read-tree", &self.commit])
+                .stderr(Stdio::null())
                 .status()
                 .map_err(|e| GitError(e.to_string()))?;
             if !status.success() {
@@ -353,6 +350,8 @@ impl GitTree {
                 .args([
                     "-c",
                     "core.attributesFile=/dev/null",
+                    "-c",
+                    "core.ignorecase=false",
                     "check-attr",
                     "--cached",
                     "-z",
@@ -364,6 +363,7 @@ impl GitTree {
                 ])
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
+                .stderr(Stdio::null())
                 .spawn()
                 .map_err(|e| GitError(e.to_string()))?;
             let mut stdin = child
