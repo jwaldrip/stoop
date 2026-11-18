@@ -367,10 +367,7 @@ pub struct ActionCheck<'a> {
 
 impl<'a> ActionCheck<'a> {
     pub fn new(resolver: &'a dyn Resolver) -> Self {
-        Self {
-            memo: Memo::new(resolver),
-            strict: run::env_flag("STOOP_STRICT_ACTIONS"),
-        }
+        Self::with_strict(resolver, false)
     }
     /// Explicit policy for callers that obtain strictness from a plan option.
     pub fn with_strict(resolver: &'a dyn Resolver, strict: bool) -> Self {
@@ -1065,5 +1062,35 @@ mod tests {
             );
         }
         assert_eq!(fake.calls(), 1);
+    }
+    #[test]
+    fn plan_caller_controls_strict_policy_not_constructor_environment() {
+        const CHILD: &str = "STOOP_STRICT_POLICY_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "gha::resolve::tests::plan_caller_controls_strict_policy_not_constructor_environment"])
+                .env(CHILD, "1")
+                .env("STOOP_STRICT_ACTIONS", "1")
+                .output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            return;
+        }
+        let fake = Fake::new();
+        fake.set("actions/checkout@v4", Ok(A));
+        let job = spec(&["actions/checkout@v4"], &[]);
+        let recorded = record(&[("actions/checkout@v4", A)]);
+        assert!(ActionCheck::new(&fake).check(&job, &recorded).is_ok());
+        let strict = run::env_flag("STOOP_STRICT_ACTIONS");
+        assert_eq!(
+            ActionCheck::with_strict(&fake, strict)
+                .check(&job, &recorded)
+                .unwrap_err()
+                .0,
+            Code::UnresolvedAction
+        );
     }
 }

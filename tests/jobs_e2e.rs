@@ -203,6 +203,90 @@ fn a_trusted_job_publishes_a_passed_record() {
     );
 }
 #[test]
+fn action_lookup_happens_at_open_before_the_first_step_moves_the_tag() {
+    let step = "repo=${GITHUB_SERVER_URL#file://}/actions/checkout.git; other=$(git --git-dir=\"$repo\" -c user.name=Test -c user.email=test@example.org -c commit.gpgsign=false commit-tree HEAD^{tree} -m other); git --git-dir=\"$repo\" update-ref refs/tags/v4 \"$other\"\n";
+    let w = Ws::new("action-open", &[step, "true\n"]);
+    let first = w.run(step, "1");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let second = w.run("true\n", "1");
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    let records = w.records();
+    let record = &records[0]["records"][0];
+    assert_eq!(record["status"], "passed");
+    assert_eq!(record["actions"]["actions/checkout@v4"], w.sha);
+    assert_ne!(
+        git(
+            &w.root.parent().unwrap().join("actions/checkout.git"),
+            &["rev-parse", "refs/tags/v4"]
+        ),
+        w.sha
+    );
+}
+
+#[test]
+fn failed_action_lookup_does_not_block_job_publication() {
+    let w = Ws::new("action-missing", &["true\n"]);
+    let out = w
+        .command("true\n", "1")
+        .env(
+            "GITHUB_SERVER_URL",
+            format!("file://{}/missing", w.root.parent().unwrap().display()),
+        )
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("action unresolved at journal open"));
+    let records = w.records();
+    assert_eq!(records[0]["records"][0]["status"], "passed");
+    assert!(records[0]["records"][0]["actions"]["actions/checkout@v4"].is_null());
+}
+
+#[test]
+fn read_only_run_does_not_resolve_actions() {
+    let w = Ws::new("action-readonly", &["true\n"]);
+    let trace = w.temp.join("git-trace");
+    let out = w
+        .command("true\n", "0")
+        .env(
+            "GITHUB_SERVER_URL",
+            format!("file://{}/missing", w.root.parent().unwrap().display()),
+        )
+        .env("GIT_TRACE", &trace)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("action unresolved at journal open"));
+    let git_trace = fs::read_to_string(&trace).unwrap_or_default();
+    assert!(
+        !git_trace.contains("ls-remote"),
+        "unexpected lookup: {git_trace}"
+    );
+    assert!(w.records().is_empty());
+}
+
+#[test]
+fn strict_env_omits_floating_action_from_published_record() {
+    let w = Ws::new("action-strict", &["true\n"]);
+    let out = w
+        .command("true\n", "1")
+        .env("STOOP_STRICT_ACTIONS", "1")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let records = w.records();
+    assert_eq!(records[0]["records"][0]["status"], "passed");
+    assert!(records[0]["records"][0]["actions"]["actions/checkout@v4"].is_null());
+}
+
+#[test]
 fn a_failing_step_publishes_a_failed_record() {
     let w = Ws::new("failed", &["exit 1\n"]);
     assert!(!w.run("exit 1\n", "1").status.success());
