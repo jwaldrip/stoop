@@ -844,6 +844,12 @@ fn top_level_workflow_identity_is_required() {
     ] {
         let o = plan(&r, &["--format", "json", "--workflow", CI], &env);
         assert_eq!(code(&o, "a"), "error");
+        if env[0].0 == "GITHUB_WORKFLOW_REF" {
+            assert!(o.plan["jobs"][0]["detail"]
+                .as_str()
+                .unwrap()
+                .contains("planned workflow differs from GITHUB_WORKFLOW_REF"));
+        }
         assert!(o.plan["skip"].as_array().unwrap().is_empty());
     }
 }
