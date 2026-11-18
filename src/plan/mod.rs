@@ -681,7 +681,7 @@ mod tests {
                 os: "linux".into(),
                 arch: "x86_64".into(),
                 tracer: "ptrace-seccomp".into(),
-                version: 4,
+                version: crate::trace::version::TRACER_VERSION,
             }),
             env: BTreeMap::new(),
             inputs: vec![input::Input {

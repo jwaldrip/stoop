@@ -40,6 +40,8 @@
   <dd>Paths whose reads don't count. Same syntax as <a href="stoopignore.html"><code>.stoopignore</code></a>. Repeatable.</dd>
   <dt id="opt-no-record">--no-record</dt>
   <dd>Check and skip as usual, but never write a proof. For jobs you don't trust.</dd>
+  <dt id="opt-allow-id-token">--allow-id-token</dt>
+  <dd>Permit the OIDC request variable names listed in <code>STOOP_PASS_ENV</code> to reach this command. Such a command runs untraced, without running probes or using or writing proofs; in shell mode it blocks job attestation.</dd>
   <dt id="opt-sync">--sync git[:REMOTE]</dt>
   <dd>On a miss, fetch this key's proofs from <code>refs/stoop/&lt;key&gt;</code> on the git remote (default <code>origin</code>) and check again. See <a href="ci.html#sync">git sync</a>.</dd>
   <dt id="opt-sync-write">--sync-write</dt>
@@ -57,6 +59,7 @@
     <tr><td><code>STOOP_STORE=DIR</code></td><td>Default for <code>--store</code>.</td></tr>
     <tr><td><code>STOOP_SYNC=git[:REMOTE]</code></td><td>Default for <code>--sync</code>.</td></tr>
     <tr><td><code>STOOP_SYNC_WRITE=1</code></td><td>Same as <code>--sync-write</code>.</td></tr>
+    <tr><td><code>STOOP_PASS_ENV</code></td><td>Comma- or whitespace-separated names selected from <code>ACTIONS_ID_TOKEN_REQUEST_URL</code> and <code>ACTIONS_ID_TOKEN_REQUEST_TOKEN</code>. Each listed name requires <code>--allow-id-token</code>. See <a href="ci.html#github-actions">CI recipes</a>.</td></tr>
     <tr><td><code>STOOP_ENV_SALT</code></td><td>A secret that keys the environment hashes stored in proofs. Set it from a repository secret wherever proofs are published. See <a href="ci.html#sync">How git sync works</a>.</td></tr>
   </tbody>
 </table>

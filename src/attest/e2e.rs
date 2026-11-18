@@ -535,3 +535,70 @@ fn published_records_are_accepted_only_through_the_verifier() {
         std::env::remove_var(name);
     }
 }
+
+#[test]
+fn captured_request_credentials_still_attest_a_job_for_the_verifier() {
+    const CHILD: &str = "STOOP_CAPTURED_ATTEST_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        crate::run::capture_id_token_env();
+        assert!(std::env::var_os("ACTIONS_ID_TOKEN_REQUEST_URL").is_none());
+        assert!(std::env::var_os("ACTIONS_ID_TOKEN_REQUEST_TOKEN").is_none());
+        let base = std::env::var("STOOP_TEST_API").unwrap();
+        let root = PathBuf::from(std::env::var_os("STOOP_TEST_ROOT").unwrap());
+        let sha = std::env::var("STOOP_TEST_SHA").unwrap();
+        std::env::set_var("GITHUB_API_URL", &base);
+        std::env::set_var("GITHUB_SERVER_URL", &base);
+        let repo = Repo {
+            work: root.join("work"),
+            root: root.clone(),
+            sha: sha.clone(),
+        };
+        let spec = planned(&runner_env(&root.join("runner-123"), &sha, "123"));
+        let key = spec.key.clone().unwrap();
+        repo.publish("123", None)
+            .expect("captured token must be available to the journal");
+        let (_, records) = repo.read(&key);
+        let trusted = find(&records, "123/1");
+        assert!(
+            trusted.attest.is_some(),
+            "captured token did not reach attestation"
+        );
+        assert_eq!(judge(&planner_for(&base), &spec, trusted), Ok(()));
+        return;
+    }
+    let root = std::env::temp_dir().join(format!("stoop-captured-attest-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let repo = Repo::new(&root);
+    let github = Arc::new(Mutex::new(Github {
+        claims: claims(&repo.sha, "123", "refs/heads/main", "push", WORKFLOW),
+        jwks: JWKS.to_vec(),
+        failing: false,
+    }));
+    let base = serve(github);
+    let out = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "attest::e2e::captured_request_credentials_still_attest_a_job_for_the_verifier",
+            "--nocapture",
+        ])
+        .env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap())
+        .env("HOME", &root)
+        .env(CHILD, "1")
+        .env("STOOP_TEST_ROOT", &root)
+        .env("STOOP_TEST_SHA", &repo.sha)
+        .env("STOOP_TEST_API", &base)
+        .env("ACTIONS_ID_TOKEN_REQUEST_URL", format!("{base}/token"))
+        .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", BEARER)
+        .env("NO_PROXY", "127.0.0.1,localhost")
+        .env("no_proxy", "127.0.0.1,localhost")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::remove_dir_all(root).unwrap();
+}

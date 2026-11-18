@@ -248,7 +248,7 @@ fn known_github(name: &str) -> bool {
 /// Recorder semantics older than this floor may produce unsound plan proofs.
 /// When recorder changes make earlier proofs unsound, bump this floor and
 /// `TRACER_VERSION` together. This is not the planner runner's runtime version.
-const MIN_PLANNABLE_RECORDER_VERSION: u32 = 4;
+const MIN_PLANNABLE_RECORDER_VERSION: u32 = 5;
 
 /// Resolve only runner labels whose platform is known without executing the job.
 fn declared_platform(runs_on: &serde_json::Value) -> Option<(&'static str, &'static str)> {
@@ -1125,7 +1125,8 @@ mod tests {
 
     #[test]
     fn older_recorder_semantics_are_not_plannable() {
-        for (version, expected) in [(3, Code::ProofPlatform), (4, Code::Proved)] {
+        let current = crate::trace::version::TRACER_VERSION;
+        for (version, expected) in [(current - 1, Code::ProofPlatform), (current, Code::Proved)] {
             let mut f = Fixture::new();
             let mut p = proof(vec![]);
             p.provenance.as_mut().unwrap().version = version;
@@ -1136,7 +1137,7 @@ mod tests {
                 "version {version}: {}",
                 result.detail
             );
-            if version == 3 {
+            if version < current {
                 assert!(result.detail.contains("recorder too old: re-record"));
             }
         }
@@ -1144,7 +1145,8 @@ mod tests {
 
     #[test]
     fn older_recorder_is_blocked_on_custom_runner_host_fallback() {
-        for (version, expected) in [(3, Code::ProofPlatform), (4, Code::Proved)] {
+        let current = crate::trace::version::TRACER_VERSION;
+        for (version, expected) in [(current - 1, Code::ProofPlatform), (current, Code::Proved)] {
             let mut f = Fixture::new();
             f.spec.runs_on = serde_json::json!("custom-runner");
             let mut p = proof(vec![]);
@@ -1160,7 +1162,7 @@ mod tests {
                 "version {version}: {}",
                 result.detail
             );
-            if version == 3 {
+            if version < current {
                 assert!(result.detail.contains("recorder too old: re-record"));
             }
         }

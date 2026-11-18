@@ -49,12 +49,15 @@ OPTIONS
   --sync-write      publish proofs to the remote (trusted runs only)
   --ignore PATTERN  paths whose reads do not count (also .stoopignore)
   --no-record       check and run, but never write a proof (untrusted jobs)
+  --allow-id-token  allow names in STOOP_PASS_ENV; runs untraced and unrecorded
   --quiet           print nothing about the decision
 
 ENVIRONMENT
   STOOP_FULL=1      never skip; still record (nightly runs)
   STOOP_OFF=1       do not trace or skip anything
                     (switches: empty, 0, false, no and off mean off; anything else is on)
+  STOOP_PASS_ENV    comma- or space-separated OIDC request variable names to pass;
+                    requires --allow-id-token and disables proof use for the run
 
 GITHUB ACTIONS
   Put this at the top of a workflow and every `run:` step is wrapped:
@@ -81,6 +84,7 @@ BLIND SPOTS
 ";
 
 fn main() {
+    run::capture_id_token_env();
     let args: Vec<String> = std::env::args().skip(1).collect();
     std::process::exit(real_main(args));
 }
@@ -112,6 +116,18 @@ fn real_main(mut args: Vec<String>) -> i32 {
             return 2;
         }
     };
+    if matches!(cmd.as_str(), "run" | "explain" | "sh") {
+        match run::parse_pass_env(
+            std::env::var_os("STOOP_PASS_ENV").as_deref(),
+            o.allow_id_token,
+        ) {
+            Ok(names) => o.pass_env = names,
+            Err(error) => {
+                eprintln!("stoop: {error}");
+                return 2;
+            }
+        }
+    }
     match cmd.as_str() {
         "ls" => {
             let store = store_for(&o);
@@ -261,6 +277,7 @@ fn parse(args: &[String]) -> Result<(Opts, Vec<String>), String> {
             "--env" => o.env.push(val("--env")?),
             "--ignore" => o.ignore.push(val("--ignore")?),
             "--no-record" => o.no_record = true,
+            "--allow-id-token" => o.allow_id_token = true,
             "--allow-network" => o.allow_network = true,
             "--ignore-env" => o.ignore_env.push(val("--ignore-env")?),
             "--max-age" => o.max_age = Some(run::parse_age(&val("--max-age")?)?),
@@ -322,6 +339,17 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
     let remote = sync_for(o).ok();
     let blocked =
         run::env_str("RUNNER_TEMP").map(|t| PathBuf::from(t).join("stoop/journal.blocked"));
+    if !o.pass_env.is_empty() && run::env_flag("GITHUB_ACTIONS") {
+        if let Some(path) = &blocked {
+            let result =
+                std::fs::create_dir_all(path.parent().expect("journal marker has a parent"))
+                    .and_then(|()| std::fs::write(path, b"OIDC request credentials passed"));
+            if let Err(error) = result {
+                eprintln!("stoop: cannot block job journal before passing OIDC request credentials: {error}");
+                return 2;
+            }
+        }
+    }
     let mut journal = if blocked.as_ref().is_some_and(|p| p.exists()) {
         None
     } else {

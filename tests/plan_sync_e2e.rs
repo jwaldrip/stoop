@@ -1,3 +1,6 @@
+#[path = "../src/trace/version.rs"]
+mod tracer_version;
+
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -162,10 +165,14 @@ impl Fixture {
             .unwrap()
             .as_secs();
         let sha = git(&self.source, &["rev-parse", "HEAD"]);
+        let version = tracer_version::TRACER_VERSION;
         let provenance =
-            json!({"os":"linux", "arch":"x86_64", "tracer":"ptrace-seccomp", "version":4});
-        let digest_bytes = b"[[],[],[],{},{},[],[],[],\"\",null,{\"os\":\"linux\",\"arch\":\"x86_64\",\"tracer\":\"ptrace-seccomp\",\"version\":4}]";
-        let digest = format!("p-{}", &blake3::hash(digest_bytes).to_hex()[..32]);
+            json!({"os":"linux", "arch":"x86_64", "tracer":"ptrace-seccomp", "version":version});
+        let digest_bytes = format!("[[],[],[],{{}},{{}},[],[],[],\"\",null,{{\"os\":\"linux\",\"arch\":\"x86_64\",\"tracer\":\"ptrace-seccomp\",\"version\":{version}}}]");
+        let digest = format!(
+            "p-{}",
+            &blake3::hash(digest_bytes.as_bytes()).to_hex()[..32]
+        );
         let mut selected = Vec::new();
         for j in plan["jobs"].as_array().unwrap() {
             let id = j["id"].as_str().unwrap();
