@@ -8,6 +8,7 @@
 //! Sync never fails a step. A remote that is down, slow or refuses the push leaves
 //! the run exactly as it would be without sync, with a warning.
 
+use crate::job::JobStore;
 use crate::proof::{now, Store};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -117,7 +118,7 @@ impl Remote {
 
     /// Fetch every proof the remote has. Run once at the start of a job so that each
     /// step finds its proof locally and never waits on the network.
-    pub fn pull_all(&self, store: &Store) -> Result<usize, String> {
+    pub fn pull_all(&self, store: &Store, jobs: &JobStore) -> Result<usize, String> {
         self.ok(
             &[
                 "fetch",
@@ -144,9 +145,61 @@ impl Remote {
             let blob = self.ok(&["cat-file", "blob", r], None)?;
             if let Some(key) = Store::key_of(&blob) {
                 added += store.import(&key, &blob).map_err(|e| e.to_string())?;
+            } else if let Some(key) = JobStore::key_of(&blob) {
+                added += jobs.import(&key, &blob).map_err(|e| e.to_string())?;
             }
         }
         Ok(added)
+    }
+
+    pub fn pull_job(&self, jobs: &JobStore, key: &str) -> Result<usize, String> {
+        let r = ref_name(key);
+        let spec = format!("+{r}:{r}");
+        let out = self.git(
+            &["fetch", "--quiet", "--no-tags", &self.remote, &spec],
+            None,
+        )?;
+        if !out.status.success() {
+            let error = String::from_utf8_lossy(&out.stderr);
+            if error.contains("couldn't find remote ref") {
+                return Ok(0);
+            }
+            return Err(error.lines().next().unwrap_or("fetch failed").to_string());
+        }
+        let blob = self.ok(&["cat-file", "blob", &r], None)?;
+        jobs.import(key, &blob).map_err(|e| e.to_string())
+    }
+
+    pub fn push_job(
+        &self,
+        jobs: &JobStore,
+        key: &str,
+        proof: Option<(&Store, &str)>,
+    ) -> Result<(), String> {
+        if !self.write {
+            return Ok(());
+        }
+        let mut objects = vec![(key, jobs.export(key).ok_or("no local job to publish")?)];
+        if let Some((store, proof_key)) = proof {
+            objects.push((
+                proof_key,
+                store.export(proof_key).ok_or("no local proof to publish")?,
+            ));
+        }
+        let mut specs = Vec::new();
+        for (key, bytes) in objects {
+            let sha =
+                String::from_utf8_lossy(&self.ok(&["hash-object", "-w", "--stdin"], Some(&bytes))?)
+                    .trim()
+                    .to_string();
+            let r = ref_name(key);
+            self.ok(&["update-ref", &r, &sha], None)?;
+            specs.push(format!("+{r}:{r}"));
+        }
+        let mut args = vec!["push", "--quiet", &self.remote];
+        args.extend(specs.iter().map(String::as_str));
+        self.ok(&args, None)?;
+        Ok(())
     }
 
     /// Publish this key's proofs. Only with `write`.
@@ -192,7 +245,9 @@ impl Remote {
         let mut removed = 0;
         for r in refs {
             let blob = self.ok(&["cat-file", "blob", &r], None)?;
-            let newest = Store::newest_created(&blob).unwrap_or(0);
+            let newest = Store::newest_created(&blob)
+                .or_else(|| JobStore::newest_created(&blob))
+                .unwrap_or(0);
             if now().saturating_sub(newest) > max_age {
                 self.ok(&["push", "--quiet", &self.remote, "--delete", &r], None)?;
                 let _ = self.ok(&["update-ref", "-d", &r], None);
