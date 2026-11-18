@@ -2154,9 +2154,7 @@ impl Tracer<'_> {
             return;
         };
         let removes_dir = dir || flags.is_some_and(|i| args[i] as i32 & AT_REMOVEDIR != 0);
-        if removes_dir
-            && self.rec.is_some()
-            && !fs::read_dir(&p).is_ok_and(|mut entries| entries.next().is_none())
+        if removes_dir && self.rec.is_some() && crate::oid_attrs::directory_removal_invalidates(&p)
         {
             self.t.oid_attrs_changed = true;
         }

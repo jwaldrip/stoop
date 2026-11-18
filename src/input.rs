@@ -555,4 +555,40 @@ mod tests {
         assert_ne!(plain, executable);
         fs::remove_dir_all(d).unwrap();
     }
+
+    #[test]
+    fn fifo_never_gets_an_oid() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = tmp("oid-fifo");
+        let path = d.join("fifo");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert_eq!(identify_recorded(&path, true, false, true), None);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn socket_never_gets_an_oid() {
+        let d = tmp("oid-socket");
+        let path = d.join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(identify_recorded(&path, true, false, true), None);
+        drop(listener);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn device_never_gets_an_oid() {
+        assert_eq!(
+            identify_recorded(Path::new("/dev/null"), false, false, true),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_file_never_gets_an_oid() {
+        let result = identify_recorded(Path::new("/proc/self/status"), false, false, true);
+        assert!(matches!(result, Some((_, None))));
+    }
 }
