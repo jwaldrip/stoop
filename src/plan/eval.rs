@@ -2554,10 +2554,22 @@ mod tests {
                 self.1.set(self.1.get() + 1);
                 Ok(self.0.borrow().clone())
             }
-            fn action_tree(&self, _: &str, _: &str, _: &str, _: std::time::Instant) -> Result<std::rc::Rc<crate::gha::actions::Tree>, String> {
+            fn action_tree(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: std::time::Instant,
+            ) -> Result<std::rc::Rc<crate::gha::actions::Tree>, String> {
                 Ok(std::rc::Rc::new(crate::gha::actions::fixture_tree()))
             }
-            fn runner_copy(&self, _: &str, _: &str, _: &str, _: std::time::Instant) -> Result<crate::gha::actions::Tree, String> {
+            fn runner_copy(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: std::time::Instant,
+            ) -> Result<crate::gha::actions::Tree, String> {
                 Ok(crate::gha::actions::fixture_tree())
             }
         }

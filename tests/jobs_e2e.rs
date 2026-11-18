@@ -6,7 +6,10 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Output},
-    sync::{atomic::{AtomicBool, Ordering}, Arc},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -40,7 +43,10 @@ impl ActionApi {
             while !server_stop.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
                         let mut reader = BufReader::new(stream.try_clone().unwrap());
                         let mut line = String::new();
                         reader.read_line(&mut line).unwrap_or(0);
@@ -60,12 +66,19 @@ impl ActionApi {
                             let _ = write!(stream, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(5)),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5))
+                    }
                     Err(e) => panic!("fixture accept: {e}"),
                 }
             }
         });
-        Self { url, stop, unexpected, thread: Some(handle) }
+        Self {
+            url,
+            stop,
+            unexpected,
+            thread: Some(handle),
+        }
     }
 }
 
@@ -76,7 +89,10 @@ impl Drop for ActionApi {
             handle.join().unwrap();
         }
         if !thread::panicking() {
-            assert!(!self.unexpected.load(Ordering::Relaxed), "action test attempted a non-fixture network request");
+            assert!(
+                !self.unexpected.load(Ordering::Relaxed),
+                "action test attempted a non-fixture network request"
+            );
         }
     }
 }
@@ -111,7 +127,11 @@ impl Ws {
         }
         fs::write(work.join(".github/workflows/ci.yml"), yaml).unwrap();
         fs::write(work.join("in.txt"), "hello\n").unwrap();
-        fs::write(work.join("action.yml"), "runs:\n  using: node20\n  main: index.js\n").unwrap();
+        fs::write(
+            work.join("action.yml"),
+            "runs:\n  using: node20\n  main: index.js\n",
+        )
+        .unwrap();
         fs::write(work.join("index.js"), "fixture\n").unwrap();
         git(&work, &["add", "."]);
         git(
@@ -152,7 +172,12 @@ impl Ws {
         let api = Arc::new(ActionApi::new(&sha, archive.stdout));
         let copy = root.join("runner-work/_actions/actions/checkout/v4");
         fs::create_dir_all(copy.join(".github/workflows")).unwrap();
-        for path in ["action.yml", "index.js", "in.txt", ".github/workflows/ci.yml"] {
+        for path in [
+            "action.yml",
+            "index.js",
+            "in.txt",
+            ".github/workflows/ci.yml",
+        ] {
             fs::copy(work.join(path), copy.join(path)).unwrap();
         }
         let temp = root.join("runner");
@@ -183,7 +208,10 @@ impl Ws {
                 format!("file://{}", self.root.parent().unwrap().display()),
             )
             .env("GITHUB_API_URL", &self.api.url)
-            .env("RUNNER_WORKSPACE", self.root.parent().unwrap().join("runner-work/repo"))
+            .env(
+                "RUNNER_WORKSPACE",
+                self.root.parent().unwrap().join("runner-work/repo"),
+            )
             .env("XDG_CACHE_HOME", self.root.parent().unwrap().join("cache"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -211,7 +239,14 @@ impl Ws {
             .env_remove("STOOP_MATRIX")
             .env_remove("STOOP_STORE")
             .env_remove("STOOP_ENV_SALT");
-        for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+        for name in [
+            "HTTP_PROXY",
+            "HTTPS_PROXY",
+            "ALL_PROXY",
+            "http_proxy",
+            "https_proxy",
+            "all_proxy",
+        ] {
             command.env(name, &self.api.url);
         }
         command
@@ -352,7 +387,11 @@ fn action_lookup_happens_at_open_before_the_first_step_moves_the_tag() {
 #[test]
 fn altered_runner_action_copy_never_produces_a_content_witness() {
     let w = Ws::new("action-copy-tampered", &["true\n"]);
-    let copy = w.root.parent().unwrap().join("runner-work/_actions/actions/checkout/v4/index.js");
+    let copy = w
+        .root
+        .parent()
+        .unwrap()
+        .join("runner-work/_actions/actions/checkout/v4/index.js");
     fs::write(copy, "tampered\n").unwrap();
     let out = w.run("true\n", "1");
     assert!(out.status.success());

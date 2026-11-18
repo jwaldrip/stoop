@@ -2,7 +2,6 @@
 use super::*;
 use crate::attest::tests as a;
 use crate::job::{JobRecord, RecordStatus, StepHow, StepRecord};
-use crate::gha::resolve::Resolver;
 use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -108,16 +107,36 @@ impl gha::resolve::Resolver for RecordingSource {
     fn commit(&self, owner: &str, repo: &str, reference: &str) -> Result<String, String> {
         self.fake.commit(owner, repo, reference)
     }
-    fn action_tree(&self, owner: &str, repo: &str, sha: &str, deadline: std::time::Instant) -> Result<std::rc::Rc<gha::actions::Tree>, String> {
+    fn action_tree(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+        deadline: std::time::Instant,
+    ) -> Result<std::rc::Rc<gha::actions::Tree>, String> {
         self.fake.action_tree(owner, repo, sha, deadline)
     }
-    fn runner_copy(&self, owner: &str, repo: &str, reference: &str, deadline: std::time::Instant) -> Result<gha::actions::Tree, String> {
+    fn runner_copy(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+        deadline: std::time::Instant,
+    ) -> Result<gha::actions::Tree, String> {
         self.fake.runner_copy(owner, repo, reference, deadline)
     }
-    fn local_tree(&self, path: &str, deadline: std::time::Instant) -> Result<(String, std::rc::Rc<gha::actions::Tree>), String> {
+    fn local_tree(
+        &self,
+        path: &str,
+        deadline: std::time::Instant,
+    ) -> Result<(String, std::rc::Rc<gha::actions::Tree>), String> {
         self.git.local_tree(path, deadline)
     }
-    fn local_copy(&self, path: &str, deadline: std::time::Instant) -> Result<gha::actions::Tree, String> {
+    fn local_copy(
+        &self,
+        path: &str,
+        deadline: std::time::Instant,
+    ) -> Result<gha::actions::Tree, String> {
         self.git.local_copy(path, deadline)
     }
 }
@@ -186,8 +205,12 @@ fn record(r: &Repo, x: Rec<'_>) -> Option<String> {
     rec.workflow_ref = Some(workflow_ref.clone());
     let source = RecordingSource {
         fake: gha::resolve::fake::Fake::new(),
-        git: gha::resolve::Git::new(&r.root, "https://github.com", std::time::Duration::from_secs(5))
-            .with_revision(r.sha.clone()),
+        git: gha::resolve::Git::new(
+            &r.root,
+            "https://github.com",
+            std::time::Duration::from_secs(5),
+        )
+        .with_revision(r.sha.clone()),
     };
     for raw in &spec.actions {
         source.fake.set(raw, Ok(PIN));
@@ -359,16 +382,24 @@ fn legacy_action_witness_is_cold_next_to_a_witnessed_positive_control() {
     claims["iat"] = json!(now);
     claims["nbf"] = json!(now);
     record.attest = Some(a::token(
-        &a::header("test-key-1"), &claims, &a::pair(a::KEY_1),
+        &a::header("test-key-1"),
+        &claims,
+        &a::pair(a::KEY_1),
     ));
     jobs.save(&key, record).unwrap();
     let mut file: Value = serde_json::from_slice(&jobs.export(&key).unwrap()).unwrap();
     file["v"] = json!(1);
     std::fs::write(
-        r.store().join("jobs").join(format!("{}.json", proof::sanitize(&key))),
+        r.store()
+            .join("jobs")
+            .join(format!("{}.json", proof::sanitize(&key))),
         serde_json::to_vec(&file).unwrap(),
-    ).unwrap();
-    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "action-unverifiable");
+    )
+    .unwrap();
+    assert_eq!(
+        code(&plan(&r, &["--format", "json"], &[]), "a"),
+        "action-unverifiable"
+    );
 }
 
 #[test]
@@ -380,7 +411,10 @@ fn local_action_uses_the_requested_revision_instead_of_head() {
     let r = Repo::new(&[
         (CI, &w),
         ("a.txt", "a\n"),
-        (".github/actions/check/action.yml", "runs:\n  using: node20\n  main: index.js\n"),
+        (
+            ".github/actions/check/action.yml",
+            "runs:\n  using: node20\n  main: index.js\n",
+        ),
         (".github/actions/check/index.js", "first\n"),
     ]);
     let now = proof::now();
@@ -388,11 +422,27 @@ fn local_action_uses_the_requested_revision_instead_of_head() {
     std::fs::write(r.root.join(".github/actions/check/index.js"), "changed\n").unwrap();
     git(&r.root, &["commit", "-qam", "change action"]);
     let new_sha = String::from_utf8(
-        Command::new("git").current_dir(&r.root).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
-    ).unwrap().trim().to_owned();
-    let old_target = plan(&r, &["--format", "json", "--rev", &r.sha], &[]);
+        Command::new("git")
+            .current_dir(&r.root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let old_target = plan(
+        &r,
+        &["--format", "json", "--rev", &r.sha],
+        &[("GITHUB_ACTIONS", ""), ("GITHUB_SHA", "")],
+    );
     assert_eq!(code(&old_target, "a"), "proved");
-    let new_target = plan(&r, &["--format", "json", "--rev", &new_sha], &[("GITHUB_SHA", &new_sha)]);
+    let new_target = plan(
+        &r,
+        &["--format", "json", "--rev", &new_sha],
+        &[("GITHUB_ACTIONS", ""), ("GITHUB_SHA", "")],
+    );
     assert_eq!(code(&new_target, "a"), "action-moved");
 }
 
@@ -1025,7 +1075,14 @@ fn inherited_age_limits_signed_attestations() {
     let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
     let now = proof::now();
     record(&r, rec(&w, now, now - 2 * DAY)).unwrap();
-    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+    let baseline = plan(&r, &["--format", "json"], &[]);
+    assert_eq!(
+        code(&baseline, "a"),
+        "proved",
+        "plan: {}; stderr: {}",
+        baseline.plan,
+        baseline.stderr
+    );
     let o = plan(&r, &["--format", "json"], &[("STOOP_MAX_AGE", "1h")]);
     assert_eq!(code(&o, "a"), "unattested");
 }
@@ -1086,7 +1143,11 @@ fn strict_actions_rejects_a_resolvable_floating_ref() {
     std::fs::create_dir_all(&source).unwrap();
     std::fs::create_dir_all(&bare).unwrap();
     git(&source, &["init", "-q"]);
-    std::fs::write(source.join("action.yml"), "runs:\n  using: node20\n  main: index.js\n").unwrap();
+    std::fs::write(
+        source.join("action.yml"),
+        "runs:\n  using: node20\n  main: index.js\n",
+    )
+    .unwrap();
     std::fs::write(source.join("index.js"), "fixture\n").unwrap();
     git(&source, &["add", "."]);
     git(&source, &["commit", "-qm", "fixture"]);
@@ -1119,7 +1180,8 @@ fn strict_actions_rejects_a_resolvable_floating_ref() {
         &[format!("actions/checkout@{PIN}"), "example/tool@v1".into()],
         &fake,
         false,
-    ).unwrap();
+    )
+    .unwrap();
     let mut claims = a::claims(&record);
     claims["aud"] = json!(attest::audience(&key, &record).unwrap());
     claims["sha"] = json!(r.sha);

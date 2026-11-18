@@ -130,7 +130,8 @@ fn local_action_requires_a_neutral_assertion_before_it_can_be_planned() {
         "      - uses: ./.github/actions/check\n      - run: cat a.txt",
     );
     let repo = Repo::new(&unmarked);
-    let value: serde_json::Value = serde_json::from_slice(&repo.plan(&["--format", "json"], false).stdout).unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&repo.plan(&["--format", "json"], false).stdout).unwrap();
     assert_eq!(value["jobs"][0]["code"], "blocked");
 
     let marked = unmarked.replace(
@@ -138,7 +139,8 @@ fn local_action_requires_a_neutral_assertion_before_it_can_be_planned() {
         "      - uses: ./.github/actions/check\n        env: {STOOP_PLAN: neutral}\n",
     );
     let repo = Repo::new(&marked);
-    let value: serde_json::Value = serde_json::from_slice(&repo.plan(&["--format", "json"], false).stdout).unwrap();
+    let value: serde_json::Value =
+        serde_json::from_slice(&repo.plan(&["--format", "json"], false).stdout).unwrap();
     assert_eq!(value["jobs"][0]["code"], "no-record");
 }
 #[test]
@@ -310,7 +312,9 @@ fn real_recorder_records_plannable_prior_states() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("action unverifiable at journal open"));
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("action unverifiable at journal open")
+    );
     let proof = fs::read_dir(r.0.join(".stoop/proofs"))
         .unwrap()
         .next()

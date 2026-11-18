@@ -104,7 +104,11 @@ fn answer(mut stream: TcpStream, github: &Github) {
     let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
     if path == "/repos/actions/checkout/tarball/1111111111111111111111111111111111111111" {
         let body = crate::gha::actions::fixture_archive();
-        let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        let _ = write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
         let _ = stream.write_all(&body);
         return;
     }
@@ -235,9 +239,14 @@ impl Repo {
         let temp = self.root.join(format!("runner-{run_id}"));
         fs::create_dir_all(&temp).map_err(|e| e.to_string())?;
         fs::write(temp.join("event.json"), "{}").map_err(|e| e.to_string())?;
-        let copy = temp.join("work/_actions/actions/checkout/1111111111111111111111111111111111111111");
+        let copy =
+            temp.join("work/_actions/actions/checkout/1111111111111111111111111111111111111111");
         fs::create_dir_all(&copy).map_err(|e| e.to_string())?;
-        fs::write(copy.join("action.yml"), "runs:\n  using: node20\n  main: index.js\n").map_err(|e| e.to_string())?;
+        fs::write(
+            copy.join("action.yml"),
+            "runs:\n  using: node20\n  main: index.js\n",
+        )
+        .map_err(|e| e.to_string())?;
         fs::write(copy.join("index.js"), "fixture\n").map_err(|e| e.to_string())?;
         let env = runner_env(&temp, &self.sha, run_id);
         for (name, value) in &env {
@@ -315,7 +324,10 @@ fn runner_env(temp: &Path, sha: &str, run_id: &str) -> BTreeMap<String, String> 
             temp.join("event.json").display().to_string(),
         ),
         ("RUNNER_TEMP", temp.display().to_string()),
-        ("RUNNER_WORKSPACE", temp.join("work/repo").display().to_string()),
+        (
+            "RUNNER_WORKSPACE",
+            temp.join("work/repo").display().to_string(),
+        ),
         ("RUNNER_OS", "Linux".to_string()),
     ]
     .into_iter()

@@ -36,19 +36,27 @@ pub struct Tree {
 fn valid_path(path: &str) -> bool {
     !path.is_empty()
         && path.len() <= MAX_PATH
-        && !path.contains(|c| c == '\\' || c == '\0' || c == ':')
+        && !path.contains(['\\', '\0', ':'])
         && !path.starts_with('/')
-        && path.split('/').all(|p| !p.is_empty() && p != "." && p != "..")
+        && path
+            .split('/')
+            .all(|p| !p.is_empty() && p != "." && p != "..")
 }
 
-fn read_bounded(mut reader: impl Read, expected: u64, deadline: Instant) -> Result<Vec<u8>, String> {
+fn read_bounded(
+    mut reader: impl Read,
+    expected: u64,
+    deadline: Instant,
+) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     let mut chunk = [0u8; 32 * 1024];
     loop {
         if Instant::now() >= deadline {
             return Err("action verification timed out".into());
         }
-        let n = reader.read(&mut chunk).map_err(|e| format!("cannot read action content: {e}"))?;
+        let n = reader
+            .read(&mut chunk)
+            .map_err(|e| format!("cannot read action content: {e}"))?;
         if n == 0 {
             break;
         }
@@ -73,18 +81,28 @@ impl Tree {
         if bytes.len() > MAX_COMPRESSED {
             return Err("action archive exceeds the compressed size limit".into());
         }
-        Self::from_tar_before(flate2::read::GzDecoder::new(Cursor::new(bytes)), true, deadline)
+        Self::from_tar_before(
+            flate2::read::GzDecoder::new(Cursor::new(bytes)),
+            true,
+            deadline,
+        )
     }
 
-
-    pub fn from_tar_before(reader: impl Read, strip_root: bool, deadline: Instant) -> Result<Self, String> {
+    pub fn from_tar_before(
+        reader: impl Read,
+        strip_root: bool,
+        deadline: Instant,
+    ) -> Result<Self, String> {
         let max_tar = MAX_UNPACKED + (MAX_ENTRIES as u64 * 1024) + 16 * 1024 * 1024;
         let mut archive = tar::Archive::new(reader.take(max_tar));
         let mut tree = Self::default();
         let mut size = 0u64;
         let mut count = 0usize;
         let mut root: Option<String> = None;
-        for entry in archive.entries().map_err(|e| format!("invalid action archive: {e}"))? {
+        for entry in archive
+            .entries()
+            .map_err(|e| format!("invalid action archive: {e}"))?
+        {
             if Instant::now() >= deadline {
                 return Err("action verification timed out".into());
             }
@@ -92,6 +110,24 @@ impl Tree {
             count += 1;
             if count > MAX_ENTRIES {
                 return Err("action archive exceeds the entry limit".into());
+            }
+            if entry.header().entry_type().is_pax_global_extensions() {
+                if count != 1
+                    || entry.path_bytes().as_ref() != b"pax_global_header"
+                    || entry.size() != 52
+                {
+                    return Err("unsupported global action archive metadata".into());
+                }
+                let comment = read_bounded(&mut entry, 52, deadline)?;
+                if !comment.starts_with(b"52 comment=")
+                    || comment[51] != b'\n'
+                    || !comment[11..51]
+                        .iter()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b))
+                {
+                    return Err("unsupported global action archive metadata".into());
+                }
+                continue;
             }
             let name = String::from_utf8(entry.path_bytes().into_owned())
                 .map_err(|_| "action archive has a non-UTF-8 path")?;
@@ -123,16 +159,24 @@ impl Tree {
                 return Err("action repository declares submodules".into());
             }
             let len = entry.size();
-            size = size.checked_add(len).ok_or("action archive size overflow")?;
+            size = size
+                .checked_add(len)
+                .ok_or("action archive size overflow")?;
             if size > MAX_UNPACKED {
                 return Err("action archive exceeds the unpacked size limit".into());
             }
             let executable = entry.header().mode().map_err(|e| e.to_string())? & 0o111 != 0;
             let bytes = read_bounded(&mut entry, len, deadline)?;
             if bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n") {
-                return Err(format!("action file {name} is an unresolved Git LFS pointer"));
+                return Err(format!(
+                    "action file {name} is an unresolved Git LFS pointer"
+                ));
             }
-            if tree.files.insert(name.to_owned(), File { executable, bytes }).is_some() {
+            if tree
+                .files
+                .insert(name.to_owned(), File { executable, bytes })
+                .is_some()
+            {
                 return Err(format!("duplicate action archive path {name}"));
             }
         }
@@ -148,8 +192,17 @@ impl Tree {
     }
 
     pub fn from_directory_before(root: &Path, deadline: Instant) -> Result<Self, String> {
-        fn walk(root: &Path, dir: &Path, tree: &mut Tree, count: &mut usize, size: &mut u64, deadline: Instant) -> Result<(), String> {
-            for entry in fs::read_dir(dir).map_err(|e| format!("cannot read runner action copy: {e}"))? {
+        fn walk(
+            root: &Path,
+            dir: &Path,
+            tree: &mut Tree,
+            count: &mut usize,
+            size: &mut u64,
+            deadline: Instant,
+        ) -> Result<(), String> {
+            for entry in
+                fs::read_dir(dir).map_err(|e| format!("cannot read runner action copy: {e}"))?
+            {
                 if Instant::now() >= deadline {
                     return Err("action verification timed out".into());
                 }
@@ -164,7 +217,9 @@ impl Tree {
                     return Err("runner action copy contains an unsupported symlink".into());
                 }
                 let relative = path.strip_prefix(root).map_err(|e| e.to_string())?;
-                let name = relative.to_str().ok_or("runner action copy has a non-UTF-8 path")?;
+                let name = relative
+                    .to_str()
+                    .ok_or("runner action copy has a non-UTF-8 path")?;
                 if !valid_path(name) {
                     return Err(format!("invalid runner action path {name:?}"));
                 }
@@ -174,7 +229,9 @@ impl Tree {
                 if metadata.is_dir() {
                     walk(root, &path, tree, count, size, deadline)?;
                 } else if metadata.is_file() {
-                    *size = size.checked_add(metadata.len()).ok_or("runner copy size overflow")?;
+                    *size = size
+                        .checked_add(metadata.len())
+                        .ok_or("runner copy size overflow")?;
                     if *size > MAX_UNPACKED {
                         return Err("runner action copy exceeds the size limit".into());
                     }
@@ -197,9 +254,14 @@ impl Tree {
                             return Err("runner action copy changed while opening".into());
                         }
                     }
-                    let bytes = read_bounded((&mut file).take(metadata.len() + 1), metadata.len(), deadline)?;
+                    let bytes = read_bounded(
+                        (&mut file).take(metadata.len() + 1),
+                        metadata.len(),
+                        deadline,
+                    )?;
                     let after = file.metadata().map_err(|e| e.to_string())?;
-                    if opened.len() != metadata.len() || after.len() != metadata.len()
+                    if opened.len() != metadata.len()
+                        || after.len() != metadata.len()
                         || opened.modified().ok() != after.modified().ok()
                     {
                         return Err("runner action copy changed while reading".into());
@@ -214,14 +276,21 @@ impl Tree {
                     };
                     #[cfg(not(unix))]
                     let executable = false;
-                    tree.files.insert(name.replace(std::path::MAIN_SEPARATOR, "/"), File { executable, bytes });
+                    tree.files.insert(
+                        name.replace(std::path::MAIN_SEPARATOR, "/"),
+                        File { executable, bytes },
+                    );
                 } else {
                     return Err("runner action copy contains an unsupported entry".into());
                 }
             }
             Ok(())
         }
-        if fs::symlink_metadata(root).map_err(|e| e.to_string())?.file_type().is_symlink() {
+        if fs::symlink_metadata(root)
+            .map_err(|e| e.to_string())?
+            .file_type()
+            .is_symlink()
+        {
             return Err("runner action directory is a symlink".into());
         }
         let mut tree = Self::default();
@@ -237,9 +306,14 @@ impl Tree {
             return Err(format!("invalid local action path {prefix:?}"));
         }
         let prefix = format!("{prefix}/");
-        let files = self.files.iter().filter_map(|(path, file)| {
-            path.strip_prefix(&prefix).map(|relative| (relative.to_owned(), file.clone()))
-        }).collect();
+        let files = self
+            .files
+            .iter()
+            .filter_map(|(path, file)| {
+                path.strip_prefix(&prefix)
+                    .map(|relative| (relative.to_owned(), file.clone()))
+            })
+            .collect();
         let tree = Self { files };
         if tree.files.is_empty() {
             return Err("local action is absent from the target revision".into());
@@ -264,8 +338,14 @@ impl Tree {
         if !path.is_empty() && !valid_path(path) {
             return Err(format!("invalid action subdirectory {path:?}"));
         }
-        let prefix = if path.is_empty() { String::new() } else { format!("{path}/") };
-        let file = self.files.get(&format!("{prefix}action.yml"))
+        let prefix = if path.is_empty() {
+            String::new()
+        } else {
+            format!("{path}/")
+        };
+        let file = self
+            .files
+            .get(&format!("{prefix}action.yml"))
             .or_else(|| self.files.get(&format!("{prefix}action.yaml")))
             .ok_or("action metadata is absent")?;
         if file.bytes.len() > 1024 * 1024 {
@@ -273,16 +353,30 @@ impl Tree {
         }
         let text = std::str::from_utf8(&file.bytes).map_err(|_| "action metadata is not UTF-8")?;
         let metadata = workflow::parse_document(text)?;
-        let runs = metadata.get("runs").and_then(|v| v.as_object()).ok_or("action metadata has no runs")?;
-        let using = runs.get("using").and_then(|v| v.as_str()).ok_or("action metadata has no static runs.using")?;
+        let runs = metadata
+            .get("runs")
+            .and_then(|v| v.as_object())
+            .ok_or("action metadata has no runs")?;
+        let using = runs
+            .get("using")
+            .and_then(|v| v.as_str())
+            .ok_or("action metadata has no static runs.using")?;
         match using.to_ascii_lowercase().as_str() {
             "composite" => {
-                let steps = runs.get("steps").and_then(|v| v.as_array()).ok_or("composite action has no steps")?;
+                let steps = runs
+                    .get("steps")
+                    .and_then(|v| v.as_array())
+                    .ok_or("composite action has no steps")?;
                 let mut refs = Vec::new();
                 for step in steps {
-                    let step = step.as_object().ok_or("composite action step is not an object")?;
+                    let step = step
+                        .as_object()
+                        .ok_or("composite action step is not an object")?;
                     if let Some(value) = step.get("uses") {
-                        let raw = value.as_str().filter(|s| !s.contains("${{")).ok_or("composite action has a dynamic uses")?;
+                        let raw = value
+                            .as_str()
+                            .filter(|s| !s.contains("${{"))
+                            .ok_or("composite action has a dynamic uses")?;
                         refs.push(raw.to_owned());
                     } else if !step.get("run").is_some_and(|v| v.as_str().is_some()) {
                         return Err("composite action step has neither uses nor run".into());
@@ -293,7 +387,10 @@ impl Tree {
             "node12" | "node16" | "node20" | "node24" => {
                 for key in ["main", "pre", "post"] {
                     if let Some(value) = runs.get(key) {
-                        let path = value.as_str().filter(|p| valid_path(p)).ok_or("invalid action entrypoint")?;
+                        let path = value
+                            .as_str()
+                            .filter(|p| valid_path(p))
+                            .ok_or("invalid action entrypoint")?;
                         if !self.files.contains_key(&format!("{prefix}{path}")) {
                             return Err(format!("action entrypoint {path} is absent"));
                         }
@@ -304,7 +401,10 @@ impl Tree {
                 Ok(Vec::new())
             }
             "docker" => {
-                let image = runs.get("image").and_then(|v| v.as_str()).ok_or("docker action has no static image")?;
+                let image = runs
+                    .get("image")
+                    .and_then(|v| v.as_str())
+                    .ok_or("docker action has no static image")?;
                 docker_digest(image)?;
                 Ok(vec![image.to_owned()])
             }
@@ -314,9 +414,18 @@ impl Tree {
 }
 
 pub fn docker_digest(raw: &str) -> Result<String, String> {
-    let image = raw.strip_prefix("docker://").ok_or("docker action must name a digest-pinned image")?;
-    let (name, digest) = image.rsplit_once("@sha256:").ok_or("docker action image has no sha256 digest")?;
-    if name.is_empty() || digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) {
+    let image = raw
+        .strip_prefix("docker://")
+        .ok_or("docker action must name a digest-pinned image")?;
+    let (name, digest) = image
+        .rsplit_once("@sha256:")
+        .ok_or("docker action image has no sha256 digest")?;
+    if name.is_empty()
+        || digest.len() != 64
+        || !digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
         return Err("docker action image has an invalid sha256 digest".into());
     }
     Ok(format!("sha256:{digest}"))
@@ -359,7 +468,14 @@ impl Walk<'_> {
         if !self.active.insert(raw.to_owned()) {
             return Err(bad("cyclic composite actions".into()));
         }
-        let old = self.recorded.map(|w| w.items.get(raw).ok_or_else(|| bad("record has no content witness".into()))).transpose()?;
+        let old = self
+            .recorded
+            .map(|w| {
+                w.items
+                    .get(raw)
+                    .ok_or_else(|| bad("record has no content witness".into()))
+            })
+            .transpose()?;
         let (sha, digest, nested) = if raw.starts_with("docker://") {
             let digest = docker_digest(raw).map_err(bad)?;
             (digest.clone(), digest, Vec::new())
@@ -370,23 +486,33 @@ impl Walk<'_> {
             let (sha, tree) = self.resolver.local_tree(path, self.deadline).map_err(bad)?;
             if let Some(old) = old {
                 if old.sha != sha {
-                    return Err((Code::ActionMoved, format!("local action {raw} is at {sha}, recorded at {}", old.sha)));
+                    return Err((
+                        Code::ActionMoved,
+                        format!("local action {raw} is at {sha}, recorded at {}", old.sha),
+                    ));
                 }
             }
             let digest = tree.digest();
             if old.is_some_and(|w| w.digest != digest) {
-                return Err((Code::ActionContentChanged, format!("action {raw} content differs from the recorded copy")));
+                return Err((
+                    Code::ActionContentChanged,
+                    format!("action {raw} content differs from the recorded copy"),
+                ));
             }
             if self.recorded.is_none() {
                 let copy = self.resolver.local_copy(path, self.deadline).map_err(bad)?;
                 if copy.digest() != digest {
-                    return Err(bad("local action copy differs from the committed tree".into()));
+                    return Err(bad(
+                        "local action copy differs from the committed tree".into()
+                    ));
                 }
             }
             let nested = tree.nested("").map_err(bad)?;
             (sha, digest, nested)
         } else {
-            let (name, reference) = raw.rsplit_once('@').ok_or_else(|| bad("action has no ref".into()))?;
+            let (name, reference) = raw
+                .rsplit_once('@')
+                .ok_or_else(|| bad("action has no ref".into()))?;
             let mut parts = name.split('/');
             let owner = parts.next().unwrap_or("");
             let repo = parts.next().unwrap_or("");
@@ -397,22 +523,43 @@ impl Walk<'_> {
             }
             let sha = match action {
                 resolve::Action::Pinned(sha) => sha,
-                resolve::Action::Remote { owner, repo, reference } => self.resolver.commit_before(&owner, &repo, &reference, self.deadline).map_err(bad)?,
+                resolve::Action::Remote {
+                    owner,
+                    repo,
+                    reference,
+                } => self
+                    .resolver
+                    .commit_before(&owner, &repo, &reference, self.deadline)
+                    .map_err(bad)?,
             };
             if let Some(old) = old {
                 if old.sha != sha {
-                    return Err((Code::ActionMoved, format!("action {raw} resolves to {sha}, recorded as {}", old.sha)));
+                    return Err((
+                        Code::ActionMoved,
+                        format!("action {raw} resolves to {sha}, recorded as {}", old.sha),
+                    ));
                 }
             }
-            let tree = self.resolver.action_tree(owner, repo, &sha, self.deadline).map_err(bad)?;
+            let tree = self
+                .resolver
+                .action_tree(owner, repo, &sha, self.deadline)
+                .map_err(bad)?;
             let digest = tree.digest();
             if old.is_some_and(|w| w.digest != digest) {
-                return Err((Code::ActionContentChanged, format!("action {raw} content differs from the recorded copy")));
+                return Err((
+                    Code::ActionContentChanged,
+                    format!("action {raw} content differs from the recorded copy"),
+                ));
             }
             if self.recorded.is_none() {
-                let copy = self.resolver.runner_copy(owner, repo, reference, self.deadline).map_err(bad)?;
+                let copy = self
+                    .resolver
+                    .runner_copy(owner, repo, reference, self.deadline)
+                    .map_err(bad)?;
                 if copy.digest() != digest {
-                    return Err(bad("runner action copy differs from the downloaded tree".into()));
+                    return Err(bad(
+                        "runner action copy differs from the downloaded tree".into()
+                    ));
                 }
             }
             let nested = tree.nested(&path).map_err(bad)?;
@@ -420,10 +567,16 @@ impl Walk<'_> {
         };
         if let Some(old) = old {
             if old.sha != sha {
-                return Err((Code::ActionMoved, format!("action {raw} resolves to {sha}, recorded as {}", old.sha)));
+                return Err((
+                    Code::ActionMoved,
+                    format!("action {raw} resolves to {sha}, recorded as {}", old.sha),
+                ));
             }
             if old.digest != digest {
-                return Err((Code::ActionContentChanged, format!("action {raw} content differs from the recorded copy")));
+                return Err((
+                    Code::ActionContentChanged,
+                    format!("action {raw} content differs from the recorded copy"),
+                ));
             }
         }
         for child in nested {
@@ -436,13 +589,28 @@ impl Walk<'_> {
 }
 
 fn roots(uses: &[String]) -> Vec<String> {
-    uses.iter().cloned().collect::<BTreeSet<_>>().into_iter().collect()
+    uses.iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// Failed capture returns no witness, so the journal can never authorize a skip.
-pub fn capture(uses: &[String], resolver: &dyn Resolver, strict: bool) -> Result<BTreeMap<String, String>, String> {
+pub fn capture(
+    uses: &[String],
+    resolver: &dyn Resolver,
+    strict: bool,
+) -> Result<BTreeMap<String, String>, String> {
     let roots = roots(uses);
-    let mut walk = Walk { resolver, deadline: Instant::now() + TOTAL_TIMEOUT, recorded: None, items: BTreeMap::new(), active: BTreeSet::new(), strict };
+    let mut walk = Walk {
+        resolver,
+        deadline: Instant::now() + TOTAL_TIMEOUT,
+        recorded: None,
+        items: BTreeMap::new(),
+        active: BTreeSet::new(),
+        strict,
+    };
     for raw in &roots {
         walk.visit(raw, 0).map_err(|(_, detail)| detail)?;
     }
@@ -450,25 +618,50 @@ pub fn capture(uses: &[String], resolver: &dyn Resolver, strict: bool) -> Result
     for (raw, witness) in &walk.items {
         actions.insert(raw.clone(), witness.sha.clone());
     }
-    let witnesses = Witnesses { version: 1, roots, items: walk.items };
-    actions.insert(WITNESS_KEY.into(), serde_json::to_string(&witnesses).map_err(|e| e.to_string())?);
+    let witnesses = Witnesses {
+        version: 1,
+        roots,
+        items: walk.items,
+    };
+    actions.insert(
+        WITNESS_KEY.into(),
+        serde_json::to_string(&witnesses).map_err(|e| e.to_string())?,
+    );
     Ok(actions)
 }
 
-pub fn verify(uses: &[String], actions: &BTreeMap<String, String>, resolver: &dyn Resolver, strict: bool, deadline: Instant) -> Result<(), (Code, String)> {
+pub fn verify(
+    uses: &[String],
+    actions: &BTreeMap<String, String>,
+    resolver: &dyn Resolver,
+    strict: bool,
+    deadline: Instant,
+) -> Result<(), (Code, String)> {
     let invalid = |message: &str| (Code::ActionUnverifiable, message.to_owned());
-    let text = actions.get(WITNESS_KEY).ok_or_else(|| invalid("record has no action content witness"))?;
-    let witnesses: Witnesses = serde_json::from_str(text).map_err(|_| invalid("record has an invalid action content witness"))?;
+    let text = actions
+        .get(WITNESS_KEY)
+        .ok_or_else(|| invalid("record has no action content witness"))?;
+    let witnesses: Witnesses = serde_json::from_str(text)
+        .map_err(|_| invalid("record has an invalid action content witness"))?;
     let roots = roots(uses);
     if witnesses.version != 1 || witnesses.roots != roots {
         return Err(invalid("record action roots do not match the job"));
     }
-    let mut walk = Walk { resolver, deadline, recorded: Some(&witnesses), items: BTreeMap::new(), active: BTreeSet::new(), strict };
+    let mut walk = Walk {
+        resolver,
+        deadline,
+        recorded: Some(&witnesses),
+        items: BTreeMap::new(),
+        active: BTreeSet::new(),
+        strict,
+    };
     for raw in &roots {
         walk.visit(raw, 0)?;
     }
     if walk.items.len() != witnesses.items.len() {
-        return Err(invalid("record action graph does not match the downloaded actions"));
+        return Err(invalid(
+            "record action graph does not match the downloaded actions",
+        ));
     }
     Ok(())
 }
@@ -494,7 +687,10 @@ impl FixtureServer {
             while !stopping.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
                         let mut reader = BufReader::new(stream.try_clone().unwrap());
                         let mut line = String::new();
                         reader.read_line(&mut line).unwrap_or(0);
@@ -503,7 +699,9 @@ impl FixtureServer {
                         let body = relative.and_then(|p| fs::read(root.join(p)).ok());
                         loop {
                             line.clear();
-                            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" { break; }
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                                break;
+                            }
                         }
                         match body {
                             Some(bytes) => {
@@ -515,12 +713,18 @@ impl FixtureServer {
                             }
                         }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => std::thread::sleep(Duration::from_millis(5)),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5))
+                    }
                     Err(e) => panic!("fixture accept: {e}"),
                 }
             }
         });
-        Self { url, stop, thread: Some(thread) }
+        Self {
+            url,
+            stop,
+            thread: Some(thread),
+        }
     }
 }
 
@@ -539,14 +743,18 @@ pub(crate) fn fixture_archive() -> Vec<u8> {
     let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
     let mut tar = tar::Builder::new(gz);
     for (name, contents) in [
-        ("action.yml", &b"runs:\n  using: node20\n  main: index.js\n"[..]),
+        (
+            "action.yml",
+            &b"runs:\n  using: node20\n  main: index.js\n"[..],
+        ),
         ("index.js", &b"fixture\n"[..]),
     ] {
         let mut header = tar::Header::new_gnu();
         header.set_mode(0o644);
         header.set_size(contents.len() as u64);
         header.set_cksum();
-        tar.append_data(&mut header, format!("repo-sha/{name}"), contents).unwrap();
+        tar.append_data(&mut header, format!("repo-sha/{name}"), contents)
+            .unwrap();
     }
     tar.into_inner().unwrap().finish().unwrap()
 }
@@ -569,7 +777,8 @@ mod tests {
             header.set_mode(0o644);
             header.set_size(contents.len() as u64);
             header.set_cksum();
-            tar.append_data(&mut header, format!("repo-sha/{name}"), *contents).unwrap();
+            tar.append_data(&mut header, format!("repo-sha/{name}"), *contents)
+                .unwrap();
         }
         tar.into_inner().unwrap().finish().unwrap()
     }
@@ -582,20 +791,47 @@ mod tests {
     }
     impl Source {
         fn add(&self, name: &str, sha: &str, tree: Tree) {
-            self.refs.borrow_mut().insert(format!("{name}@v1"), sha.into());
+            self.refs
+                .borrow_mut()
+                .insert(format!("{name}@v1"), sha.into());
             self.copies.borrow_mut().insert(name.into(), tree.clone());
             self.trees.borrow_mut().insert(name.into(), tree);
         }
     }
     impl Resolver for Source {
         fn commit(&self, owner: &str, repo: &str, reference: &str) -> Result<String, String> {
-            self.refs.borrow().get(&format!("{owner}/{repo}@{reference}")).cloned().ok_or("missing ref".into())
+            self.refs
+                .borrow()
+                .get(&format!("{owner}/{repo}@{reference}"))
+                .cloned()
+                .ok_or("missing ref".into())
         }
-        fn action_tree(&self, owner: &str, repo: &str, _: &str, _: Instant) -> Result<std::rc::Rc<Tree>, String> {
-            self.trees.borrow().get(&format!("{owner}/{repo}")).cloned().map(std::rc::Rc::new).ok_or("missing tree".into())
+        fn action_tree(
+            &self,
+            owner: &str,
+            repo: &str,
+            _: &str,
+            _: Instant,
+        ) -> Result<std::rc::Rc<Tree>, String> {
+            self.trees
+                .borrow()
+                .get(&format!("{owner}/{repo}"))
+                .cloned()
+                .map(std::rc::Rc::new)
+                .ok_or("missing tree".into())
         }
-        fn runner_copy(&self, owner: &str, repo: &str, _: &str, _: Instant) -> Result<Tree, String> {
-            self.copies.borrow().get(&format!("{owner}/{repo}")).cloned().ok_or("missing copy".into())
+        fn runner_copy(
+            &self,
+            owner: &str,
+            repo: &str,
+            _: &str,
+            _: Instant,
+        ) -> Result<Tree, String> {
+            self.copies
+                .borrow()
+                .get(&format!("{owner}/{repo}"))
+                .cloned()
+                .ok_or("missing copy".into())
         }
     }
 
@@ -607,25 +843,59 @@ mod tests {
         source.add("owner/tool", first, fixture_tree());
         let refs = vec!["owner/tool@v1".to_owned()];
         let witness = capture(&refs, &source, false).unwrap();
-        let check = |source: &Source| verify(&refs, &witness, source, false, Instant::now() + TOTAL_TIMEOUT);
+        let check = |source: &Source| {
+            verify(
+                &refs,
+                &witness,
+                source,
+                false,
+                Instant::now() + TOTAL_TIMEOUT,
+            )
+        };
         assert!(check(&source).is_ok());
-        source.refs.borrow_mut().insert("owner/tool@v1".into(), second.into());
+        source
+            .refs
+            .borrow_mut()
+            .insert("owner/tool@v1".into(), second.into());
         assert_eq!(check(&source).unwrap_err().0, Code::ActionMoved);
-        source.refs.borrow_mut().insert("owner/tool@v1".into(), first.into());
-        let changed = Tree::from_gzip(&archive(&[("action.yml", b"runs:\n  using: node20\n  main: index.js\n"), ("index.js", b"tampered")])).unwrap();
-        source.trees.borrow_mut().insert("owner/tool".into(), changed);
+        source
+            .refs
+            .borrow_mut()
+            .insert("owner/tool@v1".into(), first.into());
+        let changed = Tree::from_gzip(&archive(&[
+            ("action.yml", b"runs:\n  using: node20\n  main: index.js\n"),
+            ("index.js", b"tampered"),
+        ]))
+        .unwrap();
+        source
+            .trees
+            .borrow_mut()
+            .insert("owner/tool".into(), changed);
         assert_eq!(check(&source).unwrap_err().0, Code::ActionContentChanged);
     }
 
     #[test]
     fn recording_refuses_missing_or_tampered_runner_copy() {
         let source = Source::default();
-        source.add("owner/tool", "1111111111111111111111111111111111111111", fixture_tree());
+        source.add(
+            "owner/tool",
+            "1111111111111111111111111111111111111111",
+            fixture_tree(),
+        );
         let refs = vec!["owner/tool@v1".to_owned()];
         assert!(capture(&refs, &source, false).is_ok());
-        let changed = Tree::from_gzip(&archive(&[("action.yml", b"runs:\n  using: node20\n  main: index.js\n"), ("index.js", b"tampered")])).unwrap();
-        source.copies.borrow_mut().insert("owner/tool".into(), changed);
-        assert!(capture(&refs, &source, false).unwrap_err().contains("runner action copy differs"));
+        let changed = Tree::from_gzip(&archive(&[
+            ("action.yml", b"runs:\n  using: node20\n  main: index.js\n"),
+            ("index.js", b"tampered"),
+        ]))
+        .unwrap();
+        source
+            .copies
+            .borrow_mut()
+            .insert("owner/tool".into(), changed);
+        assert!(capture(&refs, &source, false)
+            .unwrap_err()
+            .contains("runner action copy differs"));
         source.copies.borrow_mut().clear();
         assert!(capture(&refs, &source, false).is_err());
     }
@@ -633,14 +903,43 @@ mod tests {
     #[test]
     fn nested_composite_action_movement_blocks_the_parent() {
         let source = Source::default();
-        let composite = Tree::from_gzip(&archive(&[("action.yml", b"runs:\n  using: composite\n  steps:\n    - uses: owner/child@v1\n")])).unwrap();
-        source.add("owner/parent", "1111111111111111111111111111111111111111", composite);
-        source.add("owner/child", "2222222222222222222222222222222222222222", fixture_tree());
+        let composite = Tree::from_gzip(&archive(&[(
+            "action.yml",
+            b"runs:\n  using: composite\n  steps:\n    - uses: owner/child@v1\n",
+        )]))
+        .unwrap();
+        source.add(
+            "owner/parent",
+            "1111111111111111111111111111111111111111",
+            composite,
+        );
+        source.add(
+            "owner/child",
+            "2222222222222222222222222222222222222222",
+            fixture_tree(),
+        );
         let refs = vec!["owner/parent@v1".to_owned()];
         let witness = capture(&refs, &source, false).unwrap();
-        assert!(verify(&refs, &witness, &source, false, Instant::now() + TOTAL_TIMEOUT).is_ok());
-        source.refs.borrow_mut().insert("owner/child@v1".into(), "3333333333333333333333333333333333333333".into());
-        let (code, detail) = verify(&refs, &witness, &source, false, Instant::now() + TOTAL_TIMEOUT).unwrap_err();
+        assert!(verify(
+            &refs,
+            &witness,
+            &source,
+            false,
+            Instant::now() + TOTAL_TIMEOUT
+        )
+        .is_ok());
+        source.refs.borrow_mut().insert(
+            "owner/child@v1".into(),
+            "3333333333333333333333333333333333333333".into(),
+        );
+        let (code, detail) = verify(
+            &refs,
+            &witness,
+            &source,
+            false,
+            Instant::now() + TOTAL_TIMEOUT,
+        )
+        .unwrap_err();
         assert_eq!(code, Code::ActionMoved);
         assert!(detail.contains("owner/child@v1"));
     }
@@ -648,18 +947,36 @@ mod tests {
     #[test]
     fn deadline_and_unpinned_docker_ref_fail_wide() {
         let source = Source::default();
-        source.add("owner/tool", "1111111111111111111111111111111111111111", fixture_tree());
+        source.add(
+            "owner/tool",
+            "1111111111111111111111111111111111111111",
+            fixture_tree(),
+        );
         let refs = vec!["owner/tool@v1".to_owned()];
         let witness = capture(&refs, &source, false).unwrap();
-        assert_eq!(verify(&refs, &witness, &source, false, Instant::now()).unwrap_err().0, Code::ActionUnverifiable);
+        assert_eq!(
+            verify(&refs, &witness, &source, false, Instant::now())
+                .unwrap_err()
+                .0,
+            Code::ActionUnverifiable
+        );
         assert!(capture(&["docker://alpine:latest".into()], &source, false).is_err());
     }
 
     #[test]
     fn tar_digest_is_order_independent_and_tracks_bytes_and_mode() {
-        let first = archive(&[("action.yml", b"runs:\n  using: node20\n  main: index.js\n"), ("index.js", b"one")]);
-        let reordered = archive(&[("index.js", b"one"), ("action.yml", b"runs:\n  using: node20\n  main: index.js\n")]);
-        let changed = archive(&[("index.js", b"two"), ("action.yml", b"runs:\n  using: node20\n  main: index.js\n")]);
+        let first = archive(&[
+            ("action.yml", b"runs:\n  using: node20\n  main: index.js\n"),
+            ("index.js", b"one"),
+        ]);
+        let reordered = archive(&[
+            ("index.js", b"one"),
+            ("action.yml", b"runs:\n  using: node20\n  main: index.js\n"),
+        ]);
+        let changed = archive(&[
+            ("index.js", b"two"),
+            ("action.yml", b"runs:\n  using: node20\n  main: index.js\n"),
+        ]);
         let a = Tree::from_gzip(&first).unwrap();
         assert_eq!(a.digest(), Tree::from_gzip(&reordered).unwrap().digest());
         assert_ne!(a.digest(), Tree::from_gzip(&changed).unwrap().digest());
@@ -678,9 +995,44 @@ mod tests {
         header.set_mode(0o777);
         header.set_link_name("../outside").unwrap();
         header.set_cksum();
-        tar.append_data(&mut header, "repo-sha/link", &[][..]).unwrap();
+        tar.append_data(&mut header, "repo-sha/link", &[][..])
+            .unwrap();
         let bytes = tar.into_inner().unwrap().finish().unwrap();
         assert!(Tree::from_gzip(&bytes).unwrap_err().contains("unsupported"));
+    }
+
+    #[test]
+    fn git_archive_comment_is_accepted_and_other_global_metadata_is_refused() {
+        fn with_global(value: &[u8]) -> Vec<u8> {
+            let mut archive = tar::Builder::new(Vec::new());
+            let mut header = tar::Header::new_ustar();
+            header.set_entry_type(tar::EntryType::XGlobalHeader);
+            header.set_mode(0o644);
+            header.set_size(value.len() as u64);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "pax_global_header", value)
+                .unwrap();
+            let mut header = tar::Header::new_ustar();
+            header.set_mode(0o644);
+            header.set_size(1);
+            header.set_cksum();
+            archive.append_data(&mut header, "file", &b"x"[..]).unwrap();
+            archive.into_inner().unwrap()
+        }
+        let comment = b"52 comment=1111111111111111111111111111111111111111\n";
+        assert!(Tree::from_tar_before(
+            Cursor::new(with_global(comment)),
+            false,
+            Instant::now() + TOTAL_TIMEOUT
+        )
+        .is_ok());
+        assert!(Tree::from_tar_before(
+            Cursor::new(with_global(b"13 path=evil\n")),
+            false,
+            Instant::now() + TOTAL_TIMEOUT
+        )
+        .is_err());
     }
 
     #[test]
@@ -697,23 +1049,39 @@ mod tests {
     fn docker_images_need_a_sha256_digest() {
         assert!(docker_digest("docker://alpine:latest").is_err());
         let pinned = format!("docker://alpine@sha256:{}", "1".repeat(64));
-        assert_eq!(docker_digest(&pinned).unwrap(), format!("sha256:{}", "1".repeat(64)));
+        assert_eq!(
+            docker_digest(&pinned).unwrap(),
+            format!("sha256:{}", "1".repeat(64))
+        );
     }
 
     #[test]
     fn runner_copy_must_match_the_downloaded_tree() {
-        let temp = std::env::temp_dir().join(format!("stoop-action-copy-{}-{}", std::process::id(), crate::proof::now()));
+        let temp = std::env::temp_dir().join(format!(
+            "stoop-action-copy-{}-{}",
+            std::process::id(),
+            crate::proof::now()
+        ));
         std::fs::create_dir_all(&temp).unwrap();
-        std::fs::File::create(temp.join("action.yml")).unwrap().write_all(b"runs:\n  using: node20\n  main: index.js\n").unwrap();
+        std::fs::File::create(temp.join("action.yml"))
+            .unwrap()
+            .write_all(b"runs:\n  using: node20\n  main: index.js\n")
+            .unwrap();
         std::fs::write(temp.join("index.js"), b"one").unwrap();
-        let tree = Tree::from_gzip(&archive(&[("action.yml", b"runs:\n  using: node20\n  main: index.js\n"), ("index.js", b"one")])).unwrap();
+        let tree = Tree::from_gzip(&archive(&[
+            ("action.yml", b"runs:\n  using: node20\n  main: index.js\n"),
+            ("index.js", b"one"),
+        ]))
+        .unwrap();
         assert_eq!(tree.digest(), Tree::from_directory(&temp).unwrap().digest());
         std::fs::write(temp.join("index.js"), b"tampered").unwrap();
         assert_ne!(tree.digest(), Tree::from_directory(&temp).unwrap().digest());
         #[cfg(unix)]
         {
             std::fs::hard_link(temp.join("index.js"), temp.join("hardlink.js")).unwrap();
-            assert!(Tree::from_directory(&temp).unwrap_err().contains("hard-linked"));
+            assert!(Tree::from_directory(&temp)
+                .unwrap_err()
+                .contains("hard-linked"));
         }
         std::fs::remove_dir_all(temp).unwrap();
     }

@@ -1,8 +1,8 @@
 //! Resolves action refs and verifies the trees downloaded for their commits.
 //! Missing content, credentials, or runner copies make the job run.
 
-use crate::job::JobRecord;
 use crate::gha::actions::{self, Tree};
+use crate::job::JobRecord;
 use crate::plan::spec::{Code, JobSpec, RecordCheck};
 use crate::run;
 use std::cell::RefCell;
@@ -102,11 +102,15 @@ fn is_full_sha(s: &str) -> bool {
 
 #[cfg(test)]
 fn assert_fixture_url(url: &str) {
-    let loopback = url.strip_prefix("http://")
+    let loopback = url
+        .strip_prefix("http://")
         .and_then(|rest| rest.split('/').next())
         .and_then(|authority| authority.parse::<std::net::SocketAddr>().ok())
         .is_some_and(|address| address.ip().is_loopback());
-    assert!(url.starts_with("file:///") || loopback, "non-local action network access in a test");
+    assert!(
+        url.starts_with("file:///") || loopback,
+        "non-local action network access in a test"
+    );
 }
 
 /// Answers what a `uses:` reference names on its server.
@@ -114,13 +118,31 @@ pub trait Resolver {
     /// The commit `owner/repo@reference` names now, or why that is unknown.
     fn commit(&self, owner: &str, repo: &str, reference: &str) -> Result<String, String>;
 
-    fn commit_before(&self, owner: &str, repo: &str, reference: &str, _deadline: Instant) -> Result<String, String> {
+    fn commit_before(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+        _deadline: Instant,
+    ) -> Result<String, String> {
         self.commit(owner, repo, reference)
     }
-    fn action_tree(&self, _owner: &str, _repo: &str, _sha: &str, _deadline: Instant) -> Result<Rc<Tree>, String> {
+    fn action_tree(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _sha: &str,
+        _deadline: Instant,
+    ) -> Result<Rc<Tree>, String> {
         Err("action tree download is unavailable".into())
     }
-    fn runner_copy(&self, _owner: &str, _repo: &str, _reference: &str, _deadline: Instant) -> Result<Tree, String> {
+    fn runner_copy(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _reference: &str,
+        _deadline: Instant,
+    ) -> Result<Tree, String> {
         Err("runner action copy is unavailable".into())
     }
     fn local_tree(&self, _path: &str, _deadline: Instant) -> Result<(String, Rc<Tree>), String> {
@@ -130,6 +152,7 @@ pub trait Resolver {
         Err("local action copy is unavailable".into())
     }
 }
+type DownloadCache = HashMap<(String, String, String), Result<Rc<Tree>, String>>;
 
 /// Resolves through `git ls-remote` against `<base>/<owner>/<repo>.git`.
 pub struct Git {
@@ -139,7 +162,7 @@ pub struct Git {
     api: String,
     revision: Option<String>,
     cache_root: Option<PathBuf>,
-    downloaded: RefCell<HashMap<(String, String, String), Result<Rc<Tree>, String>>>,
+    downloaded: RefCell<DownloadCache>,
 }
 
 impl Git {
@@ -153,7 +176,15 @@ impl Git {
         } else {
             format!("{base}/api/v3")
         };
-        Self { dir: dir.into(), base, timeout, api, revision: None, cache_root: None, downloaded: RefCell::new(HashMap::new()) }
+        Self {
+            dir: dir.into(),
+            base,
+            timeout,
+            api,
+            revision: None,
+            cache_root: None,
+            downloaded: RefCell::new(HashMap::new()),
+        }
     }
 
     pub fn with_revision(mut self, revision: impl Into<String>) -> Self {
@@ -172,7 +203,12 @@ impl Git {
         git
     }
 
-    fn ls_remote(&self, url: &str, patterns: &[String], total_deadline: Instant) -> Result<String, String> {
+    fn ls_remote(
+        &self,
+        url: &str,
+        patterns: &[String],
+        total_deadline: Instant,
+    ) -> Result<String, String> {
         #[cfg(test)]
         assert_fixture_url(url);
         let mut command = Command::new("git");
@@ -233,16 +269,36 @@ impl Git {
         String::from_utf8(stdout).map_err(|_| "git ls-remote output is not UTF-8".into())
     }
 
-    fn run_bounded(&self, mut command: Command, input: Option<&[u8]>, limit: usize, deadline: Instant) -> Result<Vec<u8>, String> {
+    fn run_bounded(
+        &self,
+        mut command: Command,
+        input: Option<&[u8]>,
+        limit: usize,
+        deadline: Instant,
+    ) -> Result<Vec<u8>, String> {
         if Instant::now() >= deadline {
             return Err("action verification timed out".into());
         }
-        command.current_dir(&self.dir).stdout(Stdio::piped()).stderr(Stdio::null());
-        command.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
-        for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_ATTR_SOURCE"] {
+        command
+            .current_dir(&self.dir)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        command.stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_ATTR_SOURCE",
+        ] {
             command.env_remove(var);
         }
-        let mut child = command.spawn().map_err(|e| format!("cannot start action verification: {e}"))?;
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("cannot start action verification: {e}"))?;
         if let Some(input) = input {
             if let Some(mut stdin) = child.stdin.take() {
                 if let Err(e) = stdin.write_all(input) {
@@ -252,10 +308,16 @@ impl Git {
                 }
             }
         }
-        let stdout = child.stdout.take().ok_or("cannot capture action verification output")?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or("cannot capture action verification output")?;
         let reader = thread::spawn(move || {
             let mut bytes = Vec::new();
-            stdout.take((limit + 1) as u64).read_to_end(&mut bytes).map(|_| bytes)
+            stdout
+                .take((limit + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes)
         });
         let status = loop {
             match child.try_wait() {
@@ -273,7 +335,9 @@ impl Git {
                 }
             }
         };
-        let bytes = reader.join().map_err(|_| "action output reader panicked")?
+        let bytes = reader
+            .join()
+            .map_err(|_| "action output reader panicked")?
             .map_err(|e| format!("cannot read action verification output: {e}"))?;
         if bytes.len() > limit {
             return Err("action download exceeds the size limit".into());
@@ -284,8 +348,18 @@ impl Git {
         Ok(bytes)
     }
 
-    fn cache_archive(&self, owner: &str, repo: &str, sha: &str, bytes: &[u8], deadline: Instant) -> Result<(), String> {
-        let cache_root = self.cache_root.clone().or_else(|| run::env_str("XDG_CACHE_HOME").map(PathBuf::from))
+    fn cache_archive(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+        bytes: &[u8],
+        deadline: Instant,
+    ) -> Result<(), String> {
+        let cache_root = self
+            .cache_root
+            .clone()
+            .or_else(|| run::env_str("XDG_CACHE_HOME").map(PathBuf::from))
             .or_else(|| run::env_str("HOME").map(|home| PathBuf::from(home).join(".cache")))
             .ok_or("no cache directory is available")?;
         if !cache_root.is_absolute() {
@@ -294,7 +368,9 @@ impl Git {
         let root = std::fs::canonicalize(&self.dir).map_err(|e| e.to_string())?;
         let mut ancestor = cache_root.as_path();
         while !ancestor.exists() {
-            ancestor = ancestor.parent().ok_or("action cache has no existing ancestor")?;
+            ancestor = ancestor
+                .parent()
+                .ok_or("action cache has no existing ancestor")?;
         }
         let existing = std::fs::canonicalize(ancestor).map_err(|e| e.to_string())?;
         if existing.starts_with(&root) {
@@ -316,7 +392,9 @@ impl Git {
             use std::os::unix::fs::OpenOptionsExt;
             options.mode(0o600);
         }
-        let mut file = options.open(&temp).map_err(|e| format!("cannot create action cache entry: {e}"))?;
+        let mut file = options
+            .open(&temp)
+            .map_err(|e| format!("cannot create action cache entry: {e}"))?;
         let save = (|| -> Result<(), String> {
             for chunk in bytes.chunks(64 * 1024) {
                 if Instant::now() >= deadline {
@@ -333,7 +411,13 @@ impl Git {
         Ok(())
     }
 
-    fn download(&self, owner: &str, repo: &str, sha: &str, deadline: Instant) -> Result<Rc<Tree>, String> {
+    fn download(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+        deadline: Instant,
+    ) -> Result<Rc<Tree>, String> {
         if !is_full_sha(sha) {
             return Err("resolved action commit is not a full SHA".into());
         }
@@ -344,25 +428,47 @@ impl Git {
         let result = (|| {
             let repository_url = format!("{}/{owner}/{repo}.git", self.base);
             let mut config = Command::new("git");
-            config.args(["config", "--get-urlmatch", "http.extraheader", &repository_url]);
+            config.args([
+                "config",
+                "--get-urlmatch",
+                "http.extraheader",
+                &repository_url,
+            ]);
             // A missing header is normal for public repositories. Do not print it.
             let header = self.run_bounded(config, None, 8192, deadline).ok();
             let url = format!("{}/repos/{owner}/{repo}/tarball/{sha}", self.api);
             #[cfg(test)]
             assert_fixture_url(&url);
             let mut curl = Command::new("curl");
-            let seconds = deadline.saturating_duration_since(Instant::now()).as_secs_f64().min(self.timeout.as_secs_f64());
+            let seconds = deadline
+                .saturating_duration_since(Instant::now())
+                .as_secs_f64()
+                .min(self.timeout.as_secs_f64());
             if seconds <= 0.0 {
                 return Err("action download timed out".into());
             }
-            curl.args(["--fail", "--silent", "--show-error", "--location", "--max-time", &format!("{seconds:.3}"), "--connect-timeout", "5", "--header", "Accept: application/vnd.github+json", "--header", "User-Agent: stoop"]);
+            curl.args([
+                "--fail",
+                "--silent",
+                "--show-error",
+                "--location",
+                "--max-time",
+                &format!("{seconds:.3}"),
+                "--connect-timeout",
+                "5",
+                "--header",
+                "Accept: application/vnd.github+json",
+                "--header",
+                "User-Agent: stoop",
+            ]);
             #[cfg(test)]
             curl.args(["--max-redirs", "0"]);
             if header.is_some() {
                 curl.args(["--header", "@-"]);
             }
             curl.args(["--url", &url]);
-            let bytes = self.run_bounded(curl, header.as_deref(), actions::MAX_COMPRESSED, deadline)?;
+            let bytes =
+                self.run_bounded(curl, header.as_deref(), actions::MAX_COMPRESSED, deadline)?;
             let tree = Rc::new(Tree::from_gzip_before(&bytes, deadline)?);
             self.cache_archive(owner, repo, sha, &bytes, deadline)?;
             Ok(tree)
@@ -371,8 +477,14 @@ impl Git {
         result
     }
 
-    fn checked_copy(&self, base: &Path, relative: &Path, deadline: Instant) -> Result<Tree, String> {
-        let base_meta = std::fs::symlink_metadata(base).map_err(|e| format!("action copy base is inaccessible: {e}"))?;
+    fn checked_copy(
+        &self,
+        base: &Path,
+        relative: &Path,
+        deadline: Instant,
+    ) -> Result<Tree, String> {
+        let base_meta = std::fs::symlink_metadata(base)
+            .map_err(|e| format!("action copy base is inaccessible: {e}"))?;
         if base_meta.file_type().is_symlink() || !base_meta.is_dir() {
             return Err("action copy base is not a real directory".into());
         }
@@ -382,7 +494,11 @@ impl Git {
                 std::path::Component::Normal(part) => path.push(part),
                 _ => return Err("invalid action copy path".into()),
             }
-            if std::fs::symlink_metadata(&path).map_err(|e| format!("action copy is inaccessible: {e}"))?.file_type().is_symlink() {
+            if std::fs::symlink_metadata(&path)
+                .map_err(|e| format!("action copy is inaccessible: {e}"))?
+                .file_type()
+                .is_symlink()
+            {
                 return Err("action copy path contains a symlink".into());
             }
         }
@@ -407,7 +523,13 @@ impl Resolver for Git {
         self.commit_before(owner, repo, reference, Instant::now() + self.timeout)
     }
 
-    fn commit_before(&self, owner: &str, repo: &str, reference: &str, deadline: Instant) -> Result<String, String> {
+    fn commit_before(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+        deadline: Instant,
+    ) -> Result<String, String> {
         let url = format!("{}/{owner}/{repo}.git", self.base);
         let patterns = if reference.starts_with("refs/") {
             vec![reference.to_string(), format!("{reference}^{{}}")]
@@ -421,32 +543,58 @@ impl Resolver for Git {
         pick(&self.ls_remote(&url, &patterns, deadline)?, reference)
     }
 
-    fn action_tree(&self, owner: &str, repo: &str, sha: &str, deadline: Instant) -> Result<Rc<Tree>, String> {
+    fn action_tree(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+        deadline: Instant,
+    ) -> Result<Rc<Tree>, String> {
         self.download(owner, repo, sha, deadline)
     }
 
-    fn runner_copy(&self, owner: &str, repo: &str, reference: &str, deadline: Instant) -> Result<Tree, String> {
+    fn runner_copy(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+        deadline: Instant,
+    ) -> Result<Tree, String> {
         let workspace = run::env_str("RUNNER_WORKSPACE").ok_or("RUNNER_WORKSPACE is not set")?;
-        let parent = Path::new(&workspace).parent().ok_or("invalid RUNNER_WORKSPACE")?;
+        let parent = Path::new(&workspace)
+            .parent()
+            .ok_or("invalid RUNNER_WORKSPACE")?;
         let base = parent.join("_actions");
-        self.checked_copy(&base, &PathBuf::from(owner).join(repo).join(reference), deadline)
+        self.checked_copy(
+            &base,
+            &PathBuf::from(owner).join(repo).join(reference),
+            deadline,
+        )
     }
 
     fn local_tree(&self, path: &str, deadline: Instant) -> Result<(String, Rc<Tree>), String> {
-        let sha = self.revision.clone().or_else(|| run::env_str("GITHUB_SHA")).ok_or("target revision is unavailable")?;
+        let sha = self
+            .revision
+            .clone()
+            .or_else(|| run::env_str("GITHUB_SHA"))
+            .ok_or("target revision is unavailable")?;
         if !is_full_sha(&sha) {
             return Err("target revision is not a full commit SHA".into());
         }
         let mut ls = Command::new("git");
         ls.args(["ls-tree", "-r", &sha, "--", path]);
         let listing = self.run_bounded(ls, None, 4 * 1024 * 1024, deadline)?;
-        if String::from_utf8_lossy(&listing).lines().any(|line| line.starts_with("160000 ")) {
+        if String::from_utf8_lossy(&listing)
+            .lines()
+            .any(|line| line.starts_with("160000 "))
+        {
             return Err("local action contains a submodule".into());
         }
         let mut archive = Command::new("git");
         archive.args(["archive", "--format=tar", &sha, "--", path]);
         let bytes = self.run_bounded(archive, None, 300 * 1024 * 1024, deadline)?;
-        let tree = Tree::from_tar_before(std::io::Cursor::new(bytes), false, deadline)?.subtree(path)?;
+        let tree =
+            Tree::from_tar_before(std::io::Cursor::new(bytes), false, deadline)?.subtree(path)?;
         Ok((sha, Rc::new(tree)))
     }
 
@@ -521,10 +669,21 @@ impl<'a> Memo<'a> {
 
 impl Resolver for Memo<'_> {
     fn commit(&self, owner: &str, repo: &str, reference: &str) -> Result<String, String> {
-        self.commit_before(owner, repo, reference, Instant::now() + actions::TOTAL_TIMEOUT)
+        self.commit_before(
+            owner,
+            repo,
+            reference,
+            Instant::now() + actions::TOTAL_TIMEOUT,
+        )
     }
 
-    fn commit_before(&self, owner: &str, repo: &str, reference: &str, deadline: Instant) -> Result<String, String> {
+    fn commit_before(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+        deadline: Instant,
+    ) -> Result<String, String> {
         let key = (owner.to_string(), repo.to_string(), reference.to_string());
         if let Some(answer) = self.seen.borrow().get(&key) {
             return answer.clone();
@@ -534,10 +693,22 @@ impl Resolver for Memo<'_> {
         answer
     }
 
-    fn action_tree(&self, owner: &str, repo: &str, sha: &str, deadline: Instant) -> Result<Rc<Tree>, String> {
+    fn action_tree(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+        deadline: Instant,
+    ) -> Result<Rc<Tree>, String> {
         self.inner.action_tree(owner, repo, sha, deadline)
     }
-    fn runner_copy(&self, owner: &str, repo: &str, reference: &str, deadline: Instant) -> Result<Tree, String> {
+    fn runner_copy(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+        deadline: Instant,
+    ) -> Result<Tree, String> {
         self.inner.runner_copy(owner, repo, reference, deadline)
     }
     fn local_tree(&self, path: &str, deadline: Instant) -> Result<(String, Rc<Tree>), String> {
@@ -547,7 +718,6 @@ impl Resolver for Memo<'_> {
         self.inner.local_copy(path, deadline)
     }
 }
-
 
 /// Whether an image reference is pinned to a `sha256` digest. Only a digest names
 /// the same bytes forever, and resolving a tag needs a registry client, so a tag is
@@ -595,7 +765,13 @@ impl RecordCheck for ActionCheck<'_> {
                 ));
             }
         }
-        actions::verify(&spec.actions, &record.actions, &self.memo, self.strict, self.deadline)
+        actions::verify(
+            &spec.actions,
+            &record.actions,
+            &self.memo,
+            self.strict,
+            self.deadline,
+        )
     }
 }
 
@@ -603,9 +779,9 @@ impl RecordCheck for ActionCheck<'_> {
 pub mod fake {
     use super::Resolver;
     use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
     use std::rc::Rc;
     use std::time::Instant;
-    use std::collections::HashMap;
 
     /// A resolver with fixed answers, counting every lookup it receives.
     #[derive(Default)]
@@ -641,11 +817,23 @@ pub mod fake {
                 .unwrap_or_else(|| Err(format!("no fake answer for {key}")))
         }
 
-        fn action_tree(&self, _: &str, _: &str, _: &str, _: Instant) -> Result<Rc<super::Tree>, String> {
+        fn action_tree(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Instant,
+        ) -> Result<Rc<super::Tree>, String> {
             Ok(Rc::new(crate::gha::actions::fixture_tree()))
         }
 
-        fn runner_copy(&self, _: &str, _: &str, _: &str, _: Instant) -> Result<super::Tree, String> {
+        fn runner_copy(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: Instant,
+        ) -> Result<super::Tree, String> {
             Ok(crate::gha::actions::fixture_tree())
         }
     }
@@ -670,7 +858,10 @@ mod tests {
         assert_fixture_url("http://127.0.0.1:1234/api/v3");
         assert_fixture_url("file:///tmp/fixture");
         assert!(std::panic::catch_unwind(|| assert_fixture_url("https://github.com")).is_err());
-        assert!(std::panic::catch_unwind(|| assert_fixture_url("http://127.0.0.1.example.com:1234")).is_err());
+        assert!(std::panic::catch_unwind(|| assert_fixture_url(
+            "http://127.0.0.1.example.com:1234"
+        ))
+        .is_err());
     }
 
     fn spec(actions: &[&str], images: &[&str]) -> JobSpec {
@@ -1081,10 +1272,24 @@ mod tests {
             format!("actions/cache@{B}"),
         ];
         let actions = crate::gha::actions::capture(&refs, &fake, false).unwrap();
-        assert_eq!(fake.calls(), 1, "pinned commits need no lookup, duplicates share one lookup");
-        assert_eq!(actions.get("actions/checkout@v4").map(String::as_str), Some(A));
-        assert_eq!(actions.get(&format!("actions/cache@{B}")).map(String::as_str), Some(B));
-        assert!(crate::gha::actions::capture(&["actions/setup-node@v4".into()], &fake, false).is_err());
+        assert_eq!(
+            fake.calls(),
+            1,
+            "pinned commits need no lookup, duplicates share one lookup"
+        );
+        assert_eq!(
+            actions.get("actions/checkout@v4").map(String::as_str),
+            Some(A)
+        );
+        assert_eq!(
+            actions
+                .get(&format!("actions/cache@{B}"))
+                .map(String::as_str),
+            Some(B)
+        );
+        assert!(
+            crate::gha::actions::capture(&["actions/setup-node@v4".into()], &fake, false).is_err()
+        );
     }
 
     #[test]
@@ -1096,7 +1301,8 @@ mod tests {
             &["actions/checkout@v4".into(), "actions/setup-node@v4".into()],
             &fake,
             false,
-        ).unwrap();
+        )
+        .unwrap();
         let rec = JobRecord {
             actions,
             ..record(&[])
@@ -1164,9 +1370,15 @@ mod tests {
             spec(&["actions/checkout@abcd"], &[]),
             spec(&["./local@v1"], &[]),
         ] {
-            assert_eq!(check.check(&s, &rec).unwrap_err().0, Code::ActionUnverifiable);
+            assert_eq!(
+                check.check(&s, &rec).unwrap_err().0,
+                Code::ActionUnverifiable
+            );
         }
-        for s in [spec(&[], &["node:20"]), spec(&[], &["ghcr.io/acme/app:latest"])] {
+        for s in [
+            spec(&[], &["node:20"]),
+            spec(&[], &["ghcr.io/acme/app:latest"]),
+        ] {
             assert_eq!(check.check(&s, &rec).unwrap_err().0, Code::UnresolvedAction);
         }
         assert_eq!(fake.calls(), 0, "classification never reaches the network");
@@ -1247,7 +1459,10 @@ mod tests {
         let s = spec(&["actions/checkout@v4"], &[]);
         for _ in 0..3 {
             assert_eq!(
-                check.check(&s, &record(&[("actions/checkout@v4", A)])).unwrap_err().0,
+                check
+                    .check(&s, &record(&[("actions/checkout@v4", A)]))
+                    .unwrap_err()
+                    .0,
                 Code::ActionUnverifiable
             );
         }
@@ -1296,24 +1511,50 @@ mod tests {
             let mut chunk = [0u8; 1024];
             while !request.ends_with(b"\r\n\r\n") {
                 let n = stream.read(&mut chunk).unwrap();
-                if n == 0 { break; }
+                if n == 0 {
+                    break;
+                }
                 request.extend_from_slice(&chunk[..n]);
             }
-            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
             stream.write_all(&body).unwrap();
             String::from_utf8(request).unwrap()
         });
-        let base = std::env::temp_dir().join(format!("stoop-action-http-{}-{}", std::process::id(), address.port()));
+        let base = std::env::temp_dir().join(format!(
+            "stoop-action-http-{}-{}",
+            std::process::id(),
+            address.port()
+        ));
         let root = base.join("repo");
         std::fs::create_dir_all(&root).unwrap();
         let mut git = Git::new(&root, format!("http://{address}"), Duration::from_secs(5));
         git.cache_root = Some(base.join("cache"));
-        let first = git.action_tree("owner", "repo", A, Instant::now() + Duration::from_secs(5)).unwrap();
-        let second = git.action_tree("owner", "repo", A, Instant::now() + Duration::from_secs(5)).unwrap();
-        assert!(Rc::ptr_eq(&first, &second), "same-run cache must avoid a second request");
+        let first = git
+            .action_tree("owner", "repo", A, Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        let second = git
+            .action_tree("owner", "repo", A, Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            Rc::ptr_eq(&first, &second),
+            "same-run cache must avoid a second request"
+        );
         let request = server.join().unwrap();
-        assert!(request.starts_with(&format!("GET /api/v3/repos/owner/repo/tarball/{A} ")), "wrong GHES archive path");
-        assert!(base.join("cache/stoop/actions").read_dir().unwrap().next().is_some());
+        assert!(
+            request.starts_with(&format!("GET /api/v3/repos/owner/repo/tarball/{A} ")),
+            "wrong GHES archive path"
+        );
+        assert!(base
+            .join("cache/stoop/actions")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some());
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -1330,17 +1571,30 @@ mod tests {
                         thread::sleep(Duration::from_millis(500));
                         return;
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(5)),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5))
+                    }
                     Err(e) => panic!("fixture accept: {e}"),
                 }
             }
         });
-        let base = std::env::temp_dir().join(format!("stoop-action-timeout-{}-{}", std::process::id(), address.port()));
+        let base = std::env::temp_dir().join(format!(
+            "stoop-action-timeout-{}-{}",
+            std::process::id(),
+            address.port()
+        ));
         let root = base.join("repo");
         std::fs::create_dir_all(&root).unwrap();
         let mut git = Git::new(&root, format!("http://{address}"), Duration::from_secs(3));
         git.cache_root = Some(base.join("cache"));
-        assert!(git.action_tree("owner", "repo", A, Instant::now() + Duration::from_millis(150)).is_err());
+        assert!(git
+            .action_tree(
+                "owner",
+                "repo",
+                A,
+                Instant::now() + Duration::from_millis(150)
+            )
+            .is_err());
         server.join().unwrap();
         std::fs::remove_dir_all(base).unwrap();
     }
@@ -1353,23 +1607,36 @@ mod tests {
             fn commit(&self, _: &str, _: &str, _: &str) -> Result<String, String> {
                 Ok(A.into())
             }
-            fn action_tree(&self, owner: &str, repo: &str, sha: &str, deadline: Instant) -> Result<Rc<Tree>, String> {
+            fn action_tree(
+                &self,
+                owner: &str,
+                repo: &str,
+                sha: &str,
+                deadline: Instant,
+            ) -> Result<Rc<Tree>, String> {
                 self.0.action_tree(owner, repo, sha, deadline)
             }
             fn runner_copy(&self, _: &str, _: &str, _: &str, _: Instant) -> Result<Tree, String> {
                 Ok(crate::gha::actions::fixture_tree())
             }
         }
-        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default()));
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
         for (name, contents) in [
-            ("action.yml", &b"runs:\n  using: node20\n  main: index.js\n"[..]),
+            (
+                "action.yml",
+                &b"runs:\n  using: node20\n  main: index.js\n"[..],
+            ),
             ("index.js", &b"tampered\n"[..]),
         ] {
             let mut header = tar::Header::new_gnu();
             header.set_mode(0o644);
             header.set_size(contents.len() as u64);
             header.set_cksum();
-            tar.append_data(&mut header, format!("repo-sha/{name}"), contents).unwrap();
+            tar.append_data(&mut header, format!("repo-sha/{name}"), contents)
+                .unwrap();
         }
         let tampered = tar.into_inner().unwrap().finish().unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1382,26 +1649,42 @@ mod tests {
             while Instant::now() < end {
                 match listener.accept() {
                     Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
                         let mut request = Vec::new();
                         let mut chunk = [0u8; 1024];
                         while !request.ends_with(b"\r\n\r\n") {
                             let n = stream.read(&mut chunk).unwrap();
-                            if n == 0 { break; }
+                            if n == 0 {
+                                break;
+                            }
                             request.extend_from_slice(&chunk[..n]);
                         }
                         let Some(body) = bodies.next() else { break };
-                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                        write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        )
+                        .unwrap();
                         stream.write_all(&body).unwrap();
                         served += 1;
-                        if served == 2 { break; }
+                        if served == 2 {
+                            break;
+                        }
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(5)),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5))
+                    }
                     Err(e) => panic!("fixture accept: {e}"),
                 }
             }
             served
         });
-        let base = std::env::temp_dir().join(format!("stoop-action-tamper-{}-{}", std::process::id(), address.port()));
+        let base = std::env::temp_dir().join(format!(
+            "stoop-action-tamper-{}-{}",
+            std::process::id(),
+            address.port()
+        ));
         let root = base.join("repo");
         std::fs::create_dir_all(&root).unwrap();
         let make_git = || {
@@ -1413,7 +1696,14 @@ mod tests {
         let refs = vec!["owner/repo@v1".to_string()];
         let saved = actions::capture(&refs, &Network(&recording), false).unwrap();
         let planning = make_git();
-        let (code, _) = actions::verify(&refs, &saved, &Network(&planning), false, Instant::now() + Duration::from_secs(5)).unwrap_err();
+        let (code, _) = actions::verify(
+            &refs,
+            &saved,
+            &Network(&planning),
+            false,
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap_err();
         assert_eq!(code, Code::ActionContentChanged);
         assert_eq!(server.join().unwrap(), 2);
         std::fs::remove_dir_all(base).unwrap();

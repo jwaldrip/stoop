@@ -548,8 +548,10 @@ mod tests {
         .to_string();
         let event = root.join("event.json");
         std::fs::write(&event, r#"{"repository":{"default_branch":"main"}}"#).unwrap();
-        let api_root = std::env::temp_dir().join(format!("stoop-injected-action-api-{}", std::process::id()));
-        let archive = api_root.join("repos/actions/checkout/tarball/1111111111111111111111111111111111111111");
+        let api_root =
+            std::env::temp_dir().join(format!("stoop-injected-action-api-{}", std::process::id()));
+        let archive = api_root
+            .join("repos/actions/checkout/tarball/1111111111111111111111111111111111111111");
         std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
         std::fs::write(archive, gha::actions::fixture_archive()).unwrap();
         let api = gha::actions::FixtureServer::new(api_root.clone());
@@ -598,7 +600,8 @@ mod tests {
         record.status = Some(RecordStatus::Passed);
         record.commit = Some(sha.clone());
         record.event_path = Some(event.to_string_lossy().into_owned());
-        record.actions = gha::actions::capture(&spec.actions, &gha::resolve::fake::Fake::new(), false).unwrap();
+        record.actions =
+            gha::actions::capture(&spec.actions, &gha::resolve::fake::Fake::new(), false).unwrap();
         record.steps = vec![StepRecord {
             key: step.clone(),
             proof: proof.digest(),

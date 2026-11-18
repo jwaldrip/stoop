@@ -273,15 +273,20 @@ mod tests {
     #[test]
     fn legacy_job_files_cannot_supply_action_tree_witnesses() {
         let mut legacy = record(1);
-        legacy.actions.insert(crate::gha::actions::WITNESS_KEY.into(), "forged".into());
+        legacy
+            .actions
+            .insert(crate::gha::actions::WITNESS_KEY.into(), "forged".into());
         let bytes = serde_json::to_vec(&JobFile {
             v: 1,
             kind: "job".into(),
             key: "job-a".into(),
             records: vec![legacy],
-        }).unwrap();
+        })
+        .unwrap();
         let decoded = JobStore::parse(&bytes).unwrap();
-        assert!(!decoded.records[0].actions.contains_key(crate::gha::actions::WITNESS_KEY));
+        assert!(!decoded.records[0]
+            .actions
+            .contains_key(crate::gha::actions::WITNESS_KEY));
     }
     #[test]
     fn round_trip() {
