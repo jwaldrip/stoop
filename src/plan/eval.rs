@@ -1692,6 +1692,11 @@ mod tests {
         let d = f.decide(BTreeMap::new());
         assert_eq!(d.code, Code::PriorChanged);
         assert!(d.detail.contains("parent of build/out is not a directory"));
+        let mut p = proof(vec![]);
+        p.outputs.push(input("build/out", &file_id(b"ok")));
+        p.priors = Some(vec![input("build/out", "a"), input("build", "fk")]);
+        replace_first(&mut f, p);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::InputChanged);
     }
     #[test]
     fn k_n06_order_is_by_start_and_equal_failure_wins() {
@@ -1760,19 +1765,34 @@ mod tests {
         f.install(vec![a, b]);
         assert_eq!(f.decide(BTreeMap::new()).code, Code::PriorChanged);
     }
-    #[cfg(target_os = "linux")]
     #[test]
     fn k_n26_non_utf8_below_removed_dir() {
         use std::os::unix::ffi::OsStringExt;
         let mut f = Fixture::new();
-        fs::write(
-            f.root
-                .join("dir")
-                .join(std::ffi::OsString::from_vec(vec![b'z', 255])),
-            b"x",
-        )
-        .unwrap();
-        git(&f.root, &["add", "dir"]);
+        let oid = Command::new("git")
+            .current_dir(&f.root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["hash-object", "-w", "dir/a"])
+            .output()
+            .unwrap();
+        assert!(oid.status.success());
+        let mut cache = b"100644,".to_vec();
+        cache.extend_from_slice(oid.stdout.trim_ascii());
+        cache.extend_from_slice(b",dir/z\xff");
+        let output = Command::new("git")
+            .current_dir(&f.root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["update-index", "--add", "--cacheinfo"])
+            .arg(std::ffi::OsString::from_vec(cache))
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
         git(
             &f.root,
             &[
@@ -2003,5 +2023,29 @@ mod tests {
         };
         fs::remove_file(f.root.join(".git/objects").join(&oid[..2]).join(&oid[2..])).unwrap();
         assert_eq!(f.decide(BTreeMap::new()).code, Code::Error);
+    }
+    #[test]
+    fn nonregular_attributes_are_unplannable() {
+        use std::os::unix::fs::symlink;
+        let mut f = Fixture::new();
+        symlink("dir/a", f.root.join(".gitattributes")).unwrap();
+        git(&f.root, &["add", ".gitattributes"]);
+        git(
+            &f.root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@e",
+                "commit",
+                "-qm",
+                "attrs",
+            ],
+        );
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        f.install(vec![proof(vec![input("dir/a", &file_id(b"tracked"))])]);
+        let d = f.decide(BTreeMap::new());
+        assert_eq!(d.code, Code::Unplannable);
+        assert!(d.detail.contains("not a regular file"));
     }
 }
