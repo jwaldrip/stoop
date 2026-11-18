@@ -136,23 +136,28 @@ pub fn run_probes(probes: &[String], cwd: &Path, quiet: bool) -> Option<BTreeMap
 /// cannot match and the command runs. The salt itself is never hashed in.
 pub const SALT_VAR: &str = "STOOP_ENV_SALT";
 
+pub fn env_hash(name: &str, value: &str, salt: Option<&str>) -> String {
+    match salt {
+        Some(salt) => {
+            let key = blake3::derive_key("stoop env hash v1", salt.as_bytes());
+            let mut h = blake3::Hasher::new_keyed(&key);
+            h.update(name.as_bytes());
+            h.update(&[0]);
+            h.update(value.as_bytes());
+            format!("s:{}", h.finalize().to_hex())
+        }
+        None => blake3::hash(value.as_bytes()).to_hex().to_string(),
+    }
+}
+
 fn env_hashes(names: &[String], salt: Option<&str>) -> BTreeMap<String, String> {
-    let key = salt.map(|s| blake3::derive_key("stoop env hash v1", s.as_bytes()));
     names
         .iter()
         .map(|n| {
-            let v = std::env::var(n).unwrap_or_default();
-            let h = match &key {
-                Some(k) => {
-                    let mut h = blake3::Hasher::new_keyed(k);
-                    h.update(n.as_bytes());
-                    h.update(&[0]);
-                    h.update(v.as_bytes());
-                    format!("s:{}", h.finalize().to_hex())
-                }
-                None => blake3::hash(v.as_bytes()).to_hex().to_string(),
-            };
-            (n.clone(), h)
+            (
+                n.clone(),
+                env_hash(n, &std::env::var(n).unwrap_or_default(), salt),
+            )
         })
         .collect()
 }
@@ -449,6 +454,8 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                 probes,
                 removed: Vec::new(),
                 ignore: None,
+                priors: None,
+                unplannable: Vec::new(),
             };
             if let Some(r) = remote.as_ref().filter(|r| r.write) {
                 // Fold in anything other runs published since we looked, so a push never
@@ -577,6 +584,33 @@ pub fn build_inputs(root: &Path, trace: &Trace, ignore: &Ignore) -> Result<Vec<I
 
 #[cfg(test)]
 mod flag_tests {
+    #[test]
+    fn env_hash_matches_env_hashes() {
+        let names = vec![
+            "STOOP_S0B_ENV_PRESENT".to_string(),
+            "STOOP_S0B_ENV_ABSENT".to_string(),
+        ];
+        std::env::set_var(&names[0], "value");
+        std::env::remove_var(&names[1]);
+        for salt in [None, Some("secret salt")] {
+            let actual = super::env_hashes(&names, salt);
+            assert_eq!(actual[&names[0]], super::env_hash(&names[0], "value", salt));
+            assert_eq!(actual[&names[1]], super::env_hash(&names[1], "", salt));
+            let expected = match salt {
+                None => blake3::hash(b"value").to_hex().to_string(),
+                Some(salt) => {
+                    let key = blake3::derive_key("stoop env hash v1", salt.as_bytes());
+                    let mut h = blake3::Hasher::new_keyed(&key);
+                    h.update(names[0].as_bytes());
+                    h.update(&[0]);
+                    h.update(b"value");
+                    format!("s:{}", h.finalize().to_hex())
+                }
+            };
+            assert_eq!(actual[&names[0]], expected);
+        }
+        std::env::remove_var(&names[0]);
+    }
     #[test]
     fn env_flag_truthiness() {
         const NAME: &str = "STOOP_S0_TEST_FLAG";

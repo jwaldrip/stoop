@@ -20,6 +20,11 @@ pub struct Input {
     pub id: String,
 }
 
+#[allow(dead_code)] // Used by the recorder and planner in the next slices.
+pub fn file_id(exec: bool, hex: &str) -> String {
+    format!("{}:{hex}", if exec { "x" } else { "f" })
+}
+
 #[derive(Debug)]
 pub struct Mismatch {
     pub path: String,

@@ -1,6 +1,35 @@
 use std::collections::BTreeMap;
 
 use super::expr::{Contexts, Unknowable, Value};
+pub const VERIFIED_VARS: &[&str] = &[
+    "GITHUB_REF",
+    "GITHUB_REF_NAME",
+    "GITHUB_REF_TYPE",
+    "GITHUB_REF_PROTECTED",
+    "GITHUB_SHA",
+    "GITHUB_EVENT_NAME",
+    "GITHUB_REPOSITORY",
+    "GITHUB_REPOSITORY_ID",
+    "GITHUB_REPOSITORY_OWNER",
+    "GITHUB_REPOSITORY_OWNER_ID",
+    "GITHUB_ACTOR",
+    "GITHUB_ACTOR_ID",
+    "GITHUB_TRIGGERING_ACTOR",
+    "GITHUB_HEAD_REF",
+    "GITHUB_BASE_REF",
+    "GITHUB_WORKFLOW",
+    "GITHUB_WORKFLOW_REF",
+    "GITHUB_WORKFLOW_SHA",
+    "GITHUB_RUN_ID",
+    "GITHUB_RUN_NUMBER",
+    "GITHUB_RUN_ATTEMPT",
+    "GITHUB_SERVER_URL",
+    "GITHUB_API_URL",
+    "GITHUB_GRAPHQL_URL",
+    "GITHUB_RETENTION_DAYS",
+    "GITHUB_WORKSPACE",
+    "CI",
+];
 
 #[derive(Clone, Debug)]
 pub struct GhCtx {
@@ -26,37 +55,8 @@ impl GhCtx {
     }
 
     pub fn verified_vars(&self, job: &str) -> BTreeMap<String, String> {
-        const NAMES: &[&str] = &[
-            "GITHUB_REF",
-            "GITHUB_REF_NAME",
-            "GITHUB_REF_TYPE",
-            "GITHUB_REF_PROTECTED",
-            "GITHUB_SHA",
-            "GITHUB_EVENT_NAME",
-            "GITHUB_REPOSITORY",
-            "GITHUB_REPOSITORY_ID",
-            "GITHUB_REPOSITORY_OWNER",
-            "GITHUB_REPOSITORY_OWNER_ID",
-            "GITHUB_ACTOR",
-            "GITHUB_ACTOR_ID",
-            "GITHUB_TRIGGERING_ACTOR",
-            "GITHUB_HEAD_REF",
-            "GITHUB_BASE_REF",
-            "GITHUB_WORKFLOW",
-            "GITHUB_WORKFLOW_REF",
-            "GITHUB_WORKFLOW_SHA",
-            "GITHUB_RUN_ID",
-            "GITHUB_RUN_NUMBER",
-            "GITHUB_RUN_ATTEMPT",
-            "GITHUB_SERVER_URL",
-            "GITHUB_API_URL",
-            "GITHUB_GRAPHQL_URL",
-            "GITHUB_RETENTION_DAYS",
-            "GITHUB_WORKSPACE",
-            "CI",
-        ];
         let mut vars = BTreeMap::new();
-        for name in NAMES {
+        for name in VERIFIED_VARS {
             if let Some(value) = self.env.get(*name) {
                 vars.insert((*name).into(), value.clone());
             }
