@@ -1200,12 +1200,15 @@ mod tests {
     fn proved_evidence_binds_record_and_proofs_in_step_order() {
         let mut f = Fixture::new();
         f.install(vec![
-            proof(vec![input("dir/a", &file_id(b"tracked"))]),
             proof(vec![input("absent", "a")]),
+            proof(vec![input("dir/a", &file_id(b"tracked"))]),
         ]);
         let record = f.jobs.load("job-test").remove(0);
         let expected: Vec<_> = record.steps.iter().map(|step| step.proof.clone()).collect();
-        assert_ne!(expected[0], expected[1]);
+        assert!(
+            expected[0] > expected[1],
+            "fixture must distinguish step order from sorted order"
+        );
         let mut decision = f.decide(BTreeMap::new());
         let evidence = decision.evidence.as_ref().unwrap();
         assert_eq!(
