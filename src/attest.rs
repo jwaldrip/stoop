@@ -11,9 +11,8 @@
 //!
 //! Key lifetime: GitHub documents no retention period for retired signing keys. A
 //! record whose key has left the JWKS is `unattested`, so the job runs once and
-//! publishes a new record. Every publication signs again, and the nightly full run
-//! on the default branch publishes every job, so a record is only needed until the
-//! next publication replaces it. The fetched JWKS is cached for one planning run.
+//! publishes a new record. Issuance time is bounded by the planning ceiling; key
+//! retirement can make a record unusable earlier. The JWKS is cached per verifier.
 
 use crate::job::JobRecord;
 use crate::plan::spec::{Code, JobSpec, RecordCheck};
@@ -187,6 +186,8 @@ pub fn parse_jwks(bytes: &[u8]) -> Result<Vec<Key>, String> {
 #[derive(Clone, Debug)]
 pub struct Policy {
     pub repository: String,
+    pub repository_id: String,
+    pub repository_owner_id: String,
     /// Full refs whose runs may publish, for example `refs/heads/main`.
     pub refs: Vec<String>,
     pub events: Vec<String>,
@@ -194,9 +195,16 @@ pub struct Policy {
 
 impl Policy {
     /// Only runs on the default branch, from the events in [`TRUSTED_EVENTS`], may publish.
-    pub fn default_branch(repository: &str, branch: &str) -> Self {
+    pub fn default_branch(
+        repository: &str,
+        repository_id: &str,
+        repository_owner_id: &str,
+        branch: &str,
+    ) -> Self {
         Self {
             repository: repository.into(),
+            repository_id: repository_id.into(),
+            repository_owner_id: repository_owner_id.into(),
             refs: vec![format!("refs/heads/{branch}")],
             events: TRUSTED_EVENTS
                 .iter()
@@ -210,24 +218,30 @@ impl Policy {
 pub struct Verifier<S: KeySource> {
     policy: Policy,
     source: S,
+    now: u64,
+    ceiling: u64,
     keys: OnceCell<Result<Vec<Key>, String>>,
 }
 
 /// A verifier that reads GitHub's published keys.
-pub fn github(policy: Policy) -> Verifier<Jwks> {
+pub fn github(policy: Policy, now: u64, ceiling: u64) -> Verifier<Jwks> {
     Verifier::new(
         policy,
         Jwks {
             url: JWKS_URL.into(),
         },
+        now,
+        ceiling,
     )
 }
 
 impl<S: KeySource> Verifier<S> {
-    pub fn new(policy: Policy, source: S) -> Self {
+    pub fn new(policy: Policy, source: S, now: u64, ceiling: u64) -> Self {
         Self {
             policy,
             source,
+            now,
+            ceiling,
             keys: OnceCell::new(),
         }
     }
@@ -239,7 +253,12 @@ impl<S: KeySource> Verifier<S> {
         }
     }
 
-    fn check_record(&self, job_key: &str, path: &str, record: &JobRecord) -> Result<(), String> {
+    fn check_record(
+        &self,
+        job_key: &str,
+        path: &str,
+        record: &JobRecord,
+    ) -> Result<VerifiedAttestation, String> {
         let token = Token::parse(record.attest.as_deref().ok_or(NO_ATTESTATION)?)?;
         if token.header.get("alg").and_then(Value::as_str) != Some("RS256") {
             return Err("token algorithm is not RS256".into());
@@ -285,7 +304,7 @@ impl<S: KeySource> Verifier<S> {
         path: &str,
         record: &JobRecord,
         claims: &Value,
-    ) -> Result<(), String> {
+    ) -> Result<VerifiedAttestation, String> {
         let text = |name: &str| claims.get(name).and_then(Value::as_str);
         if text("iss") != Some(ISSUER) {
             return Err("token issuer is not GitHub Actions".into());
@@ -300,6 +319,37 @@ impl<S: KeySource> Verifier<S> {
                 "repository {} is not {repository}",
                 text("repository").unwrap_or("(none)")
             ));
+        }
+        for (name, expected) in [
+            ("repository_id", &self.policy.repository_id),
+            ("repository_owner_id", &self.policy.repository_owner_id),
+        ] {
+            if expected.is_empty() || text(name) != Some(expected.as_str()) {
+                return Err(format!("{name} does not match the trusted repository"));
+            }
+        }
+        if text("runner_environment") != Some("github-hosted") {
+            return Err("runner is not GitHub-hosted".into());
+        }
+        if text("ref_protected") != Some("true") {
+            return Err("branch is not protected".into());
+        }
+        let iat = claims
+            .get("iat")
+            .and_then(Value::as_u64)
+            .ok_or("token has no integer iat")?;
+        if iat > self.now.saturating_add(300) || self.now.saturating_sub(iat) > self.ceiling {
+            return Err("token issue time is outside the plan window".into());
+        }
+        let nbf = claims
+            .get("nbf")
+            .and_then(Value::as_u64)
+            .ok_or("token has no integer nbf")?;
+        if nbf > self.now.saturating_add(300) {
+            return Err("token is not yet valid".into());
+        }
+        if record.started > iat.saturating_add(300).saturating_mul(1000) {
+            return Err("record starts after its token was issued".into());
         }
         let git_ref = text("ref").ok_or("token has no ref")?;
         if !self.policy.refs.iter().any(|allowed| allowed == git_ref) {
@@ -354,17 +404,34 @@ impl<S: KeySource> Verifier<S> {
         {
             return Err("record job workflow ref differs from the token".into());
         }
-        Ok(())
+        Ok(VerifiedAttestation { iat })
     }
 }
 
-impl<S: KeySource> RecordCheck for Verifier<S> {
-    fn check(&self, spec: &JobSpec, record: &JobRecord) -> Result<(), (Code, String)> {
-        let Some(job_key) = spec.key.as_deref() else {
-            return Err((Code::Unattested, "job has no key".into()));
-        };
+/// Authenticated issuance time. For each proof use `now - min(proof.created, iat)`
+/// when enforcing that step's maximum age. Obtain only via `verify`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VerifiedAttestation {
+    pub iat: u64,
+}
+
+impl<S: KeySource> Verifier<S> {
+    pub fn verify(
+        &self,
+        spec: &JobSpec,
+        record: &JobRecord,
+    ) -> Result<VerifiedAttestation, (Code, String)> {
+        let job_key = spec
+            .key
+            .as_deref()
+            .ok_or((Code::Unattested, "job has no key".into()))?;
         self.check_record(job_key, &spec.path, record)
             .map_err(|reason| (Code::Unattested, reason))
+    }
+}
+impl<S: KeySource> RecordCheck for Verifier<S> {
+    fn check(&self, spec: &JobSpec, record: &JobRecord) -> Result<(), (Code, String)> {
+        self.verify(spec, record).map(|_| ())
     }
 }
 
@@ -477,21 +544,7 @@ fn curl(url: &str, bearer: Option<&str>) -> Result<Vec<u8>, String> {
             quote(&format!("Authorization: bearer {bearer}"))
         ));
     }
-    let mut child = Command::new("curl")
-        .args([
-            "--silent",
-            "--show-error",
-            "--fail",
-            "--max-time",
-            "30",
-            "--max-filesize",
-            MAX_RESPONSE,
-            "--config",
-            "-",
-        ])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    let mut child = curl_command(url)
         .spawn()
         .map_err(|e| format!("cannot run curl: {e}"))?;
     if let Some(mut stdin) = child.stdin.take() {
@@ -508,6 +561,33 @@ fn curl(url: &str, bearer: Option<&str>) -> Result<Vec<u8>, String> {
         "curl failed: {}",
         error.lines().next().unwrap_or("no output").trim()
     ))
+}
+
+fn curl_command(url: &str) -> Command {
+    let mut command = Command::new("curl");
+    command
+        .args([
+            "-q",
+            "--proto",
+            if cfg!(test) && url.starts_with("http://127.0.0.1:") {
+                "=http,https"
+            } else {
+                "=https"
+            },
+            "--silent",
+            "--show-error",
+            "--fail",
+            "--max-time",
+            "30",
+            "--max-filesize",
+            MAX_RESPONSE,
+            "--config",
+            "-",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
 }
 
 #[cfg(test)]

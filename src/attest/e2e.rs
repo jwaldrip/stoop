@@ -3,7 +3,9 @@
 //! token endpoint and JWKS. Records are read back from the remote, and only the verifier
 //! decides whether a record may skip a job. Nothing here calls GitHub.
 
-use super::tests::{header, pair, token, JWKS, KEY_1, PATH, REPO, WORKFLOW};
+use super::tests::{
+    header, pair, token, CEILING, JWKS, KEY_1, OWNER_ID, PATH, REPO, REPO_ID, WORKFLOW,
+};
 use super::*;
 use crate::gha::{context::GhCtx, workflow};
 use crate::job::{JobRecord, JobStore, RecordStatus};
@@ -153,6 +155,10 @@ fn claims(sha: &str, run_id: &str, git_ref: &str, event: &str, job_workflow_ref:
     json!({
         "iss": ISSUER,
         "repository": REPO,
+        "repository_id": REPO_ID,
+        "repository_owner_id": OWNER_ID,
+        "runner_environment": "github-hosted",
+        "ref_protected": "true",
         "ref": git_ref,
         "event_name": event,
         "sha": sha,
@@ -160,8 +166,8 @@ fn claims(sha: &str, run_id: &str, git_ref: &str, event: &str, job_workflow_ref:
         "run_attempt": "1",
         "workflow_ref": WORKFLOW,
         "job_workflow_ref": job_workflow_ref,
-        "iat": 1_763_400_000u64,
-        "nbf": 1_763_400_000u64,
+        "iat": crate::proof::now(),
+        "nbf": crate::proof::now(),
         "exp": 1_763_400_300u64,
     })
 }
@@ -354,10 +360,12 @@ fn find<'a>(records: &'a [JobRecord], run: &str) -> &'a JobRecord {
 /// The verifier a planner builds against the fake GitHub's key set.
 fn planner_for(base: &str) -> Verifier<Jwks> {
     Verifier::new(
-        Policy::default_branch(REPO, "main"),
+        Policy::default_branch(REPO, REPO_ID, OWNER_ID, "main"),
         Jwks {
             url: format!("{base}/.well-known/jwks"),
         },
+        crate::proof::now(),
+        CEILING,
     )
 }
 

@@ -14,6 +14,10 @@ pub const SHA: &str = "3f2c1a9b8e7d6c5b4a39281706f5e4d3c2b1a0f9";
 pub const REPO: &str = "owner/repo";
 pub const PATH: &str = ".github/workflows/ci.yml";
 pub const WORKFLOW: &str = "owner/repo/.github/workflows/ci.yml@refs/heads/main";
+pub const NOW: u64 = 1_763_400_000;
+pub const CEILING: u64 = 604_800;
+pub const REPO_ID: &str = "12345";
+pub const OWNER_ID: &str = "6789";
 pub const KEY_1: &[u8] = include_bytes!("../../tests/fixtures/attest/test-rsa-1.pkcs8.der");
 pub const KEY_2: &[u8] = include_bytes!("../../tests/fixtures/attest/test-rsa-2.pkcs8.der");
 pub const JWKS: &[u8] = include_bytes!("../../tests/fixtures/attest/test-jwks.json");
@@ -89,6 +93,10 @@ pub fn claims(record: &JobRecord) -> Value {
         "iss": ISSUER,
         "aud": audience(JOB, record).unwrap(),
         "repository": REPO,
+        "repository_id": REPO_ID,
+        "repository_owner_id": OWNER_ID,
+        "runner_environment": "github-hosted",
+        "ref_protected": "true",
         "ref": "refs/heads/main",
         "event_name": "push",
         "sha": SHA,
@@ -96,8 +104,8 @@ pub fn claims(record: &JobRecord) -> Value {
         "run_attempt": "1",
         "workflow_ref": WORKFLOW,
         "job_workflow_ref": WORKFLOW,
-        "iat": 1_700_000_000u64,
-        "nbf": 1_700_000_000u64,
+        "iat": NOW,
+        "nbf": NOW,
         // Long past: expiry is ignored for historical attestations.
         "exp": 1_700_000_300u64,
     })
@@ -152,7 +160,12 @@ pub fn published() -> Vec<Key> {
 }
 
 pub fn verifier() -> Verifier<Fixed> {
-    Verifier::new(Policy::default_branch(REPO, "main"), Fixed(published()))
+    Verifier::new(
+        Policy::default_branch(REPO, REPO_ID, OWNER_ID, "main"),
+        Fixed(published()),
+        NOW,
+        CEILING,
+    )
 }
 
 pub fn attested(record: &JobRecord, token: String) -> JobRecord {
@@ -271,7 +284,12 @@ fn rejects_a_key_rotated_out_of_the_jwks() {
         .into_iter()
         .filter(|key| key.kid == "test-key-2")
         .collect();
-    let verifier = Verifier::new(Policy::default_branch(REPO, "main"), Fixed(only_key_2));
+    let verifier = Verifier::new(
+        Policy::default_branch(REPO, REPO_ID, OWNER_ID, "main"),
+        Fixed(only_key_2),
+        NOW,
+        CEILING,
+    );
     refused_with(
         &verifier,
         &attested(&record, token),
@@ -643,7 +661,12 @@ fn fetch_failure_is_unattested() {
     }
     let record = record();
     let token = signed(&record, |_| {}, "test-key-1", KEY_1);
-    let verifier = Verifier::new(Policy::default_branch(REPO, "main"), Down);
+    let verifier = Verifier::new(
+        Policy::default_branch(REPO, REPO_ID, OWNER_ID, "main"),
+        Down,
+        NOW,
+        CEILING,
+    );
     refused_with(
         &verifier,
         &attested(&record, token),
@@ -661,7 +684,12 @@ fn the_key_set_is_fetched_once_per_verifier() {
         }
     }
     let fetches = Cell::new(0);
-    let verifier = Verifier::new(Policy::default_branch(REPO, "main"), Counting(&fetches));
+    let verifier = Verifier::new(
+        Policy::default_branch(REPO, REPO_ID, OWNER_ID, "main"),
+        Counting(&fetches),
+        NOW,
+        CEILING,
+    );
     let record = record();
     for _ in 0..3 {
         let token = signed(&record, |_| {}, "test-key-1", KEY_1);
@@ -767,7 +795,112 @@ fn records_published_before_attestation_still_load_and_are_unattested() {
 
 #[test]
 fn policy_trusts_only_the_default_branch() {
-    let policy = Policy::default_branch(REPO, "main");
+    let policy = Policy::default_branch(REPO, REPO_ID, OWNER_ID, "main");
     assert_eq!(policy.refs, ["refs/heads/main"]);
     assert_eq!(policy.events, ["push", "schedule", "workflow_dispatch"]);
+}
+
+#[test]
+fn authenticated_time_limits_records_and_exposes_verified_iat() {
+    let record = record();
+    let token = signed(&record, |_| {}, "test-key-1", KEY_1);
+    let published = attested(&record, token);
+    assert_eq!(verifier().verify(&spec(), &published).unwrap().iat, NOW);
+    for (iat, reason) in [
+        (json!(1_700_000_000u64), "outside the plan window"),
+        (json!(NOW + 301), "outside the plan window"),
+        (json!("123"), "integer iat"),
+        (Value::Null, "integer iat"),
+    ] {
+        let token = signed(&record, |c| c["iat"] = iat, "test-key-1", KEY_1);
+        refused_with(&verifier(), &attested(&record, token), reason);
+    }
+    let mut future = record.clone();
+    future.started = 32_503_680_000_000;
+    let token = signed(&future, |_| {}, "test-key-1", KEY_1);
+    refused_with(
+        &verifier(),
+        &attested(&future, token),
+        "record starts after",
+    );
+}
+
+#[test]
+fn rejects_untrusted_ids_runner_and_unprotected_ref() {
+    let record = record();
+    for (name, value, reason) in [
+        ("repository_id", json!("999"), "repository_id"),
+        ("repository_owner_id", json!("999"), "repository_owner_id"),
+        ("runner_environment", json!("self-hosted"), "GitHub-hosted"),
+        ("ref_protected", json!("false"), "not protected"),
+    ] {
+        let token = signed(&record, |c| c[name] = value, "test-key-1", KEY_1);
+        refused_with(&verifier(), &attested(&record, token), reason);
+        let token = signed(
+            &record,
+            |c| {
+                c.as_object_mut().unwrap().remove(name);
+            },
+            "test-key-1",
+            KEY_1,
+        );
+        refused_with(&verifier(), &attested(&record, token), reason);
+    }
+}
+
+#[test]
+fn exact_ref_sha_commit_and_workflow_digest_boundaries() {
+    let record = record();
+    for git_ref in ["refs/heads/main-x", "refs/heads/main/x"] {
+        let token = signed(&record, |c| c["ref"] = json!(git_ref), "test-key-1", KEY_1);
+        refused_with(
+            &verifier(),
+            &attested(&record, token),
+            "not a trusted branch",
+        );
+    }
+    let token = signed(
+        &record,
+        |c| c["sha"] = json!(format!("{}{}", &SHA[..7], "0".repeat(33))),
+        "test-key-1",
+        KEY_1,
+    );
+    refused_with(&verifier(), &attested(&record, token), "sha does not match");
+    let mut missing = record.clone();
+    missing.commit = None;
+    let token = signed(&missing, |_| {}, "test-key-1", KEY_1);
+    refused_with(
+        &verifier(),
+        &attested(&missing, token),
+        "record has no commit",
+    );
+    let mut changed = record.clone();
+    changed.workflow_ref = Some("different".into());
+    assert_ne!(
+        digest(JOB, &record).unwrap(),
+        digest(JOB, &changed).unwrap()
+    );
+}
+
+#[test]
+fn rejects_1024_bit_rsa_signature() {
+    let jwks = include_bytes!("../../tests/fixtures/attest/rsa1024-jwks.json");
+    let signature = include_bytes!("../../tests/fixtures/attest/rsa1024.sig");
+    let keys = parse_jwks(jwks).unwrap();
+    assert!(!keys[0].verifies("stoop-test", signature));
+}
+
+#[test]
+fn curl_command_disables_configuration_and_does_not_put_credentials_in_arguments() {
+    let command = curl_command("https://token.actions.githubusercontent.com/.well-known/jwks");
+    let args: Vec<_> = command
+        .get_args()
+        .map(|s| s.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(args.first().map(String::as_str), Some("-q"));
+    assert!(args.windows(2).any(|w| w == ["--proto", "=https"]));
+    assert!(args.windows(2).any(|w| w == ["--config", "-"]));
+    assert!(!args
+        .iter()
+        .any(|arg| arg.contains("Authorization") || arg.contains("bearer")));
 }

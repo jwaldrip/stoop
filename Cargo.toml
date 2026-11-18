@@ -6,6 +6,7 @@ description = "Run only what matters: skip any command whose observed inputs hav
 license = "MIT"
 repository = "https://github.com/jwaldrip/stoop"
 readme = "README.md"
+exclude = ["tests/fixtures/attest/test-rsa-*.pkcs8.der"]
 
 [dependencies]
 blake3 = "1"
