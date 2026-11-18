@@ -245,8 +245,8 @@ mod linux {
         f.write(&input, source, false);
         let output = f.root.join(name);
         let compiled = Command::new("cc")
-            .args(flags)
             .arg(f.root.join(input))
+            .args(flags)
             .arg("-o")
             .arg(&output)
             .output()
@@ -433,6 +433,93 @@ int main(void) {
         let output = f.run(&["sh", "step.sh"]);
         assert!(output.status.success(), "{}", stderr(&output));
         assert!(!stderr(&output).contains("stoop: observed "));
+        assert_eq!(f.log(), "pytest\n");
+    }
+
+    #[test]
+    fn child_stop_before_fork_event_keeps_lineage() {
+        let f = Fixture::new();
+        f.write(
+            "bin/pytest",
+            "#!/bin/sh\nprintf 'pytest\\n' >> \"$LOG\"\n",
+            true,
+        );
+        let source = r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <stdarg.h>
+#include <stdlib.h>
+#include <sys/ptrace.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+static pid_t held, child;
+static int held_status, phase, child_resumed;
+
+long ptrace(enum __ptrace_request request, ...) {
+    static long (*real_ptrace)(enum __ptrace_request, ...);
+    if (!real_ptrace) real_ptrace = dlsym(RTLD_NEXT, "ptrace");
+    va_list args;
+    va_start(args, request);
+    pid_t pid = va_arg(args, int);
+    void *addr = va_arg(args, void *);
+    void *data = va_arg(args, void *);
+    va_end(args);
+    if ((request == PTRACE_CONT || request == PTRACE_SYSCALL) && pid == child)
+        child_resumed = 1;
+    return real_ptrace(request, pid, addr, data);
+}
+
+pid_t waitpid(pid_t pid, int *status, int options) {
+    static pid_t (*real_waitpid)(pid_t, int *, int);
+    if (!real_waitpid) real_waitpid = dlsym(RTLD_NEXT, "waitpid");
+    if (pid == -1 && phase == 2) {
+        if (child_resumed) {
+            phase = 3;
+            return real_waitpid(pid, status, options);
+        }
+        phase = 4;
+        *status = held_status;
+        return held;
+    }
+    if (pid == -1 && phase == 3) {
+        phase = 4;
+        *status = held_status;
+        return held;
+    }
+    pid_t result = real_waitpid(pid, status, options);
+    if (pid == -1 && phase == 0 && result > 0 && WIFSTOPPED(*status)) {
+        int event = (*status >> 16) & 255;
+        if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
+            held = result;
+            held_status = *status;
+            result = real_waitpid(pid, status, options);
+            if (result > 0 && WIFSTOPPED(*status) && WSTOPSIG(*status) == SIGSTOP) {
+                child = result;
+                phase = 2;
+                const char *path = getenv("ORDER_LOG");
+                int fd = path ? open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600) : -1;
+                if (fd >= 0) { write(fd, "x", 1); close(fd); }
+            } else {
+                phase = 3;
+            }
+        }
+    }
+    return result;
+}
+"#;
+        let lib = compile(&f, source, "order-lib", &["-shared", "-fPIC", "-ldl"]);
+        let output = f
+            .command()
+            .env("LD_PRELOAD", &lib)
+            .env("ORDER_LOG", f.root.join("order-log"))
+            .args(["run", "--root", ".", "--", "sh", "-c", "pytest; true"])
+            .output()
+            .unwrap();
+        one_observation(&output, "stoop: observed pytest via sh (diagnostic only)");
+        assert_eq!(fs::read_to_string(f.root.join("order-log")).unwrap(), "x");
         assert_eq!(f.log(), "pytest\n");
     }
 
