@@ -9,7 +9,7 @@
 <div class="note">
   <p><strong>Why only the default branch writes.</strong> A proof is a claim that lets later runs skip checks. Proofs written by code that hasn't been reviewed shouldn't let main skip anything. Branches read main's proofs, so a branch that matches main skips what main already proved.</p>
 </div>
-<p>stoop has no prebuilt binaries yet, so these recipes install with <code>cargo install</code>. Cache the binary the way you cache any other tool if the install time matters.</p>
+<p>Prebuilt binaries support Linux x86-64 and arm64, and macOS x86-64 and arm64. macOS runs commands untraced and records nothing.</p>
 
 <h2 id="github-actions">GitHub Actions</h2>
 <p>With sync through the repository's own remote. Proofs live at <code>refs/stoop/&lt;key&gt;</code>, which branch and tag listings ignore.</p>
@@ -34,7 +34,9 @@
       - <span class="k">uses</span>: actions/checkout@v4
       - <span class="k">name</span>: Install stoop
         <span class="k">shell</span>: bash               <span class="c"># stoop is not installed yet</span>
-        <span class="k">run</span>: cargo install --locked --git https://github.com/jwaldrip/stoop
+        <span class="k">run</span>: |
+          curl -fsSL https://stoop.build/install.sh | sh
+          echo "$HOME/.local/bin" &gt;&gt; "$GITHUB_PATH"
       - <span class="k">name</span>: Publish proofs from main only
         <span class="k">if</span>: github.ref == 'refs/heads/main'
         <span class="k">shell</span>: bash

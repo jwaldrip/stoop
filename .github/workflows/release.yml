@@ -1,0 +1,90 @@
+name: Release
+on:
+  pull_request:
+  push:
+    tags: ['v*.*.*']
+permissions:
+  contents: read
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-14
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Determine and validate version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then
+            tag="$GITHUB_REF_NAME"
+          else
+            tag="v$(python3 -c 'import re; print(re.search(r"^version = \"([^\"]+)\"", open("Cargo.toml").read(), re.M).group(1))')"
+          fi
+          version=$(python3 .github/check-release-version.py "$tag")
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" >> "$GITHUB_ENV"
+      - name: Test version guard
+        run: |
+          python3 .github/check-release-version.py "v$VERSION"
+          if python3 .github/check-release-version.py v999999.0.0; then exit 1; fi
+          if python3 .github/check-release-version.py "v$VERSION-extra"; then exit 1; fi
+      - name: Install musl tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y musl-tools shellcheck
+      - name: Configure Rust target
+        run: rustup target add '${{ matrix.target }}'
+      - name: Test
+        run: cargo test --locked
+      - name: Installer tests
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          shellcheck -s sh site/install.sh
+          python3 tests/installer.py
+      - name: Build release
+        run: cargo build --release --locked --target '${{ matrix.target }}'
+      - name: Package release
+        run: |
+          mkdir -p dist
+          python3 .github/package-release.py 'target/${{ matrix.target }}/release/stoop' "dist/stoop-$VERSION-${{ matrix.target }}.tar.gz"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: python3 .github/check-release-version.py "$GITHUB_REF_NAME"
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum stoop-*.tar.gz | LC_ALL=C sort -k2 > SHA256SUMS
+      - uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/*
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

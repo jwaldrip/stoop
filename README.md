@@ -1,5 +1,5 @@
 <p align="center">
-  <a href="https://jwaldrip.github.io/stoop/">
+  <a href="https://stoop.build/">
     <img alt="stoop" src="assets/stoop-logo-on-light.svg#gh-light-mode-only" width="300">
     <img alt="stoop" src="assets/stoop-logo-on-dark.svg#gh-dark-mode-only" width="300">
   </a>
@@ -13,10 +13,10 @@
 </p>
 
 <p align="center">
-  <a href="https://jwaldrip.github.io/stoop/">Website</a> &middot;
-  <a href="https://jwaldrip.github.io/stoop/docs/getting-started.html">Field guide</a> &middot;
-  <a href="https://jwaldrip.github.io/stoop/docs/ci.html">CI recipes</a> &middot;
-  <a href="https://jwaldrip.github.io/stoop/docs/cli.html">CLI reference</a>
+  <a href="https://stoop.build/">Website</a> &middot;
+  <a href="https://stoop.build/docs/getting-started.html">Field guide</a> &middot;
+  <a href="https://stoop.build/docs/ci.html">CI recipes</a> &middot;
+  <a href="https://stoop.build/docs/cli.html">CLI reference</a>
 </p>
 
 <p align="center">
@@ -64,15 +64,21 @@ defaults:
 
 Each step is keyed by its script, the workflow and the job. Steps that use an action run as usual; the step that installs stoop sets `shell: bash` for itself. Share proofs between runs through your own git remote (`--sync git`, no server to host) or by caching `.stoop/` with the CI's own cache. Pull requests read; only the default branch writes.
 
-Full workflows for GitHub Actions, GitLab CI, CircleCI and Buildkite are in the [CI recipes](https://jwaldrip.github.io/stoop/docs/ci.html).
+Full workflows for GitHub Actions, GitLab CI, CircleCI and Buildkite are in the [CI recipes](https://stoop.build/docs/ci.html).
 
 ## Install
 
 ```sh
-cargo install --locked --git https://github.com/jwaldrip/stoop
+curl -fsSL https://stoop.build/install.sh | sh
 ```
 
-Prebuilt binaries aren't published yet. Tracing needs Linux on x86-64 or arm64; on macOS stoop builds and runs the command untraced, so a workflow stays portable but never skips there.
+The installer places the binary in `~/.local/bin`. Set `STOOP_INSTALL_DIR` to another user-owned directory or `STOOP_VERSION=v0.1.0` to pin a release. Run the saved script with `--help`, `--dry-run`, or `--uninstall` for more options. `STOOP_RELEASE_BASE` is only for a local loopback test server.
+
+The SHA-256 check detects corruption and a tampered mirror, but a compromised release could replace both the archive and its checksum. When `gh` is installed, the installer verifies GitHub build provenance; otherwise it reports that the check was skipped. Provenance identifies the build, not whether its source is safe. `curl | sh` trusts the domain and TLS to deliver the installer.
+
+Alternatively, install from source with `cargo install --locked --git https://github.com/jwaldrip/stoop`.
+
+Tracing needs Linux on x86-64 or arm64. On macOS stoop runs the command untraced, never records, and never skips.
 
 ```sh
 stoop run -- cargo test        # skip or run
@@ -96,7 +102,7 @@ stoop sees files. It can't see:
 - **The clock and randomness.** Proofs expire after 7 days (`--max-age`), and `STOOP_FULL=1` re-proves everything. Run that nightly.
 - **Services outside the process tree**, and output written outside the repository.
 
-[Blind spots and how to cover them](https://jwaldrip.github.io/stoop/docs/blind-spots.html)
+[Blind spots and how to cover them](https://stoop.build/docs/blind-spots.html)
 
 ## Declared inputs, observed inputs
 
@@ -123,11 +129,11 @@ Not built yet. Today a skip needs byte-equal inputs; the plan loosens that only 
 - **Static vetoes:** refuse to skip a step whose code calls the clock or a random source.
 - **Restored outputs:** let a skip put back what the command produced.
 
-[The roadmap, with the reasoning](https://jwaldrip.github.io/stoop/docs/roadmap.html)
+[The roadmap, with the reasoning](https://stoop.build/docs/roadmap.html)
 
 ## Documentation
 
-The [field guide](https://jwaldrip.github.io/stoop/docs/getting-started.html) covers [getting started](https://jwaldrip.github.io/stoop/docs/getting-started.html), [how it works](https://jwaldrip.github.io/stoop/docs/how-it-works.html), [CI recipes](https://jwaldrip.github.io/stoop/docs/ci.html), [every flag](https://jwaldrip.github.io/stoop/docs/cli.html), [`.stoopignore`](https://jwaldrip.github.io/stoop/docs/stoopignore.html), [blind spots](https://jwaldrip.github.io/stoop/docs/blind-spots.html) and the [FAQ](https://jwaldrip.github.io/stoop/docs/faq.html). The site's source is in [`site/`](site/).
+The [field guide](https://stoop.build/docs/getting-started.html) covers [getting started](https://stoop.build/docs/getting-started.html), [how it works](https://stoop.build/docs/how-it-works.html), [CI recipes](https://stoop.build/docs/ci.html), [every flag](https://stoop.build/docs/cli.html), [`.stoopignore`](https://stoop.build/docs/stoopignore.html), [blind spots](https://stoop.build/docs/blind-spots.html) and the [FAQ](https://stoop.build/docs/faq.html). The site's source is in [`site/`](site/).
 
 ## Build
 
