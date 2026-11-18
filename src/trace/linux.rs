@@ -243,6 +243,34 @@ fn table() -> Vec<(i64, Vec<Op>)> {
         (s(libc::SYS_clone), vec![Clone { modern: false }]),
         (s(libc::SYS_clone3), vec![Clone { modern: true }]),
         (
+            s(libc::SYS_open_tree),
+            vec![Unsound("it attempted to change mount topology")],
+        ),
+        (
+            s(libc::SYS_move_mount),
+            vec![Unsound("it attempted to change mount topology")],
+        ),
+        (
+            s(libc::SYS_fsopen),
+            vec![Unsound("it attempted to change mount topology")],
+        ),
+        (
+            s(libc::SYS_fsconfig),
+            vec![Unsound("it attempted to change mount topology")],
+        ),
+        (
+            s(libc::SYS_fsmount),
+            vec![Unsound("it attempted to change mount topology")],
+        ),
+        (
+            s(libc::SYS_fspick),
+            vec![Unsound("it attempted to change mount topology")],
+        ),
+        (
+            s(libc::SYS_mount_setattr),
+            vec![Unsound("it attempted to change mount topology")],
+        ),
+        (
             s(libc::SYS_mount),
             vec![Unsound("it attempted to change mount topology")],
         ),
