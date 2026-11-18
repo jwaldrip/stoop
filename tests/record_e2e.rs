@@ -1033,3 +1033,222 @@ fn chained_magic_symlinks_do_not_resolve_again_in_the_recorder() {
         "{inputs:?}"
     );
 }
+
+#[test]
+fn reads_before_final_symlink_changes_keep_call_time_target() {
+    use std::os::unix::fs::PermissionsExt;
+    for (name, command, link, target, content) in [
+        (
+            "grep-retarget",
+            "grep -q 1 l && ln -sfn t2.txt l",
+            "l",
+            "t1.txt",
+            "1\n",
+        ),
+        (
+            "cat-retarget",
+            "cat l > out.txt && ln -sfn t2.txt l",
+            "l",
+            "t1.txt",
+            "1\n",
+        ),
+        (
+            "cat-remove",
+            "cat l > out.txt && rm l",
+            "l",
+            "t1.txt",
+            "1\n",
+        ),
+        (
+            "cat-rename",
+            "cat l > out.txt && mv l l2",
+            "l",
+            "t1.txt",
+            "1\n",
+        ),
+        (
+            "exec-retarget",
+            "./run > out.txt && ln -sfn run2.sh run",
+            "run",
+            "run1.sh",
+            "#!/bin/sh\necho one\n",
+        ),
+    ] {
+        let w = Ws::new(name);
+        w.write("t1.txt", "1\n");
+        w.write("t2.txt", "2\n");
+        w.write("run1.sh", "#!/bin/sh\necho one\n");
+        w.write("run2.sh", "#!/bin/sh\necho two\n");
+        for script in ["run1.sh", "run2.sh"] {
+            fs::set_permissions(w.root.join(script), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::os::unix::fs::symlink(target, w.root.join(link)).unwrap();
+        let p = recorded(&w, command);
+        let prefix = if name == "exec-retarget" { "x" } else { "f" };
+        let expected = (
+            target.to_string(),
+            format!("{prefix}:{}", hash(content.as_bytes())),
+        );
+        assert!(
+            pairs(&p, "inputs").contains(&expected),
+            "{name}: {:?}",
+            pairs(&p, "inputs")
+        );
+    }
+}
+
+#[test]
+fn removing_alias_target_invalidates_other_spelling() {
+    let w = Ws::new("topology-remove");
+    w.write("sub1/keep", "one");
+    std::os::unix::fs::symlink("sub1", w.root.join("cur")).unwrap();
+    std::os::unix::fs::symlink("cur", w.root.join("out")).unwrap();
+    let p = recorded(&w, "echo a > out/f; rm -rf cur; mkdir cur; echo b > out/g");
+    assert!(
+        pairs(&p, "outputs").iter().any(|(key, _)| key == "cur/g"),
+        "{:?}",
+        pairs(&p, "outputs")
+    );
+}
+
+#[test]
+fn replacing_alias_by_rename_invalidates_other_spelling() {
+    let w = Ws::new("topology-rename");
+    w.write("sub1/keep", "one");
+    w.write("sub2/keep", "two");
+    std::os::unix::fs::symlink("sub1", w.root.join("cur")).unwrap();
+    std::os::unix::fs::symlink("sub2", w.root.join("next")).unwrap();
+    std::os::unix::fs::symlink("cur", w.root.join("out")).unwrap();
+    let p = recorded(
+        &w,
+        "echo a > out/f; python3 -c 'import os; os.replace(\"next\", \"cur\")'; echo b > out/g",
+    );
+    assert!(
+        pairs(&p, "outputs").iter().any(|(key, _)| key == "sub2/g"),
+        "{:?}",
+        pairs(&p, "outputs")
+    );
+}
+
+#[test]
+fn exchanging_aliases_by_rename_invalidates_other_spelling() {
+    let w = Ws::new("topology-exchange");
+    w.syscall_probe();
+    w.write("s1/keep", "one");
+    w.write("s2/keep", "two");
+    std::os::unix::fs::symlink("s1", w.root.join("a")).unwrap();
+    std::os::unix::fs::symlink("s2", w.root.join("b")).unwrap();
+    std::os::unix::fs::symlink("a", w.root.join("out")).unwrap();
+    let p = recorded(
+        &w,
+        "echo a > out/f; ./syscall-probe exchange a b; echo b > out/g",
+    );
+    assert!(
+        pairs(&p, "outputs").iter().any(|(key, _)| key == "s2/g"),
+        "{:?}",
+        pairs(&p, "outputs")
+    );
+}
+
+#[test]
+fn replacing_symlink_destination_by_rename_invalidates_other_spelling() {
+    let w = Ws::new("topology-rename-destination");
+    w.write("sub1/keep", "one");
+    w.write("p", "plain file");
+    std::os::unix::fs::symlink("sub1", w.root.join("cur")).unwrap();
+    std::os::unix::fs::symlink("cur", w.root.join("out")).unwrap();
+    let p = recorded(&w, "echo a > out/f; python3 -c 'import os; os.replace(\"p\", \"cur\")'; rm cur; mkdir cur; echo b > out/g");
+    assert!(
+        pairs(&p, "outputs").iter().any(|(key, _)| key == "cur/g"),
+        "{:?}",
+        pairs(&p, "outputs")
+    );
+}
+
+#[test]
+fn creating_proc_cwd_alias_invalidates_cached_negative_walk() {
+    let w = Ws::new("topology-create");
+    w.write("sub/config.txt", "contents");
+    let p = recorded(
+        &w,
+        "cd sub; (cat d/x 2>/dev/null; true); ln -s /proc/self/cwd d; cat d/config.txt",
+    );
+    assert!(
+        pairs(&p, "inputs")
+            .contains(&("sub/config.txt".into(), format!("f:{}", hash(b"contents")))),
+        "{:?}",
+        pairs(&p, "inputs")
+    );
+}
+
+#[test]
+fn app_working_directory_records_script_key_without_dot_components() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = Ws::new("app-script-key");
+    w.write("app/build.sh", "#!/bin/sh\nexit 0\n");
+    fs::set_permissions(
+        w.root.join("app/build.sh"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    let (status, err) = w.sh_in("./build.sh", &w.root.join("app"));
+    assert_eq!(status, 0, "{err}");
+    let p = w.proof();
+    let inputs = pairs(&p, "inputs");
+    assert!(
+        inputs.iter().any(|(path, _)| path == "app/build.sh"),
+        "{inputs:?}"
+    );
+    assert!(
+        !inputs
+            .iter()
+            .any(|(path, _)| path.contains("/./") || path.is_empty()),
+        "{inputs:?}"
+    );
+}
+
+#[test]
+fn namespace_change_attempt_is_not_recorded() {
+    let w = Ws::new("namespace-attempt");
+    w.syscall_probe();
+    let (status, err) = w.sh("./syscall-probe unshare ignored");
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        err.contains("not recorded") && err.contains("namespaces"),
+        "{err}"
+    );
+    assert!(!w.store().join("proofs/t.json").exists());
+}
+
+#[test]
+fn concurrent_alias_retargets_do_not_leave_stale_cached_parents() {
+    for trial in 0..6 {
+        let w = Ws::new(&format!("topology-race-{trial}"));
+        w.write("sub/keep", "keep");
+        w.write("race.py", include_str!("fixtures/topology_race.py"));
+        let outside =
+            std::env::temp_dir().join(format!("stoop-race-{}-{trial}", std::process::id()));
+        let _ = fs::remove_dir_all(&outside);
+        fs::create_dir(&outside).unwrap();
+        let x = outside.join("x");
+        let y = outside.join("y");
+        fs::create_dir(&y).unwrap();
+        std::os::unix::fs::symlink(&y, &x).unwrap();
+        std::os::unix::fs::symlink(&w.root, y.join("alias")).unwrap();
+        let script = format!(
+            "python3 race.py {} {} {}",
+            x.display(),
+            y.display(),
+            w.root.display()
+        );
+        let p = recorded(&w, &script);
+        let _ = fs::remove_dir_all(outside);
+        assert!(
+            pairs(&p, "outputs")
+                .iter()
+                .any(|(key, _)| key == "sub/final"),
+            "trial {trial}: {:?}",
+            pairs(&p, "outputs")
+        );
+    }
+}

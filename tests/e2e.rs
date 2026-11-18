@@ -1274,5 +1274,61 @@ fn final_component_symlink_to_proc_cwd_is_not_skipped_by_fast_path() {
     assert!(!skipped(&second), "{second}");
 }
 
+#[test]
+fn fexecve_script_tracks_repository_shebang_interpreter() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let w = Ws::new("fexecve-script");
+    fs::copy("/bin/sh", w.root.join("interp")).unwrap();
+    w.write("script", "#!./interp\necho hello\n");
+    fs::set_permissions(w.root.join("script"), fs::Permissions::from_mode(0o755)).unwrap();
+    let command = "python3 -c 'import os; f=os.open(\"script\", os.O_RDONLY); os.set_inheritable(f, True); os.execve(f, [\"script\"], os.environ)'";
+    let (status, first) = w.sh(command);
+    assert_eq!(status, 0, "{first}");
+    assert!(skipped(&w.sh(command).1));
+    fs::OpenOptions::new()
+        .append(true)
+        .open(w.root.join("interp"))
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    assert!(!skipped(&w.sh(command).1));
+}
+
+#[test]
+fn fexecve_elf_tracks_repository_loader() {
+    use std::io::Write;
+    let w = Ws::new("fexecve-elf");
+    let loader = if cfg!(target_arch = "x86_64") {
+        "/lib64/ld-linux-x86-64.so.2"
+    } else {
+        "/lib/ld-linux-aarch64.so.1"
+    };
+    fs::copy(loader, w.root.join("myld.so")).unwrap();
+    w.write("main.c", "int main(void) { return 0; }\n");
+    let linker = format!("-Wl,--dynamic-linker={}", w.root.join("myld.so").display());
+    let build = Command::new("cc")
+        .current_dir(&w.root)
+        .args(["main.c", "-o", "program", &linker])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let command = "python3 -c 'import os; f=os.open(\"program\", os.O_RDONLY); os.execve(f, [\"program\"], os.environ)'";
+    let (status, first) = w.sh(command);
+    assert_eq!(status, 0, "{first}");
+    assert!(skipped(&w.sh(command).1));
+    fs::OpenOptions::new()
+        .append(true)
+        .open(w.root.join("myld.so"))
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    assert!(!skipped(&w.sh(command).1));
+}
+
 #[allow(dead_code)]
 fn _unused(_: &Path) {}

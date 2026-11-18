@@ -11,6 +11,10 @@
 int main(int argc, char **argv) {
     if (argc < 3) return 2;
     const char *op = argv[1];
+    if (!strcmp(op, "unshare")) {
+        (void)syscall(SYS_unshare, 0);
+        return 0;
+    }
     if (!strcmp(op, "pipe-fd")) {
         int pipefds[2];
         if (pipe(pipefds)) return 3;

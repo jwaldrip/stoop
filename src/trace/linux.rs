@@ -13,7 +13,7 @@ use super::{Scope, Trace};
 use crate::ignore::Ignore;
 use crate::input::{file_id, hash_file};
 use crate::pathutil::{absolutize, to_key, without_dots, Physical};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsString};
 use std::fs;
 use std::io;
@@ -39,6 +39,7 @@ const PATH_MAX: usize = 4096;
 /// Linux ABI flags, the same on every architecture.
 const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 const AT_REMOVEDIR: i32 = 0x200;
+const AT_EMPTY_PATH: i32 = 0x1000;
 const RENAME_EXCHANGE: u32 = 2;
 
 /// `fchmodat2` is missing from the libc crate on these targets; the number is 452 on both.
@@ -235,6 +236,30 @@ fn table() -> Vec<(i64, Vec<Op>)> {
         ),
         (s(libc::SYS_truncate), vec![Truncate { path: 0 }]),
         (s(libc::SYS_connect), vec![Connect]),
+        (
+            s(libc::SYS_mount),
+            vec![Unsound("it attempted to change mount topology")],
+        ),
+        (
+            s(libc::SYS_umount2),
+            vec![Unsound("it attempted to change mount topology")],
+        ),
+        (
+            s(libc::SYS_unshare),
+            vec![Unsound("it attempted to change namespaces")],
+        ),
+        (
+            s(libc::SYS_chroot),
+            vec![Unsound("it attempted to change its filesystem root")],
+        ),
+        (
+            s(libc::SYS_pivot_root),
+            vec![Unsound("it attempted to change its filesystem root")],
+        ),
+        (
+            s(libc::SYS_setns),
+            vec![Unsound("it attempted to change namespaces")],
+        ),
         (
             s(libc::SYS_fchmodat),
             vec![Chmod {
@@ -448,6 +473,7 @@ struct Tracer<'a> {
     cwds: HashMap<i32, PathBuf>,
     magic_epoch: u64,
     magic_cache: HashMap<PathBuf, (u64, bool)>,
+    pending_topology: HashSet<i32>,
     syscall: i64,
     allow_network: bool,
     /// Present when priors are recorded (not with `--no-record`).
@@ -513,6 +539,7 @@ pub fn run<'a>(
         allow_network,
         magic_epoch: 0,
         magic_cache: HashMap::new(),
+        pending_topology: HashSet::new(),
         syscall: 0,
         rec: scope.map(|s| Rec {
             phys: Physical::new(s.root, &s.real_root),
@@ -585,6 +612,13 @@ pub fn run<'a>(
             }
         }
         wait_failed = false;
+        // A namespace syscall runs after its entry stop. Clear again when that
+        // tracee next stops or exits, after the kernel has applied the change.
+        if (libc::WIFSTOPPED(st) || libc::WIFEXITED(st) || libc::WIFSIGNALED(st))
+            && tr.pending_topology.remove(&p)
+        {
+            tr.clear_topology();
+        }
         if libc::WIFEXITED(st) {
             if p == pid {
                 tr.t.status = libc::WEXITSTATUS(st);
@@ -1189,6 +1223,17 @@ impl Tracer<'_> {
                 parts.push_front(part);
             }
         }
+        // A final-component symlink can be retargeted or removed later in this run.
+        // Preserve its call-time in-repository target instead of relying on the
+        // post-run link lookup to recover what was actually read.
+        if links > 0
+            && self
+                .rec
+                .as_ref()
+                .is_some_and(|r| r.phys.repo_rel(&current).is_some())
+        {
+            self.t.touched.entry(current.clone()).or_default().read = true;
+        }
         self.magic_cache.insert(parent, (self.magic_epoch, magic));
         if magic {
             self.t.magic_links.extend(repository_links);
@@ -1333,12 +1378,17 @@ impl Tracer<'_> {
     }
 
     /// An alias topology change invalidates cache entries under every spelling.
-    fn topology_changed(&mut self) {
+    fn clear_topology(&mut self) {
         self.magic_epoch = self.magic_epoch.wrapping_add(1);
         if let Some(rec) = &mut self.rec {
             rec.phys.clear();
             rec.link_walks.clear();
         }
+    }
+
+    fn topology_changed(&mut self, pid: i32) {
+        self.clear_topology();
+        self.pending_topology.insert(pid);
     }
 
     /// Sockets that name services use. A shell or libc touches these on startup, and
@@ -1437,7 +1487,7 @@ impl Tracer<'_> {
             }
         }
         if !dir {
-            self.topology_changed();
+            self.topology_changed(pid);
         }
         self.write(&p, false);
         if dir {
@@ -1461,7 +1511,7 @@ impl Tracer<'_> {
         };
         let removes_dir = dir || flags.is_some_and(|i| args[i] as i32 & AT_REMOVEDIR != 0);
         if fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir() || m.file_type().is_symlink()) {
-            self.topology_changed();
+            self.topology_changed(pid);
         }
         // Read the directory's contents before the call, while they are still there.
         let key = self.write(&p, false);
@@ -1496,7 +1546,7 @@ impl Tracer<'_> {
         if [&a, &b].iter().any(|p| {
             fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() || m.file_type().is_symlink())
         }) {
-            self.topology_changed();
+            self.topology_changed(pid);
         }
         let ka = self.write(&a, false);
         let kb = self.write(&b, false);
@@ -1549,7 +1599,25 @@ impl Tracer<'_> {
                     }
                 }
                 Op::Exec { dirfd, path } => {
-                    if let Some(p) = self.resolve(pid, &args, dirfd, path) {
+                    let empty_fd_exec = nr == libc::SYS_execveat
+                        && args[4] as i32 & AT_EMPTY_PATH != 0
+                        && (args[path] == 0
+                            || read_cstr(pid, args[path]).is_some_and(|s| s.is_empty()));
+                    if empty_fd_exec {
+                        let fd = args[dirfd.expect("execveat has a dirfd")] as i32;
+                        match std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
+                            Ok(p)
+                                if p.is_absolute()
+                                    && !p
+                                        .as_os_str()
+                                        .as_encoded_bytes()
+                                        .ends_with(b" (deleted)") =>
+                            {
+                                self.exec_path(pid, p)
+                            }
+                            _ => self.flag("it executed an unkeyable file descriptor"),
+                        }
+                    } else if let Some(p) = self.resolve(pid, &args, dirfd, path) {
                         self.exec_path(pid, p);
                     }
                 }
