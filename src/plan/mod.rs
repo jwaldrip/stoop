@@ -384,8 +384,13 @@ mod tests {
                 },
             )
             .unwrap();
-            assert_eq!(plan["skip"], json!(["a"]));
-            assert_eq!(plan["jobs"][0]["code"], "proved");
+            if std::env::var_os("STOOP_TEST_NO_RECORD").is_some() {
+                assert_eq!(plan["skip"], json!([]));
+                assert_eq!(plan["jobs"][0]["code"], "no-record");
+            } else {
+                assert_eq!(plan["skip"], json!(["a"]));
+                assert_eq!(plan["jobs"][0]["code"], "proved");
+            }
             return;
         }
         let root = std::env::temp_dir().join(format!("stoop-injected-plan-{}", std::process::id()));
@@ -484,24 +489,40 @@ mod tests {
             &claims,
             &a::pair(a::KEY_1),
         ));
-        job::JobStore::new(store).save(key, record).unwrap();
-        let child = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "plan::tests::injected_planner_proves_an_attested_record",
-                "--nocapture",
-            ])
-            .env("STOOP_TEST_PLAN_CHILD", &root)
-            .env("GITHUB_JOB", "stoop-plan")
-            .env("GITHUB_ACTIONS", "true")
-            .env("GITHUB_REPOSITORY", a::REPO)
-            .env("GITHUB_REPOSITORY_ID", a::REPO_ID)
-            .env("GITHUB_REPOSITORY_OWNER_ID", a::OWNER_ID)
-            .env("GITHUB_SHA", &sha)
-            .env("GITHUB_EVENT_PATH", &event)
-            .env_remove("STOOP_SYNC")
-            .env_remove("STOOP_FULL")
-            .env_remove("STOOP_ENV_SALT")
+        let jobs = job::JobStore::new(store);
+        jobs.save(key, record).unwrap();
+        let child_command = || {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "plan::tests::injected_planner_proves_an_attested_record",
+                    "--nocapture",
+                ])
+                .env("STOOP_TEST_PLAN_CHILD", &root)
+                .env("GITHUB_JOB", "stoop-plan")
+                .env("GITHUB_ACTIONS", "true")
+                .env("GITHUB_REPOSITORY", a::REPO)
+                .env("GITHUB_REPOSITORY_ID", a::REPO_ID)
+                .env("GITHUB_REPOSITORY_OWNER_ID", a::OWNER_ID)
+                .env("GITHUB_SHA", &sha)
+                .env("GITHUB_EVENT_PATH", &event)
+                .env_remove("STOOP_SYNC")
+                .env_remove("STOOP_FULL")
+                .env_remove("STOOP_ENV_SALT")
+                .env_remove("STOOP_ENV_SALT");
+            command
+        };
+        let child = child_command().output().unwrap();
+        assert!(
+            child.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        assert!(jobs.forget(key).unwrap());
+        let child = child_command()
+            .env("STOOP_TEST_NO_RECORD", "1")
             .output()
             .unwrap();
         assert!(
