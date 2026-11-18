@@ -53,6 +53,7 @@ stoop: skip sh-c98f8f9c8fef6d65: 71 inputs unchanged since 0s ago (100ms)</code>
 <h2 id="actions">Actions and runner tools</h2>
 <p>Job records compare each downloaded action repository tree with the runner's action copy when the journal opens. Composite actions' nested refs are checked too. A later plan resolves the refs and downloads the trees again. Unsupported entries, missing copies, unresolved refs, and changed contents make the job run.</p>
 <p>The comparison is a snapshot, not continuous monitoring. Files changed while an action executes or after the journal opens are outside it. Committed <code>node_modules</code> are included in the tree; packages installed or modified at runtime are not. The runner's own tool cache, preinstalled actions, system software, and tools downloaded by setup actions can change without changing the action tree. Use pinned tool versions, probes, expiration, and full runs to bound those changes.</p>
+<p>Planning assumes the runner would fetch the same GitHub API archive for the resolved commit. Stoop does not inspect a future runner copy, so an action served from a package with different runtime content would not be detected by this check. A digest-pinned <code>docker://</code> image is identified by its digest; stoop does not inspect the image bytes.</p>
 <p>Reusable-workflow jobs remain unplannable. Docker action tags, submodules, Git LFS pointers, symlinks, and unsupported archive entries fail wide rather than supplying an action witness.</p>
 
 <h2 id="platform">Platforms</h2>
