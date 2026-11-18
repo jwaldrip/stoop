@@ -759,6 +759,8 @@ mod tests {
                 if_text: None,
                 steps: vec![],
                 blocked: None,
+                actions: vec![],
+                images: vec![],
             };
             Self {
                 root,
