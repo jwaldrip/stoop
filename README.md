@@ -1,10 +1,6 @@
 <p align="center">
-  <a href="https://jwaldrip.github.io/stoop/">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="assets/stoop-logo-on-dark.svg">
-      <img alt="stoop" src="assets/stoop-logo-on-light.svg" width="300">
-    </picture>
-  </a>
+  <img alt="stoop" src="assets/stoop-logo-on-light.svg#gh-light-mode-only" width="300">
+  <img alt="stoop" src="assets/stoop-logo-on-dark.svg#gh-dark-mode-only" width="300">
 </p>
 
 <h3 align="center">Run only what matters.</h3>
@@ -15,10 +11,10 @@
 </p>
 
 <p align="center">
-  <a href="https://jwaldrip.github.io/stoop/">Website</a> &middot;
-  <a href="https://jwaldrip.github.io/stoop/docs/getting-started.html">Field guide</a> &middot;
-  <a href="https://jwaldrip.github.io/stoop/docs/ci.html">CI recipes</a> &middot;
-  <a href="https://jwaldrip.github.io/stoop/docs/cli.html">CLI reference</a>
+  <a href="https://stoop.build/">Website</a> &middot;
+  <a href="https://stoop.build/docs/getting-started.html">Field guide</a> &middot;
+  <a href="https://stoop.build/docs/ci.html">CI recipes</a> &middot;
+  <a href="https://stoop.build/docs/cli.html">CLI reference</a>
 </p>
 
 <p align="center">
@@ -28,7 +24,8 @@
 </p>
 
 <p align="center">
-  <img src="assets/readme-hero.jpg" alt="A murmuration of thousands of starlings over a frosted marsh, and one peregrine diving at a single bird at its edge." width="100%">
+  <img src="assets/readme-hero-light.jpg#gh-light-mode-only" alt="A murmuration of thousands of starlings over a frosted marsh, and one peregrine diving at a single bird at its edge." width="100%">
+  <img src="assets/readme-hero-dark.jpg#gh-dark-mode-only" alt="A murmuration of thousands of starlings over a frosted marsh, and one peregrine diving at a single bird at its edge." width="100%">
 </p>
 
 ## Most of a pipeline has nothing new to say
@@ -38,7 +35,8 @@ CI reruns every step on every push. Most of those steps read the same files they
 A stoop is a peregrine's hunting dive: it folds in, ignores the rest of the sky, and drops on the one thing that matters. **stoop** does that for CI. It picks out the step whose inputs moved and skips the rest.
 
 <p align="center">
-  <img src="assets/demo-terminal.png" alt="Terminal: stoop runs cargo build and records 668 inputs, skips the same build in 289 ms, then explains that an edit to src/ignore.rs means the build would run." width="760">
+  <img src="assets/demo-terminal-light.png#gh-light-mode-only" alt="Terminal: stoop runs cargo build and records 668 inputs, skips the same build in 289 ms, then explains that an edit to src/ignore.rs means the build would run." width="760">
+  <img src="assets/demo-terminal-dark.png#gh-dark-mode-only" alt="Terminal: stoop runs cargo build and records 668 inputs, skips the same build in 289 ms, then explains that an edit to src/ignore.rs means the build would run." width="760">
 </p>
 
 <p align="center"><sub>Captured, not typed: a fresh clone of stoop building itself, Linux arm64 in a throwaway container, stoop at <code>c9082e1</code>. Only cargo's progress lines are cut.</sub></p>
@@ -50,7 +48,13 @@ A stoop is a peregrine's hunting dive: it folds in, ignores the rest of the sky,
 3. **Compare.** Next time it hashes the same paths. If all of them match and the outputs are still in place, the command is skipped.
 4. **When unsure, run.** No proof, an expired proof, a trace that might be incomplete, a read of `.git`, or use of the network: the command runs and nothing is recorded.
 
-Proofs are content-addressed and keyed by command, so a branch that matches what main already proved can skip. Up to 8 are kept per command, so steps that leave no output in the repository (tests, lint, type checks) also skip after a revert.
+By default, the proof key includes the command and its working directory relative to the repository root. The root is the nearest ancestor containing a `.git` directory or file, so a nested repository uses its own root. Without `.git`, the working directory is the root. `--root DIR` chooses a root explicitly. Paths inside it are stored relative to it, so a proof stored with the checkout can move with it.
+
+Proofs live in `<root>/.stoop` unless `--store DIR` or `STOOP_STORE` chooses another store. An external store includes the Git origin URL in automatic keys, keeping different repositories apart while allowing checkouts of the same origin to share proofs. Without an origin, stoop uses the root's absolute path, so moving that root gives it a cold cache in an external store. Explicit `--key` names remain unchanged, but a proof still has to match the working directory and repository scope.
+
+Proofs are specific to their operating system, architecture, tracer and tracer version. A Linux x86-64 proof cannot skip a Linux arm64 command, even in a shared store. Older proofs without this information are treated as cold; run the command on a supported Linux platform to record a fresh proof. New proofs use a format older stoop versions cannot read, so update runners sharing a store. `stoop ls` shows each proof's platform. macOS runs commands without tracing and never skips.
+
+Up to 8 proofs are kept per key, so steps that leave no output in the repository (tests, lint, type checks) can also skip after a revert.
 
 ## Two lines in GitHub Actions
 
@@ -62,9 +66,9 @@ defaults:
     shell: stoop sh {0}
 ```
 
-Each step is keyed by its script, the workflow and the job. Steps that use an action run as usual; the step that installs stoop sets `shell: bash` for itself. Share proofs between runs through your own git remote (`--sync git`, no server to host) or by caching `.stoop/` with the CI's own cache. Pull requests read; only the default branch writes.
+Each step is keyed by its script, arguments, workflow, job and working directory. Steps that use an action run as usual; the step that installs stoop sets `shell: bash` for itself. Share proofs between runs through your own git remote (`--sync git`, no server to host) or by caching `.stoop/` with the CI's own cache. Pull requests read; only the default branch writes.
 
-Full workflows for GitHub Actions, GitLab CI, CircleCI and Buildkite are in the [CI recipes](https://jwaldrip.github.io/stoop/docs/ci.html).
+Full workflows for GitHub Actions, GitLab CI, CircleCI and Buildkite are in the [CI recipes](https://stoop.build/docs/ci.html).
 
 ## Experimental job planning
 
@@ -91,10 +95,14 @@ JSON output has schema `stoop.plan/1`: top-level `workflow`, `path`, `rev`, `pla
 ## Install
 
 ```sh
-cargo install --locked --git https://github.com/jwaldrip/stoop
+curl -fsSL https://stoop.build/install.sh | sh
 ```
 
-Prebuilt binaries aren't published yet. Tracing needs Linux on x86-64 or arm64; on macOS stoop builds and runs the command untraced, so a workflow stays portable but never skips there.
+The installer places the binary in `~/.local/bin`. Set `STOOP_INSTALL_DIR` to another user-owned directory or `STOOP_VERSION=v0.1.0` to pin a release. Run the saved script with `--help`, `--dry-run`, or `--uninstall` for more options. `STOOP_RELEASE_BASE` is only for a local loopback test server.
+
+The SHA-256 check detects corruption and a tampered mirror, but a compromised release could replace both the archive and its checksum. When `gh` is installed, the installer verifies GitHub build provenance; otherwise it reports that the check was skipped. Provenance identifies the build, not whether its source is safe. `curl | sh` trusts the domain and TLS to deliver the installer.
+
+Tracing needs Linux on x86-64 or arm64. On macOS stoop runs the command untraced, never records, and never skips.
 
 ```sh
 stoop run -- cargo test        # skip or run
@@ -118,7 +126,7 @@ stoop sees files. It can't see:
 - **The clock and randomness.** Proofs expire after 7 days (`--max-age`), and `STOOP_FULL=1` re-proves everything. Run that nightly.
 - **Services outside the process tree**, and output written outside the repository.
 
-[Blind spots and how to cover them](https://jwaldrip.github.io/stoop/docs/blind-spots.html)
+[Blind spots and how to cover them](https://stoop.build/docs/blind-spots.html)
 
 ## Declared inputs, observed inputs
 
@@ -145,11 +153,11 @@ Not built yet. Today a skip needs byte-equal inputs; the plan loosens that only 
 - **Static vetoes:** refuse to skip a step whose code calls the clock or a random source.
 - **Restored outputs:** let a skip put back what the command produced.
 
-[The roadmap, with the reasoning](https://jwaldrip.github.io/stoop/docs/roadmap.html)
+[The roadmap, with the reasoning](https://stoop.build/docs/roadmap.html)
 
 ## Documentation
 
-The [field guide](https://jwaldrip.github.io/stoop/docs/getting-started.html) covers [getting started](https://jwaldrip.github.io/stoop/docs/getting-started.html), [how it works](https://jwaldrip.github.io/stoop/docs/how-it-works.html), [CI recipes](https://jwaldrip.github.io/stoop/docs/ci.html), [every flag](https://jwaldrip.github.io/stoop/docs/cli.html), [`.stoopignore`](https://jwaldrip.github.io/stoop/docs/stoopignore.html), [blind spots](https://jwaldrip.github.io/stoop/docs/blind-spots.html) and the [FAQ](https://jwaldrip.github.io/stoop/docs/faq.html). The site's source is in [`site/`](site/).
+The [field guide](https://stoop.build/docs/getting-started.html) covers [getting started](https://stoop.build/docs/getting-started.html), [how it works](https://stoop.build/docs/how-it-works.html), [CI recipes](https://stoop.build/docs/ci.html), [every flag](https://stoop.build/docs/cli.html), [`.stoopignore`](https://stoop.build/docs/stoopignore.html), [blind spots](https://stoop.build/docs/blind-spots.html) and the [FAQ](https://stoop.build/docs/faq.html). The site's source is in [`site/`](site/).
 
 ## Build
 
@@ -159,3 +167,10 @@ cargo test        # the end-to-end tests need Linux
 ```
 
 MIT licensed.
+
+<p align="center">
+  <img alt="The Bushido Collective seal" src="assets/bushido-seal-on-light.svg#gh-light-mode-only" width="72">
+  <img alt="The Bushido Collective seal" src="assets/bushido-seal-on-dark.svg#gh-dark-mode-only" width="72">
+  <br>
+  <sub>A <a href="https://withbushido.ai">Bushido Collective</a> project</sub>
+</p>

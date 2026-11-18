@@ -230,6 +230,67 @@ fn known_github(name: &str) -> bool {
     name == "GITHUB_JOB" || crate::gha::context::VERIFIED_VARS.contains(&name)
 }
 
+/// Recorder semantics older than this floor may produce unsound plan proofs.
+/// When recorder changes make earlier proofs unsound, bump this floor and
+/// `TRACER_VERSION` together. This is not the planner runner's runtime version.
+const MIN_PLANNABLE_RECORDER_VERSION: u32 = 4;
+
+/// Resolve only runner labels whose platform is known without executing the job.
+fn declared_platform(runs_on: &serde_json::Value) -> Option<(&'static str, &'static str)> {
+    let label = runs_on.as_str().or_else(|| {
+        let labels = runs_on.as_array()?;
+        (labels.len() == 1).then(|| labels[0].as_str()).flatten()
+    })?;
+    match label {
+        "ubuntu-latest" | "ubuntu-22.04" | "ubuntu-24.04" | "ubuntu-26.04" => {
+            Some(("linux", "x86_64"))
+        }
+        "ubuntu-latest-arm" | "ubuntu-22.04-arm" | "ubuntu-24.04-arm" | "ubuntu-26.04-arm" => {
+            Some(("linux", "aarch64"))
+        }
+        "macos-latest" | "macos-13" | "macos-14" | "macos-15" | "macos-26" => Some(("macos", "")),
+        "windows-latest" | "windows-2022" | "windows-2025" => Some(("windows", "")),
+        _ => None,
+    }
+}
+
+fn proof_platform(proof: &Proof, spec: &JobSpec, record: &JobRecord) -> Result<(), &'static str> {
+    let p = proof.provenance.as_ref().ok_or("proof lacks provenance")?;
+    if p.version < MIN_PLANNABLE_RECORDER_VERSION {
+        return Err("recorder too old: re-record");
+    }
+    if p.os != "linux"
+        || p.tracer != "ptrace-seccomp"
+        || !matches!(p.arch.as_str(), "x86_64" | "aarch64")
+    {
+        return Err("proof uses an unsupported platform or tracer");
+    }
+    if let Some((os, arch)) = declared_platform(&spec.runs_on) {
+        if p.os != os || p.arch != arch {
+            return Err("proof platform differs from declared runner");
+        }
+        return Ok(());
+    }
+    let os = record
+        .host
+        .get("os")
+        .or_else(|| record.host.get("RUNNER_OS"));
+    let arch = record
+        .host
+        .get("arch")
+        .or_else(|| record.host.get("RUNNER_ARCH"));
+    let matches_os = os.is_some_and(|value| value.eq_ignore_ascii_case(&p.os));
+    let matches_arch = arch.is_some_and(|value| {
+        value.eq_ignore_ascii_case(&p.arch)
+            || (p.arch == "x86_64" && value.eq_ignore_ascii_case("X64"))
+            || (p.arch == "aarch64" && value.eq_ignore_ascii_case("ARM64"))
+    });
+    if !matches_os || !matches_arch {
+        return Err("proof platform differs from recorded runner or runner platform is unknown");
+    }
+    Ok(())
+}
+
 fn sort_records(records: &mut [JobRecord]) {
     records.sort_by(|a, b| b.retention_key().cmp(&a.retention_key()));
 }
@@ -360,14 +421,21 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
     }
     let mut proofs: Vec<Proof> = Vec::new();
     for ((index, key, age), saved) in steps.iter().zip(&record.steps) {
-        let Some(proof) = ctx
-            .proofs
-            .load(key)
-            .into_iter()
-            .find(|p| p.digest() == saved.proof)
-        else {
+        let loaded = ctx.proofs.load(key);
+        let has_legacy = loaded.iter().any(|p| p.provenance.is_none());
+        let empty = loaded.is_empty();
+        let Some(proof) = loaded.into_iter().find(|p| p.digest() == saved.proof) else {
+            if (empty && ctx.proofs.export(key).is_some()) || has_legacy {
+                return decision(
+                    Code::ProofPlatform,
+                    format!("step {index}: proof lacks provenance"),
+                );
+            }
             return decision(Code::ProofMissing, format!("step {index}: proof missing"));
         };
+        if let Err(reason) = proof_platform(&proof, spec, record) {
+            return decision(Code::ProofPlatform, format!("step {index}: {reason}"));
+        }
         if proof.ignore.is_none() {
             return decision(Code::OldProof, format!("step {index}: old proof"));
         }
@@ -783,7 +851,7 @@ mod tests {
                 job: "test".into(),
                 leg: None,
                 key: Some("job-test".into()),
-                runs_on: serde_json::Value::Null,
+                runs_on: serde_json::json!("ubuntu-latest"),
                 needs: vec![],
                 if_text: None,
                 steps: vec![],
@@ -933,6 +1001,14 @@ mod tests {
         Proof {
             created: 90,
             argv: vec![],
+            cwd: Some(String::new()),
+            scope: None,
+            provenance: Some(crate::trace::Provenance {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                tracer: "ptrace-seccomp".into(),
+                version: MIN_PLANNABLE_RECORDER_VERSION,
+            }),
             env: BTreeMap::new(),
             inputs,
             outputs: vec![],
@@ -942,6 +1018,170 @@ mod tests {
             unplannable: vec![],
             probes: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn proof_platform_is_bound_to_declared_or_recorded_job_platform() {
+        let cases = [
+            (
+                "ubuntu-24.04-arm",
+                Some(("linux", "x86_64", "ptrace-seccomp")),
+                None,
+                Code::ProofPlatform,
+            ),
+            ("ubuntu-latest", None, None, Code::ProofPlatform),
+            (
+                "custom-runner",
+                Some(("linux", "x86_64", "ptrace-seccomp")),
+                Some(("Linux", "X64")),
+                Code::Proved,
+            ),
+            (
+                "custom-runner",
+                Some(("linux", "x86_64", "ptrace-seccomp")),
+                Some(("Linux", "ARM64")),
+                Code::ProofPlatform,
+            ),
+            (
+                "macos-latest",
+                Some(("macos", "aarch64", "unsupported")),
+                None,
+                Code::ProofPlatform,
+            ),
+            (
+                "custom-runner",
+                Some(("linux", "x86_64", "ptrace-seccomp")),
+                None,
+                Code::ProofPlatform,
+            ),
+            (
+                "ubuntu-latest",
+                Some(("linux", "x86_64", "unknown")),
+                None,
+                Code::ProofPlatform,
+            ),
+            (
+                "windows-latest",
+                Some(("linux", "x86_64", "ptrace-seccomp")),
+                None,
+                Code::ProofPlatform,
+            ),
+            (
+                "custom-runner",
+                Some(("linux", "x86_64", "ptrace-seccomp")),
+                Some(("Windows", "X64")),
+                Code::ProofPlatform,
+            ),
+            (
+                "custom-runner",
+                Some(("linux", "riscv64", "ptrace-seccomp")),
+                Some(("Linux", "riscv64")),
+                Code::ProofPlatform,
+            ),
+            (
+                "custom-runner",
+                Some(("windows", "x86_64", "ptrace-seccomp")),
+                Some(("Windows", "X64")),
+                Code::ProofPlatform,
+            ),
+        ];
+        for (label, provenance, host, expected) in cases {
+            let mut f = Fixture::new();
+            f.spec.runs_on = serde_json::json!(label);
+            let mut p = proof(vec![]);
+            p.provenance = provenance.map(|(os, arch, tracer)| crate::trace::Provenance {
+                os: os.into(),
+                arch: arch.into(),
+                tracer: tracer.into(),
+                version: MIN_PLANNABLE_RECORDER_VERSION,
+            });
+            f.install(vec![p]);
+            if let Some((os, arch)) = host {
+                let mut record = f.jobs.load("job-test").remove(0);
+                record.host.insert("os".into(), os.into());
+                record.host.insert("arch".into(), arch.into());
+                f.jobs.save("job-test", record).unwrap();
+            }
+            let result = f.decide(BTreeMap::new());
+            assert_eq!(result.code, expected, "{label}: {}", result.detail);
+        }
+    }
+
+    #[test]
+    fn older_recorder_semantics_are_not_plannable() {
+        for (version, expected) in [(3, Code::ProofPlatform), (4, Code::Proved)] {
+            let mut f = Fixture::new();
+            let mut p = proof(vec![]);
+            p.provenance.as_mut().unwrap().version = version;
+            f.install(vec![p]);
+            let result = f.decide(BTreeMap::new());
+            assert_eq!(
+                result.code, expected,
+                "version {version}: {}",
+                result.detail
+            );
+            if version == 3 {
+                assert!(result.detail.contains("recorder too old: re-record"));
+            }
+        }
+    }
+
+    #[test]
+    fn older_recorder_is_blocked_on_custom_runner_host_fallback() {
+        for (version, expected) in [(3, Code::ProofPlatform), (4, Code::Proved)] {
+            let mut f = Fixture::new();
+            f.spec.runs_on = serde_json::json!("custom-runner");
+            let mut p = proof(vec![]);
+            p.provenance.as_mut().unwrap().version = version;
+            f.install(vec![p]);
+            let mut record = f.jobs.load("job-test").remove(0);
+            record.host.insert("os".into(), "Linux".into());
+            record.host.insert("arch".into(), "X64".into());
+            f.jobs.save("job-test", record).unwrap();
+            let result = f.decide(BTreeMap::new());
+            assert_eq!(
+                result.code, expected,
+                "version {version}: {}",
+                result.detail
+            );
+            if version == 3 {
+                assert!(result.detail.contains("recorder too old: re-record"));
+            }
+        }
+    }
+
+    #[test]
+    fn recorder_semantics_floor_tracks_the_production_tracer_version() {
+        assert_eq!(
+            MIN_PLANNABLE_RECORDER_VERSION,
+            crate::trace::version::TRACER_VERSION
+        );
+    }
+
+    #[test]
+    fn legacy_proof_with_old_digest_reports_missing_provenance() {
+        let mut f = Fixture::new();
+        let mut p = proof(vec![]);
+        p.provenance = None;
+        f.install(vec![p.clone()]);
+        let mut raw = serde_json::to_value(&p).unwrap();
+        raw.as_object_mut().unwrap().remove("provenance");
+        let file = serde_json::json!({"v": 1, "key": "sh-0", "proofs": [raw]});
+        fs::write(
+            f.root.join("store/proofs/sh-0.json"),
+            serde_json::to_vec(&file).unwrap(),
+        )
+        .unwrap();
+        let mut record = f.jobs.load("job-test").remove(0);
+        record.steps[0].proof = "p-old-digest".into();
+        f.jobs.save("job-test", record).unwrap();
+        let result = f.decide(BTreeMap::new());
+        assert_eq!(result.code, Code::ProofPlatform, "{}", result.detail);
+        assert!(
+            result.detail.contains("proof lacks provenance"),
+            "{}",
+            result.detail
+        );
     }
     #[test]
     fn skips_when_every_input_matches() {

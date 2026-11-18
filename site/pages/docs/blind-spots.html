@@ -37,5 +37,18 @@ stoop: skip sh-c98f8f9c8fef6d65: 71 inputs unchanged since 0s ago (100ms)</code>
 <h2 id="git">Reading .git</h2>
 <p>A command that reads <code>.git</code> could depend on history, which a working-tree comparison can't see. Such runs aren't recorded. If the read can't change the result, add <code>.git</code> to <a href="stoopignore.html"><code>.stoopignore</code></a>.</p>
 
+<h2 id="links">Writes through links</h2>
+<p>A write through a symbolic link changes its target. The proof marks the run unplannable. A dangling link's target may not be captured as an output, so a runtime skip may not check it.</p>
+<p>With concurrent processes, stoop clears path caches when a topology change starts and again at that syscall's exit. Another process can still race the kernel's change before that exit. Avoid concurrent link retargeting when the result affects the command.</p>
+
+<h2 id="metadata">Metadata</h2>
+<p>Only a file's bytes and its executable bit are compared. Modification times, owners and the other permission bits are not, so a tool that decides by timestamp is outside what a proof can show. A hard link to a repository file is not detected: a write through the link changes the file without the proof naming it.</p>
+
+<h2 id="names">Names that are not UTF-8</h2>
+<p>A run that accesses a repository path whose name is not valid UTF-8 is not recorded. This prevents a later skip from relying on a path the proof cannot represent faithfully.</p>
+
+<h2 id="inherited-input">Inherited input</h2>
+<p>A file opened before stoop starts and passed as standard input, or read through a bind mount alias that stoop cannot map to the repository, may not appear in the trace. If the command reads that file without writing it, changes may not prevent a runtime skip or a planned skip. For a file the run writes, the prior content is recorded.</p>
+
 <h2 id="platform">Platforms</h2>
 <p>Tracing needs Linux on x86-64 or arm64. Elsewhere stoop runs the command untraced and records nothing. Programs that use <code>io_uring</code> for file access are told it is unavailable (<code>ENOSYS</code>) so they fall back to calls the tracer can see; Node, for one, handles this.</p>

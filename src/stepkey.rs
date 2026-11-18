@@ -3,19 +3,38 @@ pub fn sh_key(
     workflow: &str,
     job: &str,
     cwd_key: &str,
+    args: &[String],
     matrix: Option<&str>,
 ) -> String {
     let mut h = blake3::Hasher::new();
-    h.update(body);
-    h.update(workflow.as_bytes());
-    h.update(&[0]);
-    h.update(job.as_bytes());
-    h.update(&[0]);
-    h.update(cwd_key.as_bytes());
+    for field in [
+        body,
+        workflow.as_bytes(),
+        job.as_bytes(),
+        cwd_key.as_bytes(),
+    ]
+    .into_iter()
+    .chain(args.iter().map(|arg| arg.as_bytes()))
+    {
+        h.update(&(field.len() as u64).to_le_bytes());
+        h.update(field);
+    }
     if let Some(matrix) = matrix {
         h.update(b"\0matrix\0");
         h.update(matrix.as_bytes());
     }
+    format!("sh-{}", &h.finalize().to_hex()[..20])
+}
+
+/// Apply the repository identity used when a proof store is shared across roots.
+pub fn scoped(key: &str, scope: Option<&str>) -> String {
+    let Some(scope) = scope else {
+        return key.to_string();
+    };
+    let mut h = blake3::Hasher::new();
+    h.update(key.as_bytes());
+    h.update(&[0]);
+    h.update(scope.as_bytes());
     format!("sh-{}", &h.finalize().to_hex()[..20])
 }
 
@@ -35,22 +54,21 @@ pub fn canonical_matrix(raw: &str) -> Result<Option<String>, String> {
 mod tests {
     use super::*;
     #[test]
-    fn matches_previous_derivation() {
+    fn matches_cwd_and_argument_derivation() {
         let body = b"echo hello\n";
-        let mut old = blake3::Hasher::new();
-        old.update(body);
-        for v in ["workflow", "job"] {
-            old.update(v.as_bytes());
-            old.update(&[0]);
+        let args = vec!["argument".to_string()];
+        let mut expected = blake3::Hasher::new();
+        for field in [body.as_slice(), b"workflow", b"job", b"src", b"argument"] {
+            expected.update(&(field.len() as u64).to_le_bytes());
+            expected.update(field);
         }
-        old.update(b"src");
         assert_eq!(
-            sh_key(body, "workflow", "job", "src", None),
-            format!("sh-{}", &old.finalize().to_hex()[..20])
+            sh_key(body, "workflow", "job", "src", &args, None),
+            format!("sh-{}", &expected.finalize().to_hex()[..20])
         );
-        assert_eq!(
-            sh_key(body, "w", "j", "src", None),
-            "sh-9de6e2a8cd53977b52f4"
+        assert_ne!(
+            sh_key(body, "workflow", "job", "src", &args, None),
+            sh_key(body, "workflow", "job", "src", &[], None)
         );
     }
     #[test]
@@ -63,8 +81,8 @@ mod tests {
             .unwrap();
         assert_eq!(a, b);
         assert_ne!(
-            sh_key(b"x", "w", "j", "", Some(&a)),
-            sh_key(b"x", "w", "j", "", None)
+            sh_key(b"x", "w", "j", "", &[], Some(&a)),
+            sh_key(b"x", "w", "j", "", &[], None)
         );
         for v in ["", "null", "{}", "  { }  "] {
             assert_eq!(canonical_matrix(v).unwrap(), None);

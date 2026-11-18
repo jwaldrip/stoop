@@ -121,6 +121,14 @@ fn record(r: &Repo, x: Rec<'_>) -> Option<String> {
             let p = proof::Proof {
                 created: x.created,
                 argv: vec![],
+                cwd: Some(String::new()),
+                scope: None,
+                provenance: Some(crate::trace::Provenance {
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                    tracer: "ptrace-seccomp".into(),
+                    version: 4,
+                }),
                 env: BTreeMap::new(),
                 inputs: x.inputs.clone(),
                 outputs: vec![],
@@ -351,6 +359,47 @@ fn control_baseline_proves() {
     assert_eq!(o.plan["skip"], json!(["a"]));
     let o = plan(&r, &["--format", "github"], &[]);
     assert!(o.stdout.contains("skip=,a,\n"), "{}", o.stdout);
+}
+
+#[test]
+fn external_store_scoped_record_can_prove_a_plan_skip() {
+    let workflow = workflow("", "", "");
+    let repo = Repo::new(&[(CI, &workflow), ("a.txt", "a\n")]);
+    let now = proof::now();
+    let job_key = record(&repo, rec(&workflow, now, now)).unwrap();
+    let local_proofs = proof::Store::new(repo.store());
+    let local_jobs = job::JobStore::new(repo.store());
+    let external = repo.base.join("shared-store");
+    let scope = run::shared_scope(&std::fs::canonicalize(&repo.root).unwrap(), &external).unwrap();
+    let proofs = proof::Store::new(external.clone());
+    let jobs = job::JobStore::new(external.clone());
+    let mut record = local_jobs.load(&job_key).remove(0);
+    for step in &mut record.steps {
+        let mut proof = local_proofs.load(&step.key).remove(0);
+        proof.scope = Some(scope.clone());
+        step.key = crate::stepkey::scoped(&step.key, Some(&scope));
+        step.proof = proof.digest();
+        proofs.save(&step.key, proof).unwrap();
+    }
+    let mut claims = a::claims(&record);
+    claims["aud"] = json!(attest::audience(&job_key, &record).unwrap());
+    claims["sha"] = json!(repo.sha);
+    claims["iat"] = json!(now);
+    claims["nbf"] = json!(now);
+    claims["workflow_ref"] = json!(format!("{}/{CI}@refs/heads/main", a::REPO));
+    claims["job_workflow_ref"] = claims["workflow_ref"].clone();
+    record.attest = Some(a::token(
+        &a::header("test-key-1"),
+        &claims,
+        &a::pair(a::KEY_1),
+    ));
+    jobs.save(&job_key, record).unwrap();
+    let result = plan(
+        &repo,
+        &["--format", "json"],
+        &[("STOOP_STORE", external.to_str().unwrap())],
+    );
+    assert_eq!(result.plan["skip"], json!(["a"]), "{}", result.stderr);
 }
 
 #[test]
@@ -674,6 +723,14 @@ fn control_break_it_fixtures_all_run() {
     let weak = proof::Proof {
         created: now,
         argv: vec![],
+        cwd: Some(String::new()),
+        scope: None,
+        provenance: Some(crate::trace::Provenance {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            tracer: "ptrace-seccomp".into(),
+            version: 4,
+        }),
         env: BTreeMap::new(),
         inputs: vec![],
         outputs: vec![],

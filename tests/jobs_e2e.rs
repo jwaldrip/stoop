@@ -6,6 +6,14 @@ use std::{
     process::{Command, Output},
 };
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct RecordedProvenance {
+    os: String,
+    arch: String,
+    tracer: String,
+    version: u32,
+}
+
 struct Ws {
     root: PathBuf,
     remote: PathBuf,
@@ -163,6 +171,19 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
     String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+fn shell_key(script: &str, matrix: Option<&str>) -> String {
+    let mut h = blake3::Hasher::new();
+    for field in [script.as_bytes(), b"fixture", b"test", b""] {
+        h.update(&(field.len() as u64).to_le_bytes());
+        h.update(field);
+    }
+    if let Some(matrix) = matrix {
+        h.update(b"\0matrix\0");
+        h.update(matrix.as_bytes());
+    }
+    format!("sh-{}", &h.finalize().to_hex()[..20])
 }
 #[test]
 fn a_trusted_job_publishes_a_passed_record() {
@@ -596,9 +617,7 @@ fn matrix_reaches_step_key() {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let mut h = blake3::Hasher::new();
-    h.update(b"true\nfixture\0test\0\0matrix\0{\"a\":1,\"z\":2}");
-    let expected = format!("sh-{}", &h.finalize().to_hex()[..20]);
+    let expected = shell_key("true\n", Some("{\"a\":1,\"z\":2}"));
     assert!(String::from_utf8_lossy(&out.stderr).contains(&expected));
     assert!(w.records().is_empty());
 }
@@ -643,6 +662,9 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
         ignore: Option<Vec<String>>,
         priors: Option<Vec<Input>>,
         unplannable: Vec<String>,
+        cwd: Option<String>,
+        scope: Option<String>,
+        provenance: Option<RecordedProvenance>,
     }
     let scripts = ["cat in.txt > /dev/null\n", "true\n"];
     let w = Ws::new("remote-digests", &scripts);
@@ -653,10 +675,7 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
     let steps = files[0]["records"][0]["steps"].as_array().unwrap();
     assert_eq!(steps.len(), scripts.len());
     for (step, script) in steps.iter().zip(scripts) {
-        let mut h = blake3::Hasher::new();
-        h.update(script.as_bytes());
-        h.update(b"fixture\0test\0");
-        let key = format!("sh-{}", &h.finalize().to_hex()[..20]);
+        let key = shell_key(script, None);
         assert_eq!(step["key"], key);
         let raw = git(
             &w.remote,
@@ -674,6 +693,9 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
                 &p.ignore,
                 &p.priors,
                 &p.unplannable,
+                &p.cwd,
+                &p.scope,
+                &p.provenance,
             ))
             .unwrap();
             step["proof"] == format!("p-{}", &blake3::hash(&bytes).to_hex()[..32])
@@ -709,6 +731,9 @@ fn concurrent_proof_race(proof_only: bool) {
         ignore: Option<Vec<String>>,
         priors: Option<Vec<Input>>,
         unplannable: Vec<String>,
+        cwd: Option<String>,
+        scope: Option<String>,
+        provenance: Option<RecordedProvenance>,
     }
     let script = "cat in.txt > /dev/null\n";
     let old = Ws::new(
@@ -758,10 +783,7 @@ fn concurrent_proof_race(proof_only: bool) {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let mut hasher = blake3::Hasher::new();
-    hasher.update(script.as_bytes());
-    hasher.update(b"fixture\0test\0");
-    let key = format!("sh-{}", &hasher.finalize().to_hex()[..20]);
+    let key = shell_key(script, None);
     let competing_file: Value = serde_json::from_str(&git(
         &old.remote,
         &["cat-file", "blob", &format!("refs/stoop/{key}")],
@@ -780,6 +802,9 @@ fn concurrent_proof_race(proof_only: bool) {
             &p.ignore,
             &p.priors,
             &p.unplannable,
+            &p.cwd,
+            &p.scope,
+            &p.provenance,
         ))
         .unwrap();
         format!("p-{}", &blake3::hash(&bytes).to_hex()[..32])

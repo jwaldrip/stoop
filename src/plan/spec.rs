@@ -47,6 +47,7 @@ pub enum Code {
     Incomplete,
     ProofMissing,
     OldProof,
+    ProofPlatform,
     Expired,
     Probe,
     InputChanged,

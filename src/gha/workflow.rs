@@ -400,7 +400,7 @@ fn cwd_key(s: &str) -> Result<String, String> {
             _ => return Err("absolute working-directory".into()),
         }
     }
-    Ok(parts.join("/"))
+    Ok(parts.join("/").replace('%', "%25"))
 }
 fn shell(s: &str) -> Result<Option<u64>, String> {
     let words: Vec<_> = s.split_whitespace().collect();
@@ -933,8 +933,14 @@ fn step_key(
         static_value(&json!(run))?;
         if shell_text.split_whitespace().take(2).eq(["stoop", "sh"]) {
             let age = shell(shell_text)?.or(env_age);
-            let key =
-                crate::stepkey::sh_key(run.as_bytes(), identity.0, identity.1, &cwd_key(wd)?, leg);
+            let key = crate::stepkey::sh_key(
+                run.as_bytes(),
+                identity.0,
+                identity.1,
+                &cwd_key(wd)?,
+                &[],
+                leg,
+            );
             return Ok(Some((
                 json!({"traced":{"key":key,"if":true,"env":e,"shell":shell_text,"working-directory":wd}}),
                 StepSpec::Traced {
@@ -1058,7 +1064,7 @@ mod tests {
         match &s.steps[1] {
             StepSpec::Traced { key, .. } => assert_eq!(
                 *key,
-                crate::stepkey::sh_key(b"cargo test", "fixture", "test", "", None)
+                crate::stepkey::sh_key(b"cargo test", "fixture", "test", "", &[], None)
             ),
             _ => panic!("not traced"),
         }
@@ -1069,7 +1075,7 @@ mod tests {
         match &s.steps[1] {
             StepSpec::Traced { key, .. } => assert_eq!(
                 *key,
-                crate::stepkey::sh_key(b"cargo test", "fixture", "test", "app", None)
+                crate::stepkey::sh_key(b"cargo test", "fixture", "test", "app", &[], None)
             ),
             _ => panic!("not traced"),
         }
@@ -1502,6 +1508,9 @@ mod tests {
         let proof = crate::proof::Proof {
             created: crate::proof::now(),
             argv: vec![],
+            cwd: Some(String::new()),
+            scope: None,
+            provenance: Some(crate::trace::Provenance::current()),
             env: BTreeMap::new(),
             inputs: vec![],
             outputs: vec![],
@@ -1515,8 +1524,8 @@ mod tests {
         assert_eq!(store.load(keys[0]).len(), 1);
         assert!(store.load(keys[1]).is_empty());
         assert_ne!(
-            crate::stepkey::sh_key(b"cd a && npm test", "fixture", "test", "", None),
-            crate::stepkey::sh_key(b"cd b && npm test", "fixture", "test", "", None)
+            crate::stepkey::sh_key(b"cd a && npm test", "fixture", "test", "", &[], None),
+            crate::stepkey::sh_key(b"cd b && npm test", "fixture", "test", "", &[], None)
         );
         std::fs::remove_dir_all(dir).unwrap();
         let root = Path::new("/repo");
@@ -1525,7 +1534,7 @@ mod tests {
             let recorder_cwd = crate::pathutil::to_key(root, &actual_cwd);
             assert_eq!(
                 *key,
-                crate::stepkey::sh_key(b"npm test", "fixture", "test", &recorder_cwd, None)
+                crate::stepkey::sh_key(b"npm test", "fixture", "test", &recorder_cwd, &[], None)
             );
         }
         let root_default = spec(&fixture("", "      - run: 'npm test'\n"));
@@ -1539,7 +1548,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             key,
-            &crate::stepkey::sh_key(b"npm test", "fixture", "test", "", None)
+            &crate::stepkey::sh_key(b"npm test", "fixture", "test", "", &[], None)
         );
         let workflow_default = fixture("", "      - run: 'npm test'\n").replace(
             "    shell: stoop sh {0}\n",
@@ -1556,7 +1565,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             wf_key,
-            &crate::stepkey::sh_key(b"npm test", "fixture", "test", "a", None)
+            &crate::stepkey::sh_key(b"npm test", "fixture", "test", "a", &[], None)
         );
     }
     #[test]
