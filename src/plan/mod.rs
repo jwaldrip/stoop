@@ -640,7 +640,6 @@ mod tests {
                 .env("GITHUB_API_URL", &api.url)
                 .env("NO_PROXY", "127.0.0.1,localhost")
                 .env("no_proxy", "127.0.0.1,localhost")
-                .env("XDG_CACHE_HOME", api_root.join("cache"))
                 .env_remove("STOOP_SYNC")
                 .env_remove("STOOP_FULL")
                 .env_remove("STOOP_ENV_SALT")

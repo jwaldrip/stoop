@@ -3,6 +3,7 @@ use super::*;
 use crate::attest::tests as a;
 use crate::job::{JobRecord, RecordStatus, StepHow, StepRecord};
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -312,7 +313,6 @@ fn plan(r: &Repo, args: &[&str], env: &[(&str, &str)]) -> Out {
     .env("GITHUB_API_URL", &r.api.as_ref().unwrap().url)
     .env("NO_PROXY", "127.0.0.1,localhost")
     .env("no_proxy", "127.0.0.1,localhost")
-    .env("XDG_CACHE_HOME", r.base.join("cache"))
     .env(
         "GITHUB_WORKFLOW_REF",
         format!("{}/{CI}@refs/heads/main", a::REPO),
@@ -437,6 +437,146 @@ fn tampered_action_archive_is_reported_by_the_plan() {
     let plan = plan(&r, &["--format", "json"], &[]);
     assert_eq!(code(&plan, "a"), "action-content-changed");
     assert!(plan.plan["skip"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn unusable_disk_cache_does_not_block_a_valid_plan() {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    let cache = r.root.join("unusable-cache");
+    let result = plan(
+        &r,
+        &["--format", "json"],
+        &[("XDG_CACHE_HOME", cache.to_str().unwrap())],
+    );
+    assert_eq!(code(&result, "a"), "proved", "{}", result.plan);
+    assert!(!cache.exists());
+}
+
+fn malformed_archive_is_unverifiable(bytes: &[u8]) {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+    std::fs::write(
+        r.base
+            .join(format!("api/repos/actions/checkout/tarball/{PIN}")),
+        bytes,
+    )
+    .unwrap();
+    let result = plan(&r, &["--format", "json"], &[]);
+    assert_eq!(code(&result, "a"), "action-unverifiable", "{}", result.plan);
+    assert!(result.plan["skip"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn bad_archive_truncated_gzip_is_unverifiable() {
+    let mut bytes = gha::actions::fixture_archive();
+    bytes.truncate(bytes.len() - 8);
+    malformed_archive_is_unverifiable(&bytes);
+}
+
+#[test]
+fn bad_archive_crc_is_unverifiable() {
+    let mut bytes = gha::actions::fixture_archive();
+    let offset = bytes.len() - 8;
+    bytes[offset] ^= 1;
+    malformed_archive_is_unverifiable(&bytes);
+}
+
+#[test]
+fn bad_archive_isize_is_unverifiable() {
+    let mut bytes = gha::actions::fixture_archive();
+    let offset = bytes.len() - 4;
+    bytes[offset] ^= 1;
+    malformed_archive_is_unverifiable(&bytes);
+}
+
+#[test]
+fn bad_archive_trailing_bytes_are_unverifiable() {
+    let mut bytes = gha::actions::fixture_archive();
+    bytes.extend_from_slice(b"garbage");
+    malformed_archive_is_unverifiable(&bytes);
+}
+
+#[test]
+fn bad_archive_excess_padding_is_unverifiable() {
+    let source = gha::actions::fixture_archive();
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(&source[..])
+        .read_to_end(&mut tar)
+        .unwrap();
+    tar.resize(tar.len() + 64 * 1024 + 512, 0);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar).unwrap();
+    malformed_archive_is_unverifiable(&encoder.finish().unwrap());
+}
+
+#[test]
+fn bad_archive_incomplete_tar_end_is_unverifiable() {
+    let source = gha::actions::fixture_archive();
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(&source[..])
+        .read_to_end(&mut tar)
+        .unwrap();
+    tar.truncate(tar.len() - 512);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar).unwrap();
+    malformed_archive_is_unverifiable(&encoder.finish().unwrap());
+}
+
+#[test]
+fn bad_archive_nonzero_tar_suffix_is_unverifiable() {
+    let source = gha::actions::fixture_archive();
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(&source[..])
+        .read_to_end(&mut tar)
+        .unwrap();
+    tar.extend_from_slice(&[1u8; 512]);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar).unwrap();
+    malformed_archive_is_unverifiable(&encoder.finish().unwrap());
+}
+
+#[test]
+fn bad_archive_decompression_cap_is_unverifiable() {
+    fn file(encoder: &mut flate2::write::GzEncoder<Vec<u8>>, name: &str, bytes: &[u8]) {
+        let mut header = tar::Header::new_ustar();
+        header.set_path(name).unwrap();
+        header.set_mode(0o644);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        encoder.write_all(header.as_bytes()).unwrap();
+        encoder.write_all(bytes).unwrap();
+        encoder
+            .write_all(&vec![0; (512 - bytes.len() % 512) % 512])
+            .unwrap();
+    }
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    file(
+        &mut encoder,
+        "repo-sha/action.yml",
+        b"runs:\n  using: node20\n  main: index.js\n",
+    );
+    file(&mut encoder, "repo-sha/index.js", b"fixture\n");
+    let mut directory = tar::Header::new_ustar();
+    directory.set_path("repo-sha/padding/").unwrap();
+    directory.set_entry_type(tar::EntryType::Directory);
+    directory.set_mode(0o755);
+    directory.set_size(gha::actions::MAX_TAR - 2560);
+    directory.set_cksum();
+    encoder.write_all(directory.as_bytes()).unwrap();
+    std::io::copy(
+        &mut std::io::repeat(0).take(gha::actions::MAX_TAR - 2560),
+        &mut encoder,
+    )
+    .unwrap();
+    file(&mut encoder, "repo-sha/hidden", b"x");
+    encoder.write_all(&[0u8; 1024]).unwrap();
+    malformed_archive_is_unverifiable(&encoder.finish().unwrap());
 }
 
 #[test]

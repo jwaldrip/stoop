@@ -212,7 +212,6 @@ impl Ws {
                 "RUNNER_WORKSPACE",
                 self.root.parent().unwrap().join("runner-work/repo"),
             )
-            .env("XDG_CACHE_HOME", self.root.parent().unwrap().join("cache"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("NO_PROXY", "127.0.0.1,localhost")

@@ -37,7 +37,7 @@ jobs:
       - run: |
           true
 ";
-const ENV: [&str; 17] = [
+const ENV: [&str; 16] = [
     "GITHUB_ACTIONS",
     "GITHUB_REPOSITORY",
     "GITHUB_WORKFLOW_REF",
@@ -51,7 +51,6 @@ const ENV: [&str; 17] = [
     "RUNNER_WORKSPACE",
     "GITHUB_API_URL",
     "GITHUB_SERVER_URL",
-    "XDG_CACHE_HOME",
     "RUNNER_OS",
     "ACTIONS_ID_TOKEN_REQUEST_URL",
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
@@ -424,7 +423,6 @@ fn published_records_are_accepted_only_through_the_verifier() {
     let base = serve(github.clone());
     std::env::set_var("GITHUB_API_URL", &base);
     std::env::set_var("GITHUB_SERVER_URL", &base);
-    std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
     let token_url = format!("{base}/token?api-version=2.0");
     let planned = planned(&runner_env(&root.join("runner-123"), &repo.sha, "123"));
     // The job file is keyed by the job key, not by a step key.

@@ -72,7 +72,9 @@ Full workflows for GitHub Actions, GitLab CI, CircleCI and Buildkite are in the 
 
 ## Experimental job planning
 
-`stoop plan` can evaluate recorded job proofs before other runners start. **Do not enable plan-skips in workflow gates yet.** A floating action ref can move between the runner downloading the action and stoop resolving it. The owner has not accepted that window, and the downloaded action is not verified against the resolved commit. `STOOP_STRICT_ACTIONS=1` makes jobs with floating `uses:` refs unplannable; it does not pin tools downloaded by those actions.
+`stoop plan` can evaluate recorded job proofs before other runners start. **Do not enable plan-skips in workflow gates yet.** At recording, stoop compares each downloaded action tree with the runner's copy and follows nested composite refs. At planning, it resolves refs and downloads the trees again; a moved ref, changed content, or failed verification makes the job run. `STOOP_STRICT_ACTIONS=1` also makes floating remote refs unplannable.
+
+The action check is a snapshot. It covers committed files, including committed `node_modules`, but not dependencies installed or modified later, the runner's tool cache, preinstalled actions, or tools downloaded by actions. Reusable-workflow jobs remain unplannable.
 
 The planner requires an attested record from the planned workflow's own job, a protected branch, a GitHub-hosted runner and the same repository and owner IDs. It fails wide when it cannot establish a match. Publishing jobs need `id-token: write` and access to the shared git proof store. Any code in a publishing job that can request an OIDC token can attest records for another job in that workflow. Records whose signing key is no longer published are rejected.
 

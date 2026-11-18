@@ -6,7 +6,9 @@ use crate::plan::spec::Code;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::{Cursor, Read};
+#[cfg(test)]
+use std::io::Cursor;
+use std::io::{self, Read};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -14,6 +16,11 @@ use std::time::{Duration, Instant};
 pub const TOTAL_TIMEOUT: Duration = Duration::from_secs(90);
 pub const MAX_COMPRESSED: usize = 64 * 1024 * 1024;
 const MAX_UNPACKED: u64 = 256 * 1024 * 1024;
+pub(crate) const MAX_TAR: u64 = MAX_UNPACKED + (MAX_ENTRIES as u64 * 1024) + 16 * 1024 * 1024;
+const MAX_END_PADDING: u64 = 64 * 1024;
+pub const MAX_RETAINED: u64 = 2 * MAX_UNPACKED;
+const ENTRY_OVERHEAD: u64 = 256;
+pub(crate) const BUDGET_EXCEEDED: &str = "downloaded action trees exceed the plan's memory budget";
 const MAX_ENTRIES: usize = 30_000;
 const MAX_PATH: usize = 4096;
 const MAX_ACTIONS: usize = 256;
@@ -43,12 +50,57 @@ fn valid_path(path: &str) -> bool {
             .all(|p| !p.is_empty() && p != "." && p != "..")
 }
 
+fn charge(path: &str, bytes: u64) -> Result<u64, String> {
+    bytes
+        .checked_add(path.len() as u64)
+        .and_then(|n| n.checked_add(ENTRY_OVERHEAD))
+        .ok_or_else(|| "action memory accounting overflow".into())
+}
+
+struct Stream<R> {
+    inner: R,
+    remaining: u64,
+    deadline: Instant,
+    failed: bool,
+}
+
+impl<R: Read> Read for Stream<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.failed {
+            return Err(io::Error::other("action archive stream failed earlier"));
+        }
+        let result = if buf.is_empty() {
+            Ok(0)
+        } else if Instant::now() >= self.deadline {
+            Err(io::Error::other("action verification timed out"))
+        } else if self.remaining == 0 {
+            match self.inner.read(&mut [0u8; 1]) {
+                Ok(0) => Ok(0),
+                Ok(_) => Err(io::Error::other(
+                    "action archive stream exceeds its size limit",
+                )),
+                Err(e) => Err(e),
+            }
+        } else {
+            let len = buf
+                .len()
+                .min(usize::try_from(self.remaining).unwrap_or(usize::MAX));
+            self.inner
+                .read(&mut buf[..len])
+                .inspect(|n| self.remaining -= *n as u64)
+        };
+        self.failed = result.is_err();
+        result
+    }
+}
+
 fn read_bounded(
     mut reader: impl Read,
     expected: u64,
     deadline: Instant,
 ) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
+    let capacity = usize::try_from(expected).map_err(|_| "action content is too large")?;
+    let mut bytes = Vec::with_capacity(capacity);
     let mut chunk = [0u8; 32 * 1024];
     loop {
         if Instant::now() >= deadline {
@@ -74,29 +126,41 @@ fn read_bounded(
 impl Tree {
     #[cfg(test)]
     pub fn from_gzip(bytes: &[u8]) -> Result<Self, String> {
-        Self::from_gzip_before(bytes, Instant::now() + TOTAL_TIMEOUT)
+        Self::from_gzip_before(bytes, Instant::now() + TOTAL_TIMEOUT, u64::MAX)
     }
 
-    pub fn from_gzip_before(bytes: &[u8], deadline: Instant) -> Result<Self, String> {
+    pub fn from_gzip_before(
+        bytes: &[u8],
+        deadline: Instant,
+        allowance: u64,
+    ) -> Result<Self, String> {
         if bytes.len() > MAX_COMPRESSED {
             return Err("action archive exceeds the compressed size limit".into());
         }
-        Self::from_tar_before(
-            flate2::read::GzDecoder::new(Cursor::new(bytes)),
-            true,
-            deadline,
-        )
+        let mut gzip = flate2::bufread::GzDecoder::new(bytes);
+        let tree = Self::from_tar_before(&mut gzip, true, deadline, allowance)?;
+        if !gzip.get_ref().is_empty() {
+            return Err("action archive has data after its gzip stream".into());
+        }
+        Ok(tree)
     }
 
     pub fn from_tar_before(
         reader: impl Read,
         strip_root: bool,
         deadline: Instant,
+        allowance: u64,
     ) -> Result<Self, String> {
-        let max_tar = MAX_UNPACKED + (MAX_ENTRIES as u64 * 1024) + 16 * 1024 * 1024;
-        let mut archive = tar::Archive::new(reader.take(max_tar));
+        let stream = Stream {
+            inner: reader,
+            remaining: MAX_TAR,
+            deadline,
+            failed: false,
+        };
+        let mut archive = tar::Archive::new(stream);
         let mut tree = Self::default();
         let mut size = 0u64;
+        let mut retained = 0u64;
         let mut count = 0usize;
         let mut root: Option<String> = None;
         for entry in archive
@@ -165,6 +229,12 @@ impl Tree {
             if size > MAX_UNPACKED {
                 return Err("action archive exceeds the unpacked size limit".into());
             }
+            retained = retained
+                .checked_add(charge(name, len)?)
+                .ok_or("action memory accounting overflow")?;
+            if retained > allowance {
+                return Err(BUDGET_EXCEEDED.into());
+            }
             let executable = entry.header().mode().map_err(|e| e.to_string())? & 0o111 != 0;
             let bytes = read_bounded(&mut entry, len, deadline)?;
             if bytes.starts_with(b"version https://git-lfs.github.com/spec/v1\n") {
@@ -180,10 +250,36 @@ impl Tree {
                 return Err(format!("duplicate action archive path {name}"));
             }
         }
+        let mut stream = archive.into_inner();
+        stream.remaining = stream.remaining.min(MAX_END_PADDING);
+        let mut padding = 0u64;
+        let mut block = [0u8; 4096];
+        loop {
+            let n = stream
+                .read(&mut block)
+                .map_err(|e| format!("invalid action archive end: {e}"))?;
+            if n == 0 {
+                break;
+            }
+            if block[..n].iter().any(|&b| b != 0) {
+                return Err("action archive has data after its end marker".into());
+            }
+            padding += n as u64;
+        }
+        if padding < 512 || !padding.is_multiple_of(512) {
+            return Err("action archive has no complete end marker".into());
+        }
         if tree.files.is_empty() {
             return Err("action archive contains no files".into());
         }
         Ok(tree)
+    }
+
+    pub fn retained(&self) -> u64 {
+        self.files
+            .iter()
+            .map(|(path, file)| charge(path, file.bytes.len() as u64).unwrap_or(u64::MAX))
+            .fold(0u64, u64::saturating_add)
     }
 
     #[cfg(test)]
@@ -783,6 +879,60 @@ mod tests {
         tar.into_inner().unwrap().finish().unwrap()
     }
 
+    #[test]
+    fn stream_limit_never_masquerades_as_eof() {
+        let deadline = Instant::now() + TOTAL_TIMEOUT;
+        let mut exact = Stream {
+            inner: &b"ab"[..],
+            remaining: 2,
+            deadline,
+            failed: false,
+        };
+        let mut bytes = [0u8; 2];
+        exact.read_exact(&mut bytes).unwrap();
+        assert_eq!(exact.read(&mut bytes).unwrap(), 0);
+
+        let mut over = Stream {
+            inner: &b"abc"[..],
+            remaining: 2,
+            deadline,
+            failed: false,
+        };
+        over.read_exact(&mut bytes).unwrap();
+        assert!(over.read(&mut bytes).is_err());
+        assert!(over.read(&mut bytes).is_err());
+    }
+
+    #[test]
+    fn memory_budget_is_checked_before_reading_file_content() {
+        struct Counting<R> {
+            inner: R,
+            read: usize,
+        }
+        impl<R: Read> Read for Counting<R> {
+            fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+                let count = self.inner.read(bytes)?;
+                self.read += count;
+                Ok(count)
+            }
+        }
+        let mut header = tar::Header::new_ustar();
+        header.set_path("large").unwrap();
+        header.set_mode(0o644);
+        header.set_size(8192);
+        header.set_cksum();
+        let mut data = header.as_bytes().to_vec();
+        data.extend_from_slice(&[0u8; 8192 + 1024]);
+        let mut reader = Counting {
+            inner: Cursor::new(data),
+            read: 0,
+        };
+        let result =
+            Tree::from_tar_before(&mut reader, false, Instant::now() + TOTAL_TIMEOUT, 4096);
+        assert!(matches!(result, Err(reason) if reason.contains("memory budget")));
+        assert_eq!(reader.read, 512);
+    }
+
     #[derive(Default)]
     struct Source {
         refs: std::cell::RefCell<BTreeMap<String, String>>,
@@ -885,7 +1035,8 @@ mod tests {
         let archive = Cursor::new(header.as_bytes().to_vec())
             .chain(std::io::repeat(0).take(MAX_UNPACKED + 1))
             .chain(std::io::repeat(0).take(511 + 1024));
-        let result = Tree::from_tar_before(archive, false, Instant::now() + TOTAL_TIMEOUT);
+        let result =
+            Tree::from_tar_before(archive, false, Instant::now() + TOTAL_TIMEOUT, u64::MAX);
         assert!(
             matches!(&result, Err(reason) if reason.contains("unpacked size")),
             "oversized uncompressed archive was not refused"
@@ -908,11 +1059,14 @@ mod tests {
                 .unwrap();
         }
         let bytes = archive.into_inner().unwrap();
-        assert!(
-            Tree::from_tar_before(Cursor::new(bytes), false, Instant::now() + TOTAL_TIMEOUT)
-                .unwrap_err()
-                .contains("entry limit")
-        );
+        assert!(Tree::from_tar_before(
+            Cursor::new(bytes),
+            false,
+            Instant::now() + TOTAL_TIMEOUT,
+            u64::MAX
+        )
+        .unwrap_err()
+        .contains("entry limit"));
     }
 
     #[test]
@@ -1191,13 +1345,15 @@ mod tests {
         assert!(Tree::from_tar_before(
             Cursor::new(with_global(comment)),
             false,
-            Instant::now() + TOTAL_TIMEOUT
+            Instant::now() + TOTAL_TIMEOUT,
+            u64::MAX
         )
         .is_ok());
         assert!(Tree::from_tar_before(
             Cursor::new(with_global(b"13 path=evil\n")),
             false,
-            Instant::now() + TOTAL_TIMEOUT
+            Instant::now() + TOTAL_TIMEOUT,
+            u64::MAX
         )
         .is_err());
         for (index, byte) in [(3, b'p'), (11, b'G'), (51, b'!')] {
@@ -1206,7 +1362,8 @@ mod tests {
             assert!(Tree::from_tar_before(
                 Cursor::new(with_global(&malformed)),
                 false,
-                Instant::now() + TOTAL_TIMEOUT
+                Instant::now() + TOTAL_TIMEOUT,
+                u64::MAX
             )
             .is_err());
         }

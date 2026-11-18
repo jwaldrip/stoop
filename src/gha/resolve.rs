@@ -5,7 +5,7 @@ use crate::gha::actions::{self, Tree};
 use crate::job::JobRecord;
 use crate::plan::spec::{Code, JobSpec, RecordCheck};
 use crate::run;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -104,6 +104,7 @@ fn is_full_sha(s: &str) -> bool {
 fn assert_fixture_url(url: &str) {
     let loopback = url
         .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
         .and_then(|rest| rest.split('/').next())
         .and_then(|authority| authority.parse::<std::net::SocketAddr>().ok())
         .is_some_and(|address| address.ip().is_loopback());
@@ -152,7 +153,7 @@ pub trait Resolver {
         Err("local action copy is unavailable".into())
     }
 }
-type DownloadCache = HashMap<(String, String, String), Result<Rc<Tree>, String>>;
+type DownloadCache = HashMap<(String, String, String), Rc<Tree>>;
 
 /// Resolves through `git ls-remote` against `<base>/<owner>/<repo>.git`.
 pub struct Git {
@@ -161,7 +162,7 @@ pub struct Git {
     timeout: Duration,
     api: String,
     revision: Option<String>,
-    cache_root: Option<PathBuf>,
+    budget: Cell<u64>,
     downloaded: RefCell<DownloadCache>,
 }
 
@@ -182,7 +183,7 @@ impl Git {
             timeout,
             api,
             revision: None,
-            cache_root: None,
+            budget: Cell::new(actions::MAX_RETAINED),
             downloaded: RefCell::new(HashMap::new()),
         }
     }
@@ -190,6 +191,11 @@ impl Git {
     pub fn with_revision(mut self, revision: impl Into<String>) -> Self {
         self.revision = Some(revision.into());
         self
+    }
+
+    #[cfg(test)]
+    fn set_test_budget(&self, bytes: u64) {
+        self.budget.set(bytes);
     }
 
     /// The server is `GITHUB_SERVER_URL` in Actions, else github.com. `dir` is the
@@ -283,6 +289,12 @@ impl Git {
             .current_dir(&self.dir)
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        #[cfg(test)]
+        let check_redirect = command.get_program() == std::ffi::OsStr::new("curl");
+        #[cfg(test)]
+        if check_redirect {
+            command.stderr(Stdio::piped());
+        }
         command.stdin(if input.is_some() {
             Stdio::piped()
         } else {
@@ -299,6 +311,8 @@ impl Git {
         let mut child = command
             .spawn()
             .map_err(|e| format!("cannot start action verification: {e}"))?;
+        #[cfg(test)]
+        let redirect_log = child.stderr.take().map(|pipe| drain(Some(pipe)));
         if let Some(input) = input {
             if let Some(mut stdin) = child.stdin.take() {
                 if let Err(e) = stdin.write_all(input) {
@@ -339,6 +353,17 @@ impl Git {
             .join()
             .map_err(|_| "action output reader panicked")?
             .map_err(|e| format!("cannot read action verification output: {e}"))?;
+        #[cfg(test)]
+        if let Some(log) = redirect_log {
+            let bytes = log.join().map_err(|_| "curl error reader panicked")?;
+            let text = String::from_utf8_lossy(&bytes);
+            if let Some(url) = text
+                .lines()
+                .find_map(|line| line.strip_prefix("stoop-effective:"))
+            {
+                assert_fixture_url(url);
+            }
+        }
         if bytes.len() > limit {
             return Err("action download exceeds the size limit".into());
         }
@@ -346,69 +371,6 @@ impl Git {
             return Err("action verification command failed".into());
         }
         Ok(bytes)
-    }
-
-    fn cache_archive(
-        &self,
-        owner: &str,
-        repo: &str,
-        sha: &str,
-        bytes: &[u8],
-        deadline: Instant,
-    ) -> Result<(), String> {
-        let cache_root = self
-            .cache_root
-            .clone()
-            .or_else(|| run::env_str("XDG_CACHE_HOME").map(PathBuf::from))
-            .or_else(|| run::env_str("HOME").map(|home| PathBuf::from(home).join(".cache")))
-            .ok_or("no cache directory is available")?;
-        if !cache_root.is_absolute() {
-            return Err("action cache directory must be absolute".into());
-        }
-        let root = std::fs::canonicalize(&self.dir).map_err(|e| e.to_string())?;
-        let mut ancestor = cache_root.as_path();
-        while !ancestor.exists() {
-            ancestor = ancestor
-                .parent()
-                .ok_or("action cache has no existing ancestor")?;
-        }
-        let existing = std::fs::canonicalize(ancestor).map_err(|e| e.to_string())?;
-        if existing.starts_with(&root) {
-            return Err("action cache is inside the repository".into());
-        }
-        let dir = cache_root.join("stoop").join("actions");
-        std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create action cache: {e}"))?;
-        let cache = std::fs::canonicalize(&dir).map_err(|e| e.to_string())?;
-        if cache.starts_with(root) {
-            return Err("action cache is inside the repository".into());
-        }
-        let scope = blake3::hash(format!("{}\0{owner}\0{repo}", self.api).as_bytes()).to_hex();
-        let target = cache.join(format!("{sha}-{}", &scope[..16]));
-        let temp = cache.join(format!(".{sha}-{}-{}", std::process::id(), &scope[..16]));
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        let mut file = options
-            .open(&temp)
-            .map_err(|e| format!("cannot create action cache entry: {e}"))?;
-        let save = (|| -> Result<(), String> {
-            for chunk in bytes.chunks(64 * 1024) {
-                if Instant::now() >= deadline {
-                    return Err("action verification timed out while caching".into());
-                }
-                file.write_all(chunk).map_err(|e| e.to_string())?;
-            }
-            std::fs::rename(&temp, &target).map_err(|e| e.to_string())
-        })();
-        if let Err(e) = save {
-            let _ = std::fs::remove_file(&temp);
-            return Err(format!("cannot save action cache entry: {e}"));
-        }
-        Ok(())
     }
 
     fn download(
@@ -423,8 +385,17 @@ impl Git {
         }
         let key = (owner.to_owned(), repo.to_owned(), sha.to_owned());
         if let Some(cached) = self.downloaded.borrow().get(&key) {
-            return cached.clone();
+            return Ok(cached.clone());
         }
+        let key_cost = 256u64
+            .saturating_add(owner.len() as u64)
+            .saturating_add(repo.len() as u64)
+            .saturating_add(sha.len() as u64);
+        let remaining = self
+            .budget
+            .get()
+            .checked_sub(key_cost)
+            .ok_or(actions::BUDGET_EXCEEDED)?;
         let result = (|| {
             let repository_url = format!("{}/{owner}/{repo}.git", self.base);
             let mut config = Command::new("git");
@@ -439,6 +410,15 @@ impl Git {
             let url = format!("{}/repos/{owner}/{repo}/tarball/{sha}", self.api);
             #[cfg(test)]
             assert_fixture_url(&url);
+            let protocol = if url.starts_with("https://") {
+                "=https"
+            } else if url.starts_with("http://") {
+                "=http"
+            } else if url.starts_with("file:///") {
+                "=file"
+            } else {
+                return Err("unsupported action archive API protocol".into());
+            };
             let mut curl = Command::new("curl");
             let seconds = deadline
                 .saturating_duration_since(Instant::now())
@@ -452,6 +432,12 @@ impl Git {
                 "--silent",
                 "--show-error",
                 "--location",
+                "--max-redirs",
+                "3",
+                "--proto",
+                protocol,
+                "--proto-redir",
+                protocol,
                 "--max-time",
                 &format!("{seconds:.3}"),
                 "--connect-timeout",
@@ -462,18 +448,32 @@ impl Git {
                 "User-Agent: stoop",
             ]);
             #[cfg(test)]
-            curl.args(["--max-redirs", "0"]);
+            {
+                curl.args(["--noproxy", "*"]);
+                curl.args(["--write-out", "%{stderr}stoop-effective:%{url_effective}\n"]);
+                if let Some(address) = self
+                    .api
+                    .strip_prefix("http://")
+                    .or_else(|| self.api.strip_prefix("https://"))
+                    .and_then(|rest| rest.split('/').next())
+                    .and_then(|authority| authority.parse::<std::net::SocketAddr>().ok())
+                {
+                    curl.args(["--connect-to", &format!("::{address}")]);
+                }
+            }
             if header.is_some() {
                 curl.args(["--header", "@-"]);
             }
             curl.args(["--url", &url]);
             let bytes =
                 self.run_bounded(curl, header.as_deref(), actions::MAX_COMPRESSED, deadline)?;
-            let tree = Rc::new(Tree::from_gzip_before(&bytes, deadline)?);
-            self.cache_archive(owner, repo, sha, &bytes, deadline)?;
+            let tree = Rc::new(Tree::from_gzip_before(&bytes, deadline, remaining)?);
+            self.budget.set(remaining - tree.retained());
             Ok(tree)
         })();
-        self.downloaded.borrow_mut().insert(key, result.clone());
+        if let Ok(tree) = &result {
+            self.downloaded.borrow_mut().insert(key, tree.clone());
+        }
         result
     }
 
@@ -593,8 +593,8 @@ impl Resolver for Git {
         let mut archive = Command::new("git");
         archive.args(["archive", "--format=tar", &sha, "--", path]);
         let bytes = self.run_bounded(archive, None, 300 * 1024 * 1024, deadline)?;
-        let tree =
-            Tree::from_tar_before(std::io::Cursor::new(bytes), false, deadline)?.subtree(path)?;
+        let tree = Tree::from_tar_before(std::io::Cursor::new(bytes), false, deadline, u64::MAX)?
+            .subtree(path)?;
         Ok((sha, Rc::new(tree)))
     }
 
@@ -1042,20 +1042,99 @@ mod tests {
     }
 
     #[test]
-    fn action_cache_refuses_paths_inside_the_repository() {
-        let root = scratch("cache-inside-repository");
-        let mut git = Git::new(&root, "http://127.0.0.1:1", Duration::from_secs(1));
-        git.cache_root = Some(root.join("cache"));
-        let result = git.cache_archive(
-            "owner",
-            "repo",
-            A,
-            b"data",
-            Instant::now() + Duration::from_secs(1),
-        );
-        assert!(result.unwrap_err().contains("inside the repository"));
-        assert!(!root.join("cache").exists());
-        std::fs::remove_dir_all(root).unwrap();
+    fn action_memory_budget_is_shared_across_distinct_job_graphs() {
+        let base = scratch("action-memory-budget");
+        let root = base.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let api_root = base.join("api");
+        let server = crate::gha::actions::FixtureServer::new(api_root.clone());
+        let mut archive = tar::Builder::new(flate2::write::GzEncoder::new(
+            Vec::new(),
+            flate2::Compression::default(),
+        ));
+        let data = vec![b'x'; 128 * 1024];
+        for (name, bytes) in [
+            (
+                "action.yml",
+                &b"runs:\n  using: node20\n  main: index.js\n"[..],
+            ),
+            ("index.js", &data[..]),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, format!("repo-sha/{name}"), bytes)
+                .unwrap();
+        }
+        let bytes = archive.into_inner().unwrap().finish().unwrap();
+        for index in 0..8 {
+            let path = api_root.join(format!("repos/owner/repo{index}/tarball/{A}"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, &bytes).unwrap();
+        }
+        let bad = api_root.join(format!("repos/owner/broken/tarball/{A}"));
+        std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+        std::fs::write(bad, b"not a gzip stream").unwrap();
+        let mut git = Git::new(&root, &server.url, Duration::from_secs(10));
+        git.api = server.url.clone();
+        git.set_test_budget(661_000);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let budget_before_failure = git.budget.get();
+        assert!(git.action_tree("owner", "missing", A, deadline).is_err());
+        assert_eq!(git.budget.get(), budget_before_failure);
+        assert!(git.action_tree("owner", "broken", A, deadline).is_err());
+        assert_eq!(git.budget.get(), budget_before_failure);
+        let first = git.action_tree("owner", "repo0", A, deadline).unwrap();
+        for index in 1..5 {
+            assert!(git
+                .action_tree("owner", &format!("repo{index}"), A, deadline)
+                .is_ok());
+        }
+        for index in 5..8 {
+            let result = git.action_tree("owner", &format!("repo{index}"), A, deadline);
+            assert!(matches!(result, Err(reason) if reason.contains("memory budget")));
+        }
+        let cached = git.action_tree("owner", "repo0", A, deadline).unwrap();
+        assert!(Rc::ptr_eq(&first, &cached));
+        struct Capturer(Rc<Tree>);
+        impl Resolver for Capturer {
+            fn commit(&self, _: &str, _: &str, _: &str) -> Result<String, String> {
+                Err("pinned actions need no ref lookup".into())
+            }
+            fn action_tree(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: Instant,
+            ) -> Result<Rc<Tree>, String> {
+                Ok(self.0.clone())
+            }
+            fn runner_copy(&self, _: &str, _: &str, _: &str, _: Instant) -> Result<Tree, String> {
+                Ok((*self.0).clone())
+            }
+        }
+        let tree = Rc::new(Tree::from_gzip_before(&bytes, deadline, u64::MAX).unwrap());
+        let mut key_budget = Git::new(&root, &server.url, Duration::from_secs(10));
+        key_budget.api = server.url.clone();
+        key_budget.set_test_budget(tree.retained());
+        let result = key_budget.action_tree("owner", "repo0", A, deadline);
+        assert!(matches!(result, Err(reason) if reason.contains("memory budget")));
+        let refs: Vec<String> = (0..8)
+            .map(|index| format!("owner/repo{index}@{A}"))
+            .collect();
+        let recorded = actions::capture(&refs, &Capturer(tree), false).unwrap();
+        let mut graph_git = Git::new(&root, &server.url, Duration::from_secs(10));
+        graph_git.api = server.url.clone();
+        graph_git.set_test_budget(661_000);
+        let (code, detail) =
+            actions::verify(&refs, &recorded, &graph_git, false, deadline).unwrap_err();
+        assert_eq!(code, Code::ActionUnverifiable);
+        assert!(detail.contains("memory budget"));
+        drop(server);
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     fn file_resolver(root: &Path) -> Git {
@@ -1523,24 +1602,32 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let body = crate::gha::actions::fixture_archive();
         let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0u8; 1024];
-            while !request.ends_with(b"\r\n\r\n") {
-                let n = stream.read(&mut chunk).unwrap();
-                if n == 0 {
-                    break;
+            let mut requests = Vec::new();
+            for hop in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !request.ends_with(b"\r\n\r\n") {
+                    let n = stream.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
                 }
-                request.extend_from_slice(&chunk[..n]);
+                requests.push(String::from_utf8(request).unwrap());
+                if hop == 0 {
+                    write!(stream, "HTTP/1.1 302 Found\r\nLocation: http://{address}/archive\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&body).unwrap();
+                }
             }
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                body.len()
-            )
-            .unwrap();
-            stream.write_all(&body).unwrap();
-            String::from_utf8(request).unwrap()
+            requests
         });
         let base = std::env::temp_dir().join(format!(
             "stoop-action-http-{}-{}",
@@ -1549,8 +1636,7 @@ mod tests {
         ));
         let root = base.join("repo");
         std::fs::create_dir_all(&root).unwrap();
-        let mut git = Git::new(&root, format!("http://{address}"), Duration::from_secs(5));
-        git.cache_root = Some(base.join("cache"));
+        let git = Git::new(&root, format!("http://{address}"), Duration::from_secs(5));
         let first = git
             .action_tree("owner", "repo", A, Instant::now() + Duration::from_secs(5))
             .unwrap();
@@ -1561,17 +1647,94 @@ mod tests {
             Rc::ptr_eq(&first, &second),
             "same-run cache must avoid a second request"
         );
-        let request = server.join().unwrap();
-        assert!(
-            request.starts_with(&format!("GET /api/v3/repos/owner/repo/tarball/{A} ")),
-            "wrong GHES archive path"
-        );
-        assert!(base
-            .join("cache/stoop/actions")
-            .read_dir()
-            .unwrap()
-            .next()
-            .is_some());
+        let requests = server.join().unwrap();
+        assert!(requests[0].starts_with(&format!("GET /api/v3/repos/owner/repo/tarball/{A} ")));
+        assert!(requests[1].starts_with("GET /archive "));
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn archive_redirects_are_bounded_and_cannot_change_scheme() {
+        use std::io::{Read, Write};
+        for change_scheme in [false, true] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = thread::spawn(move || {
+                let end = Instant::now() + Duration::from_secs(3);
+                let mut seen = 0;
+                while Instant::now() < end && seen < 5 {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream.set_nonblocking(false).unwrap();
+                            stream
+                                .set_read_timeout(Some(Duration::from_millis(500)))
+                                .unwrap();
+                            let mut request = [0u8; 4096];
+                            let _ = stream.read(&mut request);
+                            seen += 1;
+                            if seen == 5 {
+                                let body = crate::gha::actions::fixture_archive();
+                                let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                                let _ = stream.write_all(&body);
+                            } else {
+                                let scheme = if change_scheme { "https" } else { "http" };
+                                let _ = write!(stream, "HTTP/1.1 302 Found\r\nLocation: {scheme}://{address}/again\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(e) => panic!("fixture accept: {e}"),
+                    }
+                }
+                seen
+            });
+            let base = scratch(if change_scheme {
+                "redirect-scheme"
+            } else {
+                "redirect-limit"
+            });
+            let git = Git::new(&base, format!("http://{address}"), Duration::from_secs(5));
+            assert!(git
+                .action_tree("owner", "repo", A, Instant::now() + Duration::from_secs(5))
+                .is_err());
+            assert_eq!(server.join().unwrap(), if change_scheme { 1 } else { 4 });
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
+
+    #[test]
+    fn redirected_nonlocal_host_is_rejected_by_the_test_transport() {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            for hop in 0..2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                if hop == 0 {
+                    write!(stream, "HTTP/1.1 302 Found\r\nLocation: http://example.invalid/archive\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+                } else {
+                    let body = crate::gha::actions::fixture_archive();
+                    write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .unwrap();
+                    stream.write_all(&body).unwrap();
+                }
+            }
+        });
+        let base = scratch("nonlocal-redirect");
+        let git = Git::new(&base, format!("http://{address}"), Duration::from_secs(5));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            git.action_tree("owner", "repo", A, Instant::now() + Duration::from_secs(5))
+        }));
+        assert!(result.is_err(), "non-loopback redirect must fail the test");
+        server.join().unwrap();
         std::fs::remove_dir_all(base).unwrap();
     }
 
@@ -1621,8 +1784,7 @@ mod tests {
         ));
         let root = base.join("repo");
         std::fs::create_dir_all(&root).unwrap();
-        let mut git = Git::new(&root, format!("http://{address}"), Duration::from_secs(3));
-        git.cache_root = Some(base.join("cache"));
+        let git = Git::new(&root, format!("http://{address}"), Duration::from_secs(3));
         assert!(git
             .action_tree(
                 "owner",
@@ -1723,11 +1885,7 @@ mod tests {
         ));
         let root = base.join("repo");
         std::fs::create_dir_all(&root).unwrap();
-        let make_git = || {
-            let mut git = Git::new(&root, format!("http://{address}"), Duration::from_secs(5));
-            git.cache_root = Some(base.join("cache"));
-            git
-        };
+        let make_git = || Git::new(&root, format!("http://{address}"), Duration::from_secs(5));
         let recording = make_git();
         let refs = vec!["owner/repo@v1".to_string()];
         let saved = actions::capture(&refs, &Network(&recording), false).unwrap();
