@@ -1,13 +1,34 @@
-//! Observing what a command reads.
+//! Observing what a command reads and writes.
 
+use crate::ignore::Ignore;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+
+/// Where the tracer records what the run's writes replace: repository paths under `root`.
+/// Keys are relative to `real_root`, the canonical path of `root`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub struct Scope<'a> {
+    pub root: &'a Path,
+    pub real_root: PathBuf,
+    pub ignore: &'a Ignore,
+}
+
+/// What the run did with a path it looked at.
+#[derive(Clone, Copy, Default)]
+pub struct Touch {
+    /// Its entries were listed (getdents).
+    pub listed: bool,
+    /// The run looked at what the path holds: opened it for reading, executed it, or ran
+    /// stat, access or readlink on it. Decides whether a write must record content.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub read: bool,
+}
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
 
 pub const UNAVAILABLE: &str = "tracing needs Linux x86-64 or arm64 (ptrace and seccomp)";
 const TRACER: &str = "ptrace-seccomp";
-// Increment when a change to the tracer invalidates existing observations.
-const TRACER_VERSION: u32 = 1;
+pub(crate) mod version;
+use version::TRACER_VERSION;
 
 pub fn supported() -> bool {
     cfg!(all(
@@ -45,9 +66,12 @@ impl Provenance {
 
 #[derive(Default)]
 pub struct Trace {
-    /// Every path the process tree looked at; the flag is "its entries were listed".
-    pub touched: HashMap<PathBuf, bool>,
-    /// Paths the run wrote, renamed, removed or created. These are outputs, not inputs.
+    /// Every path the process tree looked at, lexically resolved.
+    pub touched: HashMap<PathBuf, Touch>,
+    /// Repository symlinks whose targets passed through a proc magic link at entry.
+    pub magic_links: HashSet<PathBuf>,
+    /// Paths the run wrote, renamed, removed or created, as the run named them.
+    /// These are outputs, not inputs.
     pub written: HashSet<PathBuf>,
     /// Directories the run created. Everything below one is an output too.
     pub created_dirs: Vec<PathBuf>,
@@ -55,10 +79,16 @@ pub struct Trace {
     pub unsound: Vec<String>,
     /// Exit status of the command (128 + signal when killed).
     pub status: i32,
+    /// Each in-scope physical path the run wrote, to its key.
+    pub keys: HashMap<PathBuf, String>,
+    /// State of each in-scope key before the run first wrote it.
+    pub priors: BTreeMap<String, String>,
+    /// Reasons the planner cannot replay this run (at most 16, deduplicated). Not fatal.
+    pub unplannable: Vec<String>,
 }
 
 impl Trace {
-    pub fn is_output(&self, p: &std::path::Path) -> bool {
+    pub fn is_output(&self, p: &Path) -> bool {
         self.written.contains(p) || self.created_dirs.iter().any(|d| p.starts_with(d))
     }
 }
@@ -80,8 +110,9 @@ pub use linux::run;
 )))]
 pub fn run(
     _argv: &[String],
-    _cwd: &std::path::Path,
+    _cwd: &Path,
     _allow_network: bool,
+    _scope: Option<&Scope<'_>>,
 ) -> std::io::Result<Trace> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,

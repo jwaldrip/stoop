@@ -4,11 +4,17 @@
 //! - `a/b` (slash): matches that path, or anything below it, from the root.
 //! - `/abs/path`: the same for a path outside the root.
 //! - `*` matches within a component, `**` across components, `?` one character.
+//!
+//! Transient patterns (a CI step's script file, which has a new name on every run)
+//! exclude paths like any other, but are never stored with a proof: a proof must
+//! describe the same repository state whichever temporary name the run used.
 
 use std::path::Path;
 
 pub struct Ignore {
     rules: Vec<Rule>,
+    /// The patterns a proof stores: defaults, file lines and flags, never transient ones.
+    patterns: Vec<String>,
 }
 
 struct Rule {
@@ -32,12 +38,16 @@ const DEFAULTS: &[&str] = &[
 ];
 
 impl Ignore {
-    pub fn new(extra: &[String], file: Option<&Path>) -> Ignore {
+    pub fn new(extra: &[String], file: Option<&Path>, transient: &[String]) -> Ignore {
         let mut rules = Vec::new();
-        let mut add = |s: &str| {
+        let mut patterns = Vec::new();
+        let mut add = |s: &str, stored: bool| {
             let s = s.trim().trim_end_matches('/');
             if s.is_empty() || s.starts_with('#') {
                 return;
+            }
+            if stored {
+                patterns.push(s.to_string());
             }
             rules.push(Rule {
                 pat: s.as_bytes().to_vec(),
@@ -45,24 +55,32 @@ impl Ignore {
             });
         };
         for d in DEFAULTS {
-            add(d);
+            add(d, true);
         }
         if let Some(f) = file {
             if let Ok(text) = std::fs::read_to_string(f) {
                 for line in text.lines() {
-                    add(line);
+                    add(line, true);
                 }
             }
         }
         for e in extra {
-            add(e);
+            add(e, true);
         }
-        Ignore { rules }
+        for t in transient {
+            add(t, false);
+        }
+        Ignore { rules, patterns }
     }
 
     /// `key` is the root-relative or absolute text from `pathutil::to_key`.
     pub fn is_ignored(&self, key: &str) -> bool {
         self.rules.iter().any(|r| r.matches(key))
+    }
+
+    /// The patterns a proof records. Transient patterns are excluded.
+    pub fn patterns(&self) -> Vec<String> {
+        self.patterns.clone()
     }
 }
 
@@ -83,7 +101,7 @@ impl Rule {
     }
 }
 
-fn glob(p: &[u8], s: &[u8]) -> bool {
+pub fn glob(p: &[u8], s: &[u8]) -> bool {
     // Iterative matcher with backtracking on the last `*` / `**`.
     let (mut pi, mut si) = (0usize, 0usize);
     // (pattern index after the star, string index to retry from, star crosses '/')
@@ -133,6 +151,7 @@ mod tests {
         Ignore::new(
             &rules.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             None,
+            &[],
         )
     }
 
@@ -169,5 +188,16 @@ mod tests {
         assert!(i.is_ignored(".stoop/proofs/x.json"));
         assert!(!i.is_ignored("/etc/passwd"));
         assert!(!i.is_ignored("src/main.rs"));
+    }
+
+    #[test]
+    fn transient_patterns_exclude_but_are_never_stored() {
+        let i = Ignore::new(&["target".to_string()], None, &["step-7f3.sh".to_string()]);
+        assert!(i.is_ignored("step-7f3.sh"));
+        assert!(i.is_ignored("target/debug/x"));
+        let stored = i.patterns();
+        assert!(stored.iter().any(|p| p == "target"));
+        assert!(stored.iter().any(|p| p == "/tmp"));
+        assert!(!stored.iter().any(|p| p.contains("step-7f3")));
     }
 }

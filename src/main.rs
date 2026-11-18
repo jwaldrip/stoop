@@ -1,8 +1,19 @@
+mod attest;
+#[allow(dead_code)]
+mod gha;
+#[allow(dead_code)]
+mod gittree;
 mod ignore;
 mod input;
+#[allow(dead_code)]
+mod job;
+mod journal;
 mod pathutil;
+#[allow(dead_code)]
+mod plan;
 mod proof;
 mod run;
+mod stepkey;
 mod sync;
 mod trace;
 
@@ -21,6 +32,7 @@ USAGE
   stoop sh <script> [args...]                   shell mode for CI (see below)
   stoop ls [--store DIR]                        list recorded proofs
   stoop forget <key> [--store DIR]              drop a proof
+  stoop plan [options]                          plan experimental job skips
   stoop pull | prune [--sync git[:remote]]       fetch or expire shared proofs
 
 OPTIONS
@@ -83,13 +95,16 @@ fn real_main(mut args: Vec<String>) -> i32 {
             println!("stoop {}", env!("CARGO_PKG_VERSION"));
             return 0;
         }
-        Some(c @ ("run" | "explain" | "sh" | "ls" | "forget" | "pull" | "prune")) => {
+        Some(c @ ("run" | "explain" | "sh" | "ls" | "forget" | "pull" | "prune" | "plan")) => {
             let c = c.to_string();
             args.remove(0);
             c
         }
         Some(_) => "run".to_string(),
     };
+    if cmd == "plan" {
+        return plan::cmd(&args);
+    }
     let (mut o, rest) = match parse(&args) {
         Ok(x) => x,
         Err(e) => {
@@ -118,6 +133,9 @@ fn real_main(mut args: Vec<String>) -> i32 {
                     proof.key, proof.count, proof.inputs, proof.created
                 );
             }
+            for (key, n, created, steps) in jobs_for(&o).list() {
+                println!("{key}\t{n} records\t{steps} steps\tcreated {created}");
+            }
             0
         }
         "forget" => {
@@ -125,7 +143,12 @@ fn real_main(mut args: Vec<String>) -> i32 {
                 eprintln!("stoop: forget needs a key");
                 return 2;
             };
-            match store_for(&o).forget(&proof::sanitize(key)) {
+            let result = if key.starts_with("job-") {
+                jobs_for(&o).forget(&proof::sanitize(key))
+            } else {
+                store_for(&o).forget(&proof::sanitize(key))
+            };
+            match result {
                 Ok(true) => 0,
                 Ok(false) => {
                     eprintln!("stoop: no proof named {key}");
@@ -142,7 +165,7 @@ fn real_main(mut args: Vec<String>) -> i32 {
                 eprintln!("stoop: {e}");
                 2
             }
-            Ok(r) => match r.pull_all(&store_for(&o)) {
+            Ok(r) => match r.pull_all(&store_for(&o), &jobs_for(&o)) {
                 Ok(n) => {
                     if !o.quiet {
                         eprintln!("stoop: pulled {n} new proofs");
@@ -207,6 +230,12 @@ fn store_for(o: &Opts) -> proof::Store {
     proof::Store::new(run::store_for(o, &cwd, &root))
 }
 
+fn jobs_for(o: &Opts) -> job::JobStore {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let root = run::root_for(o, &cwd);
+    job::JobStore::new(run::store_for(o, &cwd, &root))
+}
+
 fn parse(args: &[String]) -> Result<(Opts, Vec<String>), String> {
     let mut o = Opts::default();
     let mut i = 0;
@@ -259,25 +288,25 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
     };
     let cwd = std::env::current_dir().unwrap_or_default();
     let root = run::root_for(o, &cwd);
-    let mut h = blake3::Hasher::new();
-    h.update(&(body.len() as u64).to_le_bytes());
-    h.update(&body);
-    for v in ["GITHUB_WORKFLOW", "GITHUB_JOB"] {
-        let value = std::env::var(v).unwrap_or_default();
-        h.update(&(value.len() as u64).to_le_bytes());
-        h.update(value.as_bytes());
-    }
-    let rel_cwd = pathutil::cwd_key(&root, &cwd);
-    h.update(&(rel_cwd.len() as u64).to_le_bytes());
-    h.update(rel_cwd.as_bytes());
-    for arg in rest {
-        h.update(&(arg.len() as u64).to_le_bytes());
-        h.update(arg.as_bytes());
-    }
-    o.key = Some(format!("sh-{}", &h.finalize().to_hex()[..20]));
+    let matrix = match stepkey::canonical_matrix(&std::env::var("STOOP_MATRIX").unwrap_or_default())
+    {
+        Ok(matrix) => matrix,
+        Err(error) => {
+            eprintln!("stoop: invalid STOOP_MATRIX: {error}");
+            None
+        }
+    };
+    o.key = Some(stepkey::sh_key(
+        &body,
+        &std::env::var("GITHUB_WORKFLOW").unwrap_or_default(),
+        &std::env::var("GITHUB_JOB").unwrap_or_default(),
+        &pathutil::cwd_key(&root, &cwd),
+        rest,
+        matrix.as_deref(),
+    ));
     o.shell_key = true;
-    o.ignore.push(script.to_string());
-    o.ignore
+    o.transient.push(script.to_string());
+    o.transient
         .push(pathutil::to_key(&root, std::path::Path::new(script)));
     o.mention = String::from_utf8_lossy(&body).into_owned();
     let mut argv = vec![
@@ -290,6 +319,47 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
     ];
     argv.extend(rest.iter().cloned());
     o.argv = argv;
+    let remote = sync_for(o).ok();
+    let blocked =
+        run::env_str("RUNNER_TEMP").map(|t| PathBuf::from(t).join("stoop/journal.blocked"));
+    let mut journal = if blocked.as_ref().is_some_and(|p| p.exists()) {
+        None
+    } else {
+        match journal::Journal::open(
+            &root,
+            matrix.as_deref(),
+            remote.as_ref().is_some_and(|r| r.write),
+        ) {
+            Ok(journal) => journal,
+            Err(error) => {
+                eprintln!("stoop: job record not written: {error}");
+                if let Some(path) = &blocked {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                        let _ = std::fs::write(path, b"blocked");
+                    }
+                }
+                None
+            }
+        }
+    };
+    let journal_error = journal
+        .as_mut()
+        .and_then(|j| j.before(o.key.as_deref().unwrap_or_default()).err());
+    if let Some(error) = journal_error {
+        eprintln!("stoop: journal: {error}; continuing");
+        journal = None;
+    }
+    let proofs = store_for(o);
+    let jobs = jobs_for(o);
+    o.defer_push =
+        journal.as_ref().is_some_and(|j| j.eligible()) && remote.as_ref().is_some_and(|r| r.write);
     let o = std::mem::take(o);
-    run::run(o, false)
+    let outcome = run::run_outcome(o, false);
+    if let Some(journal) = &mut journal {
+        if let Err(error) = journal.after(&outcome, &jobs, &proofs, remote.as_ref()) {
+            eprintln!("stoop: journal: {error}; continuing");
+        }
+    }
+    outcome.status
 }

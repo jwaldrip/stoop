@@ -28,6 +28,7 @@
     <span class="k">runs-on</span>: ubuntu-latest
     <span class="k">permissions</span>:
       <span class="k">contents</span>: write          <span class="c"># main pushes refs/stoop/*</span>
+      <span class="k">id-token</span>: write          <span class="c"># attests the records this job publishes</span>
     <span class="k">env</span>:
       <span class="k">STOOP_SYNC</span>: git
     <span class="k">steps</span>:
@@ -52,7 +53,15 @@
   <li>Steps that use an action (<code>uses:</code>) are not shell steps and run as usual.</li>
   <li>Set <code>STOOP_SYNC_WRITE</code> only on the default branch. An empty value or <code>0</code> is off, so <code>STOOP_SYNC_WRITE: ${{ github.ref == 'refs/heads/main' &amp;&amp; '1' || '' }}</code> works; setting it from a step guarded by <code>if:</code>, as above, is just as good.</li>
   <li>Sync never fails a step. If the remote is unreachable or refuses a push, stoop warns and the step runs as it would have without sync.</li>
+  <li>Publishing jobs can attach a GitHub OIDC token to each record with <code>id-token: write</code>. The experimental planner refuses records without a valid token. Planning needs <code>contents: read</code>, HTTPS access to <code>token.actions.githubusercontent.com</code>, the configured sync remote, and <code>git ls-remote</code> access to <code>GITHUB_SERVER_URL</code> for floating action refs. The plan runner's proxy and certificate environment is part of the trust base.</li>
+  <li>Tokens identify the workflow and run, not an individual job. Every publishing job, and every action, build script, dependency and test it runs, can request a token for records of any job in that workflow. A separate writer can publish such a token later. The signed issue time limits its usable age to the planner's ceiling. Restrict publishing permissions and use an ephemeral GitHub-hosted planner runner.</li>
+  <li>The planner accepts only protected branches and GitHub-hosted recording runners. The planned workflow file must be the same file that recorded the job. A separate main-only workflow with the same name cannot supply its records. GitHub Enterprise Server and GitHub Enterprise Cloud custom OIDC issuers are not supported and fail closed.</li>
 </ul>
+
+<h3 id="experimental-planning">Experimental job planning</h3>
+<p><strong>Do not enable plan-skips in workflow gates yet.</strong> A floating action ref can move after the runner downloads it but before stoop resolves it. The downloaded copy is not checked against the resolved commit. The owner has not accepted that window. <code>STOOP_STRICT_ACTIONS=1</code> refuses floating workflow action refs.</p>
+<p>The plan job must live in the top-level workflow. Set <code>STOOP_JOB_WORKFLOW_REF: ${{ job.workflow_ref }}</code> on the plan step. A missing or different value makes every job run. Image <code>ENV</code> and neutral setup must not set <code>STOOP_*</code> controls; the planner assumes this and does not verify it. Nonempty container options are not plannable.</p>
+<p>Set <code>STOOP_ALLOW_USES</code> at workflow or job level to exact comma- or newline-separated <code>owner/repo</code> or <code>owner/repo@ref</code> entries. This is the workflow author's assertion that those actions are side-effect free. <code>--allow-uses</code> is for local dry runs only. The plan job and publishing jobs need the same <code>STOOP_ENV_SALT</code> when proofs are salted.</p>
 
 <h3 id="github-cache">Or with the Actions cache</h3>
 <p>If you'd rather not give the job push access, cache <code>.stoop/</code>. A run can restore caches saved on its own branch and on the default branch (<a href="https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching">GitHub's cache access rules</a>), so save only on main:</p>
@@ -128,6 +137,9 @@
   <li>Shallow checkouts are fine: the proof refs are fetched on their own.</li>
   <li>Proofs record a hash of every environment variable, and published proofs are readable by anyone who can read the repository. An unsalted hash of a low-entropy value (a short token, a flag) can be guessed offline. Set <code>STOOP_ENV_SALT</code> from a repository secret on every job that records or checks proofs: the hashes are then keyed with it (they start with <code>s:</code>) and stoop warns when it publishes without one. A run without the secret, such as a pull request from a fork, cannot match a salted proof and simply runs the command. Proofs published before you set it keep their unsalted hashes until they expire or you remove them with <code>stoop prune --max-age 0</code>.</li>
 </ul>
+<p>In GitHub Actions, <code>stoop sh</code> also keeps a job journal in <code>RUNNER_TEMP</code>. Trusted sync writers publish job records alongside step proofs. These records are not yet attested and do not authorize plan-time skips. Keep write credentials unavailable to pull requests.</p>
+<p>When publishing, the job journal resolves each action reference at its first <code>stoop sh</code> step. The runner downloads actions earlier, during Set up job, so a ref that moves between download and journal open can make the recorded commit differ from the downloaded action. Pin actions to full 40-character commit SHAs to close this window. Before enabling plan-time skips, verify downloaded action copies against the resolved commit tree or explicitly accept this window.</p>
+<p>Resolution of <code>@stable</code> covers the action repository ref, not the toolchain it installs. Toolchain inputs such as <code>node-version</code> and nested composite actions are not resolved. Container and service image tags are unresolvable and make the job run. Job key equality, maximum age and nightly full runs bound outside drift; they do not prove the downloaded action's identity. Optional <code>STOOP_STRICT_ACTIONS=1</code> rejects floating action refs at recording and planning; it is off by default.</p>
 <p class="status">Tested: the sync suite runs against a bare git remote, and the ref mechanics (push, shallow fetch, delete) were checked against GitHub. Not yet verified: a full authenticated sync run inside a hosted CI provider.</p>
 
 <h2 id="nightly">The nightly full run</h2>

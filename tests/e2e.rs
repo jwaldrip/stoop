@@ -39,6 +39,12 @@ impl Ws {
             )
             .env_remove("STOOP_FULL")
             .env_remove("STOOP_OFF")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("RUNNER_TEMP")
+            .env_remove("STOOP_MATRIX")
+            .env_remove("STOOP_SYNC")
+            .env_remove("STOOP_SYNC_WRITE")
+            .env_remove("STOOP_ENV_SALT")
             .output()
             .unwrap();
         (
@@ -54,6 +60,42 @@ impl Ws {
 
 fn skipped(s: &str) -> bool {
     s.contains("stoop: skip")
+}
+
+#[test]
+fn shell_steps_in_different_working_directories_do_not_share_proofs() {
+    let w = Ws::new("shell-cwd");
+    fs::create_dir(w.root.join(".git")).unwrap();
+    w.write("a/input", "same");
+    w.write("b/input", "same");
+    let script = w.root.join("script.sh");
+    fs::write(&script, "cat input >/dev/null\n").unwrap();
+    let run = |directory: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_stoop"))
+            .args(["sh", script.to_str().unwrap()])
+            .current_dir(w.root.join(directory))
+            .env("GITHUB_WORKFLOW", "fixture")
+            .env("GITHUB_JOB", "same-job")
+            .env("STOOP_STORE", w.root.join(".stoop"))
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("RUNNER_TEMP")
+            .env_remove("STOOP_SYNC")
+            .env_remove("STOOP_SYNC_WRITE")
+            .env_remove("STOOP_FULL")
+            .env_remove("STOOP_OFF")
+            .env_remove("STOOP_ENV_SALT")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    let first = run("a");
+    assert!(first.contains("recorded"), "{first}");
+    let second = run("b");
+    assert!(second.contains("recorded") && !skipped(&second), "{second}");
+    assert!(skipped(&run("a")));
+    assert!(skipped(&run("b")));
+    fs::remove_dir_all(&w.root).unwrap();
 }
 
 #[test]
@@ -231,8 +273,14 @@ fn run_with_foo(w: &Ws, v: &str, extra: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_stoop"))
         .args(args)
         .current_dir(&w.root)
-        .env("STOOP_STORE", w.root.join("../env-store"))
+        .env("STOOP_STORE", w.root.with_extension("env-store"))
         .env("FOO", v)
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("RUNNER_TEMP")
+        .env_remove("STOOP_MATRIX")
+        .env_remove("STOOP_SYNC")
+        .env_remove("STOOP_SYNC_WRITE")
+        .env_remove("STOOP_ENV_SALT")
         .output()
         .unwrap();
     String::from_utf8_lossy(&out.stderr).into_owned()
@@ -382,6 +430,12 @@ fn full_mode_never_skips_but_still_records() {
             )),
         )
         .env("STOOP_FULL", "1")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("RUNNER_TEMP")
+        .env_remove("STOOP_MATRIX")
+        .env_remove("STOOP_SYNC")
+        .env_remove("STOOP_SYNC_WRITE")
+        .env_remove("STOOP_ENV_SALT")
         .output()
         .unwrap();
     let e = String::from_utf8_lossy(&out.stderr);
@@ -412,6 +466,24 @@ fn shell_mode_keys_on_script_content_not_its_file_name() {
     fs::write(&b, body).unwrap();
     let first = w.stoop(&["sh", a.to_str().unwrap()]);
     assert_eq!(first.0, 0, "{}", first.1);
+    let store = w.root.with_file_name(format!(
+        "{}-store",
+        w.root.file_name().unwrap().to_string_lossy()
+    ));
+    let proof_file = fs::read_dir(store.join("proofs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let proof: serde_json::Value = serde_json::from_slice(&fs::read(proof_file).unwrap()).unwrap();
+    let patterns = proof["proofs"][0]["ignore"].as_array().unwrap();
+    assert!(
+        !patterns
+            .iter()
+            .any(|p| p.as_str().is_some_and(|s| s.contains("step-aaa.sh"))),
+        "{patterns:?}"
+    );
     let (_, e) = w.stoop(&["sh", b.to_str().unwrap()]);
     assert!(skipped(&e), "{e}");
 }
@@ -562,7 +634,7 @@ fn prune_removes_expired_published_proofs() {
     let a = Ws::new("syncx-a").with_remote(&remote);
     run_sync(&a, &["--sync", "git", "--sync-write"]);
     assert_eq!(published(&remote).len(), 1);
-    std::thread::sleep(std::time::Duration::from_millis(2100));
+    std::thread::sleep(std::time::Duration::from_millis(3100));
     let (c, e) = a.stoop(&[
         "prune",
         "--sync",
@@ -829,7 +901,7 @@ fn an_expired_proof_no_longer_skips() {
     };
     run("1h");
     assert!(skipped(&run("1h")));
-    std::thread::sleep(std::time::Duration::from_millis(2100));
+    std::thread::sleep(std::time::Duration::from_millis(3100));
     let e = run("1s");
     assert!(!skipped(&e) && e.contains("proof expired"), "{e}");
 }
@@ -862,6 +934,400 @@ fn no_record_checks_but_never_writes() {
         "cat in.txt > /dev/null",
     ]);
     assert!(!skipped(&e), "{e}");
+}
+
+// ---- the executable bit is part of a file's identity ----------------------------------
+
+fn set_exec(p: &Path, exec: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = if exec { 0o755 } else { 0o644 };
+    fs::set_permissions(p, fs::Permissions::from_mode(mode)).unwrap();
+}
+
+#[test]
+fn chmod_minus_x_on_an_input_reruns() {
+    let w = Ws::new("chmodinput");
+    w.write("s.sh", "echo hi\n");
+    set_exec(&w.root.join("s.sh"), true);
+    let script = "cat s.sh > /dev/null";
+    let (c, e) = w.sh(script);
+    assert_eq!(c, 0, "{e}");
+    assert!(skipped(&w.sh(script).1));
+    set_exec(&w.root.join("s.sh"), false);
+    let (_, e) = w.sh(script);
+    assert!(!skipped(&e) && e.contains("s.sh changed"), "{e}");
+}
+
+#[test]
+fn a_step_that_chmods_reruns_in_a_fresh_checkout() {
+    let w = Ws::new("chmodfresh");
+    w.write("s.sh", "echo hi\n");
+    let script = "chmod +x s.sh";
+    let (c, e) = w.sh(script);
+    assert_eq!(c, 0, "{e}");
+    // A fresh checkout has the same bytes, without the mode the step produced.
+    set_exec(&w.root.join("s.sh"), false);
+    let (_, e) = w.sh(script);
+    assert!(!skipped(&e) && e.contains("output s.sh changed"), "{e}");
+}
+
+#[test]
+fn upgrading_reruns_executables_once() {
+    let w = Ws::new("upgrade");
+    w.write("s.sh", "echo hi\n");
+    set_exec(&w.root.join("s.sh"), true);
+    let script = "cat s.sh > /dev/null";
+    assert_eq!(w.sh(script).0, 0);
+    assert!(skipped(&w.sh(script).1));
+    // A proof written before the bit was part of the id holds `f:` for this executable.
+    let store = w.root.with_file_name(format!(
+        "{}-store",
+        w.root.file_name().unwrap().to_string_lossy()
+    ));
+    let file = store.join("proofs").join("t.json");
+    let mut v: serde_json::Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    for p in v["proofs"].as_array_mut().unwrap() {
+        for input in p["inputs"].as_array_mut().unwrap() {
+            if input["path"] == "s.sh" {
+                let id = input["id"].as_str().unwrap().replacen("x:", "f:", 1);
+                input["id"] = id.into();
+            }
+        }
+    }
+    fs::write(&file, serde_json::to_vec(&v).unwrap()).unwrap();
+    let (_, e) = w.sh(script);
+    assert!(
+        !skipped(&e) && e.contains("s.sh changed"),
+        "it reruns once: {e}"
+    );
+    assert!(skipped(&w.sh(script).1), "and then skips");
+}
+
+#[test]
+fn retargeting_a_written_through_link_reruns() {
+    let w = Ws::new("retarget-write");
+    w.write("one", "one");
+    w.write("two", "two");
+    std::os::unix::fs::symlink("one", w.root.join("link")).unwrap();
+    let script = "echo x > link";
+    assert_eq!(w.sh(script).0, 0);
+    fs::remove_file(w.root.join("link")).unwrap();
+    std::os::unix::fs::symlink("two", w.root.join("link")).unwrap();
+    let (_, err) = w.sh(script);
+    assert!(!skipped(&err), "{err}");
+}
+
+#[test]
+fn retargeting_a_written_through_directory_link_reruns() {
+    let w = Ws::new("retarget-directory");
+    w.write("sub/keep", "x");
+    w.write("other/keep", "x");
+    std::os::unix::fs::symlink("sub", w.root.join("link")).unwrap();
+    let script = "echo x > link/f";
+    assert_eq!(w.sh(script).0, 0);
+    fs::remove_file(w.root.join("link")).unwrap();
+    std::os::unix::fs::symlink("other", w.root.join("link")).unwrap();
+    let (_, err) = w.sh(script);
+    assert!(!skipped(&err), "{err}");
+}
+
+#[test]
+fn write_through_link_dotdot_does_not_hide_a_different_input() {
+    let w = Ws::new("dotdot-real-input");
+    w.write("sub/inner/keep", "k");
+    w.write("out", "old");
+    std::os::unix::fs::symlink("sub/inner", w.root.join("link")).unwrap();
+    let script = "cat out >/dev/null; echo x > link/../out";
+    assert_eq!(w.sh(script).0, 0);
+    w.write("out", "new");
+    let (_, err) = w.sh(script);
+    assert!(!skipped(&err), "{err}");
+}
+
+#[test]
+fn mkdir_through_link_dotdot_does_not_hide_a_different_directory_input() {
+    let w = Ws::new("mkdir-dotdot-input");
+    w.write("sub/inner/keep", "k");
+    w.write("gen/config", "old");
+    std::os::unix::fs::symlink("sub/inner", w.root.join("link")).unwrap();
+    let script = "mkdir link/../gen; cat gen/config > out.txt";
+    assert_eq!(w.sh(script).0, 0);
+    w.write("gen/config", "new");
+    let (_, err) = w.sh(script);
+    assert!(!skipped(&err), "{err}");
+}
+
+#[test]
+fn proc_cwd_alias_reads_recheck_the_actual_file() {
+    for (name, script) in [
+        ("self", "cat /proc/self/cwd/in.txt >/dev/null"),
+        ("thread", "cat /proc/thread-self/cwd/in.txt >/dev/null"),
+        ("root", "cat /proc/thread-self/root$PWD/in.txt >/dev/null"),
+        ("task", "cat /proc/$$/task/$$/cwd/in.txt >/dev/null"),
+        ("dotdot", "cat /proc/self/../$$/cwd/in.txt >/dev/null"),
+        (
+            "relative",
+            "P=$$; (cd /proc && cat $P/cwd/in.txt >/dev/null)",
+        ),
+    ] {
+        let w = Ws::new(&format!("proc-{name}"));
+        let (status, first) = w.sh(script);
+        assert_eq!(status, 0, "{name}: {first}");
+        assert!(first.contains("recorded"), "{name}: {first}");
+        w.write("in.txt", "changed");
+        let (_, second) = w.sh(script);
+        assert!(!skipped(&second), "{name}: {second}");
+    }
+}
+
+#[test]
+fn proc_thread_cwd_write_is_recorded_as_output() {
+    let w = Ws::new("proc-thread-write");
+    let script = "cat in.txt > /proc/thread-self/cwd/out.txt";
+    assert_eq!(w.sh(script).0, 0);
+    fs::remove_file(w.root.join("out.txt")).unwrap();
+    let (_, err) = w.sh(script);
+    assert!(!skipped(&err), "{err}");
+}
+
+#[test]
+fn same_process_chdir_then_relative_open_is_tracked() {
+    let w = Ws::new("chdir-relative");
+    w.write("sub/f", "old");
+    let script = "cd sub; : < f";
+    assert_eq!(w.sh(script).0, 0);
+    w.write("sub/f", "new");
+    let (_, err) = w.sh(script);
+    assert!(!skipped(&err), "{err}");
+}
+
+#[test]
+fn process_substitution_is_recordable() {
+    let w = Ws::new("process-substitution");
+    let (status, err) = w.sh("bash -c 'cat <(echo hello) >/dev/null'");
+    assert_eq!(status, 0, "{err}");
+    assert!(err.contains("stoop: recorded"), "{err}");
+}
+
+#[test]
+fn reopened_regular_descriptor_is_recorded() {
+    let w = Ws::new("regular-descriptor");
+    let script = "exec 3< in.txt; cat /proc/self/fd/3 >/dev/null";
+    let (status, first) = w.sh(script);
+    assert_eq!(status, 0, "{first}");
+    assert!(first.contains("stoop: recorded"), "{first}");
+    w.write("in.txt", "changed");
+    let (_, second) = w.sh(script);
+    assert!(!skipped(&second), "{second}");
+}
+
+#[test]
+fn cargo_build_with_jobserver_descriptors_is_recordable() {
+    let w = Ws::new("cargo-jobserver");
+    w.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
+    w.write("src/main.rs", "fn main() {}\n");
+    w.write(".stoopignore", "target/\n");
+    let (status, err) = w.sh("cargo build --offline");
+    assert_eq!(status, 0, "{err}");
+    assert!(err.contains("stoop: recorded"), "{err}");
+}
+
+#[test]
+fn changing_a_repository_shebang_interpreter_reruns() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let w = Ws::new("shebang-interpreter");
+    fs::copy("/bin/sh", w.root.join("interp")).unwrap();
+    w.write("script", "#!./interp\necho hello\n");
+    fs::set_permissions(w.root.join("script"), fs::Permissions::from_mode(0o755)).unwrap();
+    let script = "./script";
+    let (status, err) = w.sh(script);
+    assert_eq!(status, 0, "{err}");
+    assert!(skipped(&w.sh(script).1));
+    fs::OpenOptions::new()
+        .append(true)
+        .open(w.root.join("interp"))
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    let (_, err) = w.sh(script);
+    assert!(!skipped(&err), "{err}");
+}
+
+#[test]
+fn outside_symlink_to_proc_self_cwd_uses_tracee_directory() {
+    let w = Ws::new("proc-symlink-cwd");
+    w.write("sub/config.txt", "old");
+    let alias = std::env::temp_dir().join(format!("stoop-proc-cwd-{}", std::process::id()));
+    let _ = fs::remove_file(&alias);
+    std::os::unix::fs::symlink("/proc/self/cwd", &alias).unwrap();
+    let script = format!("cd sub && cat {}/config.txt >/dev/null", alias.display());
+    let (status, first) = w.sh(&script);
+    assert_eq!(status, 0, "{first}");
+    w.write("sub/config.txt", "new");
+    let (_, second) = w.sh(&script);
+    let _ = fs::remove_file(alias);
+    assert!(!skipped(&second), "{second}");
+}
+
+#[test]
+fn nested_shebang_interpreter_changes_rerun() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let w = Ws::new("nested-shebang");
+    fs::copy("/bin/sh", w.root.join("interp")).unwrap();
+    w.write("wrap", "#!./interp\necho wrapped\n");
+    w.write("script", "#!./wrap\n");
+    for name in ["wrap", "script"] {
+        fs::set_permissions(w.root.join(name), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    assert_eq!(w.sh("./script").0, 0);
+    assert!(skipped(&w.sh("./script").1));
+    fs::OpenOptions::new()
+        .append(true)
+        .open(w.root.join("interp"))
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    assert!(!skipped(&w.sh("./script").1));
+}
+
+#[test]
+fn relative_shebang_interpreter_is_resolved_from_the_tracee_cwd() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let w = Ws::new("shebang-relative-cwd");
+    w.write("sub/keep", "keep");
+    fs::copy("/bin/sh", w.root.join("sub/interp")).unwrap();
+    w.write("script", "#!./interp\necho hello\n");
+    fs::set_permissions(w.root.join("script"), fs::Permissions::from_mode(0o755)).unwrap();
+    let command = "cd sub && ../script";
+    assert_eq!(w.sh(command).0, 0);
+    assert!(skipped(&w.sh(command).1));
+    fs::OpenOptions::new()
+        .append(true)
+        .open(w.root.join("sub/interp"))
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    assert!(!skipped(&w.sh(command).1));
+}
+
+#[test]
+fn changing_an_in_repository_elf_loader_reruns() {
+    use std::io::Write;
+    let w = Ws::new("elf-loader");
+    let loader = if cfg!(target_arch = "x86_64") {
+        "/lib64/ld-linux-x86-64.so.2"
+    } else {
+        "/lib/ld-linux-aarch64.so.1"
+    };
+    fs::copy(loader, w.root.join("myld.so")).unwrap();
+    w.write("main.c", "int main(void) { return 0; }\n");
+    let linker = format!("-Wl,--dynamic-linker={}", w.root.join("myld.so").display());
+    let build = Command::new("cc")
+        .current_dir(&w.root)
+        .args(["main.c", "-o", "program", &linker])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    assert_eq!(w.sh("./program").0, 0);
+    assert!(skipped(&w.sh("./program").1));
+    fs::OpenOptions::new()
+        .append(true)
+        .open(w.root.join("myld.so"))
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    assert!(!skipped(&w.sh("./program").1));
+}
+
+#[test]
+fn retargeting_a_directory_to_proc_cwd_invalidates_magic_epoch() {
+    let w = Ws::new("magic-epoch");
+    w.write("sub/config.txt", "old");
+    let script =
+        "cd sub && mkdir d && cat d/x; rm -r d && ln -s /proc/self/cwd d && cat d/config.txt";
+    let (status, first) = w.sh(script);
+    assert_eq!(status, 0, "{first}");
+    w.write("sub/config.txt", "new");
+    let (_, second) = w.sh(script);
+    assert!(!skipped(&second), "{second}");
+}
+
+#[test]
+fn final_component_symlink_to_proc_cwd_is_not_skipped_by_fast_path() {
+    let w = Ws::new("magic-final-link");
+    w.write("sub/config.txt", "old");
+    let script = "cd sub && ln -s /proc/self/cwd/config.txt x && test -e y; cat x";
+    let (status, first) = w.sh(script);
+    assert_eq!(status, 0, "{first}");
+    w.write("sub/config.txt", "new");
+    let (_, second) = w.sh(script);
+    assert!(!skipped(&second), "{second}");
+}
+
+#[test]
+fn fexecve_script_tracks_repository_shebang_interpreter() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let w = Ws::new("fexecve-script");
+    fs::copy("/bin/sh", w.root.join("interp")).unwrap();
+    w.write("script", "#!./interp\necho hello\n");
+    fs::set_permissions(w.root.join("script"), fs::Permissions::from_mode(0o755)).unwrap();
+    let command = "python3 -c 'import os; f=os.open(\"script\", os.O_RDONLY); os.set_inheritable(f, True); os.execve(f, [\"script\"], os.environ)'";
+    let (status, first) = w.sh(command);
+    assert_eq!(status, 0, "{first}");
+    assert!(skipped(&w.sh(command).1));
+    fs::OpenOptions::new()
+        .append(true)
+        .open(w.root.join("interp"))
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    assert!(!skipped(&w.sh(command).1));
+}
+
+#[test]
+fn fexecve_elf_tracks_repository_loader() {
+    use std::io::Write;
+    let w = Ws::new("fexecve-elf");
+    let loader = if cfg!(target_arch = "x86_64") {
+        "/lib64/ld-linux-x86-64.so.2"
+    } else {
+        "/lib/ld-linux-aarch64.so.1"
+    };
+    fs::copy(loader, w.root.join("myld.so")).unwrap();
+    w.write("main.c", "int main(void) { return 0; }\n");
+    let linker = format!("-Wl,--dynamic-linker={}", w.root.join("myld.so").display());
+    let build = Command::new("cc")
+        .current_dir(&w.root)
+        .args(["main.c", "-o", "program", &linker])
+        .output()
+        .unwrap();
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
+    let command = "python3 -c 'import os; f=os.open(\"program\", os.O_RDONLY); os.execve(f, [\"program\"], os.environ)'";
+    let (status, first) = w.sh(command);
+    assert_eq!(status, 0, "{first}");
+    assert!(skipped(&w.sh(command).1));
+    fs::OpenOptions::new()
+        .append(true)
+        .open(w.root.join("myld.so"))
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
+    assert!(!skipped(&w.sh(command).1));
 }
 
 #[allow(dead_code)]

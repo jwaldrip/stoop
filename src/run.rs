@@ -2,11 +2,11 @@
 
 use crate::ignore::Ignore;
 use crate::input::{identify, par_map, verify, Input};
-use crate::pathutil::{absolutize, cwd_key, to_key};
+use crate::pathutil::{absolutize, cwd_key, to_key, Physical};
 use crate::proof::{now, sanitize, Proof, Store};
 use crate::sync::Remote;
 use crate::trace::{self, Trace};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -21,6 +21,9 @@ pub struct Opts {
     pub store: Option<PathBuf>,
     pub env: Vec<String>,
     pub ignore: Vec<String>,
+    /// Patterns for paths that exist for one run only, such as a CI step's script file. They
+    /// exclude like any other pattern, but a proof never stores them.
+    pub transient: Vec<String>,
     pub no_record: bool,
     pub quiet: bool,
     /// Environment variables exempted from the whole-environment input.
@@ -37,6 +40,7 @@ pub struct Opts {
     pub sync_write: bool,
     /// Seconds a proof stays valid; 0 means forever. Default: 7 days.
     pub max_age: Option<u64>,
+    pub defer_push: bool,
     pub argv: Vec<String>,
 }
 
@@ -81,7 +85,7 @@ pub fn store_for(o: &Opts, cwd: &Path, root: &Path) -> PathBuf {
 
 /// Scope a shared store to a repository. A configured origin identifies checkouts
 /// of the same repository; without one the physical root is the safe fallback.
-fn shared_scope(root: &Path, store: &Path) -> Option<String> {
+pub(crate) fn shared_scope(root: &Path, store: &Path) -> Option<String> {
     if store == root.join(".stoop") {
         return None;
     }
@@ -215,23 +219,28 @@ pub fn run_probes(probes: &[String], cwd: &Path, quiet: bool) -> Option<BTreeMap
 /// cannot match and the command runs. The salt itself is never hashed in.
 pub const SALT_VAR: &str = "STOOP_ENV_SALT";
 
+pub fn env_hash(name: &str, value: &str, salt: Option<&str>) -> String {
+    match salt {
+        Some(salt) => {
+            let key = blake3::derive_key("stoop env hash v1", salt.as_bytes());
+            let mut h = blake3::Hasher::new_keyed(&key);
+            h.update(name.as_bytes());
+            h.update(&[0]);
+            h.update(value.as_bytes());
+            format!("s:{}", h.finalize().to_hex())
+        }
+        None => blake3::hash(value.as_bytes()).to_hex().to_string(),
+    }
+}
+
 fn env_hashes(names: &[String], salt: Option<&str>) -> BTreeMap<String, String> {
-    let key = salt.map(|s| blake3::derive_key("stoop env hash v1", s.as_bytes()));
     names
         .iter()
         .map(|n| {
-            let v = std::env::var(n).unwrap_or_default();
-            let h = match &key {
-                Some(k) => {
-                    let mut h = blake3::Hasher::new_keyed(k);
-                    h.update(n.as_bytes());
-                    h.update(&[0]);
-                    h.update(v.as_bytes());
-                    format!("s:{}", h.finalize().to_hex())
-                }
-                None => blake3::hash(v.as_bytes()).to_hex().to_string(),
-            };
-            (n.clone(), h)
+            (
+                n.clone(),
+                env_hash(n, &std::env::var(n).unwrap_or_default(), salt),
+            )
         })
         .collect()
 }
@@ -270,8 +279,9 @@ pub fn parse_age(s: &str) -> Result<u64, String> {
         _ => (s, 1),
     };
     num.parse::<u64>()
-        .map(|n| n * mult)
-        .map_err(|_| format!("cannot read {s:?} as a duration (try 90s, 30m, 12h, 7d)"))
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .ok_or_else(|| format!("cannot read {s:?} as a duration (try 90s, 30m, 12h, 7d)"))
 }
 
 fn ago(created: u64) -> String {
@@ -300,15 +310,40 @@ fn plain(argv: &[String]) -> i32 {
     }
 }
 
-/// Exit code for `run` is the command's. For `explain` it is 0 when the
-/// command would be skipped and 1 when it would run.
+pub enum How {
+    Skipped { proof: String },
+    Recorded { proof: String },
+    Unrecorded(String),
+    Failed,
+    Untraced,
+}
+
+pub struct Outcome {
+    pub status: i32,
+    pub key: String,
+    pub how: How,
+}
+
 pub fn run(o: Opts, explain: bool) -> i32 {
+    run_outcome(o, explain).status
+}
+
+pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
+    let key = o.key.clone().unwrap_or_default();
     if o.argv.is_empty() {
         eprintln!("stoop: no command given");
-        return 2;
+        return Outcome {
+            status: 2,
+            key,
+            how: How::Untraced,
+        };
     }
     if env_flag("STOOP_OFF") && !explain {
-        return plain(&o.argv);
+        return Outcome {
+            status: plain(&o.argv),
+            key,
+            how: How::Untraced,
+        };
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = root_for(&o, &cwd);
@@ -320,13 +355,7 @@ pub fn run(o: Opts, explain: bool) -> i32 {
         .as_deref()
         .map(|key| {
             if o.shell_key {
-                if let Some(scope) = &scope {
-                    let mut h = blake3::Hasher::new();
-                    h.update(key.as_bytes());
-                    h.update(&[0]);
-                    h.update(scope.as_bytes());
-                    return format!("sh-{}", &h.finalize().to_hex()[..20]);
-                }
+                return crate::stepkey::scoped(key, scope.as_deref());
             }
             sanitize(key)
         })
@@ -342,7 +371,11 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                 "stoop: would run {key}: not traced ({}); no proof can be used",
                 trace::UNAVAILABLE
             );
-            return 1;
+            return Outcome {
+                status: 1,
+                key,
+                how: How::Untraced,
+            };
         }
         if !o.quiet {
             eprintln!("stoop: run {key}: no compatible tracer");
@@ -351,7 +384,11 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                 trace::UNAVAILABLE
             );
         }
-        return plain(&o.argv);
+        return Outcome {
+            status: plain(&o.argv),
+            key,
+            how: How::Untraced,
+        };
     }
     let full = env_flag("STOOP_FULL");
     let max_age = o
@@ -493,13 +530,21 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                     t0.elapsed().as_millis()
                 );
             }
-            return 0;
+            return Outcome {
+                status: 0,
+                key,
+                how: How::Skipped { proof: p.digest() },
+            };
         }
         why = "STOOP_FULL is set".into();
     }
     if explain {
         eprintln!("stoop: would run {key}: {why}");
-        return 1;
+        return Outcome {
+            status: 1,
+            key,
+            how: How::Untraced,
+        };
     }
     if !o.quiet {
         eprintln!("stoop: run {key}: {why}");
@@ -512,18 +557,46 @@ pub fn run(o: Opts, explain: bool) -> i32 {
         run_probes(&o.probes, &cwd, o.quiet)
     };
     // Declaring a probe is declaring the external dependency, so network use is accepted.
-    let trace = match trace::run(&o.argv, &cwd, o.allow_network || !o.probes.is_empty()) {
+    // The ignore set and the scope are fixed before the run: priors are recorded against them.
+    let ignore = Ignore::new(&o.ignore, Some(&root.join(".stoopignore")), &o.transient);
+    let real_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+    let trace_scope = (!o.no_record).then(|| trace::Scope {
+        root: &root,
+        real_root: real_root.clone(),
+        ignore: &ignore,
+    });
+    let trace = match trace::run(
+        &o.argv,
+        &cwd,
+        o.allow_network || !o.probes.is_empty(),
+        trace_scope.as_ref(),
+    ) {
         Ok(t) => t,
         Err(e) => {
             if !o.quiet {
                 eprintln!("stoop: not traced ({e}); running without a proof");
             }
-            return plain(&o.argv);
+            return Outcome {
+                status: plain(&o.argv),
+                key,
+                how: How::Untraced,
+            };
         }
     };
     let status = trace.status;
-    if status != 0 || o.no_record {
-        return status;
+    if status != 0 {
+        return Outcome {
+            status,
+            key,
+            how: How::Failed,
+        };
+    }
+    if o.no_record {
+        return Outcome {
+            status,
+            key,
+            how: How::Unrecorded("recording disabled".into()),
+        };
     }
     // The external state the command saw must still be what it was when it finished.
     let probes = match probes_before {
@@ -531,7 +604,11 @@ pub fn run(o: Opts, explain: bool) -> i32 {
             if !o.quiet {
                 eprintln!("stoop: not recorded: a probe failed before the run, so the external state is unknown");
             }
-            return status;
+            return Outcome {
+                status,
+                key,
+                how: How::Unrecorded("probe failed".into()),
+            };
         }
         Some(before) => {
             if !o.probes.is_empty()
@@ -540,18 +617,23 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                 if !o.quiet {
                     eprintln!("stoop: not recorded: a probe changed while the command ran");
                 }
-                return status;
+                return Outcome {
+                    status,
+                    key,
+                    how: How::Unrecorded("probe changed".into()),
+                };
             }
             before
         }
     };
 
-    // 3. It passed: write down what it read.
-    let ignore = Ignore::new(&o.ignore, Some(&root.join(".stoopignore")));
-    match build_inputs(&root, &trace, &ignore) {
-        Ok(inputs) => {
+    // 3. It passed: write down what it read, what it wrote, and what each written path held before.
+    let mut phys = Physical::new(&root, &real_root);
+    let written: BTreeSet<String> = trace.keys.values().cloned().collect();
+    match build_inputs(&root, &mut phys, &trace, &ignore, &written) {
+        Ok((inputs, read_reasons)) => {
             let n = inputs.len();
-            let outputs = build_outputs(&root, &trace, &ignore);
+            let (outputs, removed, write_reasons) = build_outputs(&real_root, &written);
             let proof = Proof {
                 created: now(),
                 argv: o.argv.clone(),
@@ -562,7 +644,15 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                 inputs,
                 outputs,
                 probes,
+                removed,
+                ignore: Some(ignore.patterns()),
+                priors: Some(build_priors(&trace)),
+                unplannable: merge_reasons(
+                    &trace.unplannable,
+                    read_reasons.into_iter().chain(write_reasons).collect(),
+                ),
             };
+            let digest = proof.digest();
             if let Some(r) = remote.as_ref().filter(|r| r.write) {
                 // Fold in anything other runs published since we looked, so a push never
                 // drops their proofs.
@@ -582,7 +672,10 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                     false
                 }
             };
-            if let Some(r) = remote.as_ref().filter(|r| saved && r.write) {
+            if let Some(r) = remote
+                .as_ref()
+                .filter(|r| saved && r.write && !o.defer_push)
+            {
                 if salt.is_none() {
                     // Hashes of every variable go into a file other people can fetch. An
                     // unsalted hash of a low-entropy secret can be guessed offline.
@@ -596,6 +689,15 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                     Err(e) => eprintln!("stoop: sync: could not publish ({e}); continuing"),
                 }
             }
+            return Outcome {
+                status,
+                key,
+                how: if saved {
+                    How::Recorded { proof: digest }
+                } else {
+                    How::Unrecorded("could not save proof".into())
+                },
+            };
         }
         Err(why) => {
             if !o.quiet {
@@ -603,41 +705,81 @@ pub fn run(o: Opts, explain: bool) -> i32 {
             }
         }
     }
-    status
+    Outcome {
+        status,
+        key,
+        how: How::Unrecorded("inputs could not be recorded".into()),
+    }
 }
 
-/// What the run left behind inside the repository: created or rewritten files and
-/// directories that still exist. Ignored paths are exempt, which is how a report
-/// file nobody needs is kept from blocking skips.
-pub fn build_outputs(root: &Path, trace: &Trace, ignore: &Ignore) -> Vec<Input> {
-    let mut paths: Vec<(PathBuf, String)> = trace
-        .written
+/// What the run left behind inside the repository, read once it finished: one entry for each
+/// in-scope path it wrote. Still there is an output. Gone again is removed, and the planner
+/// removes it with the step. Unreadable or special is a reason the planner cannot replay.
+pub fn build_outputs(
+    real_root: &Path,
+    written: &BTreeSet<String>,
+) -> (Vec<Input>, Vec<String>, Vec<String>) {
+    let keys: Vec<&String> = written.iter().collect();
+    let ids = par_map(&keys, |k| {
+        identify(&real_root.join(k.as_str()), true, false)
+    });
+    let mut outputs = Vec::new();
+    let mut removed = Vec::new();
+    let mut reasons = Vec::new();
+    for (key, id) in keys.into_iter().zip(ids) {
+        match id {
+            None => reasons.push(format!("it left {key} unreadable")),
+            Some(id) if id == "u" => reasons.push(format!("it left {key} unreadable")),
+            Some(id) if id == "a" => removed.push(key.clone()),
+            Some(id) => outputs.push(Input {
+                path: key.clone(),
+                id,
+            }),
+        }
+    }
+    if written.contains(".stoopignore") {
+        reasons.push("it wrote .stoopignore, which the proof's ignore set was read from".into());
+    }
+    (outputs, removed, reasons)
+}
+
+/// The state of each in-scope path before the run first wrote it, sorted by path.
+pub fn build_priors(trace: &Trace) -> Vec<Input> {
+    trace
+        .priors
         .iter()
-        .filter(|p| p.starts_with(root))
-        .map(|p| (p.clone(), to_key(root, p)))
-        .filter(|(_, k)| {
-            !k.is_empty() && !ignore.is_ignored(k) && !k.split('/').any(|c| c == ".git")
-        })
-        .collect();
-    paths.sort();
-    let ids = par_map(&paths, |(p, _)| identify(p, true, false));
-    paths
-        .into_iter()
-        .zip(ids)
-        .filter_map(|((_, key), id)| match id {
-            // Gone again (a temp file): not an output. Unreadable: leave it out.
-            Some(id) if id != "a" && id != "u" => Some(Input { path: key, id }),
-            _ => None,
+        .map(|(path, id)| Input {
+            path: path.clone(),
+            id: id.clone(),
         })
         .collect()
 }
 
-/// Turn what the tracer saw into comparable inputs, or say why it cannot be trusted.
-pub fn build_inputs(root: &Path, trace: &Trace, ignore: &Ignore) -> Result<Vec<Input>, String> {
+/// The proof's reasons: the tracer's first, then the rest, deduplicated and capped at 16.
+fn merge_reasons(first: &[String], more: Vec<String>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for why in first.iter().cloned().chain(more) {
+        if out.len() < 16 && !out.contains(&why) {
+            out.push(why);
+        }
+    }
+    out
+}
+
+/// What the run read, as comparable inputs, or why it cannot be trusted. A read of a path the
+/// run wrote is not an input: it reads the run's own output. A read through a link or a
+/// symlinked directory is also recorded under the key of the file it reached, so a change to
+/// that file is seen. The second value holds reasons the planner cannot replay the run.
+pub fn build_inputs(
+    root: &Path,
+    phys: &mut Physical,
+    trace: &Trace,
+    ignore: &Ignore,
+    written: &BTreeSet<String>,
+) -> Result<(Vec<Input>, Vec<String>), String> {
     if let Some(u) = trace.unsound.first() {
         return Err(u.clone());
     }
-    // Proof paths are UTF-8 strings. A lossy path could verify a different file.
     let paths = trace
         .touched
         .keys()
@@ -648,38 +790,96 @@ pub fn build_inputs(root: &Path, trace: &Trace, ignore: &Ignore) -> Result<Vec<I
             return Err("a traced path is not valid UTF-8".into());
         }
     }
-    let mut cands: Vec<(PathBuf, String, bool, bool)> = Vec::new(); // (path, key, listed, inside)
+    // Symlink targets are serialized as text too. Refuse rather than serialize lossy bytes.
+    for path in trace.keys.keys().chain(trace.touched.keys()) {
+        let in_repo = path.starts_with(root) || path.starts_with(phys.real());
+        if in_repo
+            && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+            && std::fs::read_link(path).is_ok_and(|target| target.to_str().is_none())
+        {
+            return Err("it used a repository symlink with a non-UTF-8 target".into());
+        }
+    }
+    let real_root = phys.real().to_path_buf();
+    phys.prefetch(
+        trace
+            .touched
+            .keys()
+            .filter_map(|p| p.parent().map(Path::to_path_buf)),
+    );
+    let mut reasons: Vec<String> = Vec::new();
     let mut reads_git = false;
-    for (path, &listed) in &trace.touched {
-        let inside = path.starts_with(root);
-        let key = to_key(root, path);
-        if key.is_empty() || ignore.is_ignored(&key) || trace.is_output(path) {
+    // (path to identify, key, inside the root, entries listed)
+    let mut cands: Vec<(PathBuf, String, bool, bool)> = Vec::new();
+    for (lex, touch) in &trace.touched {
+        let inside = lex.starts_with(root);
+        let key = to_key(root, lex);
+        let physical = phys.locate(lex).map(|l| l.path);
+        // The same entry reached under its physical name, when that differs from the spelled one.
+        if let Some(pp) = &physical {
+            if let Some(rel) = phys.repo_rel(pp) {
+                match rel.to_str() {
+                    None => {
+                        return Err(
+                            "it used a path in the repository that is not valid UTF-8".into()
+                        )
+                    }
+                    Some(pkey) if pkey != key => {
+                        if rel.components().any(|c| c.as_os_str() == ".git") {
+                            if !ignore.is_ignored(pkey) {
+                                reads_git = true;
+                            }
+                        } else if ignore.is_ignored(pkey) {
+                        } else if written.contains(pkey) {
+                            reasons.push(format!("it read {pkey} through {key} and also wrote it"));
+                        } else {
+                            cands.push((pp.clone(), pkey.to_string(), true, touch.listed));
+                        }
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        // A lexical key containing `..` does not describe kernel resolution across a
+        // symlink. The physical candidate above is the only faithful repository key.
+        if lex
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            continue;
+        }
+        if key.is_empty() || ignore.is_ignored(&key) {
+            continue;
+        }
+        if inside
+            && lex
+                .strip_prefix(root)
+                .ok()
+                .and_then(|r| r.to_str())
+                .is_none()
+        {
+            return Err("it used a path in the repository that is not valid UTF-8".into());
+        }
+        let written_physically = physical
+            .as_deref()
+            .and_then(|pp| phys.repo_rel(pp))
+            .and_then(|r| r.to_str())
+            .is_some_and(|k| written.contains(k));
+        if trace.is_output(lex) || written_physically {
             continue;
         }
         if inside && key.split('/').any(|c| c == ".git") {
             reads_git = true;
             continue;
         }
-        cands.push((path.clone(), key, listed, inside));
+        cands.push((lex.clone(), key, inside, touch.listed));
     }
-    if reads_git {
-        return Err("it reads .git, so a skip could hide a history change (add `.git` to .stoopignore if that read cannot change the result)".into());
-    }
-    let ids = par_map(&cands, |(p, _, listed, inside)| {
-        let id = identify(p, *inside, *listed);
-        // A symlink hides a second file; record where it points too.
-        let target = match id.as_deref() {
-            Some(s) if s.starts_with("l:") => std::fs::canonicalize(p).ok(),
-            _ => None,
-        };
-        let tid = target
-            .as_ref()
-            .and_then(|t| identify(t, t.starts_with(root), false));
-        (id, target, tid)
-    });
     let mut out: Vec<Input> = Vec::with_capacity(cands.len());
-    let mut seen = std::collections::HashSet::new();
-    for ((_, key, _, _), (id, target, tid)) in cands.iter().zip(ids) {
+    let mut seen: HashSet<String> = HashSet::new();
+    let ids = par_map(&cands, |(p, _, inside, listed)| {
+        identify(p, *inside, *listed)
+    });
+    for ((_, key, _, _), id) in cands.iter().zip(ids) {
         if let Some(id) = id {
             if seen.insert(key.clone()) {
                 out.push(Input {
@@ -688,18 +888,130 @@ pub fn build_inputs(root: &Path, trace: &Trace, ignore: &Ignore) -> Result<Vec<I
                 });
             }
         }
-        if let (Some(t), Some(tid)) = (target, tid) {
-            if t.strip_prefix(root).unwrap_or(&t).to_str().is_none() {
-                return Err("a symlink target is not valid UTF-8".into());
+    }
+    // A symlink hides a second file: record where it points, whether or not the link is
+    // ignored (an alias under an ignored /tmp can point into the repository).
+    for lex in trace.touched.keys() {
+        if trace.magic_links.contains(lex) {
+            continue;
+        }
+        if !std::fs::symlink_metadata(lex).is_ok_and(|m| m.file_type().is_symlink()) {
+            continue;
+        }
+        // Proc magic links are resolved while the tracee is stopped. Resolving them
+        // here would instead use the recorder's own process and working directory.
+        if std::fs::read_link(lex)
+            .is_ok_and(|target| target.starts_with("/proc") || target.starts_with("/dev/fd"))
+        {
+            continue;
+        }
+        let Ok(target) = std::fs::canonicalize(lex) else {
+            continue;
+        };
+        if target == real_root {
+            continue;
+        }
+        let link_key = to_key(root, lex);
+        match target.strip_prefix(&real_root) {
+            Ok(rel) if !rel.as_os_str().is_empty() => {
+                let Some(tkey) = rel.to_str() else {
+                    return Err("it used a path in the repository that is not valid UTF-8".into());
+                };
+                if rel.components().any(|c| c.as_os_str() == ".git") {
+                    if !ignore.is_ignored(tkey) {
+                        reads_git = true;
+                    }
+                    continue;
+                }
+                if ignore.is_ignored(tkey) {
+                    continue;
+                }
+                if written.contains(tkey) {
+                    reasons.push(format!(
+                        "it read {tkey} through {link_key} and also wrote it"
+                    ));
+                    continue;
+                }
+                if let Some(id) = identify(&target, true, false) {
+                    if seen.insert(tkey.to_string()) {
+                        out.push(Input {
+                            path: tkey.to_string(),
+                            id,
+                        });
+                    }
+                }
             }
-            let tk = to_key(root, &t);
-            if !ignore.is_ignored(&tk) && !trace.is_output(&t) && seen.insert(tk.clone()) {
-                out.push(Input { path: tk, id: tid });
+            _ => {
+                if target
+                    .strip_prefix(root)
+                    .unwrap_or(&target)
+                    .to_str()
+                    .is_none()
+                {
+                    return Err("a symlink target is not valid UTF-8".into());
+                }
+                let tk = to_key(root, &target);
+                if ignore.is_ignored(&link_key) || ignore.is_ignored(&tk) {
+                    continue;
+                }
+                if let Some(id) = identify(&target, false, false) {
+                    if seen.insert(tk.clone()) {
+                        out.push(Input { path: tk, id });
+                    }
+                }
             }
         }
     }
+    if reads_git {
+        return Err("it reads .git, so a skip could hide a history change (add `.git` to .stoopignore if that read cannot change the result)".into());
+    }
     out.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(out)
+    Ok((out, reasons))
+}
+
+#[cfg(test)]
+mod flag_tests {
+    #[test]
+    fn env_hash_matches_env_hashes() {
+        let names = vec![
+            "STOOP_S0B_ENV_PRESENT".to_string(),
+            "STOOP_S0B_ENV_ABSENT".to_string(),
+        ];
+        std::env::set_var(&names[0], "value");
+        std::env::remove_var(&names[1]);
+        for salt in [None, Some("secret salt")] {
+            let actual = super::env_hashes(&names, salt);
+            assert_eq!(actual[&names[0]], super::env_hash(&names[0], "value", salt));
+            assert_eq!(actual[&names[1]], super::env_hash(&names[1], "", salt));
+            let expected = match salt {
+                None => blake3::hash(b"value").to_hex().to_string(),
+                Some(salt) => {
+                    let key = blake3::derive_key("stoop env hash v1", salt.as_bytes());
+                    let mut h = blake3::Hasher::new_keyed(&key);
+                    h.update(names[0].as_bytes());
+                    h.update(&[0]);
+                    h.update(b"value");
+                    format!("s:{}", h.finalize().to_hex())
+                }
+            };
+            assert_eq!(actual[&names[0]], expected);
+        }
+        std::env::remove_var(&names[0]);
+    }
+    #[test]
+    fn env_flag_truthiness() {
+        const NAME: &str = "STOOP_S0_TEST_FLAG";
+        for value in ["", "0", "false", "no", "off", " FALSE ", "Off"] {
+            std::env::set_var(NAME, value);
+            assert!(!super::env_flag(NAME), "{value:?}");
+        }
+        for value in ["1", "true", "yes", "anything"] {
+            std::env::set_var(NAME, value);
+            assert!(super::env_flag(NAME), "{value:?}");
+        }
+        std::env::remove_var(NAME);
+        assert!(!super::env_flag(NAME));
+    }
 }
 
 #[cfg(test)]
@@ -713,11 +1025,13 @@ mod tests {
         let root = Path::new("/repo");
         let path = root.join(OsString::from_vec(b"dir-\x80".to_vec()));
         let mut trace = Trace::default();
-        trace.touched.insert(path.clone(), false);
-        let ignore = Ignore::new(&[], None);
-        assert!(build_inputs(root, &trace, &ignore).is_err());
+        trace.touched.insert(path.clone(), trace::Touch::default());
+        let ignore = Ignore::new(&[], None, &[]);
+        let mut phys = Physical::new(root, root);
+        let written = BTreeSet::new();
+        assert!(build_inputs(root, &mut phys, &trace, &ignore, &written).is_err());
         trace.touched.clear();
         trace.written.insert(path);
-        assert!(build_inputs(root, &trace, &ignore).is_err());
+        assert!(build_inputs(root, &mut phys, &trace, &ignore, &written).is_err());
     }
 }
