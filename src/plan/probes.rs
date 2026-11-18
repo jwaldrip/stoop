@@ -1020,7 +1020,7 @@ fn only_run_invariant_github_context_is_accepted() {
         let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
         record(&r, rec(&good, now, now)).unwrap();
         let o = plan(&r, &["--format", "json"], &[("STOOP_FULL", "")]);
-        assert_ne!(code(&o, "a"), "proved", "{expr}");
+        assert_eq!(code(&o, "a"), "blocked", "{expr}");
         assert!(o.plan["skip"].as_array().unwrap().is_empty(), "{expr}");
     }
 }
@@ -1057,7 +1057,7 @@ fn plan_environment_cannot_shadow_workflow_vars_or_secrets() {
         let safe = workflow("", "", "");
         record(&r, rec(&safe, now, now)).unwrap();
         let o = plan(&r, &["--format", "json"], &[("STOOP_FULL", "")]);
-        assert_ne!(code(&o, "a"), "proved", "{context}");
+        assert_eq!(code(&o, "a"), "error", "{context}");
         assert!(o.plan["skip"].as_array().unwrap().is_empty(), "{context}");
     }
 }
