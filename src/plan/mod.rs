@@ -347,3 +347,163 @@ fn build<S: attest::KeySource>(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::attest::tests as a;
+    use crate::job::{RecordStatus, StepHow, StepRecord};
+    use std::collections::BTreeMap;
+    use std::process::Command;
+
+    #[test]
+    fn injected_planner_proves_an_attested_record() {
+        if let Some(root) = std::env::var_os("STOOP_TEST_PLAN_CHILD") {
+            let root = PathBuf::from(root);
+            let args = vec![
+                "--workflow".into(),
+                ".github/workflows/ci.yml".into(),
+                "--format".into(),
+                "json".into(),
+            ];
+            let opts = parse(&args).unwrap().unwrap();
+            let mut plan = json!({"skip": [], "jobs": []});
+            build(
+                &opts,
+                &root,
+                ".github/workflows/ci.yml",
+                &mut plan,
+                |policy, now, age| {
+                    attest::Verifier::new(policy, a::Fixed(a::published()), now, age)
+                },
+            )
+            .unwrap();
+            assert_eq!(plan["skip"], json!(["a"]));
+            assert_eq!(plan["jobs"][0]["code"], "proved");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("stoop-injected-plan-{}", std::process::id()));
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        let workflow_text = "name: fixture\ndefaults:\n  run:\n    shell: stoop sh {0}\njobs:\n  stoop-plan:\n    runs-on: ubuntu-latest\n    steps: []\n  a:\n    needs: [stoop-plan]\n    if: ${{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',a,') }}\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@1111111111111111111111111111111111111111\n      - run: cat a.txt > /dev/null\n";
+        let path = ".github/workflows/ci.yml";
+        std::fs::write(root.join(path), workflow_text).unwrap();
+        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        for args in [
+            &["init", "-q"][..],
+            &["add", "."][..],
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.org",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-qm",
+                "fixture",
+            ][..],
+        ] {
+            assert!(Command::new("git")
+                .current_dir(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        }
+        let sha = String::from_utf8(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["rev-parse", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
+        let event = root.join("event.json");
+        std::fs::write(&event, r#"{"repository":{"default_branch":"main"}}"#).unwrap();
+        let workflow = gha::workflow::parse(path, workflow_text).unwrap();
+        let cx = gha::context::GhCtx::from_parts(BTreeMap::new(), Value::Null);
+        let spec = gha::workflow::job_spec(&workflow, &cx, "a", None);
+        let key = spec.key.as_deref().unwrap();
+        let step = match &spec.steps[1] {
+            StepSpec::Traced { key, .. } => key,
+            _ => panic!("expected traced step"),
+        };
+        let now = proof::now();
+        let proof = proof::Proof {
+            created: now,
+            argv: vec![],
+            env: BTreeMap::new(),
+            inputs: vec![input::Input {
+                path: "a.txt".into(),
+                id: format!("f:{}", blake3::hash(b"a\n").to_hex()),
+            }],
+            outputs: vec![],
+            removed: vec![],
+            ignore: Some(vec![]),
+            priors: Some(vec![]),
+            unplannable: vec![],
+            probes: BTreeMap::new(),
+        };
+        let store = root.join(".stoop");
+        proof::Store::new(store.clone())
+            .save(step, proof.clone())
+            .unwrap();
+        let mut record = a::record();
+        record.created = now;
+        record.started = now * 1000;
+        record.status = Some(RecordStatus::Passed);
+        record.commit = Some(sha.clone());
+        record.event_path = Some(event.to_string_lossy().into_owned());
+        record.actions = BTreeMap::from([(
+            "actions/checkout@1111111111111111111111111111111111111111".into(),
+            "1111111111111111111111111111111111111111".into(),
+        )]);
+        record.steps = vec![StepRecord {
+            key: step.clone(),
+            proof: proof.digest(),
+            how: StepHow::Ran,
+        }];
+        let mut claims = a::claims(&record);
+        claims["aud"] = json!(attest::audience(key, &record).unwrap());
+        claims["sha"] = json!(sha);
+        claims["iat"] = json!(now);
+        claims["nbf"] = json!(now);
+        record.attest = Some(a::token(
+            &a::header("test-key-1"),
+            &claims,
+            &a::pair(a::KEY_1),
+        ));
+        job::JobStore::new(store).save(key, record).unwrap();
+        let child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "plan::tests::injected_planner_proves_an_attested_record",
+                "--nocapture",
+            ])
+            .env("STOOP_TEST_PLAN_CHILD", &root)
+            .env("GITHUB_JOB", "stoop-plan")
+            .env("GITHUB_ACTIONS", "true")
+            .env("GITHUB_REPOSITORY", a::REPO)
+            .env("GITHUB_REPOSITORY_ID", a::REPO_ID)
+            .env("GITHUB_REPOSITORY_OWNER_ID", a::OWNER_ID)
+            .env("GITHUB_SHA", &sha)
+            .env("GITHUB_EVENT_PATH", &event)
+            .env_remove("STOOP_SYNC")
+            .env_remove("STOOP_FULL")
+            .env_remove("STOOP_ENV_SALT")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
