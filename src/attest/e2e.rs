@@ -33,7 +33,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@1111111111111111111111111111111111111111
       - run: |
           true
 ";
@@ -239,7 +239,7 @@ impl Repo {
                 std::env::remove_var("ACTIONS_ID_TOKEN_REQUEST_TOKEN");
             }
         }
-        let mut journal = Journal::open(&self.work, None)?.ok_or("journal is inactive")?;
+        let mut journal = Journal::open(&self.work, None, true)?.ok_or("journal is inactive")?;
         let key = traced_key(&planned(&env));
         journal.before(&key)?;
         let outcome = Outcome {

@@ -144,6 +144,8 @@ pub fn spec() -> JobSpec {
         if_text: None,
         steps: vec![],
         blocked: None,
+        actions: vec![],
+        images: vec![],
     }
 }
 
