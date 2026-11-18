@@ -479,6 +479,38 @@ mod tests {
     }
 
     #[test]
+    fn registered_wrappers_are_only_reported_when_a_runner_execs() {
+        for name in [
+            "npm", "pnpm", "yarn", "bun", "npx", "make", "just", "task", "mise", "tox", "nox",
+            "bundle",
+        ] {
+            let wrapper = event(None, name, &[name]);
+            assert!(diagnostic(&[wrapper]).is_none(), "{name}");
+            let events = vec![
+                event(None, name, &[name]),
+                event(Some(0), "jest", &["jest"]),
+            ];
+            assert_eq!(
+                diagnostic(&events),
+                Some(format!("stoop: observed jest via {name} (diagnostic only)"))
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_exec_images_have_no_diagnostic() {
+        let mut missing_cwd = event(None, "pytest", &["pytest"]);
+        missing_cwd.cwd = PathBuf::from("relative");
+        assert!(diagnostic(&[missing_cwd]).is_none());
+        let mut missing_executable = event(None, "pytest", &["pytest"]);
+        missing_executable.executable = PathBuf::from("relative");
+        assert!(diagnostic(&[missing_executable]).is_none());
+        let mut missing_args = event(None, "pytest", &["pytest"]);
+        missing_args.effective_argv.clear();
+        assert!(diagnostic(&[missing_args]).is_none());
+    }
+
+    #[test]
     fn separate_branches_never_borrow_each_others_wrappers() {
         let events = vec![
             event(None, "sh", &["sh", "-c", "npm test; pytest"]),
