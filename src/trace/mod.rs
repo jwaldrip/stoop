@@ -68,6 +68,8 @@ impl Provenance {
 pub struct Trace {
     /// Every path the process tree looked at, lexically resolved.
     pub touched: HashMap<PathBuf, Touch>,
+    /// Repository symlinks whose targets passed through a proc magic link at entry.
+    pub magic_links: HashSet<PathBuf>,
     /// Paths the run wrote, renamed, removed or created, as the run named them.
     /// These are outputs, not inputs.
     pub written: HashSet<PathBuf>,

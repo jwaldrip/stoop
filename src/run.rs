@@ -892,6 +892,9 @@ pub fn build_inputs(
     // A symlink hides a second file: record where it points, whether or not the link is
     // ignored (an alias under an ignored /tmp can point into the repository).
     for lex in trace.touched.keys() {
+        if trace.magic_links.contains(lex) {
+            continue;
+        }
         if !std::fs::symlink_metadata(lex).is_ok_and(|m| m.file_type().is_symlink()) {
             continue;
         }

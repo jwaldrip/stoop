@@ -1121,6 +1121,7 @@ impl Tracer<'_> {
         let mut current = PathBuf::from("/");
         let mut magic = false;
         let mut links = 0;
+        let mut repository_links = Vec::new();
         while let Some(part) = parts.pop_front() {
             if part.as_bytes() == b".." {
                 current.pop();
@@ -1152,6 +1153,7 @@ impl Tracer<'_> {
             } else if let Some(rec) = &self.rec {
                 if current.starts_with(rec.phys.real()) {
                     self.t.touched.entry(current.clone()).or_default().read = true;
+                    repository_links.push(current.clone());
                 }
             }
             let target = match fs::read_link(&current) {
@@ -1189,6 +1191,7 @@ impl Tracer<'_> {
         }
         self.magic_cache.insert(parent, (self.magic_epoch, magic));
         if magic {
+            self.t.magic_links.extend(repository_links);
             Some(current)
         } else {
             Some(raw)

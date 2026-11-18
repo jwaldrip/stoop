@@ -1009,3 +1009,27 @@ fn retargeting_a_release_link_via_another_alias_records_the_new_target() {
         pairs(&p, "outputs")
     );
 }
+
+#[test]
+fn chained_magic_symlinks_do_not_resolve_again_in_the_recorder() {
+    let w = Ws::new("chained-proc-link");
+    w.write("config.txt", "root copy");
+    w.write("sub/config.txt", "tracee copy");
+    std::os::unix::fs::symlink("link-b", w.root.join("link-a")).unwrap();
+    std::os::unix::fs::symlink("/proc/self/cwd/config.txt", w.root.join("link-b")).unwrap();
+    let p = recorded(&w, "cd sub && cat ../link-a >/dev/null");
+    let inputs = pairs(&p, "inputs");
+    assert!(
+        inputs.contains(&(
+            "sub/config.txt".into(),
+            format!("f:{}", hash(b"tracee copy"))
+        )),
+        "{inputs:?}"
+    );
+    assert!(
+        !inputs
+            .iter()
+            .any(|(path, _)| path == "config.txt" || path.is_empty()),
+        "{inputs:?}"
+    );
+}
