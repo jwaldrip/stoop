@@ -252,7 +252,7 @@ fn cwd_key(s: &str) -> Result<String, String> {
             _ => return Err("absolute working-directory".into()),
         }
     }
-    Ok(parts.join("/"))
+    Ok(parts.join("/").replace('%', "%25"))
 }
 fn shell(s: &str) -> Result<Option<u64>, String> {
     let words: Vec<_> = s.split_whitespace().collect();
@@ -701,7 +701,7 @@ fn step_key(
         if shell_text.split_whitespace().take(2).eq(["stoop", "sh"]) {
             let age = shell(shell_text)?.or(env_age);
             let key =
-                crate::stepkey::sh_key(run.as_bytes(), identity.0, identity.1, &cwd_key(wd)?, leg);
+                crate::stepkey::sh_key(run.as_bytes(), identity.0, identity.1, &cwd_key(wd)?, &[], leg);
             return Ok(Some((
                 json!({"traced":{"key":key,"if":true,"env":e,"shell":shell_text,"working-directory":wd}}),
                 StepSpec::Traced {
@@ -811,7 +811,7 @@ mod tests {
         match &s.steps[1] {
             StepSpec::Traced { key, .. } => assert_eq!(
                 *key,
-                crate::stepkey::sh_key(b"cargo test", "fixture", "test", "", None)
+                crate::stepkey::sh_key(b"cargo test", "fixture", "test", "", &[], None)
             ),
             _ => panic!("not traced"),
         }
@@ -822,7 +822,7 @@ mod tests {
         match &s.steps[1] {
             StepSpec::Traced { key, .. } => assert_eq!(
                 *key,
-                crate::stepkey::sh_key(b"cargo test", "fixture", "test", "app", None)
+                crate::stepkey::sh_key(b"cargo test", "fixture", "test", "app", &[], None)
             ),
             _ => panic!("not traced"),
         }

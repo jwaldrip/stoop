@@ -841,3 +841,53 @@ fn reading_written_file_through_outside_directory_alias_is_unplannable() {
     let _ = fs::remove_file(alias);
     assert!(has_reason(&p, "and also wrote it"), "{:?}", reasons(&p));
 }
+
+#[test]
+fn replacing_an_ignored_directory_invalidates_cached_parents() {
+    let w = Ws::new("ignored-cache-replace");
+    w.write(".stoopignore", "build/\n");
+    w.write("src/out", "original");
+    fs::create_dir_all(w.root.join("build/x")).unwrap();
+    let p = recorded(&w, "echo a > build/x/f; rm -r build/x; ln -s ../src build/x; echo y > build/x/out");
+    assert!(pairs(&p, "outputs").iter().any(|(key, _)| key == "src/out"), "{:?}", pairs(&p, "outputs"));
+    assert!(has_reason(&p, "symlink build/x"), "{:?}", reasons(&p));
+}
+
+#[test]
+fn replacing_an_outside_alias_invalidates_cached_parents() {
+    let w = Ws::new("outside-alias-replace");
+    w.write("sub/keep", "k");
+    let alias = std::env::temp_dir().join(format!("stoop-retarget-alias-{}", std::process::id()));
+    let _ = fs::remove_file(&alias);
+    std::os::unix::fs::symlink(&w.root, &alias).unwrap();
+    let script = format!("echo a > {0}/f; rm {0}; ln -s {1}/sub {0}; echo b > {0}/g", alias.display(), w.root.display());
+    let p = recorded(&w, &script);
+    let _ = fs::remove_file(alias);
+    assert!(pairs(&p, "outputs").iter().any(|(key, _)| key == "sub/g"), "{:?}", pairs(&p, "outputs"));
+}
+
+#[test]
+fn reopening_pipe_descriptors_is_recordable() {
+    for (name, directory) in [("dev", "/dev/fd"), ("thread", "/proc/thread-self/fd")] {
+        let w = Ws::new(&format!("pipe-{name}"));
+        w.syscall_probe();
+        let p = recorded(&w, &format!("./syscall-probe pipe-fd {directory}"));
+        assert!(reasons(&p).is_empty(), "{:?}", reasons(&p));
+    }
+}
+
+#[test]
+fn fchdir_then_relative_open_is_an_input() {
+    let w = Ws::new("fchdir");
+    w.syscall_probe();
+    w.write("sub/f", "old");
+    let p = recorded(&w, "./syscall-probe fchdir sub");
+    assert!(pairs(&p, "inputs").contains(&("sub/f".into(), format!("f:{}", hash(b"old")))), "{:?}", pairs(&p, "inputs"));
+}
+
+#[test]
+fn read_only_proc_self_cwd_is_an_input() {
+    let w = Ws::new("read-only-proc");
+    let p = recorded(&w, "cat /proc/self/cwd/in.txt >/dev/null");
+    assert!(pairs(&p, "inputs").contains(&("in.txt".into(), format!("f:{}", hash(b"one")))), "{:?}", pairs(&p, "inputs"));
+}

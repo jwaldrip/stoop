@@ -904,6 +904,8 @@ mod tests {
         Proof {
             created: 90,
             argv: vec![],
+            cwd: Some(String::new()),
+            scope: None,
             env: BTreeMap::new(),
             inputs,
             outputs: vec![],

@@ -13,7 +13,7 @@ use super::{Scope, Trace};
 use crate::ignore::Ignore;
 use crate::input::{file_id, hash_file};
 use crate::pathutil::{absolutize, to_key, Physical};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ffi::{CString, OsString};
 use std::fs;
 use std::io;
@@ -440,11 +440,15 @@ struct Rec<'a> {
     /// The root as the user spelled it; keys in reasons are relative to it.
     root: PathBuf,
     hashed: u64,
+    link_walks: BTreeMap<PathBuf, Vec<PathBuf>>,
 }
 
 struct Tracer<'a> {
     ops: HashMap<i64, Vec<Op>>,
     cwds: HashMap<i32, PathBuf>,
+    magic_epoch: u64,
+    magic_cache: HashMap<PathBuf, (u64, bool)>,
+    syscall: i64,
     allow_network: bool,
     /// Present when priors are recorded (not with `--no-record`).
     rec: Option<Rec<'a>>,
@@ -505,11 +509,15 @@ pub fn run<'a>(
         ops: tbl.into_iter().collect(),
         cwds: HashMap::new(),
         allow_network,
+        magic_epoch: 0,
+        magic_cache: HashMap::new(),
+        syscall: 0,
         rec: scope.map(|s| Rec {
             phys: Physical::new(s.root, &s.real_root),
             ignore: s.ignore,
             root: s.root.to_path_buf(),
             hashed: 0,
+            link_walks: BTreeMap::new(),
         }),
         t: Trace {
             status: 1,
@@ -674,6 +682,25 @@ fn is_dir(p: &Path) -> bool {
     fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
 }
 
+fn proc_magic_link(path: &Path) -> bool {
+    let parts: Vec<&str> = path.iter().filter_map(|part| part.to_str()).collect();
+    if parts.len() < 4 || parts[1] != "proc" || !parts[2].bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let mut index = 3;
+    if parts.get(index) == Some(&"task") {
+        if !parts.get(index + 1).is_some_and(|s| s.bytes().all(|b| b.is_ascii_digit())) {
+            return false;
+        }
+        index += 2;
+    }
+    match parts.get(index) {
+        Some(&"cwd" | &"root" | &"exe") => parts.len() == index + 1,
+        Some(&"fd" | &"map_files") => parts.len() == index + 2,
+        _ => false,
+    }
+}
+
 /// A reason the planner cannot replay the run. The first one also stops content hashing.
 fn push_reason(t: &mut Trace, why: String) {
     if t.unplannable.len() < MAX_REASONS && !t.unplannable.contains(&why) {
@@ -708,10 +735,14 @@ impl Rec<'_> {
 
     /// Follow each parent component in kernel order. A preceding outside alias may enter
     /// the repository before another symlink is encountered; `..` follows link targets.
-    fn links_below_root(&self, raw: &Path) -> Option<Vec<PathBuf>> {
+    fn links_below_root(&mut self, raw: &Path) -> Option<Vec<PathBuf>> {
         use std::collections::VecDeque;
         use std::ffi::OsString;
         use std::os::unix::ffi::OsStrExt;
+        let parent = raw.parent()?.to_path_buf();
+        if let Some(cached) = self.link_walks.get(&parent) {
+            return Some(cached.clone());
+        }
         let mut parts: VecDeque<OsString> = raw
             .parent()?
             .as_os_str()
@@ -754,13 +785,25 @@ impl Rec<'_> {
                 }
             }
         }
+        self.link_walks.insert(parent, found.clone());
         Some(found)
+    }
+
+    fn forget_walks(&mut self, path: &Path) {
+        let keys: Vec<PathBuf> = self.link_walks.range(path.to_path_buf()..)
+            .take_while(|(key, _)| key.starts_with(path))
+            .map(|(key, _)| key.clone()).collect();
+        for key in keys { self.link_walks.remove(&key); }
     }
 
     /// Record a write to `raw` (absolute, possibly with `..`). `follows` indicates
     /// whether a symlink at `raw` is followed. Returns the key when in scope.
     fn write(&mut self, t: &mut Trace, raw: &Path, follows: bool) -> Option<String> {
         let lex = absolutize(Path::new("/"), raw);
+        self.forget_walks(&lex);
+        self.forget_walks(raw);
+        self.phys.forget(&lex);
+        self.phys.forget(raw);
         let mut target = raw.to_path_buf();
         if follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink()) {
             // The write lands on the link's target, which is not named here. A link whose
@@ -783,15 +826,14 @@ impl Rec<'_> {
             target = resolved?;
         }
         let loc = self.phys.locate(&target)?;
+        self.forget_walks(&loc.path);
+        self.phys.forget(&loc.path);
         let key = self.key_of(&loc.path, t)?;
         for link in self.links_below_root(raw).unwrap_or_default() {
             let name = to_key(self.phys.real(), &link);
             t.touched.entry(link).or_default().read = true;
             push_reason(t, format!("it wrote through the symlink {name}"));
         }
-        self.phys.forget(&lex);
-        self.phys.forget(raw);
-        self.phys.forget(&loc.path);
         if !t.priors.contains_key(&key) {
             // A create fails when its parent is missing or is not a directory. A later commit
             // that adds the parent would change that outcome, so the parent's state is recorded.
@@ -903,6 +945,77 @@ impl Tracer<'_> {
         Some(c)
     }
 
+    /// Resolve proc magic links in the tracee's namespace, not stoop's own `/proc/self`.
+    /// Ordinary names remain as written so the regular link walker can track their links.
+    fn map_magic_path(&mut self, pid: i32, raw: PathBuf) -> Option<PathBuf> {
+        use std::collections::VecDeque;
+        use std::os::unix::ffi::OsStrExt;
+        if self.rec.is_none() {
+            return Some(raw);
+        }
+        let parent = raw.parent()?.to_path_buf();
+        if self.magic_cache.get(&parent) == Some(&(self.magic_epoch, false))
+            && !fs::symlink_metadata(&raw).is_ok_and(|m| m.file_type().is_symlink())
+        {
+            return Some(raw);
+        }
+        let mut parts: VecDeque<OsString> = raw.as_os_str().as_bytes().split(|b| *b == b'/')
+            .filter(|part| !part.is_empty() && *part != b".")
+            .map(|part| OsString::from_vec(part.to_vec())).collect();
+        let mut current = PathBuf::from("/");
+        let mut magic = false;
+        let mut links = 0;
+        while let Some(part) = parts.pop_front() {
+            if part.as_bytes() == b".." {
+                current.pop();
+                continue;
+            }
+            if current == Path::new("/proc") && (part.as_bytes() == b"self" || part.as_bytes() == b"thread-self") {
+                current.push(pid.to_string());
+            } else {
+                current.push(part);
+            }
+            if !fs::symlink_metadata(&current).is_ok_and(|m| m.file_type().is_symlink()) {
+                continue;
+            }
+            links += 1;
+            if links > 40 {
+                self.flag("too many links while resolving a path");
+                return None;
+            }
+            let special = proc_magic_link(&current);
+            if special {
+                magic = true;
+            } else if let Some(rec) = &self.rec {
+                if current.starts_with(rec.phys.real()) {
+                    self.t.touched.entry(current.clone()).or_default().read = true;
+                }
+            }
+            let target = match fs::read_link(&current) {
+                Ok(target) => target,
+                Err(_) if special => {
+                    self.flag("could not resolve a process path alias");
+                    return None;
+                }
+                Err(_) => return Some(raw),
+            };
+            if special && (!target.is_absolute() || target.as_os_str().as_bytes().ends_with(b" (deleted)")) {
+                if self.syscall == libc::SYS_linkat as i64 && target.as_os_str().as_bytes().ends_with(b" (deleted)") {
+                    self.flag("it accessed an unkeyable descriptor alias");
+                }
+                return None;
+            }
+            current.pop();
+            if target.is_absolute() { current = PathBuf::from("/"); }
+            let expanded: Vec<OsString> = target.as_os_str().as_bytes().split(|b| *b == b'/')
+                .filter(|part| !part.is_empty() && *part != b".")
+                .map(|part| OsString::from_vec(part.to_vec())).collect();
+            for part in expanded.into_iter().rev() { parts.push_front(part); }
+        }
+        self.magic_cache.insert(parent, (self.magic_epoch, magic));
+        if magic { Some(current) } else { Some(raw) }
+    }
+
     /// The path a call names, joined onto its directory. Not normalized: the kernel
     /// resolves `..` through symlinks, and so must the physical lookups.
     fn resolve(
@@ -932,34 +1045,7 @@ impl Tracer<'_> {
         }
         let p = PathBuf::from(OsString::from_vec(raw));
         if p.is_absolute() {
-            if p.starts_with("/dev/fd") || p.starts_with("/proc/self/fd") {
-                self.flag("it accessed an unkeyable descriptor alias");
-                return None;
-            }
-            for name in ["cwd", "root"] {
-                let prefix = format!("/proc/self/{name}");
-                if let Ok(rest) = p.strip_prefix(&prefix) {
-                    return match std::fs::read_link(format!("/proc/{pid}/{name}")) {
-                        Ok(base) => Some(base.join(rest)),
-                        Err(_) => {
-                            self.flag("could not resolve the traced process path alias");
-                            None
-                        }
-                    };
-                }
-            }
-            if let Ok(rest) = p.strip_prefix("/proc") {
-                let mut parts = rest.components();
-                let first = parts.next().and_then(|c| c.as_os_str().to_str());
-                let second = parts.next().and_then(|c| c.as_os_str().to_str());
-                if first.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
-                    && matches!(second, Some("cwd" | "root" | "fd"))
-                {
-                    self.flag("it accessed an unkeyable process path alias");
-                    return None;
-                }
-            }
-            return Some(p);
+            return self.map_magic_path(pid, p);
         }
         let base = match dirfd.map(|i| args[i] as i32) {
             None | Some(AT_FDCWD) => self.cwd(pid),
@@ -970,7 +1056,7 @@ impl Tracer<'_> {
                 self.flag("it accessed a deleted directory through a file descriptor");
                 None
             }
-            Some(b) => Some(b.join(&p)),
+            Some(b) => self.map_magic_path(pid, b.join(&p)),
             None => {
                 self.flag("could not resolve a relative path");
                 None
@@ -979,7 +1065,7 @@ impl Tracer<'_> {
     }
 
     fn touch(&mut self, lex: PathBuf, read: bool) {
-        if let Some(rec) = &self.rec {
+        if let Some(rec) = &mut self.rec {
             for link in rec.links_below_root(&lex).unwrap_or_default() {
                 self.t.touched.entry(link).or_default().read = true;
             }
@@ -987,9 +1073,37 @@ impl Tracer<'_> {
         self.t.touched.entry(lex).or_default().read |= read;
     }
 
+    /// Linux opens a shebang interpreter in the kernel, without a traceable open syscall.
+    fn exec_path(&mut self, pid: i32, path: PathBuf) {
+        use std::io::Read;
+        self.touch(path.clone(), true);
+        let mut bytes = [0u8; 256];
+        let Ok(mut file) = fs::File::open(&path) else { return };
+        let Ok(n) = file.read(&mut bytes) else { return };
+        let Some(rest) = bytes[..n].strip_prefix(b"#!") else { return };
+        let rest = rest.split(|b| *b == b'\n').next().unwrap_or_default();
+        let start = rest.iter().position(|b| !matches!(*b, b' ' | b'\t'));
+        let Some(start) = start else { return };
+        let name = rest[start..].split(|b| matches!(*b, b' ' | b'\t' | b'\r')).next().unwrap_or_default();
+        if name.is_empty() { return; }
+        let interpreter = PathBuf::from(OsString::from_vec(name.to_vec()));
+        let absolute = if interpreter.is_absolute() {
+            interpreter
+        } else if let Some(cwd) = self.cwd(pid) {
+            cwd.join(interpreter)
+        } else {
+            self.flag("could not resolve a shebang interpreter");
+            return;
+        };
+        if let Some(interpreter) = self.map_magic_path(pid, absolute) {
+            self.touch(interpreter, true);
+        }
+    }
+
     /// Record a write, and what the path held before the first one. Returns the key when in scope.
     fn write(&mut self, raw: &Path, follows: bool) -> Option<String> {
         self.rec.as_ref()?;
+        self.magic_epoch = self.magic_epoch.wrapping_add(1);
         // A write through a link changes what the link points to, not the link itself.
         let through_link =
             follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink());
@@ -1096,9 +1210,13 @@ impl Tracer<'_> {
                 self.touch(p, false);
                 return;
             }
-            self.t.created_dirs.push(absolutize(Path::new("/"), &p));
         }
         self.write(&p, false);
+        if dir {
+            if let Some(loc) = self.rec.as_mut().and_then(|r| r.phys.locate(&p)) {
+                self.t.created_dirs.push(loc.path);
+            }
+        }
     }
 
     fn remove(
@@ -1179,6 +1297,7 @@ impl Tracer<'_> {
             return;
         };
         let (nr, args) = decode(&regs);
+        self.syscall = nr;
         let Some(ops) = self.ops.get(&nr).cloned() else {
             self.flag(
                 "it ran code under a foreign syscall ABI (32-bit) that the tracer cannot follow",
@@ -1188,9 +1307,14 @@ impl Tracer<'_> {
         for op in ops {
             match op {
                 Op::Open { dirfd, path, flags } => self.open(pid, &args, dirfd, path, flags),
-                Op::Look { dirfd, path } | Op::Exec { dirfd, path } => {
+                Op::Look { dirfd, path } => {
                     if let Some(p) = self.resolve(pid, &args, dirfd, path) {
                         self.touch(p, true);
+                    }
+                }
+                Op::Exec { dirfd, path } => {
+                    if let Some(p) = self.resolve(pid, &args, dirfd, path) {
+                        self.exec_path(pid, p);
                     }
                 }
                 Op::List => {

@@ -1008,5 +1008,107 @@ fn write_through_link_dotdot_does_not_hide_a_different_input() {
     assert!(!skipped(&err), "{err}");
 }
 
+#[test]
+fn mkdir_through_link_dotdot_does_not_hide_a_different_directory_input() {
+    let w = Ws::new("mkdir-dotdot-input");
+    w.write("sub/inner/keep", "k");
+    w.write("gen/config", "old");
+    std::os::unix::fs::symlink("sub/inner", w.root.join("link")).unwrap();
+    let script = "mkdir link/../gen; cat gen/config > out.txt";
+    assert_eq!(w.sh(script).0, 0);
+    w.write("gen/config", "new");
+    let (_, err) = w.sh(script);
+    assert!(!skipped(&err), "{err}");
+}
+
+#[test]
+fn proc_cwd_alias_reads_recheck_the_actual_file() {
+    for (name, script) in [
+        ("self", "cat /proc/self/cwd/in.txt >/dev/null"),
+        ("thread", "cat /proc/thread-self/cwd/in.txt >/dev/null"),
+        ("root", "cat /proc/thread-self/root$PWD/in.txt >/dev/null"),
+        ("task", "cat /proc/$$/task/$$/cwd/in.txt >/dev/null"),
+        ("dotdot", "cat /proc/self/../$$/cwd/in.txt >/dev/null"),
+        ("relative", "P=$$; (cd /proc && cat $P/cwd/in.txt >/dev/null)"),
+    ] {
+        let w = Ws::new(&format!("proc-{name}"));
+        let (status, first) = w.sh(script);
+        assert_eq!(status, 0, "{name}: {first}");
+        assert!(first.contains("recorded"), "{name}: {first}");
+        w.write("in.txt", "changed");
+        let (_, second) = w.sh(script);
+        assert!(!skipped(&second), "{name}: {second}");
+    }
+}
+
+#[test]
+fn proc_thread_cwd_write_is_recorded_as_output() {
+    let w = Ws::new("proc-thread-write");
+    let script = "cat in.txt > /proc/thread-self/cwd/out.txt";
+    assert_eq!(w.sh(script).0, 0);
+    fs::remove_file(w.root.join("out.txt")).unwrap();
+    let (_, err) = w.sh(script);
+    assert!(!skipped(&err), "{err}");
+}
+
+#[test]
+fn same_process_chdir_then_relative_open_is_tracked() {
+    let w = Ws::new("chdir-relative");
+    w.write("sub/f", "old");
+    let script = "cd sub; : < f";
+    assert_eq!(w.sh(script).0, 0);
+    w.write("sub/f", "new");
+    let (_, err) = w.sh(script);
+    assert!(!skipped(&err), "{err}");
+}
+
+#[test]
+fn process_substitution_is_recordable() {
+    let w = Ws::new("process-substitution");
+    let (status, err) = w.sh("bash -c 'cat <(echo hello) >/dev/null'");
+    assert_eq!(status, 0, "{err}");
+    assert!(err.contains("stoop: recorded"), "{err}");
+}
+
+#[test]
+fn reopened_regular_descriptor_is_recorded() {
+    let w = Ws::new("regular-descriptor");
+    let script = "exec 3< in.txt; cat /proc/self/fd/3 >/dev/null";
+    let (status, first) = w.sh(script);
+    assert_eq!(status, 0, "{first}");
+    assert!(first.contains("stoop: recorded"), "{first}");
+    w.write("in.txt", "changed");
+    let (_, second) = w.sh(script);
+    assert!(!skipped(&second), "{second}");
+}
+
+#[test]
+fn cargo_build_with_jobserver_descriptors_is_recordable() {
+    let w = Ws::new("cargo-jobserver");
+    w.write("Cargo.toml", "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    w.write("src/main.rs", "fn main() {}\n");
+    w.write(".stoopignore", "target/\n");
+    let (status, err) = w.sh("cargo build --offline");
+    assert_eq!(status, 0, "{err}");
+    assert!(err.contains("stoop: recorded"), "{err}");
+}
+
+#[test]
+fn changing_a_repository_shebang_interpreter_reruns() {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    let w = Ws::new("shebang-interpreter");
+    fs::copy("/bin/sh", w.root.join("interp")).unwrap();
+    w.write("script", "#!./interp\necho hello\n");
+    fs::set_permissions(w.root.join("script"), fs::Permissions::from_mode(0o755)).unwrap();
+    let script = "./script";
+    let (status, err) = w.sh(script);
+    assert_eq!(status, 0, "{err}");
+    assert!(skipped(&w.sh(script).1));
+    fs::OpenOptions::new().append(true).open(w.root.join("interp")).unwrap().write_all(&[0]).unwrap();
+    let (_, err) = w.sh(script);
+    assert!(!skipped(&err), "{err}");
+}
+
 #[allow(dead_code)]
 fn _unused(_: &Path) {}

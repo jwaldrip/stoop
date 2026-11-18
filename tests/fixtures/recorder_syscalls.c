@@ -11,6 +11,27 @@
 int main(int argc, char **argv) {
     if (argc < 3) return 2;
     const char *op = argv[1];
+    if (!strcmp(op, "pipe-fd")) {
+        int pipefds[2];
+        if (pipe(pipefds)) return 3;
+        char name[64];
+        snprintf(name, sizeof(name), "%s/%d", argv[2], pipefds[0]);
+        int reopened = open(name, O_RDONLY);
+        if (reopened < 0) return 4;
+        close(reopened);
+        close(pipefds[0]);
+        close(pipefds[1]);
+        return 0;
+    }
+    if (!strcmp(op, "fchdir")) {
+        int fd = open(argv[2], O_RDONLY | O_DIRECTORY);
+        if (fd < 0 || fchdir(fd)) return 3;
+        close(fd);
+        fd = open("f", O_RDONLY);
+        if (fd < 0) return 4;
+        close(fd);
+        return 0;
+    }
     if (!strcmp(op, "tmp")) {
         int fd = open(argv[2], O_TMPFILE | O_WRONLY, 0600);
         if (fd < 0) return 3;
