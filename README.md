@@ -110,6 +110,12 @@ stoop explain -- cargo test    # say what would run and why (exit 1 if it would 
 stoop ls                       # list proofs
 ```
 
+On a traced `stoop run`, a recognized test, lint or build runner may produce a
+line such as `stoop: observed jest via npm (diagnostic only)`. This names
+successful launches seen through wrappers. It does not change the command or
+split its tests, and the observation is not saved in the proof. Warm skips,
+`--quiet`, `--no-record`, `stoop sh`, and `stoop explain` omit the line.
+
 ## What it sees, and what it can't
 
 | Counts as an input | How |

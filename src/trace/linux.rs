@@ -9,7 +9,7 @@
 //! except for priors: what a path held before the run first wrote it is read at the
 //! same stop, because the write is about to change it.
 
-use super::{Scope, Trace};
+use super::{ExecEvent, Scope, Trace};
 use crate::ignore::Ignore;
 use crate::input::{file_id, hash_file};
 use crate::pathutil::{absolutize, to_key, without_dots, Physical};
@@ -50,6 +50,13 @@ const MAX_FILE_BYTES: u64 = 8 << 20;
 const MAX_RUN_BYTES: u64 = 256 << 20;
 /// Same cap as the tracer's other reasons.
 const MAX_REASONS: usize = 16;
+
+// Observation is informational, so an unreadable or oversized chain is discarded without
+// affecting the legacy trace or the command. Bounds include live tasks as well as execs.
+const MAX_EXEC_EVENTS: usize = 1024;
+const MAX_EXEC_TASKS: usize = 1024;
+const MAX_EXEC_ARGS: usize = 128;
+const MAX_EXEC_ARG_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -519,6 +526,7 @@ struct Tracer<'a> {
     allow_network: bool,
     /// Present when priors are recorded (not with `--no-record`).
     rec: Option<Rec<'a>>,
+    execs: Option<ExecObserver>,
     t: Trace,
 }
 
@@ -527,6 +535,7 @@ pub fn run<'a>(
     cwd: &Path,
     allow_network: bool,
     scope: Option<&Scope<'a>>,
+    observe_execs: bool,
 ) -> io::Result<Trace> {
     if argv.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty command"));
@@ -582,6 +591,7 @@ pub fn run<'a>(
         magic_cache: HashMap::new(),
         pending_topology: HashSet::new(),
         syscall: 0,
+        execs: observe_execs.then(|| ExecObserver::new(pid)),
         rec: scope.map(|s| Rec {
             phys: Physical::new(s.root, &s.real_root),
             ignore: s.ignore,
@@ -637,12 +647,18 @@ pub fn run<'a>(
                 Some(libc::ECHILD) => {
                     if !root_finished {
                         tr.flag("tracer wait ended before the command exit status was observed");
+                        if let Some(execs) = &mut tr.execs {
+                            execs.invalidate();
+                        }
                     }
                     break;
                 }
                 Some(libc::EINTR) => continue,
                 _ => {
                     tr.flag(&format!("tracer wait failed: {err}"));
+                    if let Some(execs) = &mut tr.execs {
+                        execs.invalidate();
+                    }
                     if wait_failed {
                         if !root_finished {
                             tr.t.status = kill_and_reap(pid).unwrap_or(1);
@@ -667,6 +683,9 @@ pub fn run<'a>(
                 root_finished = true;
             }
             tr.cwds.remove(&p);
+            if let Some(execs) = &mut tr.execs {
+                execs.exit(p);
+            }
             continue;
         }
         if libc::WIFSIGNALED(st) {
@@ -675,6 +694,9 @@ pub fn run<'a>(
                 root_finished = true;
             }
             tr.cwds.remove(&p);
+            if let Some(execs) = &mut tr.execs {
+                execs.exit(p);
+            }
             continue;
         }
         if !libc::WIFSTOPPED(st) {
@@ -695,9 +717,26 @@ pub fn run<'a>(
                 tr.on_syscall(p);
                 resume(p, 0, tr.pending_topology.contains(&p));
             }
+            e if matches!(
+                e,
+                libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE
+            ) =>
+            {
+                if let Some(execs) = &mut tr.execs {
+                    execs.fork(p);
+                }
+                cont(p, 0);
+            }
+            e if e == libc::PTRACE_EVENT_EXEC => {
+                if let Some(execs) = &mut tr.execs {
+                    execs.exec(p);
+                }
+                cont(p, 0);
+            }
             _ => cont(p, 0),
         }
     }
+    tr.t.execs = tr.execs.and_then(ExecObserver::finish);
     Ok(tr.t)
 }
 
@@ -787,6 +826,193 @@ fn read_cstr(pid: i32, addr: u64) -> Option<Vec<u8>> {
     let end = buf.iter().position(|&b| b == 0)?;
     buf.truncate(end);
     Some(buf)
+}
+struct PendingExec {
+    requested: PathBuf,
+    argv: Vec<OsString>,
+}
+
+struct ExecObserver {
+    // The current image for each traced task; a fork inherits its parent's image.
+    tasks: HashMap<i32, Option<usize>>,
+    pending: HashMap<i32, Option<PendingExec>>,
+    events: Vec<ExecEvent>,
+    valid: bool,
+}
+
+impl ExecObserver {
+    fn new(root: i32) -> Self {
+        Self {
+            tasks: HashMap::from([(root, None)]),
+            pending: HashMap::new(),
+            events: Vec::new(),
+            valid: true,
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.valid = false;
+        self.tasks.clear();
+        self.pending.clear();
+        self.events.clear();
+    }
+
+    fn enter(&mut self, pid: i32, nr: i64, args: &[u64; 6]) {
+        if !self.valid {
+            return;
+        }
+        if !self.tasks.contains_key(&pid) {
+            self.invalidate();
+            return;
+        }
+        let (path, argv) = if nr == libc::SYS_execve {
+            (args[0], args[1])
+        } else {
+            (args[1], args[2])
+        };
+        let candidate = read_cstr(pid, path).and_then(|path| {
+            read_exec_argv(pid, argv).map(|argv| PendingExec {
+                requested: PathBuf::from(OsString::from_vec(path)),
+                argv,
+            })
+        });
+        // A failed PATH lookup never gets an exec event. Only the candidate associated
+        // with a successful PTRACE_EVENT_EXEC is promoted into the observation.
+        self.pending.insert(pid, candidate);
+    }
+
+    fn fork(&mut self, parent: i32) {
+        if !self.valid {
+            return;
+        }
+        let child = event_message(parent);
+        let inherited = self.tasks.get(&parent).copied();
+        match (child, inherited) {
+            (Some(child), Some(image)) if self.tasks.len() < MAX_EXEC_TASKS => {
+                self.tasks.insert(child, image);
+                self.pending.remove(&child);
+            }
+            _ => self.invalidate(),
+        }
+    }
+
+    fn exec(&mut self, pid: i32) {
+        if !self.valid {
+            return;
+        }
+        // A non-leader thread takes the leader's TID at exec. Linux reports its former
+        // TID in the event message, which identifies the pending entry and ancestry.
+        let Some(former) = event_message(pid) else {
+            self.invalidate();
+            return;
+        };
+        let Some(parent) = self.tasks.remove(&former) else {
+            self.invalidate();
+            return;
+        };
+        let Some(Some(pending)) = self.pending.remove(&former) else {
+            self.invalidate();
+            return;
+        };
+        if former != pid {
+            self.tasks.remove(&pid);
+            self.pending.remove(&pid);
+        }
+        let Some((executable, effective_argv, cwd)) = exec_image(pid) else {
+            self.invalidate();
+            return;
+        };
+        if self.events.len() >= MAX_EXEC_EVENTS {
+            self.invalidate();
+            return;
+        }
+        let index = self.events.len();
+        self.events.push(ExecEvent {
+            parent,
+            requested: pending.requested,
+            argv: pending.argv,
+            executable,
+            effective_argv,
+            cwd,
+        });
+        self.tasks.insert(pid, Some(index));
+    }
+
+    fn exit(&mut self, pid: i32) {
+        self.tasks.remove(&pid);
+        self.pending.remove(&pid);
+    }
+
+    fn finish(self) -> Option<Vec<ExecEvent>> {
+        self.valid.then_some(self.events)
+    }
+}
+
+fn event_message(pid: i32) -> Option<i32> {
+    let mut value = 0u64;
+    let result = unsafe {
+        libc::ptrace(
+            libc::PTRACE_GETEVENTMSG as _,
+            pid,
+            0,
+            &mut value as *mut u64,
+        )
+    };
+    if result < 0 {
+        None
+    } else {
+        i32::try_from(value).ok()
+    }
+}
+
+fn read_exec_argv(pid: i32, address: u64) -> Option<Vec<OsString>> {
+    if address == 0 {
+        return Some(Vec::new());
+    }
+    let pointers = read_mem(pid, address, (MAX_EXEC_ARGS + 1) * 8)?;
+    let mut argv = Vec::new();
+    let mut bytes = 0;
+    for raw in pointers.chunks_exact(8).take(MAX_EXEC_ARGS + 1) {
+        let pointer = u64::from_ne_bytes(raw.try_into().ok()?);
+        if pointer == 0 {
+            return Some(argv);
+        }
+        if argv.len() == MAX_EXEC_ARGS {
+            return None;
+        }
+        let mut arg = read_mem(pid, pointer, MAX_EXEC_ARG_BYTES.checked_sub(bytes)? + 1)?;
+        let end = arg.iter().position(|byte| *byte == 0)?;
+        bytes += end + 1;
+        if bytes > MAX_EXEC_ARG_BYTES {
+            return None;
+        }
+        arg.truncate(end);
+        argv.push(OsString::from_vec(arg));
+    }
+    None
+}
+
+fn exec_image(pid: i32) -> Option<(PathBuf, Vec<OsString>, PathBuf)> {
+    use std::io::Read;
+
+    let proc = format!("/proc/{pid}");
+    let executable = fs::read_link(format!("{proc}/exe")).ok()?;
+    let cwd = fs::read_link(format!("{proc}/cwd")).ok()?;
+    let mut raw = Vec::new();
+    fs::File::open(format!("{proc}/cmdline"))
+        .ok()?
+        .take((MAX_EXEC_ARG_BYTES + 1) as u64)
+        .read_to_end(&mut raw)
+        .ok()?;
+    if raw.len() > MAX_EXEC_ARG_BYTES || raw.last() != Some(&0) {
+        return None;
+    }
+    raw.pop();
+    let argv: Vec<OsString> = raw
+        .split(|byte| *byte == 0)
+        .map(|arg| OsString::from_vec(arg.to_vec()))
+        .collect();
+    (argv.len() <= MAX_EXEC_ARGS).then_some((executable, argv, cwd))
 }
 
 /// `ip:port` for an IPv4 or IPv6 sockaddr, so a refusal says what the step talked to.
@@ -1667,9 +1893,17 @@ impl Tracer<'_> {
     fn on_syscall(&mut self, pid: i32) {
         let Some(regs) = get_regs(pid) else {
             self.flag("could not read registers");
+            if let Some(execs) = &mut self.execs {
+                execs.invalidate();
+            }
             return;
         };
         let (nr, args) = decode(&regs);
+        if matches!(nr, libc::SYS_execve | libc::SYS_execveat) {
+            if let Some(execs) = &mut self.execs {
+                execs.enter(pid, nr, &args);
+            }
+        }
         self.syscall = nr;
         let Some(ops) = self.ops.get(&nr).cloned() else {
             self.flag(

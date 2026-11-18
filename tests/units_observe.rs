@@ -102,6 +102,15 @@ fn npm_shell_and_jest_run_once_then_warm_skip_and_explain_do_not_launch() {
     one_observation(&cold, "stoop: observed jest via npm (diagnostic only)");
     assert_eq!(f.log(), "npm\njest\n");
     assert!(stderr(&cold).contains("recorded"), "{}", stderr(&cold));
+    let proof_path = fs::read_dir(f.root.join(".stoop/proofs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let proof: serde_json::Value = serde_json::from_slice(&fs::read(proof_path).unwrap()).unwrap();
+    assert!(proof["proofs"][0].get("execs").is_none());
+    assert!(proof["proofs"][0].get("effective_argv").is_none());
 
     let explain = f.run(&["explain", "--root", ".", "--", "npm", "test"]);
     assert!(explain.status.success(), "{}", stderr(&explain));
