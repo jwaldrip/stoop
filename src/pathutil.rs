@@ -32,6 +32,27 @@ pub fn to_key(root: &Path, p: &Path) -> String {
     }
 }
 
+/// The relative working directory used to identify a command. Percent escapes
+/// preserve non-UTF-8 bytes without colliding with literal percent signs.
+pub fn cwd_key(root: &Path, cwd: &Path) -> String {
+    use std::fmt::Write;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = cwd.strip_prefix(root).unwrap_or(cwd);
+    if let Some(text) = path.to_str() {
+        return text.replace('%', "%25");
+    }
+    let mut key = String::new();
+    for &byte in path.as_os_str().as_bytes() {
+        if byte.is_ascii() && byte != b'%' {
+            key.push(char::from(byte));
+        } else {
+            write!(key, "%{byte:02X}").unwrap();
+        }
+    }
+    key
+}
+
 pub fn from_key(root: &Path, key: &str) -> PathBuf {
     if key.starts_with('/') {
         PathBuf::from(key)
@@ -64,5 +85,17 @@ mod tests {
         assert_eq!(to_key(root, Path::new("/usr/lib/x")), "/usr/lib/x");
         assert_eq!(from_key(root, "a/b"), PathBuf::from("/w/a/b"));
         assert_eq!(from_key(root, "/usr/lib/x"), PathBuf::from("/usr/lib/x"));
+    }
+
+    #[test]
+    fn cwd_keys_do_not_fold_non_utf8() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let root = Path::new("/repo");
+        let a = root.join(OsString::from_vec(b"dir-\x80".to_vec()));
+        let b = root.join(OsString::from_vec(b"dir-\x81".to_vec()));
+        assert_ne!(cwd_key(root, &a), cwd_key(root, &b));
+        assert_ne!(cwd_key(root, &a), cwd_key(root, &root.join("dir-%80")));
     }
 }

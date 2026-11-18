@@ -48,7 +48,11 @@ A stoop is a peregrine's hunting dive: it folds in, ignores the rest of the sky,
 3. **Compare.** Next time it hashes the same paths. If all of them match and the outputs are still in place, the command is skipped.
 4. **When unsure, run.** No proof, an expired proof, a trace that might be incomplete, a read of `.git`, or use of the network: the command runs and nothing is recorded.
 
-Proofs are content-addressed and keyed by command, so a branch that matches what main already proved can skip. Up to 8 are kept per command, so steps that leave no output in the repository (tests, lint, type checks) also skip after a revert.
+By default, the proof key includes the command and its working directory relative to the repository root. The root is the nearest ancestor containing a `.git` directory or file, so a nested repository uses its own root. Without `.git`, the working directory is the root. `--root DIR` chooses a root explicitly. Paths inside it are stored relative to it, so a proof stored with the checkout can move with it.
+
+Proofs live in `<root>/.stoop` unless `--store DIR` or `STOOP_STORE` chooses another store. An external store includes the Git origin URL in automatic keys, keeping different repositories apart while allowing checkouts of the same origin to share proofs. Without an origin, stoop uses the root's absolute path, so moving that root gives it a cold cache in an external store. Explicit `--key` names remain unchanged, but a proof still has to match the working directory and repository scope.
+
+Up to 8 proofs are kept per key, so steps that leave no output in the repository (tests, lint, type checks) can also skip after a revert.
 
 ## Two lines in GitHub Actions
 
@@ -60,7 +64,7 @@ defaults:
     shell: stoop sh {0}
 ```
 
-Each step is keyed by its script, the workflow and the job. Steps that use an action run as usual; the step that installs stoop sets `shell: bash` for itself. Share proofs between runs through your own git remote (`--sync git`, no server to host) or by caching `.stoop/` with the CI's own cache. Pull requests read; only the default branch writes.
+Each step is keyed by its script, arguments, workflow, job and working directory. Steps that use an action run as usual; the step that installs stoop sets `shell: bash` for itself. Share proofs between runs through your own git remote (`--sync git`, no server to host) or by caching `.stoop/` with the CI's own cache. Pull requests read; only the default branch writes.
 
 Full workflows for GitHub Actions, GitLab CI, CircleCI and Buildkite are in the [CI recipes](https://stoop.build/docs/ci.html).
 

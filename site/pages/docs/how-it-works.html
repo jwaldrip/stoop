@@ -20,17 +20,20 @@
     <tr><td>Environment</td><td>A hash of each variable's value. See <a href="#env">the environment</a> below.</td></tr>
     <tr><td>Outputs</td><td>What the run left inside the repository, with hashes. A skip needs them still in place.</td></tr>
     <tr><td>Probes</td><td>For each <code>--probe</code> command, a hash of what it printed.</td></tr>
+    <tr><td>Directory and repository</td><td>The working directory relative to the root and, for an external store, a repository identity.</td></tr>
   </tbody>
 </table>
-<p>A failing run records nothing. Neither does a run started with <code>--no-record</code>.</p>
+<p>Inputs and outputs inside the root are stored as relative paths, so a proof stored with the checkout can move with it. Paths outside the root stay absolute. A failing run records nothing. Neither does a run started with <code>--no-record</code>.</p>
 
 <h2 id="compare">The comparison</h2>
 <p>Next time, before running anything, stoop loads the proofs for the key, newest first, and checks each in turn: not expired, same environment, every input still the same, every output still in place, every probe still printing the same thing. The first proof that passes means a skip. If none passes, the command runs and the reason given is what differed from the newest proof. <code>stoop explain</code> prints what differed in each proof it checked.</p>
 <p>Checking costs one hash of every recorded input. For the cargo build in the <a href="getting-started.html">getting started</a> transcript that was 668 inputs, the Rust toolchain included, in 289 ms. Every file is hashed byte for byte, with no sampling and no trust in timestamps.</p>
 
 <h2 id="keys">Keys</h2>
-<p>A key names one command in one place. By default it is the program's name plus a hash of the full argument list and the working directory relative to the repository root, for example <code>cargo-46fcb2881638d3cc</code>. Change an argument and you get a different key. <code>--key NAME</code> sets one yourself.</p>
-<p>In shell mode (<code>stoop sh</code>, used by GitHub Actions), the key comes from the step's script contents, the workflow name, the job name and the working directory. The script file itself is not an input: the runner gives it a new name on every run.</p>
+<p>A key names one command in one place. By default it is the program's name plus a hash of the full argument list and the working directory relative to the repository root, for example <code>cargo-46fcb2881638d3cc</code>. The root is the nearest ancestor containing a <code>.git</code> directory or file. A nested repository uses the inner root; without <code>.git</code>, the working directory is the root. <code>--root DIR</code> selects a different root. Symlinked paths are resolved to their physical directories.</p>
+<p>Proofs live under <code>&lt;root&gt;/.stoop</code> by default, so separate roots have separate stores. With an external <code>--store</code> or <code>STOOP_STORE</code>, automatic keys also include a repository identity. The configured Git origin URL identifies the repository, so checkouts with the same origin can share proofs. Local origin paths are resolved relative to the checkout. Without an origin, the physical root path is the identity: separate roots stay separate, and moving one starts with a cold cache in an external store. The URL or path is hashed before it is stored.</p>
+<p><code>--key NAME</code> keeps the chosen name, while each proof still has to match the working directory and repository identity. Proofs recorded before directory tracking are rerun once. <code>stoop explain</code> and <code>stoop ls</code> show the directory, with literal percent signs and non-UTF-8 bytes percent-escaped.</p>
+<p>In shell mode (<code>stoop sh</code>, used by GitHub Actions), the key comes from the step's script contents, its arguments, the workflow name, the job name and the working directory. The script file itself is not an input: the runner gives it a new name on every run.</p>
 
 <h2 id="history">Branches, reverts and history</h2>
 <p>Proofs are content-addressed. They don't know which branch or commit made them, only what the command read. Each key keeps its 8 most recent proofs, so a branch that matches what main already proved can skip, and so can a revert, as long as the earlier proof's conditions still hold.</p>
@@ -54,6 +57,7 @@
     <tr><td><code>STOOP_FULL=1</code></td><td>Runs even when a proof matches, then records.</td></tr>
     <tr><td>The command failed</td><td>Exits with its code; not recorded.</td></tr>
     <tr><td>The trace may be incomplete</td><td>Not recorded, with the reason.</td></tr>
+    <tr><td>A traced path cannot be represented as UTF-8</td><td>Not recorded: the proof must name the exact path.</td></tr>
     <tr><td>The command read <code>.git</code></td><td>Not recorded: a skip could hide a history change. Add <code>.git</code> to <code>.stoopignore</code> if that read cannot change the result.</td></tr>
     <tr><td>The command used the network or a local service</td><td>Not recorded, naming the destination, unless a <code>--probe</code> covers it or <code>--allow-network</code> is set.</td></tr>
     <tr><td>A probe failed, or changed while the command ran</td><td>Not recorded.</td></tr>
