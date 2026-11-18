@@ -11,7 +11,10 @@ impl EventReceiver for ScalarCheck {
         match event {
             Event::Alias(_) => self.0 = Some("YAML aliases are not supported".into()),
             Event::Scalar(value, yaml_rust2::scanner::TScalarStyle::Plain, _, _)
-                if ["Null", "NULL", "-0"].contains(&value.as_str()) =>
+                if ["Null", "NULL"].contains(&value.as_str())
+                    || value
+                        .strip_prefix('-')
+                        .is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b == b'0')) =>
             {
                 self.0 = Some(format!("unsupported ambiguous YAML scalar {value}"));
             }
@@ -288,6 +291,7 @@ fn check_setup(name: &str, fields: &Map<String, Value>) -> Result<(), String> {
         "go-version-file",
         "java-version-file",
         "jdk-file",
+        "jdkfile",
         "global-json-file",
         "bun-version-file",
         "deno-version-file",
@@ -302,6 +306,8 @@ fn check_setup(name: &str, fields: &Map<String, Value>) -> Result<(), String> {
         "actions/setup-python" => Some("python-version"),
         "ruby/setup-ruby" => Some("ruby-version"),
         "actions/setup-dotnet" => Some("dotnet-version"),
+        "oven-sh/setup-bun" => Some("bun-version"),
+        "actions-rust-lang/setup-rust-toolchain" => Some("toolchain"),
         _ => None,
     };
     if let Some(field) = required {
@@ -440,7 +446,7 @@ fn build(
                 return Err(format!("unsupported strategy field {k}"));
             }
         }
-        stoop_settings(&[w.root.get("env"), j.get("env")])?;
+        stoop_settings(&[j.get("env")])?;
         let needs = match j.get("needs") {
             None => vec![],
             Some(Value::String(s)) => vec![s.clone()],
@@ -502,7 +508,7 @@ fn build(
                 &defaults,
                 (&w.name, job),
                 leg.as_deref(),
-                &[w.root.get("env"), j.get("env")],
+                &[j.get("env")],
                 seen_traced,
             );
             match result {
@@ -658,7 +664,17 @@ fn step_key(
     if marker && seen_traced {
         return Err("neutral marker after traced step".into());
     }
-    let with = object(s.get("with"), "with")?;
+    let mut normalized = Map::new();
+    for (input, value) in object(s.get("with"), "with")? {
+        if !input.is_ascii() {
+            return Err(format!("non-ASCII action input {input}"));
+        }
+        let key = input.to_ascii_lowercase();
+        if normalized.insert(key, value.clone()).is_some() {
+            return Err(format!("duplicate action input {input}"));
+        }
+    }
+    let with = &normalized;
     if class == Some("checkout") {
         action_with("checkout", &name, with)?;
     }
@@ -893,5 +909,116 @@ mod tests {
         ] {
             assert_eq!(key0, key(&base.replace(from, to)), "{from}");
         }
+    }
+    #[test]
+    fn action_inputs_are_case_insensitive_and_safe() {
+        for (field, value) in [
+            ("Ref", "other"),
+            ("REPOSITORY", "other"),
+            ("Path", "other"),
+            ("Clean", "false"),
+            ("Submodules", "true"),
+            ("LFS", "true"),
+            ("Sparse-Checkout", "other"),
+        ] {
+            let text = fixture("", &format!("      - uses: actions/checkout@v4\n        with: {{{field}: '{value}'}}\n      - run: test\n"));
+            assert!(spec(&text).blocked.is_some(), "{field}");
+        }
+        for (action, field, value) in [
+            ("actions/setup-node", "Node-Version-File", ".nvmrc"),
+            ("actions/setup-java", "jdkFile", "a"),
+            ("erlef/setup-beam", "Version-File", "a"),
+            ("ruby/setup-ruby", "Bundler-Cache", "true"),
+        ] {
+            let text = fixture("", &format!("      - uses: {action}@v1\n        with: {{{field}: '{value}'}}\n      - run: test\n"));
+            assert!(spec(&text).blocked.is_some(), "{field}");
+        }
+        for action in [
+            "oven-sh/setup-bun",
+            "actions-rust-lang/setup-rust-toolchain",
+        ] {
+            let text = fixture(
+                "",
+                &format!("      - uses: {action}@v1\n      - run: test\n"),
+            );
+            assert!(spec(&text).blocked.is_some(), "{action}");
+        }
+        let cache = fixture("", "      - uses: actions/cache@v4\n        with: {Path: one, KEY: ignored}\n      - run: test\n");
+        assert_ne!(key(&cache), key(&cache.replace("Path: one", "Path: two")));
+        let bad = cache.replace("Path:", "Pıth:");
+        assert!(spec(&bad).blocked.unwrap().detail.contains("non-ASCII"));
+        let dup = cache.replace("Path: one", "Path: one, path: two");
+        assert!(spec(&dup).blocked.unwrap().detail.contains("duplicate"));
+    }
+
+    #[test]
+    fn workflow_flags_are_inherited_by_planner_not_rejected() {
+        let text = fixture("", RUN).replace(
+            "on: push\n",
+            "on: push\nenv: {STOOP_FULL: \"${{ github.event_name }}\"}\n",
+        );
+        assert!(spec(&text).blocked.is_none());
+        let text = fixture("    env: {STOOP_FULL: '${{ github.event_name }}'}\n", RUN);
+        assert!(spec(&text).blocked.unwrap().detail.contains("STOOP_FULL"));
+        for scalar in ["-0", "-00", "-000"] {
+            assert!(parse(
+                "ci.yml",
+                &fixture(&format!("    env: {{X: {scalar}}}\n"), RUN)
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn remaining_key_and_blocker_regressions() {
+        let no_step = fixture("", "      - run: test\n        if: false\n");
+        assert!(spec(&no_step).blocked.unwrap().detail.contains("no traced"));
+        let with_step = fixture("", "      - run: test\n");
+        let with_false = fixture(
+            "",
+            "      - run: ignored\n        if: false\n      - run: test\n",
+        );
+        assert_eq!(key(&with_step), key(&with_false));
+        assert_ne!(
+            key(&with_step),
+            key(&fixture(
+                "",
+                "      - run: test\n        shell: stoop sh --quiet {0}\n"
+            ))
+        );
+        let cases = [
+            ("", "      - uses: actions/setup-node@v1\n        with: {node-version: '${{ x }}'}\n      - run: x\n", "expression"),
+            ("", "      - run: x\n        shell: '${{ x }}'\n", "expression"),
+            ("", "      - run: x\n        working-directory: '${{ x }}'\n", "expression"),
+            ("", "      - uses: actions/checkout@v4\n        with: {repository: other}\n      - run: x\n", "repository"),
+            ("", "      - uses: actions/checkout@v4\n        with: {submodules: true}\n      - run: x\n", "submodules"),
+            ("", "      - uses: actions/checkout@v4\n        with: {lfs: true}\n      - run: x\n", "lfs"),
+            ("", "      - shell: stoop sh --root x {0}\n        run: x\n", "--root"),
+            ("", "      - run: x\n        timeout-minutes: 5\n", "timeout-minutes"),
+            ("", "      - run: x\n        if: success()\n", "step if"),
+            ("", "      - uses: docker://image\n      - run: x\n", "docker"),
+            ("", "      - uses: '.\\\\local'\n      - run: x\n", "unsupported action"),
+            ("    strategy: {unknown: value}\n", RUN, "strategy field"),
+            ("", "      - uses: ruby/setup-ruby@v1\n        with: {ruby-version: default}\n      - run: x\n", "ruby-version"),
+            ("", "      - run: x\n      - uses: actions/upload-artifact@v4\n        env: {STOOP_PLAN: neutral}\n", "neutral marker after"),
+            ("", "      - run: x\n      - uses: actions//checkout@v4\n", "checkout after"),
+        ];
+        for (extra, steps, expected) in cases {
+            let detail = spec(&fixture(extra, steps)).blocked.expect(expected).detail;
+            assert!(detail.contains(expected), "{detail}: {expected}");
+        }
+        let checkout = fixture("", "      - uses: actions/checkout@v4\n        with: {fetch-depth: 1}\n      - run: test\n");
+        assert_eq!(
+            key(&checkout),
+            key(&checkout.replace("fetch-depth: 1", "fetch-depth: 2"))
+        );
+        let age = spec(&fixture("    env: {STOOP_MAX_AGE: 1h}\n", RUN));
+        assert!(matches!(
+            age.steps.last(),
+            Some(StepSpec::Traced {
+                max_age: Some(3600),
+                ..
+            })
+        ));
     }
 }
