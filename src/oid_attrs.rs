@@ -274,6 +274,12 @@ pub fn check_many(root: &Path, paths: &[String]) -> HashMap<String, OidBasis> {
     check_paths(root, paths.iter().map(String::as_str))
 }
 
+/// An unknown or nonempty directory may hide an attribute source.
+#[cfg(any(target_os = "linux", test))]
+pub fn directory_removal_invalidates(path: &Path) -> bool {
+    !std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -320,6 +326,17 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn directory_removal_requires_proven_empty() {
+        let repo = Repo::new();
+        let dir = repo.0.join("nested");
+        assert!(directory_removal_invalidates(&dir));
+        fs::create_dir(&dir).unwrap();
+        assert!(!directory_removal_invalidates(&dir));
+        fs::write(dir.join(".gitattributes"), "* text\n").unwrap();
+        assert!(directory_removal_invalidates(&dir));
     }
 
     #[test]
