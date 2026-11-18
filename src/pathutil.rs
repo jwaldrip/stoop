@@ -49,6 +49,7 @@ pub fn from_key(root: &Path, key: &str) -> PathBuf {
 pub struct Location {
     pub path: PathBuf,
     /// A symlink above the name moved its parent somewhere else.
+    #[allow(dead_code)]
     pub redirected: bool,
 }
 
@@ -142,8 +143,17 @@ impl Physical {
     }
 
     /// Drop cached parents at or below `p`: a write to `p` may change what they resolve to.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn forget(&mut self, p: &Path) {
-        self.parents.retain(|k, _| !k.starts_with(p));
+        let descendants: Vec<PathBuf> = self
+            .parents
+            .range(p.to_path_buf()..)
+            .take_while(|(key, _)| key.starts_with(p))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in descendants {
+            self.parents.remove(&key);
+        }
     }
 }
 

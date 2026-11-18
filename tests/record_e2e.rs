@@ -302,7 +302,7 @@ fn a_failed_create_records_the_missing_parent() {
 fn a_failed_create_under_a_file_records_the_file() {
     let w = Ws::new("notdir");
     let p = recorded(&w, "echo x > in.txt/x || true");
-    assert_eq!(prior(&p, "in.txt"), Some("fk".into()));
+    assert_eq!(prior(&p, "in.txt"), Some(format!("f:{}", hash(b"one"))));
     assert_eq!(prior(&p, "in.txt/x"), Some("a".into()));
 }
 
@@ -341,21 +341,27 @@ fn an_append_keeps_the_old_bytes_so_the_prior_records_them() {
 }
 
 #[test]
-fn a_truncating_write_records_only_the_kind() {
+fn a_truncating_write_records_the_old_content() {
     let w = Ws::new("truncate");
     w.write("config.txt", "foo\n");
     let p = recorded(&w, "echo y > config.txt");
-    assert_eq!(prior(&p, "config.txt"), Some("fk".into()));
+    assert_eq!(
+        prior(&p, "config.txt"),
+        Some(format!("f:{}", hash(b"foo\n")))
+    );
 }
 
 #[test]
-fn a_truncated_executable_records_its_executable_kind() {
+fn a_truncated_executable_records_its_content_and_mode() {
     use std::os::unix::fs::PermissionsExt;
     let w = Ws::new("truncexec");
     w.write("run.sh", "echo hi\n");
     fs::set_permissions(w.root.join("run.sh"), fs::Permissions::from_mode(0o755)).unwrap();
     let p = recorded(&w, "echo y > run.sh");
-    assert_eq!(prior(&p, "run.sh"), Some("xk".into()));
+    assert_eq!(
+        prior(&p, "run.sh"),
+        Some(format!("x:{}", hash(b"echo hi\n")))
+    );
 }
 
 #[test]
@@ -467,5 +473,143 @@ fn reading_a_link_after_writing_through_it_keeps_the_link_as_an_input() {
             .contains(&("l".into(), format!("l:{}", w.root.join("t.txt").display()))),
         "{:?}",
         pairs(&p, "inputs")
+    );
+}
+
+#[test]
+fn writing_through_symlink_then_dotdot_is_unplannable() {
+    let w = Ws::new("linkdotdot");
+    w.write("sub/inner/keep", "k");
+    std::os::unix::fs::symlink("sub/inner", w.root.join("link")).unwrap();
+    let p = recorded(&w, "echo ok > link/../out");
+    assert!(
+        has_reason(&p, "wrote through the symlink link"),
+        "{:?}",
+        reasons(&p)
+    );
+    assert!(pairs(&p, "outputs").iter().any(|(key, _)| key == "sub/out"));
+}
+
+#[test]
+fn outside_alias_through_in_repo_symlink_is_unplannable() {
+    let w = Ws::new("aliassymlink");
+    w.write("sub/keep", "k");
+    std::os::unix::fs::symlink("sub", w.root.join("link")).unwrap();
+    let alias = std::env::temp_dir().join(format!("stoop-record-aliasdir-{}", std::process::id()));
+    let _ = fs::remove_file(&alias);
+    std::os::unix::fs::symlink(w.root.join("link"), &alias).unwrap();
+    let p = recorded(&w, &format!("echo ok > {}/out", alias.display()));
+    let _ = fs::remove_file(alias);
+    assert!(
+        has_reason(&p, "wrote through the symlink link"),
+        "{:?}",
+        reasons(&p)
+    );
+}
+
+#[test]
+fn reading_through_symlink_then_dotdot_records_physical_path() {
+    let w = Ws::new("readdotdot");
+    w.write("sub/inner/keep", "k");
+    w.write("sub/f", "content");
+    std::os::unix::fs::symlink("sub/inner", w.root.join("link")).unwrap();
+    let p = recorded(&w, "cat link/../f >/dev/null");
+    assert!(pairs(&p, "inputs").contains(&("sub/f".into(), format!("f:{}", hash(b"content")))));
+}
+
+#[test]
+fn proc_alias_read_then_truncate_records_old_content() {
+    let w = Ws::new("procread");
+    w.write("config.txt", "old content");
+    let p = recorded(
+        &w,
+        "cat /proc/self/cwd/config.txt >/dev/null; echo new > config.txt",
+    );
+    assert_eq!(
+        prior(&p, "config.txt"),
+        Some(format!("f:{}", hash(b"old content")))
+    );
+}
+
+#[test]
+fn outside_alias_read_then_truncate_records_old_content() {
+    let w = Ws::new("outside-before-write");
+    w.write("config.txt", "old content");
+    let alias = std::env::temp_dir().join(format!("stoop-old-config-{}", std::process::id()));
+    let _ = fs::remove_file(&alias);
+    std::os::unix::fs::symlink(w.root.join("config.txt"), &alias).unwrap();
+    let p = recorded(
+        &w,
+        &format!("cat {} >/dev/null; echo new > config.txt", alias.display()),
+    );
+    let _ = fs::remove_file(alias);
+    assert_eq!(
+        prior(&p, "config.txt"),
+        Some(format!("f:{}", hash(b"old content")))
+    );
+}
+
+#[test]
+fn inherited_stdin_read_then_truncate_records_old_content() {
+    let w = Ws::new("inherited-stdin");
+    w.write("config.txt", "old content");
+    let input = fs::File::open(w.root.join("config.txt")).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_stoop"))
+        .args([
+            "run",
+            "--root",
+            ".",
+            "--key",
+            "t",
+            "--",
+            "sh",
+            "-c",
+            "cat >/dev/null; echo new > config.txt",
+        ])
+        .current_dir(&w.root)
+        .env("STOOP_STORE", w.store())
+        .env_remove("STOOP_FULL")
+        .env_remove("STOOP_OFF")
+        .env_remove("GITHUB_ACTIONS")
+        .env_remove("STOOP_SYNC")
+        .stdin(input)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        prior(&w.proof(), "config.txt"),
+        Some(format!("f:{}", hash(b"old content")))
+    );
+}
+
+#[test]
+fn bind_mount_alias_of_unwritten_repo_file_is_a_documented_residual() {
+    let w = Ws::new("bind-residual");
+    w.write("config.txt", "old");
+    let alias = std::env::temp_dir().join(format!("stoop-bind-{}", std::process::id()));
+    fs::create_dir_all(&alias).unwrap();
+    let mounted = Command::new("mount")
+        .args(["--bind", w.root.to_str().unwrap(), alias.to_str().unwrap()])
+        .output();
+    if !mounted.is_ok_and(|o| o.status.success()) {
+        let _ = fs::remove_dir(&alias);
+        return;
+    }
+    let script = format!("cat {}/config.txt >/dev/null", alias.display());
+    let first = w.sh(&script);
+    w.write("config.txt", "new");
+    let second = w.sh(&script);
+    let unmounted = Command::new("umount").arg(&alias).status().unwrap();
+    let _ = fs::remove_dir(&alias);
+    assert!(unmounted.success());
+    assert_eq!(first.0, 0, "{}", first.1);
+    assert!(
+        second.1.contains("stoop: skip"),
+        "documented bind alias blind spot changed: {}",
+        second.1
     );
 }

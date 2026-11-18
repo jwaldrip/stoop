@@ -682,18 +682,6 @@ fn push_reason(t: &mut Trace, why: String) {
     }
 }
 
-/// The id of a regular file whose content is not needed, by its executable bit.
-fn kind_id(exec: bool) -> String {
-    String::from(if exec { "xk" } else { "fk" })
-}
-
-/// The run looked at this path (lexical or physical) before its first write.
-fn read_before(t: &Trace, lex: &Path, phys: &Path) -> bool {
-    [lex, phys]
-        .iter()
-        .any(|p| t.touched.get(*p).is_some_and(|x| x.read))
-}
-
 impl Rec<'_> {
     fn key_text(&self, lex: &Path) -> String {
         to_key(&self.root, lex)
@@ -719,27 +707,61 @@ impl Rec<'_> {
         Some(key.to_string())
     }
 
-    /// The first symlink on the spelled path below the root, as a key. A parent that moved
-    /// only because the root itself is reached through a link is not a repository symlink.
-    fn link_below_root(&self, lex: &Path) -> Option<String> {
-        let rel = lex.parent()?.strip_prefix(&self.root).ok()?;
-        let mut cur = self.root.clone();
-        for c in rel.components() {
-            cur.push(c);
-            if fs::symlink_metadata(&cur).is_ok_and(|m| m.file_type().is_symlink()) {
-                return Some(to_key(&self.root, &cur));
+    /// Follow each parent component in kernel order. A preceding outside alias may enter
+    /// the repository before another symlink is encountered; `..` follows link targets.
+    fn links_below_root(&self, raw: &Path) -> Option<Vec<PathBuf>> {
+        use std::collections::VecDeque;
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStrExt;
+        let mut parts: VecDeque<OsString> = raw
+            .parent()?
+            .as_os_str()
+            .as_bytes()
+            .split(|b| *b == b'/')
+            .filter(|p| !p.is_empty() && *p != b".")
+            .map(|p| OsString::from_vec(p.to_vec()))
+            .collect();
+        let mut current = PathBuf::from("/");
+        let mut links = 0;
+        let mut found = Vec::new();
+        while let Some(part) = parts.pop_front() {
+            if part.as_bytes() == b".." {
+                current.pop();
+                continue;
+            }
+            current.push(part);
+            if fs::symlink_metadata(&current).is_ok_and(|m| m.file_type().is_symlink()) {
+                if current.starts_with(self.phys.real()) {
+                    found.push(current.clone());
+                }
+                links += 1;
+                if links > 40 {
+                    return None;
+                }
+                let target = fs::read_link(&current).ok()?;
+                current.pop();
+                if target.is_absolute() {
+                    current = PathBuf::from("/");
+                }
+                let expanded: Vec<OsString> = target
+                    .as_os_str()
+                    .as_bytes()
+                    .split(|b| *b == b'/')
+                    .filter(|p| !p.is_empty() && *p != b".")
+                    .map(|p| OsString::from_vec(p.to_vec()))
+                    .collect();
+                for part in expanded.into_iter().rev() {
+                    parts.push_front(part);
+                }
             }
         }
-        None
+        Some(found)
     }
 
     /// Record a write to `raw` (absolute, possibly with `..`). `keeps`: the write keeps the
     /// old bytes. `follows`: a symlink at `raw` is followed. Returns the key, when in scope.
     fn write(&mut self, t: &mut Trace, raw: &Path, keeps: bool, follows: bool) -> Option<String> {
         let lex = absolutize(Path::new("/"), raw);
-        // The write may change what cached parents resolve to.
-        self.phys.forget(&lex);
-        self.phys.forget(raw);
         let mut target = raw.to_path_buf();
         if follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink()) {
             // The write lands on the link's target, which is not named here. A link whose
@@ -763,11 +785,14 @@ impl Rec<'_> {
         }
         let loc = self.phys.locate(&target)?;
         let key = self.key_of(&loc.path, t)?;
-        if loc.redirected {
-            if let Some(link) = self.link_below_root(&lex) {
-                push_reason(t, format!("it wrote through the symlink {link}"));
-            }
+        for link in self.links_below_root(raw).unwrap_or_default() {
+            let name = to_key(self.phys.real(), &link);
+            t.touched.entry(link).or_default().read = true;
+            push_reason(t, format!("it wrote through the symlink {name}"));
         }
+        self.phys.forget(&lex);
+        self.phys.forget(raw);
+        self.phys.forget(&loc.path);
         if !t.priors.contains_key(&key) {
             // A create fails when its parent is missing or is not a directory. A later commit
             // that adds the parent would change that outcome, so the parent's state is recorded.
@@ -809,8 +834,8 @@ impl Rec<'_> {
         t: &mut Trace,
         phys: &Path,
         key: &str,
-        lex: &Path,
-        keeps: bool,
+        _lex: &Path,
+        _keeps: bool,
     ) -> Option<String> {
         let m = match fs::symlink_metadata(phys) {
             Ok(m) => m,
@@ -846,20 +871,17 @@ impl Rec<'_> {
             return None;
         }
         let exec = m.mode() & 0o111 != 0;
-        if !(keeps || read_before(t, lex, phys)) {
-            return Some(kind_id(exec));
-        }
         let size = m.len();
         if size > MAX_FILE_BYTES || self.hashed + size > MAX_RUN_BYTES {
             push_reason(
                 t,
                 format!("{key} is too large to record before the run wrote it ({size} bytes)"),
             );
-            return Some(kind_id(exec));
+            return None;
         }
         if !t.unplannable.is_empty() {
-            // The proof cannot replay anyway: record kinds only.
-            return Some(kind_id(exec));
+            // Once replay is already impossible, avoid hashing more content.
+            return None;
         }
         match hash_file(phys) {
             Ok(h) => {
@@ -919,6 +941,33 @@ impl Tracer<'_> {
         }
         let p = PathBuf::from(OsString::from_vec(raw));
         if p.is_absolute() {
+            if p.starts_with("/dev/fd") || p.starts_with("/proc/self/fd") {
+                self.flag("it accessed an unkeyable descriptor alias");
+                return None;
+            }
+            for name in ["cwd", "root"] {
+                let prefix = format!("/proc/self/{name}");
+                if let Ok(rest) = p.strip_prefix(&prefix) {
+                    return match std::fs::read_link(format!("/proc/{pid}/{name}")) {
+                        Ok(base) => Some(base.join(rest)),
+                        Err(_) => {
+                            self.flag("could not resolve the traced process path alias");
+                            None
+                        }
+                    };
+                }
+            }
+            if let Ok(rest) = p.strip_prefix("/proc") {
+                let mut parts = rest.components();
+                let first = parts.next().and_then(|c| c.as_os_str().to_str());
+                let second = parts.next().and_then(|c| c.as_os_str().to_str());
+                if first.is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()))
+                    && matches!(second, Some("cwd" | "root" | "fd"))
+                {
+                    self.flag("it accessed an unkeyable process path alias");
+                    return None;
+                }
+            }
             return Some(p);
         }
         let base = match dirfd.map(|i| args[i] as i32) {
@@ -926,6 +975,10 @@ impl Tracer<'_> {
             Some(fd) => std::fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok(),
         };
         match base {
+            Some(b) if b.as_os_str().as_encoded_bytes().ends_with(b" (deleted)") => {
+                self.flag("it accessed a deleted directory through a file descriptor");
+                None
+            }
             Some(b) => Some(b.join(&p)),
             None => {
                 self.flag("could not resolve a relative path");
@@ -935,16 +988,24 @@ impl Tracer<'_> {
     }
 
     fn touch(&mut self, lex: PathBuf, read: bool) {
+        if let Some(rec) = &self.rec {
+            for link in rec.links_below_root(&lex).unwrap_or_default() {
+                self.t.touched.entry(link).or_default().read = true;
+            }
+        }
         self.t.touched.entry(lex).or_default().read |= read;
     }
 
     /// Record a write, and what the path held before the first one. Returns the key when in scope.
     fn write(&mut self, raw: &Path, keeps: bool, follows: bool) -> Option<String> {
+        self.rec.as_ref()?;
         // A write through a link changes what the link points to, not the link itself.
         let through_link =
             follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink());
         if !through_link {
-            self.t.written.insert(absolutize(Path::new("/"), raw));
+            self.t.written.insert(raw.to_path_buf());
+        } else {
+            self.touch(raw.to_path_buf(), true);
         }
         let rec = self.rec.as_mut()?;
         rec.write(&mut self.t, raw, keeps, follows)
@@ -1008,7 +1069,7 @@ impl Tracer<'_> {
         match flags.map(|i| args[i] as i32) {
             // An O_TMPFILE open writes nothing; the later linkat names the file.
             Some(f) if f & libc::O_TMPFILE == libc::O_TMPFILE => {
-                self.touch(absolutize(Path::new("/"), &p), false);
+                self.touch(p, false);
             }
             // creat truncates, so the old bytes do not survive.
             None => {
@@ -1028,7 +1089,7 @@ impl Tracer<'_> {
                     let follows = f & libc::O_NOFOLLOW == 0 && !creates_exclusively;
                     self.write(&p, keeps, follows);
                 } else {
-                    self.touch(absolutize(Path::new("/"), &p), true);
+                    self.touch(p, true);
                 }
             }
         }
@@ -1042,7 +1103,7 @@ impl Tracer<'_> {
             // mkdir on a path that exists fails with EEXIST and creates nothing: `mkdir -p`
             // and `create_dir_all` do this for every ancestor. The existence is an input.
             if fs::symlink_metadata(&p).is_ok() {
-                self.touch(absolutize(Path::new("/"), &p), false);
+                self.touch(p, false);
                 return;
             }
             self.t.created_dirs.push(absolutize(Path::new("/"), &p));
@@ -1115,7 +1176,7 @@ impl Tracer<'_> {
             return;
         }
         match fs::symlink_metadata(raw) {
-            Ok(m) if m.is_dir() => self.touch(absolutize(Path::new("/"), raw), false),
+            Ok(m) if m.is_dir() => self.touch(raw.to_path_buf(), false),
             Ok(_) => {
                 self.write(raw, true, follows);
             }
@@ -1140,7 +1201,7 @@ impl Tracer<'_> {
                 Op::Open { dirfd, path, flags } => self.open(pid, &args, dirfd, path, flags),
                 Op::Look { dirfd, path } | Op::Exec { dirfd, path } => {
                     if let Some(p) = self.resolve(pid, &args, dirfd, path) {
-                        self.touch(absolutize(Path::new("/"), &p), true);
+                        self.touch(p, true);
                     }
                 }
                 Op::List => {
@@ -1151,7 +1212,7 @@ impl Tracer<'_> {
                 }
                 Op::Chdir { path } => {
                     if let Some(p) = self.resolve(pid, &args, None, path) {
-                        self.touch(absolutize(Path::new("/"), &p), false);
+                        self.touch(p, false);
                     }
                     // Threads can share a cwd, so any chdir drops every cached value.
                     self.cwds.clear();

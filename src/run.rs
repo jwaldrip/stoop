@@ -712,6 +712,14 @@ pub fn build_inputs(
                 }
             }
         }
+        // A lexical key containing `..` does not describe kernel resolution across a
+        // symlink. The physical candidate above is the only faithful repository key.
+        if lex
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+        {
+            continue;
+        }
         if key.is_empty() || ignore.is_ignored(&key) {
             continue;
         }

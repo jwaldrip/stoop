@@ -23,7 +23,7 @@
   </tbody>
 </table>
 <p>A failing run records nothing. Neither does a run started with <code>--no-record</code>.</p>
-<p>Before the run first writes a path, stoop also notes what that path held: absent, a directory, a link and its target, or a file (with its hash when the run read the old bytes or kept them). A skip does not read this record.</p>
+<p>Before the run first writes a path, stoop also notes what that path held: absent, a directory, a link and its target, or a file with its content hash. A skip does not read this record.</p>
 
 <h2 id="compare">The comparison</h2>
 <p>Next time, before running anything, stoop loads the proofs for the key, newest first, and checks each in turn: not expired, same environment, every input still the same, every output still in place, every probe still printing the same thing. The first proof that passes means a skip. If none passes, the command runs and the reason given is what differed from the newest proof. <code>stoop explain</code> prints what differed in each proof it checked.</p>

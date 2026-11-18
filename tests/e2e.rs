@@ -949,5 +949,46 @@ fn upgrading_reruns_executables_once() {
     assert!(skipped(&w.sh(script).1), "and then skips");
 }
 
+#[test]
+fn retargeting_a_written_through_link_reruns() {
+    let w = Ws::new("retarget-write");
+    w.write("one", "one");
+    w.write("two", "two");
+    std::os::unix::fs::symlink("one", w.root.join("link")).unwrap();
+    let script = "echo x > link";
+    assert_eq!(w.sh(script).0, 0);
+    fs::remove_file(w.root.join("link")).unwrap();
+    std::os::unix::fs::symlink("two", w.root.join("link")).unwrap();
+    let (_, err) = w.sh(script);
+    assert!(!skipped(&err), "{err}");
+}
+
+#[test]
+fn retargeting_a_written_through_directory_link_reruns() {
+    let w = Ws::new("retarget-directory");
+    w.write("sub/keep", "x");
+    w.write("other/keep", "x");
+    std::os::unix::fs::symlink("sub", w.root.join("link")).unwrap();
+    let script = "echo x > link/f";
+    assert_eq!(w.sh(script).0, 0);
+    fs::remove_file(w.root.join("link")).unwrap();
+    std::os::unix::fs::symlink("other", w.root.join("link")).unwrap();
+    let (_, err) = w.sh(script);
+    assert!(!skipped(&err), "{err}");
+}
+
+#[test]
+fn write_through_link_dotdot_does_not_hide_a_different_input() {
+    let w = Ws::new("dotdot-real-input");
+    w.write("sub/inner/keep", "k");
+    w.write("out", "old");
+    std::os::unix::fs::symlink("sub/inner", w.root.join("link")).unwrap();
+    let script = "cat out >/dev/null; echo x > link/../out";
+    assert_eq!(w.sh(script).0, 0);
+    w.write("out", "new");
+    let (_, err) = w.sh(script);
+    assert!(!skipped(&err), "{err}");
+}
+
 #[allow(dead_code)]
 fn _unused(_: &Path) {}

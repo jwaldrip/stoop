@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 /// Where the tracer records what the run's writes replace: repository paths under `root`.
 /// Keys are relative to `real_root`, the canonical path of `root`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub struct Scope<'a> {
     pub root: &'a Path,
     pub real_root: PathBuf,
@@ -19,6 +20,7 @@ pub struct Touch {
     pub listed: bool,
     /// The run looked at what the path holds: opened it for reading, executed it, or ran
     /// stat, access or readlink on it. Decides whether a write must record content.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub read: bool,
 }
 
