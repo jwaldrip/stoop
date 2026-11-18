@@ -359,6 +359,13 @@ fn control_baseline_proves() {
     assert_eq!(o.plan["skip"], json!(["a"]));
     let o = plan(&r, &["--format", "github"], &[]);
     assert!(o.stdout.contains("skip=,a,\n"), "{}", o.stdout);
+    let o = plan(
+        &r,
+        &["--format", "json", "--explain"],
+        &[("STOOP_DEBUG", "1")],
+    );
+    assert!(o.stderr.contains("stoop: time: tree "), "{}", o.stderr);
+    assert!(o.stderr.contains("fetched objects 0"), "{}", o.stderr);
 }
 
 #[test]
