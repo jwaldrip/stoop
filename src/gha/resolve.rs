@@ -1041,6 +1041,23 @@ mod tests {
         d
     }
 
+    #[test]
+    fn action_cache_refuses_paths_inside_the_repository() {
+        let root = scratch("cache-inside-repository");
+        let mut git = Git::new(&root, "http://127.0.0.1:1", Duration::from_secs(1));
+        git.cache_root = Some(root.join("cache"));
+        let result = git.cache_archive(
+            "owner",
+            "repo",
+            A,
+            b"data",
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(result.unwrap_err().contains("inside the repository"));
+        assert!(!root.join("cache").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn file_resolver(root: &Path) -> Git {
         Git::new(
             root,
@@ -1567,8 +1584,27 @@ mod tests {
             let end = Instant::now() + Duration::from_secs(2);
             while Instant::now() < end {
                 match listener.accept() {
-                    Ok((_stream, _)) => {
+                    Ok((mut stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        while !request.ends_with(b"\r\n\r\n") {
+                            match stream.read(&mut chunk) {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => request.extend_from_slice(&chunk[..n]),
+                            }
+                        }
                         thread::sleep(Duration::from_millis(500));
+                        let body = crate::gha::actions::fixture_archive();
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            body.len()
+                        );
+                        let _ = stream.write_all(&body);
                         return;
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {

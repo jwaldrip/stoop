@@ -459,11 +459,11 @@ impl Walk<'_> {
         if Instant::now() >= self.deadline {
             return Err(bad("verification exceeded the total timeout".into()));
         }
-        if depth > MAX_DEPTH || self.items.len() >= MAX_ACTIONS {
-            return Err(bad("action dependency graph exceeds its limit".into()));
-        }
         if self.items.contains_key(raw) {
             return Ok(());
+        }
+        if depth > MAX_DEPTH || self.items.len() + self.active.len() >= MAX_ACTIONS {
+            return Err(bad("action dependency graph exceeds its limit".into()));
         }
         if !self.active.insert(raw.to_owned()) {
             return Err(bad("cyclic composite actions".into()));
@@ -836,6 +836,163 @@ mod tests {
     }
 
     #[test]
+    fn action_paths_reject_traversal_and_platform_escapes() {
+        assert!(valid_path("nested/action.yml"));
+        for invalid in [
+            "",
+            "../secret",
+            "nested/../secret",
+            "/absolute",
+            "nested//action.yml",
+            "nested/./action.yml",
+            "nested\\action.yml",
+            "C:/action.yml",
+            "nul\0byte",
+            &"x".repeat(MAX_PATH + 1),
+        ] {
+            assert!(!valid_path(invalid), "accepted {invalid:?}");
+        }
+    }
+
+    #[test]
+    fn archives_reject_submodules_and_lfs_pointers() {
+        let submodule = archive(&[(".gitmodules", b"[submodule \"x\"]\n")]);
+        assert!(Tree::from_gzip(&submodule)
+            .unwrap_err()
+            .contains("submodules"));
+        let lfs = archive(&[(
+            "index.js",
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:123\nsize 9\n",
+        )]);
+        assert!(Tree::from_gzip(&lfs).unwrap_err().contains("Git LFS"));
+    }
+
+    #[test]
+    fn archives_reject_duplicate_file_paths() {
+        let duplicate = archive(&[("index.js", b"first"), ("index.js", b"second")]);
+        assert!(Tree::from_gzip(&duplicate)
+            .unwrap_err()
+            .contains("duplicate"));
+    }
+
+    #[test]
+    fn archives_bound_unpacked_bytes_and_entry_count() {
+        let mut header = tar::Header::new_ustar();
+        header.set_path("big").unwrap();
+        header.set_mode(0o644);
+        header.set_size(MAX_UNPACKED + 1);
+        header.set_cksum();
+        let archive = Cursor::new(header.as_bytes().to_vec())
+            .chain(std::io::repeat(0).take(MAX_UNPACKED + 1))
+            .chain(std::io::repeat(0).take(511 + 1024));
+        let result = Tree::from_tar_before(archive, false, Instant::now() + TOTAL_TIMEOUT);
+        assert!(
+            matches!(&result, Err(reason) if reason.contains("unpacked size")),
+            "oversized uncompressed archive was not refused"
+        );
+
+        let mut archive = tar::Builder::new(Vec::new());
+        let mut file = tar::Header::new_ustar();
+        file.set_mode(0o644);
+        file.set_size(1);
+        file.set_cksum();
+        archive.append_data(&mut file, "file", &b"x"[..]).unwrap();
+        for index in 0..MAX_ENTRIES {
+            let mut dir = tar::Header::new_ustar();
+            dir.set_entry_type(tar::EntryType::Directory);
+            dir.set_mode(0o755);
+            dir.set_size(0);
+            dir.set_cksum();
+            archive
+                .append_data(&mut dir, format!("d{index}/"), &[][..])
+                .unwrap();
+        }
+        let bytes = archive.into_inner().unwrap();
+        assert!(
+            Tree::from_tar_before(Cursor::new(bytes), false, Instant::now() + TOTAL_TIMEOUT)
+                .unwrap_err()
+                .contains("entry limit")
+        );
+    }
+
+    #[test]
+    fn composite_graph_rejects_cycles_and_excessive_depth() {
+        fn composite(child: &str) -> Tree {
+            let metadata = format!("runs:\n  using: composite\n  steps:\n    - uses: {child}\n");
+            Tree::from_gzip(&archive(&[("action.yml", metadata.as_bytes())])).unwrap()
+        }
+        let source = Source::default();
+        let sha = "1111111111111111111111111111111111111111";
+        source.add("owner/a", sha, composite("owner/b@v1"));
+        source.add("owner/b", sha, composite("owner/a@v1"));
+        assert!(capture(&["owner/a@v1".into()], &source, false)
+            .unwrap_err()
+            .contains("cyclic"));
+
+        let source = Source::default();
+        for index in 0..=MAX_DEPTH {
+            source.add(
+                &format!("owner/n{index}"),
+                sha,
+                composite(&format!("owner/n{}@v1", index + 1)),
+            );
+        }
+        source.add(&format!("owner/n{}", MAX_DEPTH + 1), sha, fixture_tree());
+        assert!(capture(&["owner/n0@v1".into()], &source, false)
+            .unwrap_err()
+            .contains("graph exceeds"));
+    }
+
+    #[test]
+    fn composite_graph_counts_active_parents_toward_the_limit() {
+        let source = Source::default();
+        let sha = "1111111111111111111111111111111111111111";
+        let mut metadata = String::from("runs:\n  using: composite\n  steps:\n");
+        for index in 0..(MAX_ACTIONS - 1) {
+            metadata.push_str(&format!("    - uses: owner/c{index}@v1\n"));
+            source.add(&format!("owner/c{index}"), sha, fixture_tree());
+        }
+        let at_limit = Tree::from_gzip(&archive(&[("action.yml", metadata.as_bytes())])).unwrap();
+        source.add("owner/parent", sha, at_limit);
+        assert!(capture(&["owner/parent@v1".into()], &source, false).is_ok());
+        metadata.push_str(&format!("    - uses: owner/c{}@v1\n", MAX_ACTIONS - 1));
+        source.add(&format!("owner/c{}", MAX_ACTIONS - 1), sha, fixture_tree());
+        let parent = Tree::from_gzip(&archive(&[("action.yml", metadata.as_bytes())])).unwrap();
+        source.add("owner/parent", sha, parent);
+        let result = capture(&["owner/parent@v1".into()], &source, false);
+        assert!(
+            matches!(&result, Err(reason) if reason.contains("graph exceeds")),
+            "oversized composite action graph was not refused"
+        );
+    }
+
+    #[test]
+    fn unexpected_witness_graph_entries_are_refused() {
+        let source = Source::default();
+        source.add(
+            "owner/tool",
+            "1111111111111111111111111111111111111111",
+            fixture_tree(),
+        );
+        let refs = vec!["owner/tool@v1".to_owned()];
+        let mut record = capture(&refs, &source, false).unwrap();
+        let mut witness: Witnesses = serde_json::from_str(&record[WITNESS_KEY]).unwrap();
+        let extra = witness.items["owner/tool@v1"].clone();
+        witness.items.insert("owner/extra@v1".into(), extra);
+        record.insert(WITNESS_KEY.into(), serde_json::to_string(&witness).unwrap());
+        let (code, detail) = verify(
+            &refs,
+            &record,
+            &source,
+            false,
+            Instant::now() + TOTAL_TIMEOUT,
+        )
+        .unwrap_err();
+        assert_eq!(code, Code::ActionUnverifiable);
+        assert!(detail.contains("graph"));
+    }
+
+    #[test]
     fn unchanged_then_moved_and_tampered_actions_are_distinct() {
         let source = Source::default();
         let first = "1111111111111111111111111111111111111111";
@@ -987,18 +1144,28 @@ mod tests {
         let mut raw = vec![0; MAX_COMPRESSED + 1];
         assert!(Tree::from_gzip(&raw).unwrap_err().contains("size"));
         raw.clear();
-        let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        let mut tar = tar::Builder::new(gz);
-        let mut header = tar::Header::new_gnu();
-        header.set_entry_type(tar::EntryType::Symlink);
-        header.set_size(0);
-        header.set_mode(0o777);
-        header.set_link_name("../outside").unwrap();
-        header.set_cksum();
-        tar.append_data(&mut header, "repo-sha/link", &[][..])
-            .unwrap();
-        let bytes = tar.into_inner().unwrap().finish().unwrap();
-        assert!(Tree::from_gzip(&bytes).unwrap_err().contains("unsupported"));
+        for kind in [
+            tar::EntryType::Symlink,
+            tar::EntryType::Link,
+            tar::EntryType::Char,
+            tar::EntryType::Block,
+            tar::EntryType::Fifo,
+        ] {
+            let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            let mut tar = tar::Builder::new(gz);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_size(0);
+            header.set_mode(0o777);
+            if matches!(kind, tar::EntryType::Symlink | tar::EntryType::Link) {
+                header.set_link_name("../outside").unwrap();
+            }
+            header.set_cksum();
+            tar.append_data(&mut header, "repo-sha/link", &[][..])
+                .unwrap();
+            let bytes = tar.into_inner().unwrap().finish().unwrap();
+            assert!(Tree::from_gzip(&bytes).unwrap_err().contains("unsupported"));
+        }
     }
 
     #[test]
@@ -1033,6 +1200,16 @@ mod tests {
             Instant::now() + TOTAL_TIMEOUT
         )
         .is_err());
+        for (index, byte) in [(3, b'p'), (11, b'G'), (51, b'!')] {
+            let mut malformed = comment.to_vec();
+            malformed[index] = byte;
+            assert!(Tree::from_tar_before(
+                Cursor::new(with_global(&malformed)),
+                false,
+                Instant::now() + TOTAL_TIMEOUT
+            )
+            .is_err());
+        }
     }
 
     #[test]
@@ -1082,7 +1259,17 @@ mod tests {
             assert!(Tree::from_directory(&temp)
                 .unwrap_err()
                 .contains("hard-linked"));
+            std::fs::remove_file(temp.join("hardlink.js")).unwrap();
+            std::os::unix::fs::symlink("index.js", temp.join("symlink.js")).unwrap();
+            assert!(Tree::from_directory(&temp).unwrap_err().contains("symlink"));
+            std::fs::remove_file(temp.join("symlink.js")).unwrap();
         }
+        std::fs::write(
+            temp.join("index.js"),
+            b"version https://git-lfs.github.com/spec/v1\noid sha256:123\nsize 9\n",
+        )
+        .unwrap();
+        assert!(Tree::from_directory(&temp).unwrap_err().contains("Git LFS"));
         std::fs::remove_dir_all(temp).unwrap();
     }
 }
