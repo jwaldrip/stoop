@@ -336,6 +336,23 @@ pub fn run(o: Opts, explain: bool) -> i32 {
         let dir = if rel_cwd.is_empty() { "." } else { &rel_cwd };
         eprintln!("stoop: dir {dir:?}");
     }
+    if !trace::supported() {
+        if explain {
+            eprintln!(
+                "stoop: would run {key}: not traced ({}); no proof can be used",
+                trace::UNAVAILABLE
+            );
+            return 1;
+        }
+        if !o.quiet {
+            eprintln!("stoop: run {key}: no compatible tracer");
+            eprintln!(
+                "stoop: not traced ({}); running without a proof",
+                trace::UNAVAILABLE
+            );
+        }
+        return plain(&o.argv);
+    }
     let full = env_flag("STOOP_FULL");
     let max_age = o
         .max_age
@@ -382,7 +399,11 @@ pub fn run(o: Opts, explain: bool) -> i32 {
         hit_idx = None;
         for (i, p) in proofs.iter().enumerate() {
             let expired = max_age > 0 && now().saturating_sub(p.created) > max_age;
-            let diffs: Vec<(String, &'static str)> = if p.cwd.as_deref() != Some(rel_cwd.as_str()) {
+            let diffs: Vec<(String, &'static str)> = if p.provenance.is_none() {
+                vec![("provenance".to_string(), "missing; run once to refresh")]
+            } else if !p.provenance.as_ref().is_some_and(|p| p.is_current()) {
+                vec![("provenance".to_string(), "changed")]
+            } else if p.cwd.as_deref() != Some(rel_cwd.as_str()) {
                 vec![("directory".to_string(), "changed")]
             } else if p.scope != scope {
                 vec![("repository".to_string(), "changed")]
@@ -536,6 +557,7 @@ pub fn run(o: Opts, explain: bool) -> i32 {
                 argv: o.argv.clone(),
                 cwd: Some(rel_cwd.clone()),
                 scope: scope.clone(),
+                provenance: Some(trace::Provenance::current()),
                 env: env_now,
                 inputs,
                 outputs,

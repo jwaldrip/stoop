@@ -1,7 +1,47 @@
 //! Observing what a command reads.
 
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+
+pub const UNAVAILABLE: &str = "tracing needs Linux x86-64 or arm64 (ptrace and seccomp)";
+const TRACER: &str = "ptrace-seccomp";
+// Increment when a change to the tracer invalidates existing observations.
+const TRACER_VERSION: u32 = 1;
+
+pub fn supported() -> bool {
+    cfg!(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Provenance {
+    pub os: String,
+    pub arch: String,
+    pub tracer: String,
+    pub version: u32,
+}
+
+impl Provenance {
+    pub fn current() -> Self {
+        Self {
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            tracer: TRACER.into(),
+            version: TRACER_VERSION,
+        }
+    }
+
+    pub fn is_current(&self) -> bool {
+        supported()
+            && self.os == std::env::consts::OS
+            && self.arch == std::env::consts::ARCH
+            && self.tracer == TRACER
+            && self.version == TRACER_VERSION
+    }
+}
 
 #[derive(Default)]
 pub struct Trace {
@@ -45,6 +85,6 @@ pub fn run(
 ) -> std::io::Result<Trace> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "tracing needs Linux (ptrace and seccomp)",
+        UNAVAILABLE,
     ))
 }

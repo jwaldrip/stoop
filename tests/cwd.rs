@@ -82,6 +82,12 @@ fn write_proof(store: &Path, key: &str, cwd: Option<&str>) {
     let mut proof = serde_json::json!({
         "created": 4_000_000_000u64,
         "argv": ["cat", "./data.txt"],
+        "provenance": {
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "tracer": "ptrace-seccomp",
+            "version": 1
+        },
         "env": {"PATH": blake3::hash(b"/usr/bin:/bin").to_hex().to_string()},
         "inputs": [],
         "outputs": [],
@@ -92,7 +98,7 @@ fn write_proof(store: &Path, key: &str, cwd: Option<&str>) {
     }
     fs::write(
         dir.join(format!("{key}.json")),
-        serde_json::to_vec(&serde_json::json!({"v": 1, "key": key, "proofs": [proof]})).unwrap(),
+        serde_json::to_vec(&serde_json::json!({"v": 2, "key": key, "proofs": [proof]})).unwrap(),
     )
     .unwrap();
 }
@@ -281,7 +287,15 @@ fn explicitly_named_proofs_cannot_skip_from_another_directory() {
     write_proof(&root.join(".stoop"), "manual", Some("a"));
     let args = ["explain", "--key", "manual", "--", "cat", "./data.txt"];
     let in_a = stoop(&a, &args, None);
-    assert!(in_a.status.success(), "{}", stderr(&in_a));
+    assert_eq!(
+        in_a.status.success(),
+        cfg!(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        "{}",
+        stderr(&in_a)
+    );
     let in_b = stoop(&b, &args, None);
     assert_eq!(in_b.status.code(), Some(1), "{}", stderr(&in_b));
 }
@@ -313,7 +327,15 @@ fn explain_and_ls_name_the_directory() {
         &["explain", "--key", "manual", "--", "cat", "./data.txt"],
         None,
     );
-    assert!(hit.status.success(), "{}", stderr(&hit));
+    assert_eq!(
+        hit.status.success(),
+        cfg!(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )),
+        "{}",
+        stderr(&hit)
+    );
     assert!(stderr(&hit).contains("dir \"sub\""), "{}", stderr(&hit));
     let ls = stoop(&root, &["ls"], None);
     let text = String::from_utf8_lossy(&ls.stdout);
