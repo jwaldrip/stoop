@@ -248,7 +248,9 @@ fn build<S: attest::KeySource>(
     out: &mut Value,
     verifier_factory: impl FnOnce(attest::Policy, u64, u64) -> attest::Verifier<S>,
 ) -> Result<(), String> {
+    let tree_started = (o.explain && run::env_flag("STOOP_DEBUG")).then(std::time::Instant::now);
     let mut tree = crate::gittree::GitTree::load(root, &o.rev).map_err(|e| e.0)?;
+    let tree_elapsed = tree_started.map(|started| started.elapsed());
     out["rev"] = json!(tree.commit());
     let text = show(root, tree.commit(), path)?;
     let workflow = gha::workflow::parse(path, &text)?;
@@ -448,6 +450,13 @@ fn build<S: attest::KeySource>(
             &decision,
             spec.key.as_deref(),
         ));
+    }
+    if let Some(tree_elapsed) = tree_elapsed {
+        eprintln!(
+            "stoop: time: tree {} ms; fetched objects {}",
+            tree_elapsed.as_millis(),
+            ctx.tree.fetched_objects()
+        );
     }
     out["skip"] = json!(skip);
     out["jobs"] = json!(results);

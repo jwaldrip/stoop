@@ -359,6 +359,13 @@ fn control_baseline_proves() {
     assert_eq!(o.plan["skip"], json!(["a"]));
     let o = plan(&r, &["--format", "github"], &[]);
     assert!(o.stdout.contains("skip=,a,\n"), "{}", o.stdout);
+    let o = plan(
+        &r,
+        &["--format", "json", "--explain"],
+        &[("STOOP_DEBUG", "1")],
+    );
+    assert!(o.stderr.contains("stoop: time: tree "), "{}", o.stderr);
+    assert!(o.stderr.contains("fetched objects 0"), "{}", o.stderr);
 }
 
 #[test]
@@ -1125,7 +1132,7 @@ fn only_run_invariant_github_context_is_accepted() {
         let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
         record(&r, rec(&good, now, now)).unwrap();
         let o = plan(&r, &["--format", "json"], &[("STOOP_FULL", "")]);
-        assert_ne!(code(&o, "a"), "proved", "{expr}");
+        assert_eq!(code(&o, "a"), "blocked", "{expr}");
         assert!(o.plan["skip"].as_array().unwrap().is_empty(), "{expr}");
     }
 }
@@ -1162,7 +1169,7 @@ fn plan_environment_cannot_shadow_workflow_vars_or_secrets() {
         let safe = workflow("", "", "");
         record(&r, rec(&safe, now, now)).unwrap();
         let o = plan(&r, &["--format", "json"], &[("STOOP_FULL", "")]);
-        assert_ne!(code(&o, "a"), "proved", "{context}");
+        assert_eq!(code(&o, "a"), "error", "{context}");
         assert!(o.plan["skip"].as_array().unwrap().is_empty(), "{context}");
     }
 }
