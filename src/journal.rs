@@ -76,7 +76,9 @@ impl Journal {
         let workflow = workflow::parse(workflow_path, text)?;
         let cx = GhCtx::from_env()?;
         let job = run::env_str("GITHUB_JOB").ok_or("missing GITHUB_JOB")?;
-        let spec = workflow::job_spec(&workflow, &cx, &job, matrix);
+        let allowed =
+            workflow::parse_allow_uses(&std::env::var("STOOP_ALLOW_USES").unwrap_or_default())?;
+        let spec = workflow::job_spec_with_allow(&workflow, &cx, &job, matrix, &allowed);
         if let Some(blocked) = spec.blocked {
             return Err(blocked.detail);
         }
