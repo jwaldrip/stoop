@@ -270,7 +270,7 @@ fn shell_command(args: &[std::ffi::OsString]) -> bool {
             }
             continue;
         }
-        if arg == "+o" {
+        if matches!(arg, "+o" | "+O") {
             if args.next().is_none() {
                 return false;
             }
@@ -282,7 +282,7 @@ fn shell_command(args: &[std::ffi::OsString]) -> bool {
         if short.contains('c') {
             return true;
         }
-        if short.ends_with('o') && args.next().is_none() {
+        if (short.ends_with('o') || short.ends_with('O')) && args.next().is_none() {
             return false;
         }
     }
@@ -543,6 +543,9 @@ mod tests {
             vec!["bash", "-o", "pipefail", "-c", "pytest"],
             vec!["bash", "--norc", "-lc", "pytest"],
             vec!["bash", "--rcfile", "rc", "-c", "pytest"],
+            vec!["bash", "--init-file", "rc", "-c", "pytest"],
+            vec!["bash", "-O", "extglob", "-c", "pytest"],
+            vec!["bash", "+O", "extglob", "-c", "pytest"],
         ] {
             let events = vec![
                 event(None, "bash", &args),

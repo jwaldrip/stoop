@@ -20,6 +20,7 @@ use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 #[cfg(target_arch = "x86_64")]
 const AUDIT_ARCH: u32 = 0xC000_003E;
@@ -57,6 +58,7 @@ const MAX_EXEC_EVENTS: usize = 1024;
 const MAX_EXEC_TASKS: usize = 1024;
 const MAX_EXEC_ARGS: usize = 128;
 const MAX_EXEC_ARG_BYTES: usize = 16 * 1024;
+const MAX_EXEC_HOLD: Duration = Duration::from_secs(1);
 
 #[derive(Clone, Copy)]
 enum Op {
@@ -640,7 +642,26 @@ pub fn run<'a>(
     let mut wait_failed = false;
 
     loop {
-        let p = unsafe { libc::waitpid(-1, &mut st, libc::__WALL) };
+        // A missing parent notification must not leave a child stopped forever.
+        // Poll only while a child is held, and discard the diagnostic on expiry.
+        let remaining = tr
+            .execs
+            .as_ref()
+            .and_then(|execs| execs.hold_remaining(Instant::now()));
+        if remaining.is_some_and(|duration| duration.is_zero()) {
+            if let Some(execs) = &mut tr.execs {
+                execs.invalidate();
+            }
+        }
+        let polling = remaining.is_some_and(|duration| !duration.is_zero());
+        let options = libc::__WALL | if polling { libc::WNOHANG } else { 0 };
+        let p = unsafe { libc::waitpid(-1, &mut st, options) };
+        if p == 0 {
+            if let Some(remaining) = remaining {
+                std::thread::sleep(remaining.min(Duration::from_millis(1)));
+            }
+            continue;
+        }
         if p < 0 {
             let err = io::Error::last_os_error();
             match err.raw_os_error() {
@@ -708,7 +729,12 @@ pub fn run<'a>(
                 // A child can report its initial stop before waitpid delivers its
                 // parent's fork event. Hold that already-stopped child until its
                 // inherited image is known; it has not executed user code yet.
-                if sig == libc::SIGSTOP && tr.execs.as_mut().is_some_and(|execs| execs.defer(p)) {
+                if sig == libc::SIGSTOP
+                    && tr
+                        .execs
+                        .as_mut()
+                        .is_some_and(|execs| execs.defer(p, Instant::now()))
+                {
                     continue;
                 }
                 // A fresh tracee announces itself with SIGSTOP; swallow that one.
@@ -838,7 +864,7 @@ struct ExecObserver {
     // The current image for each traced task; a fork inherits its parent's image.
     tasks: HashMap<i32, Option<usize>>,
     pending: HashMap<i32, Option<PendingExec>>,
-    deferred: HashSet<i32>,
+    deferred: HashMap<i32, Instant>,
     events: Vec<ExecEvent>,
     valid: bool,
     collecting: bool,
@@ -848,7 +874,7 @@ impl ExecObserver {
     fn new(root: i32) -> Self {
         Self {
             tasks: HashMap::from([(root, None)]),
-            deferred: HashSet::new(),
+            deferred: HashMap::new(),
             pending: HashMap::new(),
             events: Vec::new(),
             valid: true,
@@ -861,7 +887,7 @@ impl ExecObserver {
         self.tasks.clear();
         self.pending.clear();
         // Never leave a tracee stopped solely for diagnostic collection.
-        for pid in self.deferred.drain() {
+        for (pid, _) in self.deferred.drain() {
             cont(pid, 0);
         }
     }
@@ -872,7 +898,7 @@ impl ExecObserver {
         self.events.clear();
     }
 
-    fn defer(&mut self, pid: i32) -> bool {
+    fn defer(&mut self, pid: i32, now: Instant) -> bool {
         if !self.collecting || self.tasks.contains_key(&pid) {
             return false;
         }
@@ -880,8 +906,15 @@ impl ExecObserver {
             self.stop_collecting();
             return false;
         }
-        self.deferred.insert(pid);
+        self.deferred.entry(pid).or_insert(now);
         true
+    }
+
+    fn hold_remaining(&self, now: Instant) -> Option<Duration> {
+        self.deferred
+            .values()
+            .min()
+            .map(|oldest| MAX_EXEC_HOLD.saturating_sub(now.saturating_duration_since(*oldest)))
     }
 
     fn enter(&mut self, pid: i32, nr: i64, args: &[u64; 6]) {
@@ -943,7 +976,7 @@ impl ExecObserver {
         }
         self.tasks.insert(child, image);
         self.pending.remove(&child);
-        self.deferred.remove(&child)
+        self.deferred.remove(&child).is_some()
     }
 
     fn exec(&mut self, pid: i32) {
@@ -2164,11 +2197,28 @@ mod tests {
         let mut observer = ExecObserver::new(10);
         observer.events.push(sample_exec());
         observer.tasks.insert(10, Some(0));
-        assert!(observer.defer(11));
+        assert!(observer.defer(11, Instant::now()));
         assert!(observer.register_child(10, 11));
         assert_eq!(observer.tasks.get(&11), Some(&Some(0)));
-        assert!(!observer.defer(11));
-        assert!(!observer.deferred.contains(&11));
+        assert!(!observer.defer(11, Instant::now()));
+        assert!(!observer.deferred.contains_key(&11));
+    }
+
+    #[test]
+    fn oldest_deferred_child_controls_the_deadline() {
+        let mut observer = ExecObserver::new(10);
+        let start = Instant::now();
+        let later = start + Duration::from_millis(250);
+        assert!(observer.defer(11, start));
+        assert!(observer.defer(12, later));
+        assert_eq!(
+            observer.hold_remaining(later),
+            Some(Duration::from_millis(750))
+        );
+        assert!(observer.register_child(10, 11));
+        assert_eq!(observer.hold_remaining(later), Some(MAX_EXEC_HOLD));
+        observer.exit(12);
+        assert_eq!(observer.hold_remaining(later), None);
     }
 
     #[test]
