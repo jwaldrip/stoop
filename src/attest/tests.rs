@@ -904,3 +904,42 @@ fn curl_command_disables_configuration_and_does_not_put_credentials_in_arguments
         .iter()
         .any(|arg| arg.contains("Authorization") || arg.contains("bearer")));
 }
+
+#[test]
+fn curl_sends_bearer_on_stdin_not_argv() {
+    use std::os::unix::fs::PermissionsExt;
+    const TOKEN: &str = "test-only-bearer-for-argv-check";
+    if std::env::var_os("STOOP_CURL_ARGV_CHILD").is_some() {
+        assert!(curl(
+            "https://token.actions.githubusercontent.com/test",
+            Some(TOKEN)
+        )
+        .is_ok());
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("stoop-curl-argv-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let script = dir.join("curl");
+    std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$STOOP_CURL_CAPTURE/args\"\n/bin/cat > \"$STOOP_CURL_CAPTURE/stdin\"\nprintf '{}'\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "attest::tests::curl_sends_bearer_on_stdin_not_argv",
+        ])
+        .env("STOOP_CURL_ARGV_CHILD", "1")
+        .env("STOOP_CURL_CAPTURE", &dir)
+        .env("PATH", &dir)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let args = std::fs::read_to_string(dir.join("args")).unwrap();
+    let stdin = std::fs::read_to_string(dir.join("stdin")).unwrap();
+    assert!(!args.contains(TOKEN), "bearer leaked into argv");
+    assert!(stdin.contains(TOKEN), "bearer missing from stdin");
+    std::fs::remove_dir_all(dir).unwrap();
+}
