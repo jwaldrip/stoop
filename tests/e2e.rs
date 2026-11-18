@@ -679,6 +679,118 @@ fn an_empty_off_variable_does_not_disable_stoop() {
     assert!(skipped(&run_with_env(&w, &[("STOOP_OFF", "")])));
 }
 
+/// Run with the given variables; returns stderr. `FOO` is a low-entropy "secret".
+fn run_salted(w: &Ws, vars: &[(&str, &str)], extra: &[&str]) -> String {
+    let mut args = vec!["run", "--root", ".", "--key", "salt"];
+    args.extend(extra);
+    args.extend(["--", "sh", "-c", SCRIPT]);
+    let mut c = Command::new(env!("CARGO_BIN_EXE_stoop"));
+    c.args(args)
+        .current_dir(&w.root)
+        .env(
+            "STOOP_STORE",
+            w.root.join("..").join(format!(
+                "{}-store",
+                w.root.file_name().unwrap().to_string_lossy()
+            )),
+        )
+        .env_remove("STOOP_ENV_SALT")
+        .env_remove("STOOP_SYNC_WRITE")
+        .env("FOO", "hunter2");
+    for (k, v) in vars {
+        c.env(k, v);
+    }
+    String::from_utf8_lossy(&c.output().unwrap().stderr).into_owned()
+}
+
+fn proof_text(w: &Ws) -> String {
+    let dir = w
+        .root
+        .join("..")
+        .join(format!(
+            "{}-store",
+            w.root.file_name().unwrap().to_string_lossy()
+        ))
+        .join("proofs");
+    fs::read_dir(dir)
+        .unwrap()
+        .map(|e| fs::read_to_string(e.unwrap().path()).unwrap())
+        .collect()
+}
+
+#[test]
+fn a_salted_proof_does_not_contain_the_plain_hash_of_a_secret() {
+    let guess = blake3::hash(b"hunter2").to_hex().to_string();
+    let plain = Ws::new("salt-plain");
+    run_salted(&plain, &[], &[]);
+    assert!(
+        proof_text(&plain).contains(&guess),
+        "without a salt the plain hash is what is stored"
+    );
+    let salted = Ws::new("salt-on");
+    let e = run_salted(&salted, &[("STOOP_ENV_SALT", "repo-secret")], &[]);
+    assert!(e.contains("recorded"), "{e}");
+    let text = proof_text(&salted);
+    assert!(
+        !text.contains(&guess),
+        "a dictionary guess of the value must not match anything stored"
+    );
+    assert!(
+        text.contains("\"FOO\":\"s:"),
+        "salted hashes carry the s: prefix: {text}"
+    );
+    assert!(
+        !text.contains("repo-secret"),
+        "the salt itself is never stored"
+    );
+}
+
+#[test]
+fn the_same_salt_skips_and_a_different_or_missing_salt_runs() {
+    let w = Ws::new("salt-match");
+    run_salted(&w, &[("STOOP_ENV_SALT", "one")], &[]);
+    assert!(skipped(&run_salted(&w, &[("STOOP_ENV_SALT", "one")], &[])));
+    let e = run_salted(&w, &[("STOOP_ENV_SALT", "two")], &[]);
+    assert!(
+        !skipped(&e) && e.contains("env changed"),
+        "another salt cannot match: {e}"
+    );
+    // A run without the secret (a fork pull request) cannot verify, so it runs.
+    let w2 = Ws::new("salt-missing");
+    run_salted(&w2, &[("STOOP_ENV_SALT", "one")], &[]);
+    assert!(!skipped(&run_salted(&w2, &[], &[])));
+}
+
+#[test]
+fn a_changed_variable_still_runs_with_a_salt() {
+    let w = Ws::new("salt-changed");
+    run_salted(&w, &[("STOOP_ENV_SALT", "one")], &[]);
+    let e = run_salted(&w, &[("STOOP_ENV_SALT", "one"), ("FOO", "other")], &[]);
+    assert!(!skipped(&e) && e.contains("env changed"), "{e}");
+}
+
+#[test]
+fn publishing_without_a_salt_warns_and_with_a_salt_does_not() {
+    let remote = bare("salt-warn");
+    let a = Ws::new("salt-warn-a").with_remote(&remote);
+    let e = run_salted(&a, &[("STOOP_SYNC_WRITE", "1")], &["--sync", "git"]);
+    assert!(
+        e.contains("published") && e.contains("STOOP_ENV_SALT"),
+        "{e}"
+    );
+    let remote2 = bare("salt-warn2");
+    let b = Ws::new("salt-warn-b").with_remote(&remote2);
+    let e = run_salted(
+        &b,
+        &[("STOOP_SYNC_WRITE", "1"), ("STOOP_ENV_SALT", "s")],
+        &["--sync", "git"],
+    );
+    assert!(
+        e.contains("published") && !e.contains("STOOP_ENV_SALT"),
+        "{e}"
+    );
+}
+
 #[test]
 fn io_uring_is_refused_inside_a_traced_command_so_runtimes_fall_back() {
     let w = Ws::new("iouring");
