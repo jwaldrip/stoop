@@ -44,7 +44,7 @@ stoop: skip sh-c98f8f9c8fef6d65: 71 inputs unchanged since 0s ago (100ms)</code>
 <p>Only a file's bytes and its executable bit are compared. Modification times, owners and the other permission bits are not, so a tool that decides by timestamp is outside what a proof can show. A hard link to a repository file is not detected: a write through the link changes the file without the proof naming it.</p>
 
 <h2 id="names">Names that are not UTF-8</h2>
-<p>A path inside the repository whose name is not valid UTF-8 is not recorded by name, so a skip does not check it. The proof records the run as unplannable.</p>
+<p>A run that accesses a repository path whose name is not valid UTF-8 is not recorded. This prevents a later skip from relying on a path the proof cannot represent faithfully.</p>
 
 <h2 id="platform">Platforms</h2>
 <p>Tracing needs Linux on x86-64 or arm64. Elsewhere stoop runs the command untraced and records nothing. Programs that use <code>io_uring</code> for file access are told it is unavailable (<code>ENOSYS</code>) so they fall back to calls the tracer can see; Node, for one, handles this.</p>

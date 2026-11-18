@@ -706,20 +706,17 @@ impl Rec<'_> {
         if rel.components().any(|c| c.as_os_str() == ".git") {
             return None;
         }
-        let text = rel.to_string_lossy();
-        if self.ignore.is_ignored(&text) {
+        let Some(key) = rel.to_str() else {
+            if t.unsound.len() < 16 {
+                t.unsound
+                    .push("it used a path in the repository that is not valid UTF-8".into());
+            }
+            return None;
+        };
+        if self.ignore.is_ignored(key) {
             return None;
         }
-        match rel.to_str() {
-            Some(k) => Some(k.to_string()),
-            None => {
-                push_reason(
-                    t,
-                    format!("it used a path in the repository that is not valid UTF-8 ({text})"),
-                );
-                None
-            }
-        }
+        Some(key.to_string())
     }
 
     /// The first symlink on the spelled path below the root, as a key. A parent that moved
@@ -834,10 +831,9 @@ impl Rec<'_> {
             {
                 Some(target) => Some(format!("l:{target}")),
                 None => {
-                    push_reason(
-                        t,
-                        format!("the link {key} points to a path that is not valid UTF-8"),
-                    );
+                    t.unsound.push(format!(
+                        "the link {key} has an unreadable or non-UTF-8 target"
+                    ));
                     None
                 }
             };

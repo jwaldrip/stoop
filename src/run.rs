@@ -662,6 +662,16 @@ pub fn build_inputs(
     if let Some(u) = trace.unsound.first() {
         return Err(u.clone());
     }
+    // Symlink targets are serialized as text too. Refuse rather than serialize lossy bytes.
+    for path in trace.keys.keys().chain(trace.touched.keys()) {
+        let in_repo = path.starts_with(root) || path.starts_with(phys.real());
+        if in_repo
+            && std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+            && std::fs::read_link(path).is_ok_and(|target| target.to_str().is_none())
+        {
+            return Err("it used a repository symlink with a non-UTF-8 target".into());
+        }
+    }
     let real_root = phys.real().to_path_buf();
     phys.prefetch(
         trace
@@ -681,10 +691,11 @@ pub fn build_inputs(
         if let Some(pp) = &physical {
             if let Some(rel) = phys.repo_rel(pp) {
                 match rel.to_str() {
-                    None => reasons.push(format!(
-                        "it used a path in the repository that is not valid UTF-8 ({})",
-                        rel.to_string_lossy()
-                    )),
+                    None => {
+                        return Err(
+                            "it used a path in the repository that is not valid UTF-8".into()
+                        )
+                    }
                     Some(pkey) if pkey != key => {
                         if rel.components().any(|c| c.as_os_str() == ".git") {
                             if !ignore.is_ignored(pkey) {
@@ -711,10 +722,7 @@ pub fn build_inputs(
                 .and_then(|r| r.to_str())
                 .is_none()
         {
-            reasons.push(format!(
-                "it used a path in the repository that is not valid UTF-8 ({key})"
-            ));
-            continue;
+            return Err("it used a path in the repository that is not valid UTF-8".into());
         }
         let written_physically = physical
             .as_deref()
@@ -758,11 +766,7 @@ pub fn build_inputs(
         match target.strip_prefix(&real_root) {
             Ok(rel) if !rel.as_os_str().is_empty() => {
                 let Some(tkey) = rel.to_str() else {
-                    reasons.push(format!(
-                        "it used a path in the repository that is not valid UTF-8 ({})",
-                        rel.to_string_lossy()
-                    ));
-                    continue;
+                    return Err("it used a path in the repository that is not valid UTF-8".into());
                 };
                 if rel.components().any(|c| c.as_os_str() == ".git") {
                     if !ignore.is_ignored(tkey) {

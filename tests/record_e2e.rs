@@ -307,17 +307,26 @@ fn a_failed_create_under_a_file_records_the_file() {
 }
 
 #[test]
-fn a_non_utf8_name_in_the_repository_is_unplannable_and_unkeyed() {
+fn non_utf8_repository_access_never_records_a_proof() {
+    use std::os::unix::ffi::OsStringExt;
     let w = Ws::new("nonutf8");
-    let p = recorded(&w, "printf x > \"$(printf 'bad\\377name')\"");
-    assert!(has_reason(&p, "not valid UTF-8"), "{:?}", reasons(&p));
-    assert!(
-        !pairs(&p, "outputs")
-            .iter()
-            .any(|(k, _)| k.contains('\u{FFFD}')),
-        "no lossy keys: {:?}",
-        pairs(&p, "outputs")
-    );
+    let invalid = w
+        .root
+        .join(std::ffi::OsString::from_vec(b"bad\xffname".to_vec()));
+    fs::write(&invalid, b"one").unwrap();
+    for script in [
+        "cat \"$(printf 'bad\\377name')\" >/dev/null",
+        "printf x > \"$(printf 'bad\\377name')\"",
+        "ls \"$(printf 'bad\\377name')\" >/dev/null",
+    ] {
+        let (code, err) = w.sh(script);
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            err.contains("not recorded") && err.contains("not valid UTF-8"),
+            "{err}"
+        );
+        assert!(!w.store().join("proofs/t.json").exists(), "{err}");
+    }
 }
 
 #[test]
@@ -454,7 +463,8 @@ fn reading_a_link_after_writing_through_it_keeps_the_link_as_an_input() {
     std::os::unix::fs::symlink(w.root.join("t.txt"), w.root.join("l")).unwrap();
     let p = recorded(&w, "echo x > l && cat l > /dev/null");
     assert!(
-        pairs(&p, "inputs").contains(&("l".into(), format!("l:{}", w.root.join("t.txt").display()))),
+        pairs(&p, "inputs")
+            .contains(&("l".into(), format!("l:{}", w.root.join("t.txt").display()))),
         "{:?}",
         pairs(&p, "inputs")
     );
