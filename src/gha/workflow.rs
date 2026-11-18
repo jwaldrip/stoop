@@ -446,6 +446,8 @@ pub fn job_spec(w: &Workflow, cx: &GhCtx, job: &str, leg: Option<&str>) -> JobSp
         if_text: None,
         steps: vec![],
         blocked: None,
+        actions: vec![],
+        images: vec![],
     };
     let result = build(w, cx, job, leg, &mut spec);
     if let Err((step, detail)) = result {
@@ -519,6 +521,7 @@ fn build(
             Value::String(s) => s.clone(),
             _ => v.to_string(),
         });
+        spec.images = images_of(j)?;
         if j.contains_key("uses") {
             return Err("reusable uses is not supported".into());
         }
@@ -580,6 +583,9 @@ fn build(
                         }
                         seen_traced = true;
                     }
+                    if let Some(uses) = step.get("uses").and_then(Value::as_str) {
+                        spec.actions.push(uses.to_string());
+                    }
                     keyed_steps.push(key);
                     spec.steps.push(desc);
                 }
@@ -606,6 +612,27 @@ fn build(
         Ok(())
     };
     work().map_err(|e| (None, e))
+}
+fn images_of(job: &Map<String, Value>) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    if let Some(container) = job.get("container").filter(|v| !v.is_null()) {
+        out.push(image_of(container)?);
+    }
+    for service in object(job.get("services"), "services")?.values() {
+        out.push(image_of(service)?);
+    }
+    Ok(out)
+}
+fn image_of(v: &Value) -> Result<String, String> {
+    let image = match v {
+        Value::String(s) => Some(s.as_str()),
+        Value::Object(o) => o.get("image").and_then(Value::as_str),
+        _ => None,
+    };
+    image
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "container or service image is not a static string".into())
 }
 fn action_name(uses: &str) -> Option<String> {
     let (path, _) = uses.rsplit_once('@')?;
@@ -1120,5 +1147,21 @@ mod tests {
                 assert!(specs[0].key.is_none());
             }
         }
+    }
+
+    #[test]
+    fn spec_lists_running_action_references_and_job_images() {
+        let steps = format!(
+            "      - if: false\n        uses: actions/setup-node@v4\n        with: {{node-version: 20}}\n{RUN}"
+        );
+        let s = spec(&fixture(
+            "    container: node:20\n    services:\n      cache:\n        image: redis:7\n",
+            &steps,
+        ));
+        assert!(s.blocked.is_none(), "{:?}", s.blocked);
+        assert_eq!(s.actions, vec!["actions/checkout@v4".to_string()]);
+        assert_eq!(s.images, vec!["node:20".to_string(), "redis:7".to_string()]);
+        let plain = spec(&fixture("", RUN));
+        assert!(plain.images.is_empty());
     }
 }
