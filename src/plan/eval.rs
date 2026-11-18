@@ -413,12 +413,16 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
     }
     let mut proofs: Vec<Proof> = Vec::new();
     for ((index, key, age), saved) in steps.iter().zip(&record.steps) {
-        let Some(proof) = ctx
-            .proofs
-            .load(key)
-            .into_iter()
-            .find(|p| p.digest() == saved.proof)
-        else {
+        let loaded = ctx.proofs.load(key);
+        let has_legacy = loaded.iter().any(|p| p.provenance.is_none());
+        let empty = loaded.is_empty();
+        let Some(proof) = loaded.into_iter().find(|p| p.digest() == saved.proof) else {
+            if (empty && ctx.proofs.export(key).is_some()) || has_legacy {
+                return decision(
+                    Code::ProofPlatform,
+                    format!("step {index}: proof lacks provenance"),
+                );
+            }
             return decision(Code::ProofMissing, format!("step {index}: proof missing"));
         };
         if let Err(reason) = proof_platform(&proof, spec, record) {
@@ -1033,6 +1037,24 @@ mod tests {
             (
                 "macos-latest",
                 Some(("macos", "aarch64", "unsupported")),
+                None,
+                Code::ProofPlatform,
+            ),
+            (
+                "custom-runner",
+                Some(("linux", "x86_64", "ptrace-seccomp")),
+                None,
+                Code::ProofPlatform,
+            ),
+            (
+                "ubuntu-latest",
+                Some(("linux", "x86_64", "unknown")),
+                None,
+                Code::ProofPlatform,
+            ),
+            (
+                "windows-latest",
+                Some(("linux", "x86_64", "ptrace-seccomp")),
                 None,
                 Code::ProofPlatform,
             ),
