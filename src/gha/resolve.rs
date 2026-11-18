@@ -324,7 +324,6 @@ pub fn require_pinned(uses: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-
 /// What the recorder stores in `JobRecord.actions`: the commit of every reference that
 /// resolved, and one reason for each reference that did not. A reference that did not
 /// resolve is left out, so the planner has no answer for it and the job runs.
@@ -375,7 +374,10 @@ impl<'a> ActionCheck<'a> {
     }
     /// Explicit policy for callers that obtain strictness from a plan option.
     pub fn with_strict(resolver: &'a dyn Resolver, strict: bool) -> Self {
-        Self { memo: Memo::new(resolver), strict }
+        Self {
+            memo: Memo::new(resolver),
+            strict,
+        }
     }
 }
 
@@ -1005,13 +1007,23 @@ mod tests {
         fake.set("actions/checkout@v4", Ok(A));
         let floating = spec(&["actions/checkout@v4"], &[]);
         let rec = record(&[("actions/checkout@v4", A)]);
-        assert_eq!(ActionCheck::with_strict(&fake, true).check(&floating, &rec).unwrap_err().0, Code::UnresolvedAction);
+        assert_eq!(
+            ActionCheck::with_strict(&fake, true)
+                .check(&floating, &rec)
+                .unwrap_err()
+                .0,
+            Code::UnresolvedAction
+        );
         assert_eq!(fake.calls(), 0);
-        assert!(ActionCheck::with_strict(&fake, false).check(&floating, &rec).is_ok());
+        assert!(ActionCheck::with_strict(&fake, false)
+            .check(&floating, &rec)
+            .is_ok());
         let pin = format!("actions/checkout@{A}");
         assert!(require_pinned(std::slice::from_ref(&pin)).is_ok());
         assert!(require_pinned(&["actions/checkout@v4".into()]).is_err());
-        assert!(ActionCheck::with_strict(&fake, true).check(&spec(&[&pin], &[]), &record(&[(&pin, A)])).is_ok());
+        assert!(ActionCheck::with_strict(&fake, true)
+            .check(&spec(&[&pin], &[]), &record(&[(&pin, A)]))
+            .is_ok());
     }
     #[test]
     fn second_action_change_and_second_image_are_checked() {
