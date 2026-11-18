@@ -2278,10 +2278,11 @@ mod tests {
         use crate::attest::tests as a;
         use crate::gha::resolve::{ActionCheck, Resolver};
         use crate::plan::Composite;
-        use std::cell::RefCell;
-        struct Local(RefCell<String>);
+        use std::cell::{Cell, RefCell};
+        struct Local(RefCell<String>, Cell<usize>);
         impl Resolver for Local {
             fn commit(&self, _: &str, _: &str, _: &str) -> Result<String, String> {
+                self.1.set(self.1.get() + 1);
                 Ok(self.0.borrow().clone())
             }
         }
@@ -2300,9 +2301,10 @@ mod tests {
             "1111111111111111111111111111111111111111".into(),
         );
         let verifier = a::verifier();
-        let resolver = Local(RefCell::new(
-            "1111111111111111111111111111111111111111".into(),
-        ));
+        let resolver = Local(
+            RefCell::new("1111111111111111111111111111111111111111".into()),
+            Cell::new(0),
+        );
         let evaluate = |f: &mut Fixture, record: &JobRecord, resolver: &Local| {
             f.jobs.save(a::JOB, record.clone()).unwrap();
             let actions = ActionCheck::new(resolver);
@@ -2333,6 +2335,11 @@ mod tests {
         let d = evaluate(&mut f, &record, &resolver);
         assert_eq!(d.code, Code::Unattested);
         assert!(d.detail.contains("would otherwise prove"));
+        assert_eq!(
+            resolver.1.get(),
+            0,
+            "unattested records must not resolve actions"
+        );
         record.attest = Some(a::signed(&record, |_| {}, "test-key-1", a::KEY_1));
         assert_eq!(evaluate(&mut f, &record, &resolver).code, Code::Proved);
         *resolver.0.borrow_mut() = "2222222222222222222222222222222222222222".into();
@@ -2375,8 +2382,28 @@ mod tests {
         let reverted = evaluate(&mut f, &record, &resolver);
         assert_eq!(reverted.code, Code::Proved);
         assert_eq!(reverted.evidence.unwrap().run.as_deref(), Some("123/1"));
+        let mut failed = record.clone();
+        failed.run = Some("125/1".into());
+        failed.started = (a::NOW - 60) * 1000;
+        failed.status = Some(RecordStatus::Failed);
+        failed.failed = Some("sh-0".into());
+        failed.attest = Some(a::signed(
+            &failed,
+            |claims| claims["run_id"] = serde_json::json!("125"),
+            "test-key-1",
+            a::KEY_1,
+        ));
+        f.jobs.save(a::JOB, failed).unwrap();
         record.started = (a::NOW + 1_000_000) * 1000;
-        record.attest = Some(a::signed(&record, |_| {}, "test-key-1", a::KEY_1));
-        assert_eq!(evaluate(&mut f, &record, &resolver).code, Code::Unattested);
+        record.attest = Some(a::signed(
+            &record,
+            |claims| {
+                claims["iat"] = serde_json::json!(a::NOW - 1000);
+                claims["nbf"] = serde_json::json!(a::NOW - 1000);
+            },
+            "test-key-1",
+            a::KEY_1,
+        ));
+        assert_eq!(evaluate(&mut f, &record, &resolver).code, Code::Stale);
     }
 }

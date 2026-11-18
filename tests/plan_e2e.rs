@@ -108,6 +108,21 @@ fn ungated_job_and_dependent_run() {
     assert_eq!(v["jobs"][0]["code"], "graph");
 }
 #[test]
+fn unallowlisted_action_is_blocked() {
+    let text = WORKFLOW.replace(
+        "      - run: cat a.txt",
+        "      - uses: actions/upload-artifact@v4\n      - run: cat a.txt",
+    );
+    let r = Repo::new(&text);
+    let v: serde_json::Value =
+        serde_json::from_slice(&r.plan(&["--format", "json"], false).stdout).unwrap();
+    assert_eq!(v["jobs"][0]["code"], "blocked");
+    assert!(v["jobs"][0]["detail"]
+        .as_str()
+        .unwrap()
+        .contains("upload-artifact"));
+}
+#[test]
 fn missing_workflow_fails_wide_and_bad_age_is_usage_error() {
     let r = Repo::new(WORKFLOW);
     let out = r.plan(&["--workflow", "missing.yml", "--format", "github"], false);

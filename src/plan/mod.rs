@@ -320,6 +320,12 @@ fn build<S: attest::KeySource>(
             run_decision(Code::Full, "STOOP_FULL enabled")
         } else if let Some(error) = &global_error {
             run_decision(Code::Error, error.clone())
+        } else if (spec.blocked.is_some() || spec.key.is_none())
+            && gate
+                .as_ref()
+                .is_none_or(|(code, _)| *code != Code::NotGated)
+        {
+            eval::decide(spec, &mut ctx)
         } else if let Some((code, detail)) = gate {
             run_decision(code, detail)
         } else {
