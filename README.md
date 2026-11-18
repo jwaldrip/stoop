@@ -137,3 +137,12 @@ cargo test        # the end-to-end tests need Linux
 ```
 
 MIT licensed.
+
+<p align="center">
+  <a href="https://withbushido.ai">
+    <img alt="The Bushido Collective seal" src="assets/bushido-seal-on-light.svg#gh-light-mode-only" width="72">
+    <img alt="The Bushido Collective seal" src="assets/bushido-seal-on-dark.svg#gh-dark-mode-only" width="72">
+  </a>
+  <br>
+  <sub>A <a href="https://withbushido.ai">Bushido Collective</a> project</sub>
+</p>

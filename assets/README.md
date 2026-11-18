@@ -14,6 +14,8 @@ The mark is a peregrine in its stoop: wings folded, head down, the yellow eye-ri
 | `social-preview.png` | 1280x640 card for the repository's social preview and link unfurls |
 | `readme-hero-light.jpg`, `readme-hero-dark.jpg` | README hero, daylight and blue hour. The dark one is a tonal grade of the light one (exposure about half, cold blue cast, a faint warm band at the horizon), not a separate scene |
 | `demo-terminal-light.png`, `demo-terminal-dark.png` | README terminal capture, one theme each, rendered from the same template. The transcript is a captured run, with only cargo's progress lines cut |
+| `bushido-seal.svg` | The Bushido Collective's seal, byte for byte as TheBushidoCollective/website ships it (`public/images/brand/tbc-seal.svg`). Its ink is `currentColor`; the site uses it as a mask so it takes the ink of the text beside it. Never redraw it |
+| `bushido-seal-on-light.svg`, `bushido-seal-on-dark.svg` | The same seal with only its fill changed, to malar black and barred-breast pale, for the README's light and dark GitHub themes |
 
 On GitHub, pair the light and dark files with the theme fragments. They follow the theme chosen in GitHub's own settings; `<picture>` with `prefers-color-scheme` follows the browser's setting instead and shows the dark logo on a dark page whenever the two differ:
 
