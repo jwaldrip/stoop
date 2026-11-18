@@ -600,7 +600,8 @@ fn curl_command(url: &str) -> Command {
 }
 
 #[cfg(test)]
-mod tests;
+#[allow(dead_code)]
+pub(crate) mod tests;
 
 #[cfg(test)]
 mod e2e;

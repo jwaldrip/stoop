@@ -409,8 +409,52 @@ fn action_with(class: &str, name: &str, fields: &Map<String, Value>) -> Result<V
     }
     Ok(Value::Object(result))
 }
+pub fn parse_allow_uses(raw: &str) -> Result<Vec<String>, String> {
+    if raw.contains("${{") {
+        return Err("STOOP_ALLOW_USES is an expression".into());
+    }
+    raw.split([',', '\n'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|entry| {
+            let (name, reference) = entry
+                .rsplit_once('@')
+                .map_or((entry, "v1"), |(n, r)| (n, r));
+            let parts: Vec<_> = name.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+            if parts.len() != 2
+                || crate::gha::resolve::classify(&format!("{}@{reference}", parts.join("/")))
+                    .is_err()
+            {
+                return Err(format!("invalid STOOP_ALLOW_USES entry {entry}"));
+            }
+            Ok(entry.to_string())
+        })
+        .collect()
+}
+
+fn workflow_allow_uses(w: &Workflow, id: &str) -> Result<Vec<String>, String> {
+    let workflow = object(w.root.get("env"), "workflow env")?;
+    let job = object(w.root["jobs"].get(id).and_then(|j| j.get("env")), "job env")?;
+    match job
+        .get("STOOP_ALLOW_USES")
+        .or_else(|| workflow.get("STOOP_ALLOW_USES"))
+    {
+        None | Some(Value::Null) => Ok(vec![]),
+        Some(Value::String(raw)) => parse_allow_uses(raw),
+        _ => Err("STOOP_ALLOW_USES must be a string".into()),
+    }
+}
 
 pub fn job_specs(w: &Workflow, cx: &GhCtx, plan_job: &str) -> Vec<JobSpec> {
+    job_specs_with_allow(w, cx, plan_job, &[])
+}
+
+pub fn job_specs_with_allow(
+    w: &Workflow,
+    cx: &GhCtx,
+    plan_job: &str,
+    allowed: &[String],
+) -> Vec<JobSpec> {
     let reason = match plan_job_override(w, plan_job) {
         Ok(reason) => reason,
         Err(error) => Some(error),
@@ -421,7 +465,14 @@ pub fn job_specs(w: &Workflow, cx: &GhCtx, plan_job: &str) -> Vec<JobSpec> {
         .flat_map(|m| m.keys())
         .filter(|id| id.as_str() != plan_job)
         .map(|id| {
-            let mut spec = job_spec(w, cx, id, None);
+            let list = workflow_allow_uses(w, id);
+            let mut combined = list.clone().unwrap_or_default();
+            combined.extend_from_slice(allowed);
+            let mut spec = job_spec_with_allow(w, cx, id, None, &combined);
+            if let Err(detail) = list {
+                spec.key = None;
+                spec.blocked = Some(Blocker { step: None, detail });
+            }
             if let Some(detail) = &reason {
                 spec.key = None;
                 spec.blocked = Some(Blocker {
@@ -435,6 +486,16 @@ pub fn job_specs(w: &Workflow, cx: &GhCtx, plan_job: &str) -> Vec<JobSpec> {
 }
 
 pub fn job_spec(w: &Workflow, cx: &GhCtx, job: &str, leg: Option<&str>) -> JobSpec {
+    job_spec_with_allow(w, cx, job, leg, &[])
+}
+
+pub fn job_spec_with_allow(
+    w: &Workflow,
+    cx: &GhCtx,
+    job: &str,
+    leg: Option<&str>,
+    allowed: &[String],
+) -> JobSpec {
     let mut spec = JobSpec {
         workflow: w.name.clone(),
         path: w.path.clone(),
@@ -449,7 +510,7 @@ pub fn job_spec(w: &Workflow, cx: &GhCtx, job: &str, leg: Option<&str>) -> JobSp
         actions: vec![],
         images: vec![],
     };
-    let result = build(w, cx, job, leg, &mut spec);
+    let result = build(w, cx, job, leg, &mut spec, allowed);
     if let Err((step, detail)) = result {
         spec.blocked = Some(Blocker { step, detail });
     }
@@ -461,6 +522,7 @@ fn build(
     job: &str,
     leg: Option<&str>,
     spec: &mut JobSpec,
+    allowed: &[String],
 ) -> Result<(), (Option<usize>, String)> {
     let mut work = || -> Result<(), String> {
         let j = w.root["jobs"]
@@ -565,7 +627,7 @@ fn build(
                 &defaults,
                 (&w.name, job),
                 leg.as_deref(),
-                &[Some(&workflow_settings), j.get("env")],
+                (&[Some(&workflow_settings), j.get("env")], allowed),
                 seen_traced,
             );
             match result {
@@ -649,7 +711,7 @@ fn step_key(
     defaults: &Map<String, Value>,
     identity: (&str, &str),
     leg: Option<&str>,
-    env_layers: &[Option<&Value>],
+    (env_layers, allowed): (&[Option<&Value>], &[String]),
     seen_traced: bool,
 ) -> Result<Option<(Value, StepSpec)>, String> {
     let s = step.as_object().ok_or("step must be an object")?;
@@ -739,7 +801,18 @@ fn step_key(
         return Err("action has no ref".into());
     }
     let class = action_class(&name);
-    if class.is_none() && !marker {
+    let user_allowed = allowed.iter().any(|entry| {
+        let (path, r) = entry
+            .rsplit_once('@')
+            .map_or((entry.as_str(), None), |(p, r)| (p, Some(r)));
+        let normalized = path
+            .split(['/', '\\'])
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        normalized.eq_ignore_ascii_case(&name) && r.is_none_or(|r| r == reference)
+    });
+    if class.is_none() && !marker && !user_allowed {
         return Err(format!("action {uses} is not allowlisted"));
     }
     if marker && seen_traced {
@@ -759,13 +832,13 @@ fn step_key(
     if class == Some("checkout") {
         action_with("checkout", &name, with)?;
     }
-    if class == Some("setup") {
+    if class == Some("setup") || (class.is_none() && user_allowed) {
         check_setup(&name, with)?;
     }
     let fields = if marker {
         static_value(&Value::Object(with.clone()))?
     } else {
-        action_with(class.unwrap(), &name, with)?
+        action_with(class.unwrap_or("user"), &name, with)?
     };
     let is_cache = class == Some("cache") && !marker;
     let mut value = json!({"uses":uses,"with":fields,"env":e});
@@ -1163,5 +1236,66 @@ mod tests {
         assert_eq!(s.images, vec!["node:20".to_string(), "redis:7".to_string()]);
         let plain = spec(&fixture("", RUN));
         assert!(plain.images.is_empty());
+    }
+    #[test]
+    fn user_allowlist_is_exact_and_preserves_action_inputs() {
+        let make = |action: &str, extra: &str, allowed: &[String]| {
+            let steps = format!("      - uses: {action}\n{extra}{RUN}");
+            let w = parse("ci.yml", &fixture("", &steps)).unwrap();
+            job_spec_with_allow(
+                &w,
+                &GhCtx::from_parts(BTreeMap::new(), Value::Null),
+                "test",
+                None,
+                allowed,
+            )
+        };
+        let allowed = vec!["EXAMPLE/tool".to_string()];
+        assert!(make("example/tool@v1", "", &[]).blocked.is_some());
+        let ok = make("example/tool@v1", "", &allowed);
+        assert!(ok.blocked.is_none());
+        assert!(make("example/tool-extra@v1", "", &allowed)
+            .blocked
+            .is_some());
+        assert!(make(
+            "example/tool@v1",
+            "        with: {node-version-file: .nvmrc}\n",
+            &allowed
+        )
+        .blocked
+        .is_some());
+        assert_ne!(ok.key, make("example/tool@v2", "", &allowed).key);
+        assert!(make("example/tool@v2", "", &["example/tool@v1".into()])
+            .blocked
+            .is_some());
+        assert!(make(
+            "actions/setup-python@v4",
+            "",
+            &["actions/setup-python".into()]
+        )
+        .blocked
+        .is_some());
+    }
+    #[test]
+    fn yaml_and_recorder_allowlists_make_the_same_key() {
+        let text = fixture(
+            "    env: {STOOP_ALLOW_USES: 'example/tool, unused/tool'}\n",
+            &format!("      - uses: example/tool@v1\n{RUN}"),
+        );
+        let workflow = parse("ci.yml", &text).unwrap();
+        let cx = GhCtx::from_parts(BTreeMap::new(), Value::Null);
+        let planned = job_specs(&workflow, &cx, "plan").remove(0);
+        let allowed = parse_allow_uses("example/tool").unwrap();
+        let recorded = job_spec_with_allow(&workflow, &cx, "test", None, &allowed);
+        assert!(planned.blocked.is_none());
+        assert_eq!(planned.key, recorded.key);
+        let dynamic = text.replace("example/tool, unused/tool", "${{ vars.ACTIONS }}");
+        let dynamic = parse("ci.yml", &dynamic).unwrap();
+        assert!(job_specs(&dynamic, &cx, "plan")[0]
+            .blocked
+            .as_ref()
+            .unwrap()
+            .detail
+            .contains("STOOP_ALLOW_USES"));
     }
 }

@@ -66,6 +66,24 @@ Each step is keyed by its script, the workflow and the job. Steps that use an ac
 
 Full workflows for GitHub Actions, GitLab CI, CircleCI and Buildkite are in the [CI recipes](https://jwaldrip.github.io/stoop/docs/ci.html).
 
+## Experimental job planning
+
+`stoop plan` can evaluate recorded job proofs before other runners start. **Do not enable plan-skips in workflow gates yet.** A floating action ref can move between the runner downloading the action and stoop resolving it. The owner has not accepted that window, and the downloaded action is not verified against the resolved commit. `STOOP_STRICT_ACTIONS=1` makes jobs with floating `uses:` refs unplannable; it does not pin tools downloaded by those actions.
+
+The planner requires an attested record from the planned workflow's own job, a protected branch, a GitHub-hosted runner and the same repository and owner IDs. It fails wide when it cannot establish a match. Publishing jobs need `id-token: write` and access to the shared git proof store. Any code in a publishing job that can request an OIDC token can attest records for another job in that workflow. Records whose signing key is no longer published are rejected.
+
+Set `STOOP_ALLOW_USES` in workflow or job environment to a comma- or newline-separated list of exact `owner/repo` or `owner/repo@ref` actions. This asserts that each listed action is side-effect free; the workflow author is responsible for that assertion. Refs are still resolved and checked, and `STOOP_STRICT_ACTIONS` still applies. The `--allow-uses` flag is for local dry runs only. Supply `STOOP_ENV_SALT` to the plan job and recorded jobs alike when using salted proofs.
+
+| Input | Plan-time handling |
+|---|---|
+| Repository inputs | Compared against the selected git tree and earlier recorded step outputs |
+| State before a recorded write | Compared before applying its outputs; unknown prior state makes the job run |
+| Files outside the repository and most runner environment | Assumed under the job definition and maximum age, not checked on the plan runner |
+| GitHub event payload and known GitHub variables | Compared with the plan job's values |
+| Probe or unknown setup | The job runs |
+
+The default maximum age is seven days; `stoop plan --max-age` sets a positive ceiling. A trusted full run should re-prove jobs regularly. The planner does not restore outputs or run probes.
+
 ## Install
 
 ```sh
