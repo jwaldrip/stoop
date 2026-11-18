@@ -247,6 +247,16 @@ impl<S: KeySource> Verifier<S> {
         if token.header.get("crit").is_some() {
             return Err("token declares critical extensions".into());
         }
+        // A token may name only the key set GitHub publishes. A header that carries or
+        // points to a key is refused, not ignored.
+        if ["jwk", "jku", "x5u", "x5c"]
+            .iter()
+            .any(|name| token.header.get(*name).is_some())
+        {
+            return Err(
+                "token declares its own key; only GitHub's published key set is trusted".into(),
+            );
+        }
         let kid = token
             .header
             .get("kid")

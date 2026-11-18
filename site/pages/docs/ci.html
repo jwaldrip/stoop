@@ -52,6 +52,7 @@
   <li>Set <code>STOOP_SYNC_WRITE</code> only on the default branch. An empty value or <code>0</code> is off, so <code>STOOP_SYNC_WRITE: ${{ github.ref == 'refs/heads/main' &amp;&amp; '1' || '' }}</code> works; setting it from a step guarded by <code>if:</code>, as above, is just as good.</li>
   <li>Sync never fails a step. If the remote is unreachable or refuses a push, stoop warns and the step runs as it would have without sync.</li>
   <li>Records are attested. Give the job that publishes <code>id-token: write</code>, as above, and stoop attaches a GitHub OIDC token to each record it publishes. The token names the repository, the branch, the commit, the run and the workflow file, and it is tied to that record's contents. Without the permission a record is published unattested. Nothing reads attestations until <code>stoop plan</code> is released; a planner will refuse any record without a valid one. Planning needs only <code>contents: read</code> and outbound HTTPS to <code>token.actions.githubusercontent.com</code>.</li>
+  <li>Give <code>id-token: write</code> and <code>contents: write</code> only to the job that publishes. Another job in the same run that holds both can publish a record that verifies as that job's, because GitHub's token names the workflow and the run, not the job, and a planner cannot tell the two jobs apart. Grant the permissions at job level, and leave the other jobs at read.</li>
 </ul>
 
 <h3 id="github-cache">Or with the Actions cache</h3>

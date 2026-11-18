@@ -291,23 +291,30 @@ fn rejects_a_signature_made_by_another_key_under_a_kid() {
 }
 
 #[test]
-fn rejects_an_embedded_jwk_header() {
+fn rejects_headers_that_declare_their_own_key() {
     let record = record();
     let attacker = published()
         .into_iter()
         .find(|key| key.kid == "test-key-2")
         .unwrap();
     let jwk = json!({"kty": "RSA", "n": b64_encode(&attacker.n), "e": b64_encode(&attacker.e)});
-    let token = token(
-        &json!({"alg": "RS256", "kid": "test-key-1", "jwk": jwk}),
-        &claims(&record),
-        &pair(KEY_2),
-    );
-    refused_with(
-        &verifier(),
-        &attested(&record, token),
-        "signature does not verify",
-    );
+    // Each token is signed by the key its kid names, so only the header rule can refuse it.
+    let cases = [
+        ("jwk", jwk),
+        ("jku", json!("https://evil.example/jwks")),
+        ("x5u", json!("https://evil.example/cert")),
+        ("x5c", json!(["AAAA"])),
+    ];
+    for (name, value) in cases {
+        let mut head = header("test-key-1");
+        head[name] = value;
+        let token = token(&head, &claims(&record), &pair(KEY_1));
+        refused_with(
+            &verifier(),
+            &attested(&record, token),
+            "declares its own key",
+        );
+    }
 }
 
 #[test]
