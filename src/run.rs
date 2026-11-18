@@ -4,7 +4,7 @@
 mod units;
 
 use crate::ignore::Ignore;
-use crate::input::{identify, par_map, verify, Input};
+use crate::input::{identify, identify_recorded, par_map, records_oids, verify, Input};
 use crate::pathutil::{absolutize, cwd_key, to_key, Physical};
 use crate::proof::{now, sanitize, Proof, Store};
 use crate::sync::Remote;
@@ -571,6 +571,7 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         root: &root,
         real_root: real_root.clone(),
         ignore: &ignore,
+        oids: records_oids(&root),
     });
     let trace = match trace::run(
         &o.argv,
@@ -745,6 +746,7 @@ pub fn build_outputs(
             Some(id) => outputs.push(Input {
                 path: key.clone(),
                 id,
+                oid: None,
             }),
         }
     }
@@ -762,6 +764,7 @@ pub fn build_priors(trace: &Trace) -> Vec<Input> {
         .map(|(path, id)| Input {
             path: path.clone(),
             id: id.clone(),
+            oid: trace.prior_oids.get(path).cloned(),
         })
         .collect()
 }
@@ -820,8 +823,8 @@ pub fn build_inputs(
     );
     let mut reasons: Vec<String> = Vec::new();
     let mut reads_git = false;
-    // (path to identify, key, inside the root, entries listed)
-    let mut cands: Vec<(PathBuf, String, bool, bool)> = Vec::new();
+    // (path, key, lexical inside, entries listed, physical inside)
+    let mut cands: Vec<(PathBuf, String, bool, bool, bool)> = Vec::new();
     for (lex, touch) in &trace.touched {
         let inside = lex.starts_with(root);
         let key = to_key(root, lex);
@@ -844,7 +847,7 @@ pub fn build_inputs(
                         } else if written.contains(pkey) {
                             reasons.push(format!("it read {pkey} through {key} and also wrote it"));
                         } else {
-                            cands.push((pp.clone(), pkey.to_string(), true, touch.listed));
+                            cands.push((pp.clone(), pkey.to_string(), true, touch.listed, true));
                         }
                     }
                     Some(_) => {}
@@ -883,19 +886,24 @@ pub fn build_inputs(
             reads_git = true;
             continue;
         }
-        cands.push((lex.clone(), key, inside, touch.listed));
+        let physical_inside = physical
+            .as_deref()
+            .is_some_and(|p| phys.repo_rel(p).is_some());
+        cands.push((lex.clone(), key, inside, touch.listed, physical_inside));
     }
     let mut out: Vec<Input> = Vec::with_capacity(cands.len());
     let mut seen: HashSet<String> = HashSet::new();
-    let ids = par_map(&cands, |(p, _, inside, listed)| {
-        identify(p, *inside, *listed)
+    let oids = records_oids(root);
+    let ids = par_map(&cands, |(p, _, inside, listed, physical_inside)| {
+        identify_recorded(p, *inside, *listed, oids && *physical_inside)
     });
-    for ((_, key, _, _), id) in cands.iter().zip(ids) {
-        if let Some(id) = id {
+    for ((_, key, _, _, _), id) in cands.iter().zip(ids) {
+        if let Some((id, oid)) = id {
             if seen.insert(key.clone()) {
                 out.push(Input {
                     path: key.clone(),
                     id,
+                    oid,
                 });
             }
         }
@@ -943,11 +951,12 @@ pub fn build_inputs(
                     ));
                     continue;
                 }
-                if let Some(id) = identify(&target, true, false) {
+                if let Some((id, oid)) = identify_recorded(&target, true, false, oids) {
                     if seen.insert(tkey.to_string()) {
                         out.push(Input {
                             path: tkey.to_string(),
                             id,
+                            oid,
                         });
                     }
                 }
@@ -967,7 +976,11 @@ pub fn build_inputs(
                 }
                 if let Some(id) = identify(&target, false, false) {
                     if seen.insert(tk.clone()) {
-                        out.push(Input { path: tk, id });
+                        out.push(Input {
+                            path: tk,
+                            id,
+                            oid: None,
+                        });
                     }
                 }
             }

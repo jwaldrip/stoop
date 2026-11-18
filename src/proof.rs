@@ -307,6 +307,7 @@ mod tests {
             inputs: vec![Input {
                 path: "a".into(),
                 id: id.into(),
+                oid: None,
             }],
             outputs: vec![],
             probes: BTreeMap::new(),
@@ -314,6 +315,59 @@ mod tests {
             ignore: None,
             priors: None,
             unplannable: vec![],
+        }
+    }
+
+    fn legacy_proof() -> Proof {
+        serde_json::from_str(
+            r#"{"created":1,"argv":["x"],"env":{},"inputs":[{"path":"a","id":"f:1"}],"priors":[{"path":"prior","id":"f:2"}]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn legacy_proof_without_oids_keeps_golden_digest() {
+        let legacy = legacy_proof();
+        assert_eq!(legacy.inputs[0].oid, None);
+        assert_eq!(legacy.priors.as_ref().unwrap()[0].oid, None);
+        let serialized = serde_json::to_value(&legacy).unwrap();
+        assert_eq!(
+            serialized["inputs"][0],
+            serde_json::json!({"path": "a", "id": "f:1"})
+        );
+        assert_eq!(
+            serialized["priors"][0],
+            serde_json::json!({"path": "prior", "id": "f:2"})
+        );
+        // The pre-OID digest input is the JSON tuple of the proof fields.
+        assert_eq!(legacy.digest(), "p-0d2ac5193d1ccb16d01c21b0e61f858e");
+    }
+
+    #[test]
+    fn digest_and_equality_cover_input_and_prior_oids() {
+        let legacy = legacy_proof();
+        let first_oid = format!("sha1:{}", "1".repeat(40));
+        let second_oid = format!("sha1:{}", "2".repeat(40));
+        for prior in [false, true] {
+            let mut first = legacy.clone();
+            let mut second = legacy.clone();
+            if prior {
+                first.priors.as_mut().unwrap()[0].oid = Some(first_oid.clone());
+                second.priors.as_mut().unwrap()[0].oid = Some(second_oid.clone());
+            } else {
+                first.inputs[0].oid = Some(first_oid.clone());
+                second.inputs[0].oid = Some(second_oid.clone());
+            }
+            for changed in [&first, &second] {
+                assert_ne!(legacy.digest(), changed.digest(), "prior={prior}");
+                assert!(!same_proof(&legacy, changed), "prior={prior}");
+            }
+            assert_ne!(first.digest(), second.digest(), "prior={prior}");
+            assert!(!same_proof(&first, &second), "prior={prior}");
+            let round_trip: Proof =
+                serde_json::from_slice(&serde_json::to_vec(&first).unwrap()).unwrap();
+            assert!(same_proof(&first, &round_trip));
+            assert_eq!(first.digest(), round_trip.digest());
         }
     }
 
@@ -355,6 +409,7 @@ mod tests {
         prior.priors = Some(vec![Input {
             path: "out".into(),
             id: "a".into(),
+            oid: None,
         }]);
         let mut reason = base.clone();
         reason.unplannable.push("renamed a directory".into());
@@ -389,6 +444,7 @@ mod tests {
         base.inputs.push(Input {
             path: "b".into(),
             id: "f:2".into(),
+            oid: None,
         });
         let mut variants = vec![base.clone()];
         let mut v = base.clone();
@@ -407,6 +463,7 @@ mod tests {
         v.outputs.push(Input {
             path: "out".into(),
             id: "f:3".into(),
+            oid: None,
         });
         variants.push(v);
         let mut v = base.clone();

@@ -25,6 +25,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - name: Measure blob-id recording fixture
+        run: STOOP_DEBUG=1 cargo test --test record_e2e recorder_oid_timing_fixture -- --nocapture
 
   linux-arm:
     name: tests (Linux arm64)

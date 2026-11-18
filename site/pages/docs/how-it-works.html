@@ -26,6 +26,7 @@
 </table>
 <p>Inputs and outputs inside the root are stored as relative paths, so a proof stored with the checkout can move with it. Paths outside the root stay absolute. A failing run records nothing. Neither does a run started with <code>--no-record</code>.</p>
 <p>Before the run first writes a path, stoop also notes what that path held: absent, a directory, a link and its target, or a file with its content hash. A skip does not read this record.</p>
+<p>When the root contains a <code>.git</code> entry, regular files inside it also get a Git-compatible SHA-1 blob id on their input and content-prior records. stoop computes it from the same bytes as the file's BLAKE3 hash. If the bytes read do not match the file's reported length, the blob id is omitted. Outputs, kind-only priors, symlinks, directories, absent paths and paths outside the root carry no blob id. Proofs without blob ids remain valid, and runtime skip checks continue to compare the original ids.</p>
 <p>Proofs are specific to that platform and tracer. A Linux x86-64 proof cannot skip a Linux arm64 command, even when they share a store or Git remote. Proofs without platform information are treated as cold; run the command on a supported Linux platform to record a fresh one. New proofs use a format older stoop versions cannot read, so update runners sharing a store. <code>stoop ls</code> shows the recorded platforms. macOS has no tracer, so it runs commands without recording or skipping; <code>stoop explain</code> reports that they would run.</p>
 
 <h2 id="compare">The comparison</h2>

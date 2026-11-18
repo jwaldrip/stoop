@@ -651,6 +651,8 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
     struct Input {
         path: String,
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oid: Option<String>,
     }
     #[derive(serde::Deserialize)]
     struct Proof {
@@ -683,6 +685,17 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
         );
         let file: Value = serde_json::from_str(&raw).unwrap();
         let proofs: Vec<Proof> = serde_json::from_value(file["proofs"].clone()).unwrap();
+        if script == scripts[0] {
+            let input = proofs
+                .iter()
+                .flat_map(|proof| &proof.inputs)
+                .find(|input| input.path == "in.txt")
+                .expect("the proof records in.txt");
+            assert!(input
+                .oid
+                .as_deref()
+                .is_some_and(|oid| oid.starts_with("sha1:")));
+        }
         assert!(proofs.iter().any(|p| {
             let bytes = serde_json::to_vec(&(
                 &p.inputs,
@@ -720,6 +733,8 @@ fn concurrent_proof_race(proof_only: bool) {
     struct Input {
         path: String,
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oid: Option<String>,
     }
     #[derive(serde::Deserialize)]
     struct Proof {

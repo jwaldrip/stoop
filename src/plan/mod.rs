@@ -584,6 +584,7 @@ mod tests {
                     "f:{}",
                     blake3::hash(include_bytes!("../../tests/fixtures/plan/a.txt")).to_hex()
                 ),
+                oid: None,
             }],
             outputs: vec![],
             removed: vec![],

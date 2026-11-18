@@ -12,6 +12,7 @@ pub struct Scope<'a> {
     pub root: &'a Path,
     pub real_root: PathBuf,
     pub ignore: &'a Ignore,
+    pub oids: bool,
 }
 
 /// What the run did with a path it looked at.
@@ -95,6 +96,8 @@ pub struct Trace {
     pub keys: HashMap<PathBuf, String>,
     /// State of each in-scope key before the run first wrote it.
     pub priors: BTreeMap<String, String>,
+    /// Blob ids captured in the same read as each content prior.
+    pub prior_oids: BTreeMap<String, String>,
     /// Reasons the planner cannot replay this run (at most 16, deduplicated). Not fatal.
     pub unplannable: Vec<String>,
     /// Successful execs, present only for an ordinary, traced `stoop run`.

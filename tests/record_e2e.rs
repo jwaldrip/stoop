@@ -30,6 +30,49 @@ impl Ws {
         fs::write(p, body).unwrap();
     }
 
+    fn git(&self, args: &[&str]) -> String {
+        let out = Command::new("git")
+            .args(args)
+            .current_dir(&self.root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+
+    fn init_git(&self) {
+        self.git(&["init", "-q", "--object-format=sha1"]);
+    }
+
+    fn commit_all(&self) {
+        self.git(&["add", "--all"]);
+        self.git(&[
+            "-c",
+            "user.name=Stoop Test",
+            "-c",
+            "user.email=stoop@example.org",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "fixture",
+        ]);
+    }
+
+    fn clean(&self) {
+        fs::remove_dir_all(&self.root).unwrap();
+        fs::remove_dir_all(self.store()).unwrap();
+    }
+
     fn syscall_probe(&self) {
         let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/recorder_syscalls.c");
@@ -59,6 +102,16 @@ impl Ws {
     }
 
     fn sh_with_affinity(&self, script: &str, cwd: &std::path::Path, pin: bool) -> (i32, String) {
+        self.sh_with_options(script, cwd, pin, false)
+    }
+
+    fn sh_with_options(
+        &self,
+        script: &str,
+        cwd: &std::path::Path,
+        pin: bool,
+        debug: bool,
+    ) -> (i32, String) {
         let mut cmd = if pin {
             let cpu = unsafe { libc::sched_getcpu() };
             assert!(cpu >= 0);
@@ -68,6 +121,9 @@ impl Ws {
         } else {
             Command::new(env!("CARGO_BIN_EXE_stoop"))
         };
+        if debug {
+            cmd.env("STOOP_DEBUG", "1");
+        }
         let out = cmd
             .args([
                 "run",
@@ -161,6 +217,229 @@ fn removed(p: &Value) -> Vec<String> {
 
 fn hash(bytes: &[u8]) -> String {
     blake3::hash(bytes).to_hex().to_string()
+}
+
+fn entry<'a>(proof: &'a Value, field: &str, path: &str) -> &'a Value {
+    proof[field]
+        .as_array()
+        .unwrap_or_else(|| panic!("{field} is missing"))
+        .iter()
+        .find(|item| item["path"].as_str() == Some(path))
+        .unwrap_or_else(|| panic!("missing {field} entry {path}: {}", proof[field]))
+}
+
+fn assert_blob_oid(proof: &Value, field: &str, path: &str, git_oid: &str) {
+    let expected = format!("sha1:{git_oid}");
+    let item = entry(proof, field, path);
+    assert_eq!(item["oid"].as_str(), Some(expected.as_str()), "{item}");
+}
+
+fn assert_no_oid(item: &Value) {
+    assert!(item.get("oid").is_none(), "{item}");
+}
+
+#[test]
+fn git_root_records_blob_ids_for_file_inputs_and_symlink_targets() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    for gitdir_file in [false, true] {
+        let w = Ws::new(if gitdir_file {
+            "oid-input-gitdir-file"
+        } else {
+            "oid-input-gitdir"
+        });
+        w.write("a.txt", "alpha\n");
+        w.write("bin/x.sh", "#!/bin/sh\nexit 0\n");
+        w.write("target.txt", "target\n");
+        w.write("dirty.txt", "committed\n");
+        fs::set_permissions(w.root.join("bin/x.sh"), fs::Permissions::from_mode(0o755)).unwrap();
+        symlink("target.txt", w.root.join("alias.txt")).unwrap();
+        symlink("/etc/passwd", w.root.join("outside-link")).unwrap();
+        w.init_git();
+        w.commit_all();
+        if gitdir_file {
+            fs::rename(w.root.join(".git"), w.root.join(".git-dir")).unwrap();
+            w.write(".git", "gitdir: .git-dir\n");
+        }
+        w.write("dirty.txt", "working tree\n");
+
+        let p = recorded(
+            &w,
+            "cat a.txt bin/x.sh alias.txt dirty.txt /etc/passwd outside-link >/dev/null && ls bin >/dev/null && test ! -e missing.txt",
+        );
+        for (path, contents, kind) in [
+            ("a.txt", "alpha\n", "f"),
+            ("bin/x.sh", "#!/bin/sh\nexit 0\n", "x"),
+            ("target.txt", "target\n", "f"),
+        ] {
+            let item = entry(&p, "inputs", path);
+            let id = format!("{kind}:{}", hash(contents.as_bytes()));
+            assert_eq!(item["id"].as_str(), Some(id.as_str()), "{item}");
+            let tree_path = format!("HEAD:{path}");
+            let oid = w.git(&["rev-parse", &tree_path]);
+            assert_blob_oid(&p, "inputs", path, &oid);
+        }
+
+        let dirty = entry(&p, "inputs", "dirty.txt");
+        let dirty_id = format!("f:{}", hash(b"working tree\n"));
+        assert_eq!(dirty["id"].as_str(), Some(dirty_id.as_str()), "{dirty}");
+        let dirty_oid = w.git(&["hash-object", "--no-filters", "dirty.txt"]);
+        assert_ne!(dirty_oid, w.git(&["rev-parse", "HEAD:dirty.txt"]));
+        assert_blob_oid(&p, "inputs", "dirty.txt", &dirty_oid);
+
+        for (path, target) in [
+            ("alias.txt", "l:target.txt"),
+            ("outside-link", "l:/etc/passwd"),
+        ] {
+            let link = entry(&p, "inputs", path);
+            assert_eq!(link["id"].as_str(), Some(target), "{link}");
+            assert_no_oid(link);
+        }
+        let directory = entry(&p, "inputs", "bin");
+        assert!(
+            directory["id"].as_str().unwrap().starts_with("dl:"),
+            "{directory}"
+        );
+        assert_no_oid(directory);
+        let missing = entry(&p, "inputs", "missing.txt");
+        assert_eq!(missing["id"].as_str(), Some("a"), "{missing}");
+        assert_no_oid(missing);
+        // /etc/hostname is ignored by default; passwd is an ordinary outside input.
+        let outside = entry(&p, "inputs", "/etc/passwd");
+        assert!(
+            outside["id"].as_str().unwrap().starts_with("f:"),
+            "{outside}"
+        );
+        assert_no_oid(outside);
+        w.clean();
+    }
+}
+
+#[test]
+fn git_root_records_original_content_prior_but_never_output_blob_ids() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let w = Ws::new("oid-priors");
+    w.write("config.txt", "old\n");
+    w.write("executable.sh", "echo old\n");
+    fs::set_permissions(
+        w.root.join("executable.sh"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    symlink("config.txt", w.root.join("link")).unwrap();
+    fs::create_dir(w.root.join("empty-dir")).unwrap();
+    w.init_git();
+    w.commit_all();
+    let p = recorded(
+        &w,
+        "sed -i s/old/new/ config.txt && chmod -x executable.sh && rm link && rmdir empty-dir && echo output > built.txt",
+    );
+
+    for (path, old, kind) in [
+        ("config.txt", "old\n", "f"),
+        ("executable.sh", "echo old\n", "x"),
+    ] {
+        let item = entry(&p, "priors", path);
+        let id = format!("{kind}:{}", hash(old.as_bytes()));
+        assert_eq!(item["id"].as_str(), Some(id.as_str()), "{item}");
+        let tree_path = format!("HEAD:{path}");
+        let old_oid = w.git(&["rev-parse", &tree_path]);
+        assert_blob_oid(&p, "priors", path, &old_oid);
+    }
+    assert_ne!(
+        w.git(&["hash-object", "--no-filters", "config.txt"]),
+        w.git(&["rev-parse", "HEAD:config.txt"])
+    );
+    for (path, id) in [
+        ("link", "l:config.txt"),
+        ("empty-dir", "d"),
+        ("built.txt", "a"),
+    ] {
+        let item = entry(&p, "priors", path);
+        assert_eq!(item["id"].as_str(), Some(id), "{item}");
+        assert_no_oid(item);
+    }
+    for path in ["config.txt", "executable.sh", "built.txt"] {
+        assert_no_oid(entry(&p, "outputs", path));
+    }
+    let outputs = p["outputs"].as_array().unwrap();
+    assert!(!outputs.is_empty(), "{p}");
+    for output in outputs {
+        assert_no_oid(output);
+    }
+    for item in p["priors"].as_array().unwrap() {
+        let id = item["id"].as_str().unwrap();
+        if !id.starts_with("f:") && !id.starts_with("x:") {
+            assert_no_oid(item);
+        }
+    }
+    w.clean();
+}
+
+#[test]
+fn root_without_git_records_no_blob_ids() {
+    let w = Ws::new("oid-no-git");
+    assert!(!w.root.join(".git").exists());
+    w.write("config.txt", "old\n");
+    let p = recorded(
+        &w,
+        "cat in.txt >/dev/null; printf 'new\\n' > config.txt; printf 'out\\n' > built.txt",
+    );
+    assert_eq!(
+        entry(&p, "inputs", "in.txt")["id"].as_str(),
+        Some(format!("f:{}", hash(b"one")).as_str())
+    );
+    assert_eq!(
+        entry(&p, "priors", "config.txt")["id"].as_str(),
+        Some(format!("f:{}", hash(b"old\n")).as_str())
+    );
+    entry(&p, "outputs", "built.txt");
+    for field in ["inputs", "priors", "outputs"] {
+        let items = p[field].as_array().unwrap();
+        assert!(!items.is_empty(), "{field}: {p}");
+        for item in items {
+            assert_no_oid(item);
+        }
+    }
+    w.clean();
+}
+
+#[test]
+fn recorder_oid_timing_fixture() {
+    use std::time::Instant;
+
+    let without_git = Ws::new("oid-timing-plain");
+    let with_git = Ws::new("oid-timing-git");
+    let bytes = vec![b'x'; 16 * 1024 * 1024];
+    let expected_id = format!("f:{}", hash(&bytes));
+    fs::write(without_git.root.join("payload.bin"), &bytes).unwrap();
+    fs::write(with_git.root.join("payload.bin"), &bytes).unwrap();
+    with_git.init_git();
+
+    let mut elapsed = Vec::new();
+    for (w, expect_oid) in [(&without_git, false), (&with_git, true)] {
+        let started = Instant::now();
+        let (code, err) = w.sh_with_options("cat payload.bin >/dev/null", &w.root, false, true);
+        elapsed.push(started.elapsed().as_secs_f64() * 1000.0);
+        assert_eq!(code, 0, "{err}");
+        assert!(err.contains("recorded"), "not recorded: {err}");
+        let p = w.proof();
+        let item = entry(&p, "inputs", "payload.bin");
+        assert_eq!(item["id"].as_str(), Some(expected_id.as_str()), "{item}");
+        if expect_oid {
+            let oid = w.git(&["hash-object", "--no-filters", "payload.bin"]);
+            assert_blob_oid(&p, "inputs", "payload.bin", &oid);
+        } else {
+            assert_no_oid(item);
+        }
+    }
+    eprintln!(
+        "stoop recorder fixture (16 MiB, one run each, command + trace + record): without .git {:.3}ms; with .git {:.3}ms; difference {:+.3}ms",
+        elapsed[0], elapsed[1], elapsed[1] - elapsed[0]
+    );
+    without_git.clean();
+    with_git.clean();
 }
 
 #[test]

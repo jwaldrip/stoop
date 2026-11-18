@@ -11,7 +11,7 @@
 
 use super::{ExecEvent, Scope, Trace};
 use crate::ignore::Ignore;
-use crate::input::{file_id, hash_file};
+use crate::input::{file_id, hash_file, hash_file_with_oid};
 use crate::pathutil::{absolutize, to_key, without_dots, Physical};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsString};
@@ -514,6 +514,7 @@ struct Rec<'a> {
     /// The root as the user spelled it; keys in reasons are relative to it.
     root: PathBuf,
     hashed: u64,
+    oids: bool,
     link_walks: BTreeMap<PathBuf, Vec<PathBuf>>,
     redirected_reads: HashSet<String>,
 }
@@ -598,6 +599,7 @@ pub fn run<'a>(
             phys: Physical::new(s.root, &s.real_root),
             ignore: s.ignore,
             root: s.root.to_path_buf(),
+            oids: s.oids,
             hashed: 0,
             link_walks: BTreeMap::new(),
             redirected_reads: HashSet::new(),
@@ -1517,8 +1519,16 @@ impl Rec<'_> {
             // Once replay is already impossible, avoid hashing more content.
             return None;
         }
-        match hash_file(phys) {
-            Ok(h) => {
+        let hash = if self.oids {
+            hash_file_with_oid(phys)
+        } else {
+            hash_file(phys).map(|hash| (hash, None))
+        };
+        match hash {
+            Ok((h, oid)) => {
+                if let Some(oid) = oid {
+                    t.prior_oids.insert(key.to_owned(), oid);
+                }
                 self.hashed += size;
                 Some(file_id(exec, &h))
             }

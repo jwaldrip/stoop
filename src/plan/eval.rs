@@ -1002,6 +1002,7 @@ mod tests {
         Input {
             path: path.into(),
             id: id.into(),
+            oid: None,
         }
     }
     fn proof(inputs: Vec<Input>) -> Proof {
