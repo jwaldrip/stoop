@@ -17,7 +17,7 @@ The mark is a peregrine in its stoop: wings folded, head down, the yellow eye-ri
 | `bushido-seal.svg` | The Bushido Collective's seal, byte for byte as TheBushidoCollective/website ships it (`public/images/brand/tbc-seal.svg`). Its ink is `currentColor`; the site uses it as a mask so it takes the ink of the text beside it. Never redraw it |
 | `bushido-seal-on-light.svg`, `bushido-seal-on-dark.svg` | The same seal with only its fill changed, to malar black and barred-breast pale, for the README's light and dark GitHub themes |
 
-On GitHub, pair the light and dark files with the theme fragments. They follow the theme chosen in GitHub's own settings; `<picture>` with `prefers-color-scheme` follows the browser's setting instead and shows the dark logo on a dark page whenever the two differ:
+On GitHub, pair the light and dark files with the theme fragments, and leave the images out of any link of your own: GitHub hides the image for the other theme through the link it wraps around each image, so a link of yours shows both. They follow the theme chosen in GitHub's own settings; `<picture>` with `prefers-color-scheme` follows the browser's setting instead and shows the dark logo on a dark page whenever the two differ:
 
 ```html
 <img alt="stoop" src="assets/stoop-logo-on-light.svg#gh-light-mode-only" width="300">
