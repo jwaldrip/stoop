@@ -430,6 +430,24 @@ fn shell_mode_keys_on_script_content_not_its_file_name() {
     fs::write(&b, body).unwrap();
     let first = w.stoop(&["sh", a.to_str().unwrap()]);
     assert_eq!(first.0, 0, "{}", first.1);
+    let store = w.root.with_file_name(format!(
+        "{}-store",
+        w.root.file_name().unwrap().to_string_lossy()
+    ));
+    let proof_file = fs::read_dir(store.join("proofs"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let proof: serde_json::Value = serde_json::from_slice(&fs::read(proof_file).unwrap()).unwrap();
+    let patterns = proof["proofs"][0]["ignore"].as_array().unwrap();
+    assert!(
+        !patterns
+            .iter()
+            .any(|p| p.as_str().is_some_and(|s| s.contains("step-aaa.sh"))),
+        "{patterns:?}"
+    );
     let (_, e) = w.stoop(&["sh", b.to_str().unwrap()]);
     assert!(skipped(&e), "{e}");
 }

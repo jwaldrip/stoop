@@ -183,11 +183,23 @@ mod tests {
         assert_eq!(from_key(root, "/usr/lib/x"), PathBuf::from("/usr/lib/x"));
     }
 
-    fn scratch(name: &str) -> PathBuf {
+    struct Scratch(PathBuf);
+    impl std::ops::Deref for Scratch {
+        type Target = Path;
+        fn deref(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn scratch(name: &str) -> Scratch {
         let d = std::env::temp_dir().join(format!("stoop-pathutil-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
-        fs::canonicalize(&d).unwrap()
+        Scratch(fs::canonicalize(&d).unwrap())
     }
 
     #[test]
@@ -242,5 +254,38 @@ mod tests {
         assert!(p.locate(Path::new("/proc/self/cwd/x")).is_none());
         assert!(p.locate(Path::new("/dev/stdout")).is_none());
         assert!(p.locate(&root.join("x")).is_some());
+    }
+
+    #[test]
+    fn forgetting_a_prefix_visits_only_its_cached_descendants() {
+        let root = scratch("range-count");
+        let mut p = Physical::new(&root, &root);
+        for i in 0..10_000 {
+            let key = root.join(format!("entry-{i:05}"));
+            p.parents.insert(key.clone(), key);
+        }
+        let prefix = root.join("entry-05000");
+        let visited = p
+            .parents
+            .range(prefix.clone()..)
+            .take_while(|(key, _)| key.starts_with(&prefix))
+            .count();
+        assert_eq!(visited, 1);
+        p.forget(&prefix);
+        assert_eq!(p.parents.len(), 9_999);
+    }
+
+    #[test]
+    fn missing_parent_is_rerooted_when_lexical_root_is_a_symlink() {
+        let root = scratch("reroot");
+        let alias = root.join("alias");
+        fs::create_dir(root.join("actual")).unwrap();
+        std::os::unix::fs::symlink(root.join("actual"), &alias).unwrap();
+        let real = root.join("actual");
+        let mut p = Physical::new(&alias, &real);
+        assert_eq!(
+            p.locate(&alias.join("missing/child")).unwrap().path,
+            real.join("missing/child")
+        );
     }
 }

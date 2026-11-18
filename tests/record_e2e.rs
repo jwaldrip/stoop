@@ -30,6 +30,18 @@ impl Ws {
         fs::write(p, body).unwrap();
     }
 
+    fn syscall_probe(&self) {
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/recorder_syscalls.c");
+        let status = Command::new("cc")
+            .arg(source)
+            .arg("-o")
+            .arg(self.root.join("syscall-probe"))
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+
     fn store(&self) -> PathBuf {
         self.root.with_file_name(format!(
             "{}-store",
@@ -629,4 +641,155 @@ fn proof_stores_effective_ignore_patterns() {
     assert!(patterns.contains(&"*.log"));
     assert!(patterns.contains(&"/tmp"));
     assert!(!patterns.contains(&"# ignored comment"));
+}
+
+#[test]
+fn anonymous_tmpfile_without_link_records_without_writing_directory() {
+    let w = Ws::new("tmpfile-unlinked");
+    w.syscall_probe();
+    fs::create_dir(w.root.join("tmpdir")).unwrap();
+    let p = recorded(&w, "./syscall-probe tmp tmpdir");
+    assert!(pairs(&p, "priors").is_empty(), "{:?}", pairs(&p, "priors"));
+    assert!(reasons(&p).is_empty(), "{:?}", reasons(&p));
+}
+
+#[test]
+fn anonymous_tmpfile_linked_through_proc_fd_refuses_recording() {
+    let w = Ws::new("tmpfile-linked");
+    w.syscall_probe();
+    let (code, err) = w.sh("./syscall-probe tmp . output");
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("not recorded") && err.contains("descriptor alias"),
+        "{err}"
+    );
+    assert!(!w.store().join("proofs/t.json").exists());
+}
+
+#[test]
+fn rename_exchange_captures_both_original_files() {
+    let w = Ws::new("rename-exchange");
+    w.syscall_probe();
+    w.write("a", "aaa");
+    w.write("b", "bbb");
+    let p = recorded(&w, "./syscall-probe exchange a b");
+    assert_eq!(prior(&p, "a"), Some(format!("f:{}", hash(b"aaa"))));
+    assert_eq!(prior(&p, "b"), Some(format!("f:{}", hash(b"bbb"))));
+    assert!(pairs(&p, "outputs").contains(&("a".into(), format!("f:{}", hash(b"bbb")))));
+    assert!(pairs(&p, "outputs").contains(&("b".into(), format!("f:{}", hash(b"aaa")))));
+}
+
+#[test]
+fn rename_source_prior_contains_its_original_bytes() {
+    let w = Ws::new("rename-source");
+    w.syscall_probe();
+    w.write("a", "old");
+    let p = recorded(&w, "./syscall-probe rename a b");
+    assert_eq!(prior(&p, "a"), Some(format!("f:{}", hash(b"old"))));
+    assert_eq!(prior(&p, "b"), Some("a".into()));
+}
+
+#[test]
+fn creat_and_nonzero_truncate_record_original_bytes() {
+    for operation in ["creat", "truncate"] {
+        let w = Ws::new(operation);
+        w.syscall_probe();
+        w.write("f", "original");
+        let p = recorded(&w, &format!("./syscall-probe {operation} f"));
+        assert_eq!(prior(&p, "f"), Some(format!("f:{}", hash(b"original"))));
+    }
+}
+
+#[test]
+fn fchmodat2_and_fchmod_record_mode_changes_and_original_bytes() {
+    for operation in ["fchmodat2", "fchmod"] {
+        let w = Ws::new(operation);
+        w.syscall_probe();
+        w.write("f", "original");
+        let p = recorded(&w, &format!("./syscall-probe {operation} f"));
+        assert_eq!(prior(&p, "f"), Some(format!("f:{}", hash(b"original"))));
+        assert!(pairs(&p, "outputs").contains(&("f".into(), format!("x:{}", hash(b"original")))));
+    }
+}
+
+#[test]
+fn accesses_through_deleted_directory_fd_refuse_recording() {
+    let w = Ws::new("deleted-fd");
+    w.syscall_probe();
+    fs::create_dir(w.root.join("d")).unwrap();
+    let (code, err) = w.sh("./syscall-probe deleted-dirfd d");
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("not recorded") && err.contains("deleted directory"),
+        "{err}"
+    );
+    assert!(!w.store().join("proofs/t.json").exists());
+}
+
+#[test]
+fn exchanging_a_file_with_a_directory_is_unplannable() {
+    let w = Ws::new("exchange-directory");
+    w.syscall_probe();
+    w.write("a", "file");
+    w.write("d/child", "entry");
+    let p = recorded(&w, "./syscall-probe exchange a d");
+    assert!(has_reason(&p, "renamed the directory"), "{:?}", reasons(&p));
+}
+
+/// Explicitly regenerate the committed real-recorder planner fixtures on Linux.
+#[test]
+#[ignore]
+fn regenerate_planner_recorder_fixtures() {
+    use std::os::unix::fs::PermissionsExt;
+    assert_eq!(
+        std::env::var("STOOP_REGENERATE_RECORDER_FIXTURES").as_deref(),
+        Ok("1")
+    );
+    let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recorder");
+    fs::create_dir_all(&out).unwrap();
+    for case in [
+        "sed", "mkdir", "rename", "eol", "chmod", "parent", "failed", "symlink", "proc",
+    ] {
+        let w = Ws::new(&format!("fixture-{case}"));
+        let script = match case {
+            "sed" => {
+                w.write("config.txt", "foo\n");
+                "sed -i s/foo/bar/ config.txt"
+            }
+            "mkdir" => {
+                w.write("src/keep", "keep");
+                "mkdir -p src"
+            }
+            "rename" => {
+                w.write("d/file", "keep");
+                "mv d moved"
+            }
+            "eol" => "cat in.txt >/dev/null",
+            "chmod" => {
+                w.write("s.sh", "echo hi\n");
+                fs::set_permissions(w.root.join("s.sh"), fs::Permissions::from_mode(0o755))
+                    .unwrap();
+                "chmod -x s.sh"
+            }
+            "parent" => {
+                w.write("build/.keep", "keep");
+                "echo data > build/out"
+            }
+            "failed" => "echo x > missing/file || true",
+            "symlink" => {
+                w.write("sub/inner/keep", "keep");
+                std::os::unix::fs::symlink("sub/inner", w.root.join("link")).unwrap();
+                "echo x > link/../out"
+            }
+            "proc" => {
+                w.write("config.txt", "old content");
+                "cat /proc/self/cwd/config.txt >/dev/null; echo new > config.txt"
+            }
+            _ => unreachable!(),
+        };
+        let _ = recorded(&w, script);
+        let fixture = out.join(case);
+        fs::create_dir_all(&fixture).unwrap();
+        fs::copy(w.store().join("proofs/t.json"), fixture.join("proof.json")).unwrap();
+    }
 }
