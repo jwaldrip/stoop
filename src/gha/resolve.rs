@@ -1,25 +1,16 @@
-//! Resolves `uses:` references and container images to what they name now.
-//!
-//! A floating reference (`@v4`, `@main`) names a commit that can move. A record
-//! stores the commit the ref named at journal open, not necessarily the commit
-//! downloaded by the runner at Set up job. The planner resolves again.
-//! A reference that cannot be resolved also makes the job run: no answer, no proof.
-//!
-//! Resolution uses `git ls-remote`, not the REST API. The smart HTTP endpoint is
-//! not a REST request, so it does not draw on the REST quota. It follows
-//! `GITHUB_SERVER_URL`, so GitHub Enterprise Server works by URL. It sends the
-//! same credentials as `actions/checkout`, whose `extraheader` lives in the
-//! workspace's git config. It reports annotated tags already peeled to commits.
-//! No HTTP client is added to the crate.
+//! Resolves action refs and verifies the trees downloaded for their commits.
+//! Missing content, credentials, or runner copies make the job run.
 
 use crate::job::JobRecord;
+use crate::gha::actions::{self, Tree};
 use crate::plan::spec::{Code, JobSpec, RecordCheck};
 use crate::run;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::io::Read;
+use std::collections::{BTreeSet, HashMap};
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::rc::Rc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -109,10 +100,35 @@ fn is_full_sha(s: &str) -> bool {
         && s.bytes().any(|b| b != b'0')
 }
 
+#[cfg(test)]
+fn assert_fixture_url(url: &str) {
+    let loopback = url.strip_prefix("http://")
+        .and_then(|rest| rest.split('/').next())
+        .and_then(|authority| authority.parse::<std::net::SocketAddr>().ok())
+        .is_some_and(|address| address.ip().is_loopback());
+    assert!(url.starts_with("file:///") || loopback, "non-local action network access in a test");
+}
+
 /// Answers what a `uses:` reference names on its server.
 pub trait Resolver {
     /// The commit `owner/repo@reference` names now, or why that is unknown.
     fn commit(&self, owner: &str, repo: &str, reference: &str) -> Result<String, String>;
+
+    fn commit_before(&self, owner: &str, repo: &str, reference: &str, _deadline: Instant) -> Result<String, String> {
+        self.commit(owner, repo, reference)
+    }
+    fn action_tree(&self, _owner: &str, _repo: &str, _sha: &str, _deadline: Instant) -> Result<Rc<Tree>, String> {
+        Err("action tree download is unavailable".into())
+    }
+    fn runner_copy(&self, _owner: &str, _repo: &str, _reference: &str, _deadline: Instant) -> Result<Tree, String> {
+        Err("runner action copy is unavailable".into())
+    }
+    fn local_tree(&self, _path: &str, _deadline: Instant) -> Result<(String, Rc<Tree>), String> {
+        Err("local action tree is unavailable".into())
+    }
+    fn local_copy(&self, _path: &str, _deadline: Instant) -> Result<Tree, String> {
+        Err("local action copy is unavailable".into())
+    }
 }
 
 /// Resolves through `git ls-remote` against `<base>/<owner>/<repo>.git`.
@@ -120,6 +136,10 @@ pub struct Git {
     dir: PathBuf,
     base: String,
     timeout: Duration,
+    api: String,
+    revision: Option<String>,
+    cache_root: Option<PathBuf>,
+    downloaded: RefCell<HashMap<(String, String, String), Result<Rc<Tree>, String>>>,
 }
 
 impl Git {
@@ -127,22 +147,34 @@ impl Git {
     pub const TIMEOUT: Duration = Duration::from_secs(15);
 
     pub fn new(dir: impl Into<PathBuf>, base: impl Into<String>, timeout: Duration) -> Self {
-        let base: String = base.into();
-        Self {
-            dir: dir.into(),
-            base: base.trim_end_matches('/').to_string(),
-            timeout,
-        }
+        let base = base.into().trim_end_matches('/').to_string();
+        let api = if base == "https://github.com" {
+            "https://api.github.com".to_string()
+        } else {
+            format!("{base}/api/v3")
+        };
+        Self { dir: dir.into(), base, timeout, api, revision: None, cache_root: None, downloaded: RefCell::new(HashMap::new()) }
+    }
+
+    pub fn with_revision(mut self, revision: impl Into<String>) -> Self {
+        self.revision = Some(revision.into());
+        self
     }
 
     /// The server is `GITHUB_SERVER_URL` in Actions, else github.com. `dir` is the
     /// workspace, so git reads its credentials.
     pub fn from_env(dir: &Path) -> Self {
         let base = run::env_str("GITHUB_SERVER_URL").unwrap_or_else(|| "https://github.com".into());
-        Self::new(dir, base, Self::TIMEOUT)
+        let mut git = Self::new(dir, base, Self::TIMEOUT);
+        if let Some(api) = run::env_str("GITHUB_API_URL") {
+            git.api = api.trim_end_matches('/').to_owned();
+        }
+        git
     }
 
-    fn ls_remote(&self, url: &str, patterns: &[String]) -> Result<String, String> {
+    fn ls_remote(&self, url: &str, patterns: &[String], total_deadline: Instant) -> Result<String, String> {
+        #[cfg(test)]
+        assert_fixture_url(url);
         let mut command = Command::new("git");
         command
             .current_dir(&self.dir)
@@ -165,7 +197,7 @@ impl Git {
             .map_err(|e| format!("cannot run git: {e}"))?;
         let out = drain(child.stdout.take());
         let err = drain(child.stderr.take());
-        let deadline = Instant::now() + self.timeout;
+        let deadline = (Instant::now() + self.timeout).min(total_deadline);
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -186,6 +218,9 @@ impl Git {
         };
         let stdout = out.join().map_err(|_| "git output reader panicked")?;
         let stderr = err.join().map_err(|_| "git error reader panicked")?;
+        if stdout.len() > 1024 * 1024 || stderr.len() > 1024 * 1024 {
+            return Err("git ls-remote output exceeds the size limit".into());
+        }
         if !status.success() {
             let text = String::from_utf8_lossy(&stderr);
             let first = text
@@ -197,6 +232,162 @@ impl Git {
         }
         String::from_utf8(stdout).map_err(|_| "git ls-remote output is not UTF-8".into())
     }
+
+    fn run_bounded(&self, mut command: Command, input: Option<&[u8]>, limit: usize, deadline: Instant) -> Result<Vec<u8>, String> {
+        if Instant::now() >= deadline {
+            return Err("action verification timed out".into());
+        }
+        command.current_dir(&self.dir).stdout(Stdio::piped()).stderr(Stdio::null());
+        command.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() });
+        for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_ATTR_SOURCE"] {
+            command.env_remove(var);
+        }
+        let mut child = command.spawn().map_err(|e| format!("cannot start action verification: {e}"))?;
+        if let Some(input) = input {
+            if let Some(mut stdin) = child.stdin.take() {
+                if let Err(e) = stdin.write_all(input) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("cannot send verification input: {e}"));
+                }
+            }
+        }
+        let stdout = child.stdout.take().ok_or("cannot capture action verification output")?;
+        let reader = thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout.take((limit + 1) as u64).read_to_end(&mut bytes).map(|_| bytes)
+        });
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err("action verification timed out".into());
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!("cannot wait for action verification: {e}"));
+                }
+            }
+        };
+        let bytes = reader.join().map_err(|_| "action output reader panicked")?
+            .map_err(|e| format!("cannot read action verification output: {e}"))?;
+        if bytes.len() > limit {
+            return Err("action download exceeds the size limit".into());
+        }
+        if !status.success() {
+            return Err("action verification command failed".into());
+        }
+        Ok(bytes)
+    }
+
+    fn cache_archive(&self, owner: &str, repo: &str, sha: &str, bytes: &[u8], deadline: Instant) -> Result<(), String> {
+        let cache_root = self.cache_root.clone().or_else(|| run::env_str("XDG_CACHE_HOME").map(PathBuf::from))
+            .or_else(|| run::env_str("HOME").map(|home| PathBuf::from(home).join(".cache")))
+            .ok_or("no cache directory is available")?;
+        if !cache_root.is_absolute() {
+            return Err("action cache directory must be absolute".into());
+        }
+        let root = std::fs::canonicalize(&self.dir).map_err(|e| e.to_string())?;
+        let mut ancestor = cache_root.as_path();
+        while !ancestor.exists() {
+            ancestor = ancestor.parent().ok_or("action cache has no existing ancestor")?;
+        }
+        let existing = std::fs::canonicalize(ancestor).map_err(|e| e.to_string())?;
+        if existing.starts_with(&root) {
+            return Err("action cache is inside the repository".into());
+        }
+        let dir = cache_root.join("stoop").join("actions");
+        std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create action cache: {e}"))?;
+        let cache = std::fs::canonicalize(&dir).map_err(|e| e.to_string())?;
+        if cache.starts_with(root) {
+            return Err("action cache is inside the repository".into());
+        }
+        let scope = blake3::hash(format!("{}\0{owner}\0{repo}", self.api).as_bytes()).to_hex();
+        let target = cache.join(format!("{sha}-{}", &scope[..16]));
+        let temp = cache.join(format!(".{sha}-{}-{}", std::process::id(), &scope[..16]));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temp).map_err(|e| format!("cannot create action cache entry: {e}"))?;
+        let save = (|| -> Result<(), String> {
+            for chunk in bytes.chunks(64 * 1024) {
+                if Instant::now() >= deadline {
+                    return Err("action verification timed out while caching".into());
+                }
+                file.write_all(chunk).map_err(|e| e.to_string())?;
+            }
+            std::fs::rename(&temp, &target).map_err(|e| e.to_string())
+        })();
+        if let Err(e) = save {
+            let _ = std::fs::remove_file(&temp);
+            return Err(format!("cannot save action cache entry: {e}"));
+        }
+        Ok(())
+    }
+
+    fn download(&self, owner: &str, repo: &str, sha: &str, deadline: Instant) -> Result<Rc<Tree>, String> {
+        if !is_full_sha(sha) {
+            return Err("resolved action commit is not a full SHA".into());
+        }
+        let key = (owner.to_owned(), repo.to_owned(), sha.to_owned());
+        if let Some(cached) = self.downloaded.borrow().get(&key) {
+            return cached.clone();
+        }
+        let result = (|| {
+            let repository_url = format!("{}/{owner}/{repo}.git", self.base);
+            let mut config = Command::new("git");
+            config.args(["config", "--get-urlmatch", "http.extraheader", &repository_url]);
+            // A missing header is normal for public repositories. Do not print it.
+            let header = self.run_bounded(config, None, 8192, deadline).ok();
+            let url = format!("{}/repos/{owner}/{repo}/tarball/{sha}", self.api);
+            #[cfg(test)]
+            assert_fixture_url(&url);
+            let mut curl = Command::new("curl");
+            let seconds = deadline.saturating_duration_since(Instant::now()).as_secs_f64().min(self.timeout.as_secs_f64());
+            if seconds <= 0.0 {
+                return Err("action download timed out".into());
+            }
+            curl.args(["--fail", "--silent", "--show-error", "--location", "--max-time", &format!("{seconds:.3}"), "--connect-timeout", "5", "--header", "Accept: application/vnd.github+json", "--header", "User-Agent: stoop"]);
+            #[cfg(test)]
+            curl.args(["--max-redirs", "0"]);
+            if header.is_some() {
+                curl.args(["--header", "@-"]);
+            }
+            curl.args(["--url", &url]);
+            let bytes = self.run_bounded(curl, header.as_deref(), actions::MAX_COMPRESSED, deadline)?;
+            let tree = Rc::new(Tree::from_gzip_before(&bytes, deadline)?);
+            self.cache_archive(owner, repo, sha, &bytes, deadline)?;
+            Ok(tree)
+        })();
+        self.downloaded.borrow_mut().insert(key, result.clone());
+        result
+    }
+
+    fn checked_copy(&self, base: &Path, relative: &Path, deadline: Instant) -> Result<Tree, String> {
+        let base_meta = std::fs::symlink_metadata(base).map_err(|e| format!("action copy base is inaccessible: {e}"))?;
+        if base_meta.file_type().is_symlink() || !base_meta.is_dir() {
+            return Err("action copy base is not a real directory".into());
+        }
+        let mut path = base.to_path_buf();
+        for component in relative.components() {
+            match component {
+                std::path::Component::Normal(part) => path.push(part),
+                _ => return Err("invalid action copy path".into()),
+            }
+            if std::fs::symlink_metadata(&path).map_err(|e| format!("action copy is inaccessible: {e}"))?.file_type().is_symlink() {
+                return Err("action copy path contains a symlink".into());
+            }
+        }
+        Tree::from_directory_before(&path, deadline)
+    }
 }
 
 /// Reads a reader to its end on its own thread, so a full pipe cannot stall git.
@@ -204,8 +395,8 @@ impl Git {
 fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<Vec<u8>> {
     thread::spawn(move || {
         let mut buf = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut buf);
+        if let Some(pipe) = pipe {
+            let _ = pipe.take(1024 * 1024 + 1).read_to_end(&mut buf);
         }
         buf
     })
@@ -213,6 +404,10 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<Vec<u8
 
 impl Resolver for Git {
     fn commit(&self, owner: &str, repo: &str, reference: &str) -> Result<String, String> {
+        self.commit_before(owner, repo, reference, Instant::now() + self.timeout)
+    }
+
+    fn commit_before(&self, owner: &str, repo: &str, reference: &str, deadline: Instant) -> Result<String, String> {
         let url = format!("{}/{owner}/{repo}.git", self.base);
         let patterns = if reference.starts_with("refs/") {
             vec![reference.to_string(), format!("{reference}^{{}}")]
@@ -223,7 +418,40 @@ impl Resolver for Git {
                 format!("refs/heads/{reference}"),
             ]
         };
-        pick(&self.ls_remote(&url, &patterns)?, reference)
+        pick(&self.ls_remote(&url, &patterns, deadline)?, reference)
+    }
+
+    fn action_tree(&self, owner: &str, repo: &str, sha: &str, deadline: Instant) -> Result<Rc<Tree>, String> {
+        self.download(owner, repo, sha, deadline)
+    }
+
+    fn runner_copy(&self, owner: &str, repo: &str, reference: &str, deadline: Instant) -> Result<Tree, String> {
+        let workspace = run::env_str("RUNNER_WORKSPACE").ok_or("RUNNER_WORKSPACE is not set")?;
+        let parent = Path::new(&workspace).parent().ok_or("invalid RUNNER_WORKSPACE")?;
+        let base = parent.join("_actions");
+        self.checked_copy(&base, &PathBuf::from(owner).join(repo).join(reference), deadline)
+    }
+
+    fn local_tree(&self, path: &str, deadline: Instant) -> Result<(String, Rc<Tree>), String> {
+        let sha = self.revision.clone().or_else(|| run::env_str("GITHUB_SHA")).ok_or("target revision is unavailable")?;
+        if !is_full_sha(&sha) {
+            return Err("target revision is not a full commit SHA".into());
+        }
+        let mut ls = Command::new("git");
+        ls.args(["ls-tree", "-r", &sha, "--", path]);
+        let listing = self.run_bounded(ls, None, 4 * 1024 * 1024, deadline)?;
+        if String::from_utf8_lossy(&listing).lines().any(|line| line.starts_with("160000 ")) {
+            return Err("local action contains a submodule".into());
+        }
+        let mut archive = Command::new("git");
+        archive.args(["archive", "--format=tar", &sha, "--", path]);
+        let bytes = self.run_bounded(archive, None, 300 * 1024 * 1024, deadline)?;
+        let tree = Tree::from_tar_before(std::io::Cursor::new(bytes), false, deadline)?.subtree(path)?;
+        Ok((sha, Rc::new(tree)))
+    }
+
+    fn local_copy(&self, path: &str, deadline: Instant) -> Result<Tree, String> {
+        self.checked_copy(&self.dir, Path::new(path), deadline)
     }
 }
 
@@ -293,57 +521,33 @@ impl<'a> Memo<'a> {
 
 impl Resolver for Memo<'_> {
     fn commit(&self, owner: &str, repo: &str, reference: &str) -> Result<String, String> {
+        self.commit_before(owner, repo, reference, Instant::now() + actions::TOTAL_TIMEOUT)
+    }
+
+    fn commit_before(&self, owner: &str, repo: &str, reference: &str, deadline: Instant) -> Result<String, String> {
         let key = (owner.to_string(), repo.to_string(), reference.to_string());
         if let Some(answer) = self.seen.borrow().get(&key) {
             return answer.clone();
         }
-        let answer = self.inner.commit(owner, repo, reference);
+        let answer = self.inner.commit_before(owner, repo, reference, deadline);
         self.seen.borrow_mut().insert(key, answer.clone());
         answer
     }
+
+    fn action_tree(&self, owner: &str, repo: &str, sha: &str, deadline: Instant) -> Result<Rc<Tree>, String> {
+        self.inner.action_tree(owner, repo, sha, deadline)
+    }
+    fn runner_copy(&self, owner: &str, repo: &str, reference: &str, deadline: Instant) -> Result<Tree, String> {
+        self.inner.runner_copy(owner, repo, reference, deadline)
+    }
+    fn local_tree(&self, path: &str, deadline: Instant) -> Result<(String, Rc<Tree>), String> {
+        self.inner.local_tree(path, deadline)
+    }
+    fn local_copy(&self, path: &str, deadline: Instant) -> Result<Tree, String> {
+        self.inner.local_copy(path, deadline)
+    }
 }
 
-/// Resolves one `uses:` value to its commit. A full SHA needs no lookup.
-fn resolve_one(uses: &str, resolver: &dyn Resolver) -> Result<String, String> {
-    match classify(uses)? {
-        Action::Pinned(sha) => Ok(sha),
-        Action::Remote {
-            owner,
-            repo,
-            reference,
-        } => resolver.commit(&owner, &repo, &reference),
-    }
-}
-/// In strict mode, only a complete commit ID is eligible for a job record.
-pub fn require_pinned(uses: &[String]) -> Result<(), String> {
-    for raw in uses {
-        if !matches!(classify(raw), Ok(Action::Pinned(_))) {
-            return Err(format!("action {raw} is not pinned to a full commit SHA"));
-        }
-    }
-    Ok(())
-}
-
-/// What the recorder stores in `JobRecord.actions`: the commit of every reference that
-/// resolved, and one reason for each reference that did not. A reference that did not
-/// resolve is left out, so the planner has no answer for it and the job runs.
-pub fn resolve_all(
-    uses: &[String],
-    resolver: &dyn Resolver,
-) -> (BTreeMap<String, String>, Vec<String>) {
-    let memo = Memo::new(resolver);
-    let mut actions = BTreeMap::new();
-    let mut failures = Vec::new();
-    for raw in uses.iter().collect::<BTreeSet<_>>() {
-        match resolve_one(raw, &memo) {
-            Ok(sha) => {
-                actions.insert(raw.clone(), sha);
-            }
-            Err(reason) => failures.push(format!("{raw}: {reason}")),
-        }
-    }
-    (actions, failures)
-}
 
 /// Whether an image reference is pinned to a `sha256` digest. Only a digest names
 /// the same bytes forever, and resolving a tag needs a registry client, so a tag is
@@ -358,11 +562,11 @@ pub fn image_pinned(image: &str) -> bool {
     })
 }
 
-/// The plan-time check. For each record that would otherwise prove, every action must
-/// resolve now to the commit the record stored, and every image must be pinned.
+/// Verifies the attested action graph against fresh downloads for this plan run.
 pub struct ActionCheck<'a> {
     memo: Memo<'a>,
     strict: bool,
+    deadline: Instant,
 }
 
 impl<'a> ActionCheck<'a> {
@@ -374,15 +578,13 @@ impl<'a> ActionCheck<'a> {
         Self {
             memo: Memo::new(resolver),
             strict,
+            deadline: Instant::now() + actions::TOTAL_TIMEOUT,
         }
     }
 }
 
 impl RecordCheck for ActionCheck<'_> {
     fn check(&self, spec: &JobSpec, record: &JobRecord) -> Result<(), (Code, String)> {
-        if self.strict {
-            require_pinned(&spec.actions).map_err(|e| (Code::UnresolvedAction, e))?;
-        }
         for image in &spec.images {
             if !image_pinned(image) {
                 return Err((
@@ -393,26 +595,7 @@ impl RecordCheck for ActionCheck<'_> {
                 ));
             }
         }
-        for raw in spec.actions.iter().collect::<BTreeSet<_>>() {
-            let now = resolve_one(raw, &self.memo)
-                .map_err(|e| (Code::UnresolvedAction, format!("action {raw}: {e}")))?;
-            match record.actions.get(raw) {
-                None => {
-                    return Err((
-                        Code::UnresolvedAction,
-                        format!("record has no resolution for action {raw}"),
-                    ))
-                }
-                Some(recorded) if *recorded != now => {
-                    return Err((
-                        Code::InputChanged,
-                        format!("action {raw} resolves to {now}, recorded as {recorded}"),
-                    ))
-                }
-                Some(_) => {}
-            }
-        }
-        Ok(())
+        actions::verify(&spec.actions, &record.actions, &self.memo, self.strict, self.deadline)
     }
 }
 
@@ -420,6 +603,8 @@ impl RecordCheck for ActionCheck<'_> {
 pub mod fake {
     use super::Resolver;
     use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
+    use std::time::Instant;
     use std::collections::HashMap;
 
     /// A resolver with fixed answers, counting every lookup it receives.
@@ -455,6 +640,14 @@ pub mod fake {
                 .cloned()
                 .unwrap_or_else(|| Err(format!("no fake answer for {key}")))
         }
+
+        fn action_tree(&self, _: &str, _: &str, _: &str, _: Instant) -> Result<Rc<super::Tree>, String> {
+            Ok(Rc::new(crate::gha::actions::fixture_tree()))
+        }
+
+        fn runner_copy(&self, _: &str, _: &str, _: &str, _: Instant) -> Result<super::Tree, String> {
+            Ok(crate::gha::actions::fixture_tree())
+        }
     }
 }
 
@@ -463,6 +656,7 @@ mod tests {
     use super::fake::Fake;
     use super::*;
     use crate::plan::spec::JobSpec;
+    use std::collections::BTreeMap;
     use std::net::TcpListener;
     use std::process::Command as Cmd;
 
@@ -470,6 +664,14 @@ mod tests {
     const B: &str = "2222222222222222222222222222222222222222";
     const TAG_OBJECT: &str = "3333333333333333333333333333333333333333";
     const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn unit_test_resolver_refuses_real_network_destinations() {
+        assert_fixture_url("http://127.0.0.1:1234/api/v3");
+        assert_fixture_url("file:///tmp/fixture");
+        assert!(std::panic::catch_unwind(|| assert_fixture_url("https://github.com")).is_err());
+        assert!(std::panic::catch_unwind(|| assert_fixture_url("http://127.0.0.1.example.com:1234")).is_err());
+    }
 
     fn spec(actions: &[&str], images: &[&str]) -> JobSpec {
         JobSpec {
@@ -489,15 +691,18 @@ mod tests {
     }
 
     fn record(actions: &[(&str, &str)]) -> JobRecord {
+        let fake = Fake::new();
+        for (raw, sha) in actions {
+            fake.set(raw, Ok(*sha));
+        }
+        let refs: Vec<String> = actions.iter().map(|(raw, _)| raw.to_string()).collect();
+        let actions = crate::gha::actions::capture(&refs, &fake, false).unwrap();
         JobRecord {
             created: 1,
             started: 1,
             status: None,
             failed: None,
-            actions: actions
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+            actions,
             commit: None,
             host: BTreeMap::new(),
             event_path: None,
@@ -870,31 +1075,16 @@ mod tests {
         let fake = Fake::new();
         fake.set("actions/checkout@v4", Ok(A));
         fake.set("actions/setup-node@v4", Err("no such ref"));
-        let (actions, failures) = resolve_all(
-            &[
-                "actions/checkout@v4".into(),
-                "actions/checkout@v4".into(),
-                format!("actions/cache@{B}"),
-                "actions/setup-node@v4".into(),
-            ],
-            &fake,
-        );
-        assert_eq!(fake.calls(), 2, "one lookup per distinct action");
-        assert_eq!(
-            actions.get("actions/checkout@v4").map(String::as_str),
-            Some(A)
-        );
-        assert_eq!(
-            actions
-                .get(&format!("actions/cache@{B}"))
-                .map(String::as_str),
-            Some(B)
-        );
-        assert!(
-            !actions.contains_key("actions/setup-node@v4"),
-            "a failed lookup is not stored"
-        );
-        assert_eq!(failures.len(), 1);
+        let refs = vec![
+            "actions/checkout@v4".into(),
+            "actions/checkout@v4".into(),
+            format!("actions/cache@{B}"),
+        ];
+        let actions = crate::gha::actions::capture(&refs, &fake, false).unwrap();
+        assert_eq!(fake.calls(), 1, "pinned commits need no lookup, duplicates share one lookup");
+        assert_eq!(actions.get("actions/checkout@v4").map(String::as_str), Some(A));
+        assert_eq!(actions.get(&format!("actions/cache@{B}")).map(String::as_str), Some(B));
+        assert!(crate::gha::actions::capture(&["actions/setup-node@v4".into()], &fake, false).is_err());
     }
 
     #[test]
@@ -902,10 +1092,11 @@ mod tests {
         let fake = Fake::new();
         fake.set("actions/checkout@v4", Ok(A));
         fake.set("actions/setup-node@v4", Ok(B));
-        let (actions, _) = resolve_all(
+        let actions = crate::gha::actions::capture(
             &["actions/checkout@v4".into(), "actions/setup-node@v4".into()],
             &fake,
-        );
+            false,
+        ).unwrap();
         let rec = JobRecord {
             actions,
             ..record(&[])
@@ -929,7 +1120,7 @@ mod tests {
         let (code, detail) = check
             .check(&spec(&["actions/checkout@v4"], &[]), &rec)
             .unwrap_err();
-        assert_eq!(code, Code::InputChanged);
+        assert_eq!(code, Code::ActionMoved);
         assert!(detail.contains(B) && detail.contains(A), "{detail}");
     }
 
@@ -944,7 +1135,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             code,
-            Code::UnresolvedAction,
+            Code::ActionUnverifiable,
             "an error must never read as unchanged"
         );
     }
@@ -959,7 +1150,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(
             code,
-            Code::UnresolvedAction,
+            Code::ActionUnverifiable,
             "records from before resolution have no answer"
         );
     }
@@ -972,11 +1163,11 @@ mod tests {
         for s in [
             spec(&["actions/checkout@abcd"], &[]),
             spec(&["./local@v1"], &[]),
-            spec(&[], &["node:20"]),
-            spec(&[], &["ghcr.io/acme/app:latest"]),
         ] {
-            let (code, _) = check.check(&s, &rec).unwrap_err();
-            assert_eq!(code, Code::UnresolvedAction);
+            assert_eq!(check.check(&s, &rec).unwrap_err().0, Code::ActionUnverifiable);
+        }
+        for s in [spec(&[], &["node:20"]), spec(&[], &["ghcr.io/acme/app:latest"])] {
+            assert_eq!(check.check(&s, &rec).unwrap_err().0, Code::UnresolvedAction);
         }
         assert_eq!(fake.calls(), 0, "classification never reaches the network");
         assert!(ActionCheck::new(&fake)
@@ -1009,15 +1200,14 @@ mod tests {
                 .check(&floating, &rec)
                 .unwrap_err()
                 .0,
-            Code::UnresolvedAction
+            Code::ActionUnverifiable
         );
         assert_eq!(fake.calls(), 0);
         assert!(ActionCheck::with_strict(&fake, false)
             .check(&floating, &rec)
             .is_ok());
         let pin = format!("actions/checkout@{A}");
-        assert!(require_pinned(std::slice::from_ref(&pin)).is_ok());
-        assert!(require_pinned(&["actions/checkout@v4".into()]).is_err());
+        assert!(matches!(classify(&pin), Ok(Action::Pinned(_))));
         assert!(ActionCheck::with_strict(&fake, true)
             .check(&spec(&[&pin], &[]), &record(&[(&pin, A)]))
             .is_ok());
@@ -1037,7 +1227,7 @@ mod tests {
                 )
                 .unwrap_err()
                 .0,
-            Code::InputChanged
+            Code::ActionMoved
         );
         let pinned = format!("node@{DIGEST}");
         assert_eq!(
@@ -1057,8 +1247,8 @@ mod tests {
         let s = spec(&["actions/checkout@v4"], &[]);
         for _ in 0..3 {
             assert_eq!(
-                check.check(&s, &record(&[])).unwrap_err().0,
-                Code::UnresolvedAction
+                check.check(&s, &record(&[("actions/checkout@v4", A)])).unwrap_err().0,
+                Code::ActionUnverifiable
             );
         }
         assert_eq!(fake.calls(), 1);
@@ -1090,7 +1280,142 @@ mod tests {
                 .check(&job, &recorded)
                 .unwrap_err()
                 .0,
-            Code::UnresolvedAction
+            Code::ActionUnverifiable
         );
+    }
+
+    #[test]
+    fn ghes_tarball_download_is_cached_within_a_plan() {
+        use std::io::{Read, Write};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let body = crate::gha::actions::fixture_archive();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.ends_with(b"\r\n\r\n") {
+                let n = stream.read(&mut chunk).unwrap();
+                if n == 0 { break; }
+                request.extend_from_slice(&chunk[..n]);
+            }
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+            stream.write_all(&body).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let base = std::env::temp_dir().join(format!("stoop-action-http-{}-{}", std::process::id(), address.port()));
+        let root = base.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut git = Git::new(&root, format!("http://{address}"), Duration::from_secs(5));
+        git.cache_root = Some(base.join("cache"));
+        let first = git.action_tree("owner", "repo", A, Instant::now() + Duration::from_secs(5)).unwrap();
+        let second = git.action_tree("owner", "repo", A, Instant::now() + Duration::from_secs(5)).unwrap();
+        assert!(Rc::ptr_eq(&first, &second), "same-run cache must avoid a second request");
+        let request = server.join().unwrap();
+        assert!(request.starts_with(&format!("GET /api/v3/repos/owner/repo/tarball/{A} ")), "wrong GHES archive path");
+        assert!(base.join("cache/stoop/actions").read_dir().unwrap().next().is_some());
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn stalled_tarball_fails_within_the_total_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let end = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < end {
+                match listener.accept() {
+                    Ok((_stream, _)) => {
+                        thread::sleep(Duration::from_millis(500));
+                        return;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(5)),
+                    Err(e) => panic!("fixture accept: {e}"),
+                }
+            }
+        });
+        let base = std::env::temp_dir().join(format!("stoop-action-timeout-{}-{}", std::process::id(), address.port()));
+        let root = base.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut git = Git::new(&root, format!("http://{address}"), Duration::from_secs(3));
+        git.cache_root = Some(base.join("cache"));
+        assert!(git.action_tree("owner", "repo", A, Instant::now() + Duration::from_millis(150)).is_err());
+        server.join().unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn fresh_http_download_detects_tampered_bytes_for_the_same_sha() {
+        use std::io::{Read, Write};
+        struct Network<'a>(&'a Git);
+        impl Resolver for Network<'_> {
+            fn commit(&self, _: &str, _: &str, _: &str) -> Result<String, String> {
+                Ok(A.into())
+            }
+            fn action_tree(&self, owner: &str, repo: &str, sha: &str, deadline: Instant) -> Result<Rc<Tree>, String> {
+                self.0.action_tree(owner, repo, sha, deadline)
+            }
+            fn runner_copy(&self, _: &str, _: &str, _: &str, _: Instant) -> Result<Tree, String> {
+                Ok(crate::gha::actions::fixture_tree())
+            }
+        }
+        let mut tar = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default()));
+        for (name, contents) in [
+            ("action.yml", &b"runs:\n  using: node20\n  main: index.js\n"[..]),
+            ("index.js", &b"tampered\n"[..]),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_mode(0o644);
+            header.set_size(contents.len() as u64);
+            header.set_cksum();
+            tar.append_data(&mut header, format!("repo-sha/{name}"), contents).unwrap();
+        }
+        let tampered = tar.into_inner().unwrap().finish().unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let mut bodies = vec![crate::gha::actions::fixture_archive(), tampered].into_iter();
+            let end = Instant::now() + Duration::from_secs(10);
+            let mut served = 0;
+            while Instant::now() < end {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let mut request = Vec::new();
+                        let mut chunk = [0u8; 1024];
+                        while !request.ends_with(b"\r\n\r\n") {
+                            let n = stream.read(&mut chunk).unwrap();
+                            if n == 0 { break; }
+                            request.extend_from_slice(&chunk[..n]);
+                        }
+                        let Some(body) = bodies.next() else { break };
+                        write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len()).unwrap();
+                        stream.write_all(&body).unwrap();
+                        served += 1;
+                        if served == 2 { break; }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(5)),
+                    Err(e) => panic!("fixture accept: {e}"),
+                }
+            }
+            served
+        });
+        let base = std::env::temp_dir().join(format!("stoop-action-tamper-{}-{}", std::process::id(), address.port()));
+        let root = base.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let make_git = || {
+            let mut git = Git::new(&root, format!("http://{address}"), Duration::from_secs(5));
+            git.cache_root = Some(base.join("cache"));
+            git
+        };
+        let recording = make_git();
+        let refs = vec!["owner/repo@v1".to_string()];
+        let saved = actions::capture(&refs, &Network(&recording), false).unwrap();
+        let planning = make_git();
+        let (code, _) = actions::verify(&refs, &saved, &Network(&planning), false, Instant::now() + Duration::from_secs(5)).unwrap_err();
+        assert_eq!(code, Code::ActionContentChanged);
+        assert_eq!(server.join().unwrap(), 2);
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

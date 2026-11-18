@@ -37,7 +37,7 @@ jobs:
       - run: |
           true
 ";
-const ENV: [&str; 13] = [
+const ENV: [&str; 17] = [
     "GITHUB_ACTIONS",
     "GITHUB_REPOSITORY",
     "GITHUB_WORKFLOW_REF",
@@ -48,6 +48,10 @@ const ENV: [&str; 13] = [
     "GITHUB_RUN_ATTEMPT",
     "GITHUB_EVENT_PATH",
     "RUNNER_TEMP",
+    "RUNNER_WORKSPACE",
+    "GITHUB_API_URL",
+    "GITHUB_SERVER_URL",
+    "XDG_CACHE_HOME",
     "RUNNER_OS",
     "ACTIONS_ID_TOKEN_REQUEST_URL",
     "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
@@ -98,6 +102,12 @@ fn answer(mut stream: TcpStream, github: &Github) {
     }
     let target = request.split_whitespace().nth(1).unwrap_or("/").to_string();
     let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
+    if path == "/repos/actions/checkout/tarball/1111111111111111111111111111111111111111" {
+        let body = crate::gha::actions::fixture_archive();
+        let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+        let _ = stream.write_all(&body);
+        return;
+    }
     let expected = format!("bearer {BEARER}");
     let (status, body) = match path {
         "/token" if github.failing => (500, "{}".to_string()),
@@ -225,6 +235,10 @@ impl Repo {
         let temp = self.root.join(format!("runner-{run_id}"));
         fs::create_dir_all(&temp).map_err(|e| e.to_string())?;
         fs::write(temp.join("event.json"), "{}").map_err(|e| e.to_string())?;
+        let copy = temp.join("work/_actions/actions/checkout/1111111111111111111111111111111111111111");
+        fs::create_dir_all(&copy).map_err(|e| e.to_string())?;
+        fs::write(copy.join("action.yml"), "runs:\n  using: node20\n  main: index.js\n").map_err(|e| e.to_string())?;
+        fs::write(copy.join("index.js"), "fixture\n").map_err(|e| e.to_string())?;
         let env = runner_env(&temp, &self.sha, run_id);
         for (name, value) in &env {
             std::env::set_var(name, value);
@@ -301,6 +315,7 @@ fn runner_env(temp: &Path, sha: &str, run_id: &str) -> BTreeMap<String, String> 
             temp.join("event.json").display().to_string(),
         ),
         ("RUNNER_TEMP", temp.display().to_string()),
+        ("RUNNER_WORKSPACE", temp.join("work/repo").display().to_string()),
         ("RUNNER_OS", "Linux".to_string()),
     ]
     .into_iter()
@@ -395,6 +410,9 @@ fn published_records_are_accepted_only_through_the_verifier() {
         failing: false,
     }));
     let base = serve(github.clone());
+    std::env::set_var("GITHUB_API_URL", &base);
+    std::env::set_var("GITHUB_SERVER_URL", &base);
+    std::env::set_var("XDG_CACHE_HOME", root.join("cache"));
     let token_url = format!("{base}/token?api-version=2.0");
     let planned = planned(&runner_env(&root.join("runner-123"), &repo.sha, "123"));
     // The job file is keyed by the job key, not by a step key.

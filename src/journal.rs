@@ -1,5 +1,5 @@
 use crate::attest;
-use crate::gha::{context::GhCtx, resolve, workflow};
+use crate::gha::{actions, context::GhCtx, resolve, workflow};
 use crate::job::{JobRecord, JobStore, RecordStatus, StepHow, StepRecord};
 use crate::plan::spec::StepSpec;
 use crate::proof::{now, Store};
@@ -297,16 +297,14 @@ fn record_actions(
     resolver: &dyn resolve::Resolver,
     strict: bool,
 ) -> BTreeMap<String, String> {
-    let eligible: Vec<String> = refs
-        .iter()
-        .filter(|raw| !strict || resolve::require_pinned(std::slice::from_ref(*raw)).is_ok())
-        .cloned()
-        .collect();
-    let (actions, failures) = resolve::resolve_all(&eligible, resolver);
-    for failure in failures {
-        eprintln!("stoop: action unresolved at journal open: {failure}");
+    let memo = resolve::Memo::new(resolver);
+    match actions::capture(refs, &memo, strict) {
+        Ok(actions) => actions,
+        Err(reason) => {
+            eprintln!("stoop: action unverifiable at journal open: {reason}");
+            BTreeMap::new()
+        }
     }
-    actions
 }
 
 #[cfg(test)]
@@ -315,25 +313,21 @@ mod tests {
     use crate::gha::resolve::fake::Fake;
     const A: &str = "1111111111111111111111111111111111111111";
     #[test]
-    fn open_records_resolved_actions_and_omits_failures() {
+    fn a_failed_action_prevents_a_witness_for_the_entire_job() {
         let fake = Fake::new();
         fake.set("actions/checkout@v4", Ok(A));
         fake.set("x/y@v9", Err("unavailable"));
         let refs = vec!["actions/checkout@v4".into(), "x/y@v9".into()];
         let actions = record_actions(&refs, &fake, false);
-        assert_eq!(
-            actions.get("actions/checkout@v4").map(String::as_str),
-            Some(A)
-        );
-        assert!(!actions.contains_key("x/y@v9"));
+        assert!(actions.is_empty());
         assert_eq!(fake.calls(), 2);
     }
     #[test]
-    fn strict_recording_omits_floating_refs_without_network() {
+    fn strict_recording_refuses_floating_refs_without_network() {
         let fake = Fake::new();
         let pin = format!("actions/checkout@{A}");
         let actions = record_actions(&["actions/checkout@v4".into(), pin.clone()], &fake, true);
-        assert_eq!(actions.get(&pin).map(String::as_str), Some(A));
+        assert!(actions.is_empty());
         assert_eq!(fake.calls(), 0);
     }
 }

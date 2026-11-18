@@ -2,6 +2,7 @@
 use super::*;
 use crate::attest::tests as a;
 use crate::job::{JobRecord, RecordStatus, StepHow, StepRecord};
+use crate::gha::resolve::Resolver;
 use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +37,7 @@ struct Repo {
     root: PathBuf,
     sha: String,
     event: PathBuf,
+    api: Option<gha::actions::FixtureServer>,
 }
 
 impl Repo {
@@ -65,11 +67,16 @@ impl Repo {
         .to_string();
         let event = base.join("event.json");
         std::fs::write(&event, r#"{"repository":{"default_branch":"main"}}"#).unwrap();
+        let archive = base.join(format!("api/repos/actions/checkout/tarball/{PIN}"));
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(archive, crate::gha::actions::fixture_archive()).unwrap();
+        let api = gha::actions::FixtureServer::new(base.join("api"));
         Repo {
             base,
             root,
             sha,
             event,
+            api: Some(api),
         }
     }
     fn store(&self) -> PathBuf {
@@ -79,6 +86,7 @@ impl Repo {
 
 impl Drop for Repo {
     fn drop(&mut self) {
+        drop(self.api.take());
         if std::env::var_os("PROBE_KEEP").is_none() {
             let _ = std::fs::remove_dir_all(&self.base);
         }
@@ -89,6 +97,28 @@ fn file(path: &str, bytes: &[u8]) -> input::Input {
     input::Input {
         path: path.into(),
         id: format!("f:{}", blake3::hash(bytes).to_hex()),
+    }
+}
+
+struct RecordingSource {
+    fake: gha::resolve::fake::Fake,
+    git: gha::resolve::Git,
+}
+impl gha::resolve::Resolver for RecordingSource {
+    fn commit(&self, owner: &str, repo: &str, reference: &str) -> Result<String, String> {
+        self.fake.commit(owner, repo, reference)
+    }
+    fn action_tree(&self, owner: &str, repo: &str, sha: &str, deadline: std::time::Instant) -> Result<std::rc::Rc<gha::actions::Tree>, String> {
+        self.fake.action_tree(owner, repo, sha, deadline)
+    }
+    fn runner_copy(&self, owner: &str, repo: &str, reference: &str, deadline: std::time::Instant) -> Result<gha::actions::Tree, String> {
+        self.fake.runner_copy(owner, repo, reference, deadline)
+    }
+    fn local_tree(&self, path: &str, deadline: std::time::Instant) -> Result<(String, std::rc::Rc<gha::actions::Tree>), String> {
+        self.git.local_tree(path, deadline)
+    }
+    fn local_copy(&self, path: &str, deadline: std::time::Instant) -> Result<gha::actions::Tree, String> {
+        self.git.local_copy(path, deadline)
     }
 }
 
@@ -154,11 +184,15 @@ fn record(r: &Repo, x: Rec<'_>) -> Option<String> {
     rec.commit = Some(r.sha.clone());
     rec.event_path = Some(r.event.to_string_lossy().into_owned());
     rec.workflow_ref = Some(workflow_ref.clone());
-    rec.actions = spec
-        .actions
-        .iter()
-        .map(|u| (u.clone(), u.rsplit_once('@').unwrap().1.to_string()))
-        .collect();
+    let source = RecordingSource {
+        fake: gha::resolve::fake::Fake::new(),
+        git: gha::resolve::Git::new(&r.root, "https://github.com", std::time::Duration::from_secs(5))
+            .with_revision(r.sha.clone()),
+    };
+    for raw in &spec.actions {
+        source.fake.set(raw, Ok(PIN));
+    }
+    rec.actions = gha::actions::capture(&spec.actions, &source, false).unwrap();
     rec.steps = steps;
     if x.attested {
         let mut claims = a::claims(&rec);
@@ -252,6 +286,10 @@ fn plan(r: &Repo, args: &[&str], env: &[(&str, &str)]) -> Out {
     .env("GITHUB_REPOSITORY_OWNER_ID", a::OWNER_ID)
     .env("GITHUB_SHA", &r.sha)
     .env("GITHUB_EVENT_PATH", &r.event)
+    .env("GITHUB_API_URL", &r.api.as_ref().unwrap().url)
+    .env("NO_PROXY", "127.0.0.1,localhost")
+    .env("no_proxy", "127.0.0.1,localhost")
+    .env("XDG_CACHE_HOME", r.base.join("cache"))
     .env(
         "GITHUB_WORKFLOW_REF",
         format!("{}/{CI}@refs/heads/main", a::REPO),
@@ -303,6 +341,59 @@ fn code(o: &Out, job: &str) -> String {
         .find(|j| j["id"] == job)
         .map(|j| j["code"].as_str().unwrap().to_string())
         .unwrap_or_else(|| "absent".into())
+}
+
+#[test]
+fn legacy_action_witness_is_cold_next_to_a_witnessed_positive_control() {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    let key = record(&r, rec(&w, now, now)).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+    let jobs = job::JobStore::new(r.store());
+    let mut record = jobs.load(&key).remove(0);
+    record.actions.remove(gha::actions::WITNESS_KEY);
+    let mut claims = a::claims(&record);
+    claims["aud"] = json!(attest::audience(&key, &record).unwrap());
+    claims["sha"] = json!(r.sha);
+    claims["iat"] = json!(now);
+    claims["nbf"] = json!(now);
+    record.attest = Some(a::token(
+        &a::header("test-key-1"), &claims, &a::pair(a::KEY_1),
+    ));
+    jobs.save(&key, record).unwrap();
+    let mut file: Value = serde_json::from_slice(&jobs.export(&key).unwrap()).unwrap();
+    file["v"] = json!(1);
+    std::fs::write(
+        r.store().join("jobs").join(format!("{}.json", proof::sanitize(&key))),
+        serde_json::to_vec(&file).unwrap(),
+    ).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "action-unverifiable");
+}
+
+#[test]
+fn local_action_uses_the_requested_revision_instead_of_head() {
+    let w = workflow("", "", "").replace(
+        "      - run: cat a.txt",
+        "      - uses: ./.github/actions/check\n        env: {STOOP_PLAN: neutral}\n      - run: cat a.txt",
+    );
+    let r = Repo::new(&[
+        (CI, &w),
+        ("a.txt", "a\n"),
+        (".github/actions/check/action.yml", "runs:\n  using: node20\n  main: index.js\n"),
+        (".github/actions/check/index.js", "first\n"),
+    ]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    std::fs::write(r.root.join(".github/actions/check/index.js"), "changed\n").unwrap();
+    git(&r.root, &["commit", "-qam", "change action"]);
+    let new_sha = String::from_utf8(
+        Command::new("git").current_dir(&r.root).args(["rev-parse", "HEAD"]).output().unwrap().stdout,
+    ).unwrap().trim().to_owned();
+    let old_target = plan(&r, &["--format", "json", "--rev", &r.sha], &[]);
+    assert_eq!(code(&old_target, "a"), "proved");
+    let new_target = plan(&r, &["--format", "json", "--rev", &new_sha], &[("GITHUB_SHA", &new_sha)]);
+    assert_eq!(code(&new_target, "a"), "action-moved");
 }
 
 fn report(name: &str, o: &Out) {
@@ -843,7 +934,7 @@ fn control_allowlisted_floating_action_under_strict() {
         "allowlisted example/tool@v1 under STOOP_STRICT_ACTIONS=1",
         &o,
     );
-    assert_eq!(code(&o, "a"), "unresolved-action");
+    assert_eq!(code(&o, "a"), "action-unverifiable");
 }
 
 #[test]
@@ -995,7 +1086,8 @@ fn strict_actions_rejects_a_resolvable_floating_ref() {
     std::fs::create_dir_all(&source).unwrap();
     std::fs::create_dir_all(&bare).unwrap();
     git(&source, &["init", "-q"]);
-    std::fs::write(source.join("action.yml"), "name: test\n").unwrap();
+    std::fs::write(source.join("action.yml"), "runs:\n  using: node20\n  main: index.js\n").unwrap();
+    std::fs::write(source.join("index.js"), "fixture\n").unwrap();
     git(&source, &["add", "."]);
     git(&source, &["commit", "-qm", "fixture"]);
     git(&bare, &["init", "--bare", "-q"]);
@@ -1018,7 +1110,16 @@ fn strict_actions_rejects_a_resolvable_floating_ref() {
     let key = record(&r, rec(&w, now, now)).unwrap();
     let jobs = job::JobStore::new(r.store());
     let mut record = jobs.load(&key).remove(0);
-    record.actions.insert("example/tool@v1".into(), sha);
+    let archive = r.base.join(format!("api/repos/example/tool/tarball/{sha}"));
+    std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    std::fs::write(archive, gha::actions::fixture_archive()).unwrap();
+    let fake = gha::resolve::fake::Fake::new();
+    fake.set("example/tool@v1", Ok(&sha));
+    record.actions = gha::actions::capture(
+        &[format!("actions/checkout@{PIN}"), "example/tool@v1".into()],
+        &fake,
+        false,
+    ).unwrap();
     let mut claims = a::claims(&record);
     claims["aud"] = json!(attest::audience(&key, &record).unwrap());
     claims["sha"] = json!(r.sha);
@@ -1042,7 +1143,7 @@ fn strict_actions_rejects_a_resolvable_floating_ref() {
             ("STOOP_STRICT_ACTIONS", "1"),
         ],
     );
-    assert_eq!(code(&strict, "a"), "unresolved-action");
+    assert_eq!(code(&strict, "a"), "action-unverifiable");
 }
 
 #[test]

@@ -122,6 +122,25 @@ fn unallowlisted_action_is_blocked() {
         .unwrap()
         .contains("upload-artifact"));
 }
+
+#[test]
+fn local_action_requires_a_neutral_assertion_before_it_can_be_planned() {
+    let unmarked = WORKFLOW.replace(
+        "      - run: cat a.txt",
+        "      - uses: ./.github/actions/check\n      - run: cat a.txt",
+    );
+    let repo = Repo::new(&unmarked);
+    let value: serde_json::Value = serde_json::from_slice(&repo.plan(&["--format", "json"], false).stdout).unwrap();
+    assert_eq!(value["jobs"][0]["code"], "blocked");
+
+    let marked = unmarked.replace(
+        "      - uses: ./.github/actions/check\n",
+        "      - uses: ./.github/actions/check\n        env: {STOOP_PLAN: neutral}\n",
+    );
+    let repo = Repo::new(&marked);
+    let value: serde_json::Value = serde_json::from_slice(&repo.plan(&["--format", "json"], false).stdout).unwrap();
+    assert_eq!(value["jobs"][0]["code"], "no-record");
+}
 #[test]
 fn missing_workflow_fails_wide_and_bad_age_is_usage_error() {
     let r = Repo::new(WORKFLOW);
@@ -276,6 +295,11 @@ fn real_recorder_records_plannable_prior_states() {
         .env("GITHUB_RUN_ATTEMPT", "1")
         .env("GITHUB_EVENT_PATH", event)
         .env("RUNNER_TEMP", &temp)
+        .env("GITHUB_SERVER_URL", "http://127.0.0.1:1")
+        .env("GITHUB_API_URL", "http://127.0.0.1:1")
+        .env_remove("STOOP_SYNC_WRITE")
+        .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
+        .env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
         .env_remove("STOOP_SYNC")
         .env_remove("STOOP_FULL")
         .env_remove("STOOP_OFF")
@@ -286,6 +310,7 @@ fn real_recorder_records_plannable_prior_states() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("action unverifiable at journal open"));
     let proof = fs::read_dir(r.0.join(".stoop/proofs"))
         .unwrap()
         .next()

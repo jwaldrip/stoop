@@ -62,7 +62,7 @@ fn convert(y: &Yaml) -> Result<Value, String> {
     }
 }
 
-pub fn parse(path: &str, text: &str) -> Result<Workflow, String> {
+pub(crate) fn parse_document(text: &str) -> Result<Value, String> {
     let mut check = ScalarCheck::default();
     Parser::new_from_str(text)
         .load(&mut check, true)
@@ -72,9 +72,13 @@ pub fn parse(path: &str, text: &str) -> Result<Workflow, String> {
     }
     let docs = YamlLoader::load_from_str(text).map_err(|e| e.to_string())?;
     if docs.len() != 1 {
-        return Err("workflow must contain one document".into());
+        return Err("YAML must contain one document".into());
     }
-    let root = convert(&docs[0])?;
+    convert(&docs[0])
+}
+
+pub fn parse(path: &str, text: &str) -> Result<Workflow, String> {
+    let root = parse_document(text)?;
     let obj = root.as_object().ok_or("workflow must be an object")?;
     let name = match obj.get("name") {
         None => path.to_string(),
@@ -969,17 +973,21 @@ fn step_key(
     }
     let uses = uses.unwrap();
     static_value(&json!(uses))?;
-    if uses.starts_with("./")
-        || uses.starts_with(".\\")
-        || uses.to_ascii_lowercase().starts_with("docker://")
-    {
+    let local = uses.starts_with("./");
+    let docker = uses.starts_with("docker://");
+    if uses.starts_with(".\\") {
         return Err(format!("unsupported action {uses}"));
     }
-    let (_, reference) = uses.rsplit_once('@').ok_or("action has no ref")?;
-    let name = action_name(uses).ok_or("action has no ref")?;
-    if name.is_empty() || reference.is_empty() {
-        return Err("action has no ref".into());
-    }
+    let (name, reference) = if local || docker {
+        (uses.to_string(), "")
+    } else {
+        let (_, reference) = uses.rsplit_once('@').ok_or("action has no ref")?;
+        let name = action_name(uses).ok_or("action has no ref")?;
+        if name.is_empty() || reference.is_empty() {
+            return Err("action has no ref".into());
+        }
+        (name, reference)
+    };
     let class = action_class(&name);
     let user_allowed = allowed.iter().any(|entry| {
         let (path, r) = entry

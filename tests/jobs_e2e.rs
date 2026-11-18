@@ -2,8 +2,13 @@
 use serde_json::Value;
 use std::{
     fs,
+    io::{BufRead, BufReader, Write},
+    net::TcpListener,
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::{atomic::{AtomicBool, Ordering}, Arc},
+    thread::{self, JoinHandle},
+    time::Duration,
 };
 
 #[derive(serde::Deserialize, serde::Serialize)]
@@ -14,11 +19,74 @@ struct RecordedProvenance {
     version: u32,
 }
 
+struct ActionApi {
+    url: String,
+    stop: Arc<AtomicBool>,
+    unexpected: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl ActionApi {
+    fn new(sha: &str, archive: Vec<u8>) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let expected = format!("/repos/actions/checkout/tarball/{sha}");
+        let stop = Arc::new(AtomicBool::new(false));
+        let unexpected = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server_unexpected = unexpected.clone();
+        let handle = thread::spawn(move || {
+            while !server_stop.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap_or(0);
+                        let target = line.split_whitespace().nth(1).unwrap_or("");
+                        let valid = target == expected;
+                        loop {
+                            line.clear();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                                break;
+                            }
+                        }
+                        if valid {
+                            let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", archive.len());
+                            let _ = stream.write_all(&archive);
+                        } else {
+                            server_unexpected.store(true, Ordering::Relaxed);
+                            let _ = write!(stream, "HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        }
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => thread::sleep(Duration::from_millis(5)),
+                    Err(e) => panic!("fixture accept: {e}"),
+                }
+            }
+        });
+        Self { url, stop, unexpected, thread: Some(handle) }
+    }
+}
+
+impl Drop for ActionApi {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.thread.take() {
+            handle.join().unwrap();
+        }
+        if !thread::panicking() {
+            assert!(!self.unexpected.load(Ordering::Relaxed), "action test attempted a non-fixture network request");
+        }
+    }
+}
+
 struct Ws {
     root: PathBuf,
     remote: PathBuf,
     temp: PathBuf,
     sha: String,
+    api: Arc<ActionApi>,
 }
 impl Ws {
     fn new(name: &str, steps: &[&str]) -> Self {
@@ -43,6 +111,8 @@ impl Ws {
         }
         fs::write(work.join(".github/workflows/ci.yml"), yaml).unwrap();
         fs::write(work.join("in.txt"), "hello\n").unwrap();
+        fs::write(work.join("action.yml"), "runs:\n  using: node20\n  main: index.js\n").unwrap();
+        fs::write(work.join("index.js"), "fixture\n").unwrap();
         git(&work, &["add", "."]);
         git(
             &work,
@@ -73,6 +143,18 @@ impl Ws {
             ],
         );
         git(&action_remote, &["update-ref", "refs/tags/v4", &sha]);
+        let archive = Command::new("git")
+            .current_dir(&work)
+            .args(["archive", "--format=tar.gz", "--prefix=repo-sha/", &sha])
+            .output()
+            .unwrap();
+        assert!(archive.status.success());
+        let api = Arc::new(ActionApi::new(&sha, archive.stdout));
+        let copy = root.join("runner-work/_actions/actions/checkout/v4");
+        fs::create_dir_all(copy.join(".github/workflows")).unwrap();
+        for path in ["action.yml", "index.js", "in.txt", ".github/workflows/ci.yml"] {
+            fs::copy(work.join(path), copy.join(path)).unwrap();
+        }
         let temp = root.join("runner");
         fs::create_dir(&temp).unwrap();
         fs::write(temp.join("event.json"), "{}").unwrap();
@@ -81,6 +163,7 @@ impl Ws {
             remote,
             temp,
             sha,
+            api,
         }
     }
     fn run(&self, script: &str, write: &str) -> Output {
@@ -99,6 +182,15 @@ impl Ws {
                 "GITHUB_SERVER_URL",
                 format!("file://{}", self.root.parent().unwrap().display()),
             )
+            .env("GITHUB_API_URL", &self.api.url)
+            .env("RUNNER_WORKSPACE", self.root.parent().unwrap().join("runner-work/repo"))
+            .env("XDG_CACHE_HOME", self.root.parent().unwrap().join("cache"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("NO_PROXY", "127.0.0.1,localhost")
+            .env("no_proxy", "127.0.0.1,localhost")
+            .env_remove("ACTIONS_ID_TOKEN_REQUEST_URL")
+            .env_remove("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
             .env_remove("STOOP_STRICT_ACTIONS")
             .env("GITHUB_REPOSITORY", "owner/repo")
             .env(
@@ -119,6 +211,9 @@ impl Ws {
             .env_remove("STOOP_MATRIX")
             .env_remove("STOOP_STORE")
             .env_remove("STOOP_ENV_SALT");
+        for name in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"] {
+            command.env(name, &self.api.url);
+        }
         command
     }
     fn records(&self) -> Vec<Value> {
@@ -158,6 +253,7 @@ impl Ws {
             remote: self.remote.clone(),
             temp,
             sha: self.sha.clone(),
+            api: self.api.clone(),
         }
     }
 }
@@ -213,6 +309,7 @@ fn a_trusted_job_publishes_a_passed_record() {
     assert!(record["created"].as_u64().unwrap() > created);
     assert_eq!(record["commit"], w.sha);
     assert_eq!(record["actions"]["actions/checkout@v4"], w.sha);
+    assert!(record["actions"]["!stoop-action-trees-v1"].is_string());
     assert_eq!(
         record["workflow_ref"],
         "owner/repo/.github/workflows/ci.yml@refs/heads/main"
@@ -253,6 +350,19 @@ fn action_lookup_happens_at_open_before_the_first_step_moves_the_tag() {
 }
 
 #[test]
+fn altered_runner_action_copy_never_produces_a_content_witness() {
+    let w = Ws::new("action-copy-tampered", &["true\n"]);
+    let copy = w.root.parent().unwrap().join("runner-work/_actions/actions/checkout/v4/index.js");
+    fs::write(copy, "tampered\n").unwrap();
+    let out = w.run("true\n", "1");
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("runner action copy differs"));
+    let records = w.records();
+    assert_eq!(records[0]["records"][0]["status"], "passed");
+    assert!(records[0]["records"][0]["actions"]["!stoop-action-trees-v1"].is_null());
+}
+
+#[test]
 fn failed_action_lookup_does_not_block_job_publication() {
     let w = Ws::new("action-missing", &["true\n"]);
     let out = w
@@ -264,7 +374,7 @@ fn failed_action_lookup_does_not_block_job_publication() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert!(String::from_utf8_lossy(&out.stderr).contains("action unresolved at journal open"));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("action unverifiable at journal open"));
     let records = w.records();
     assert_eq!(records[0]["records"][0]["status"], "passed");
     assert!(records[0]["records"][0]["actions"]["actions/checkout@v4"].is_null());
@@ -284,7 +394,7 @@ fn read_only_run_does_not_resolve_actions() {
         .output()
         .unwrap();
     assert!(out.status.success());
-    assert!(!String::from_utf8_lossy(&out.stderr).contains("action unresolved at journal open"));
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("action unverifiable at journal open"));
     let git_trace = fs::read_to_string(&trace).unwrap_or_default();
     assert!(
         !git_trace.contains("ls-remote"),
