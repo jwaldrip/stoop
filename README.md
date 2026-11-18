@@ -72,6 +72,8 @@ Full workflows for GitHub Actions, GitLab CI, CircleCI and Buildkite are in the 
 
 The planner requires an attested record from the planned workflow's own job, a protected branch, a GitHub-hosted runner and the same repository and owner IDs. It fails wide when it cannot establish a match. Publishing jobs need `id-token: write` and access to the shared git proof store. Any code in a publishing job that can request an OIDC token can attest records for another job in that workflow. Records whose signing key is no longer published are rejected.
 
+The plan job must be in the top-level workflow. Set `STOOP_JOB_WORKFLOW_REF: ${{ job.workflow_ref }}` on the plan step; the planner refuses a missing or mismatched value in Actions. Container image `ENV` must not set `STOOP_*` controls, and neutral setup must not change them through `GITHUB_ENV`. These are assumptions, not checks. Jobs with nonempty `container.options` are unplannable.
+
 Set `STOOP_ALLOW_USES` in workflow or job environment to a comma- or newline-separated list of exact `owner/repo` or `owner/repo@ref` actions. This asserts that each listed action is side-effect free; the workflow author is responsible for that assertion. Refs are still resolved and checked, and `STOOP_STRICT_ACTIONS` still applies. The `--allow-uses` flag is for local dry runs only. Supply `STOOP_ENV_SALT` to the plan job and recorded jobs alike when using salted proofs.
 
 | Input | Plan-time handling |

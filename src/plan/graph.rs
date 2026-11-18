@@ -43,7 +43,7 @@ pub fn check(w: &Workflow, spec: &JobSpec, plan: &str) -> Option<(Code, String)>
     if spec.if_text.as_deref().map(compact).as_deref() != Some(expected.as_str()) {
         return Some((Code::NotGated, "job has no recognized plan gate".into()));
     }
-    if spec.needs.len() != 1 || spec.needs[0] != plan {
+    if spec.needs.len() != 1 || !spec.needs[0].eq_ignore_ascii_case(plan) {
         return Some((Code::Graph, "job must need only the plan job".into()));
     }
     for (id, job) in jobs {

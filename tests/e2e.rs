@@ -63,6 +63,42 @@ fn skipped(s: &str) -> bool {
 }
 
 #[test]
+fn shell_steps_in_different_working_directories_do_not_share_proofs() {
+    let w = Ws::new("shell-cwd");
+    fs::create_dir(w.root.join(".git")).unwrap();
+    w.write("a/input", "same");
+    w.write("b/input", "same");
+    let script = w.root.join("script.sh");
+    fs::write(&script, "cat input >/dev/null\n").unwrap();
+    let run = |directory: &str| {
+        let output = Command::new(env!("CARGO_BIN_EXE_stoop"))
+            .args(["sh", script.to_str().unwrap()])
+            .current_dir(w.root.join(directory))
+            .env("GITHUB_WORKFLOW", "fixture")
+            .env("GITHUB_JOB", "same-job")
+            .env("STOOP_STORE", w.root.join(".stoop"))
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("RUNNER_TEMP")
+            .env_remove("STOOP_SYNC")
+            .env_remove("STOOP_SYNC_WRITE")
+            .env_remove("STOOP_FULL")
+            .env_remove("STOOP_OFF")
+            .env_remove("STOOP_ENV_SALT")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stderr).into_owned()
+    };
+    let first = run("a");
+    assert!(first.contains("recorded"), "{first}");
+    let second = run("b");
+    assert!(second.contains("recorded") && !skipped(&second), "{second}");
+    assert!(skipped(&run("a")));
+    assert!(skipped(&run("b")));
+    fs::remove_dir_all(&w.root).unwrap();
+}
+
+#[test]
 fn unchanged_inputs_skip_and_a_changed_input_runs() {
     let w = Ws::new("basic");
     let (c, e) = w.sh("cat in.txt > /dev/null");

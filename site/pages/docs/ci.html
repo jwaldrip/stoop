@@ -58,6 +58,7 @@
 
 <h3 id="experimental-planning">Experimental job planning</h3>
 <p><strong>Do not enable plan-skips in workflow gates yet.</strong> A floating action ref can move after the runner downloads it but before stoop resolves it. The downloaded copy is not checked against the resolved commit. The owner has not accepted that window. <code>STOOP_STRICT_ACTIONS=1</code> refuses floating workflow action refs.</p>
+<p>The plan job must live in the top-level workflow. Set <code>STOOP_JOB_WORKFLOW_REF: ${{ job.workflow_ref }}</code> on the plan step. A missing or different value makes every job run. Image <code>ENV</code> and neutral setup must not set <code>STOOP_*</code> controls; the planner assumes this and does not verify it. Nonempty container options are not plannable.</p>
 <p>Set <code>STOOP_ALLOW_USES</code> at workflow or job level to exact comma- or newline-separated <code>owner/repo</code> or <code>owner/repo@ref</code> entries. This is the workflow author's assertion that those actions are side-effect free. <code>--allow-uses</code> is for local dry runs only. The plan job and publishing jobs need the same <code>STOOP_ENV_SALT</code> when proofs are salted.</p>
 
 <h3 id="github-cache">Or with the Actions cache</h3>

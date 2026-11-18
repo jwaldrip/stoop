@@ -6,6 +6,8 @@ pub fn escape(s: &str) -> String {
     s.replace('%', "%25")
         .replace('\r', "%0D")
         .replace('\n', "%0A")
+        .replace("##[", "#%23[")
+        .replace("::", "%3A%3A")
 }
 
 pub fn job(id: &str, gated: bool, decision: &Decision, key: Option<&str>) -> Value {
@@ -26,7 +28,10 @@ pub fn emit(
     quiet: bool,
     warning: Option<&str>,
 ) -> Result<(), String> {
-    let json = serde_json::to_string_pretty(plan).map_err(|e| e.to_string())?;
+    let json = serde_json::to_string_pretty(plan)
+        .map_err(|e| e.to_string())?
+        .replace("##[", "#\\u0023[")
+        .replace("::", "\\u003a\\u003a");
     if !quiet {
         if let Some(jobs) = plan["jobs"].as_array() {
             for job in jobs {
@@ -90,11 +95,16 @@ pub fn emit(
                     String::from("| Job | Decision | Code | Detail |\n| --- | --- | --- | --- |\n");
                 for j in plan["jobs"].as_array().into_iter().flatten() {
                     let cell = |key: &str| {
-                        j[key]
+                        let text = j[key]
                             .as_str()
                             .unwrap_or("")
-                            .replace('|', "\\|")
-                            .replace(['\n', '\r'], " ")
+                            .replace('&', "&amp;")
+                            .replace('<', "&lt;")
+                            .replace('>', "&gt;")
+                            .replace('|', "&#124;")
+                            .replace('`', "&#96;")
+                            .replace(['\n', '\r'], " ");
+                        format!("`{text}`")
                     };
                     summary.push_str(&format!(
                         "| {} | {} | {} | {} |\n",

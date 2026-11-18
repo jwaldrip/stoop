@@ -212,7 +212,7 @@ pub fn cmd(args: &[String]) -> i32 {
             return 0;
         }
         Err(e) => {
-            eprintln!("stoop: {e}\n{HELP}");
+            eprintln!("stoop: {}\n\n{HELP}", output::escape(&e));
             return 2;
         }
     };
@@ -259,7 +259,9 @@ fn build<S: attest::KeySource>(
         }
     }
     let mut global_error = plan_override(&workflow, &o.plan_job).err();
-    if std::env::var("GITHUB_JOB").ok().as_deref() != Some(o.plan_job.as_str()) {
+    if run::env_flag("GITHUB_ACTIONS")
+        && std::env::var("GITHUB_JOB").ok().as_deref() != Some(o.plan_job.as_str())
+    {
         global_error = Some("plan job differs from GITHUB_JOB".into());
     }
     if run::env_flag("GITHUB_ACTIONS")
@@ -268,6 +270,11 @@ fn build<S: attest::KeySource>(
         global_error = Some("planned revision differs from GITHUB_SHA".into());
     }
     if run::env_flag("GITHUB_ACTIONS") {
+        if run::env_str("STOOP_JOB_WORKFLOW_REF") != run::env_str("GITHUB_WORKFLOW_REF")
+            || run::env_str("STOOP_JOB_WORKFLOW_REF").is_none()
+        {
+            global_error = Some("STOOP_JOB_WORKFLOW_REF must equal GITHUB_WORKFLOW_REF".into());
+        }
         let running = std::env::var("GITHUB_REPOSITORY")
             .ok()
             .zip(std::env::var("GITHUB_WORKFLOW_REF").ok())
@@ -281,6 +288,7 @@ fn build<S: attest::KeySource>(
             global_error = Some("planned workflow differs from GITHUB_WORKFLOW_REF".into());
         }
     }
+    let mut graph_error = false;
     for spec in &specs {
         if spec
             .needs
@@ -291,10 +299,25 @@ fn build<S: attest::KeySource>(
                 Some((Code::NotGated, _))
             )
         {
+            graph_error = true;
             global_error = Some(format!(
                 "job {} needs the planner without its own recognized gate",
                 spec.job
             ));
+        }
+        if spec
+            .needs
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&o.plan_job))
+            && workflow.root["jobs"]
+                .get(&spec.job)
+                .and_then(|j| j.get("outputs"))
+                .is_some_and(|outputs| {
+                    !outputs.is_null() && outputs.as_object().is_none_or(|o| !o.is_empty())
+                })
+        {
+            graph_error = true;
+            global_error = Some(format!("job {} may relay planner output", spec.job));
         }
     }
     let ceiling = match run::env_str("STOOP_MAX_AGE") {
@@ -369,21 +392,22 @@ fn build<S: attest::KeySource>(
         let gated = gate
             .as_ref()
             .is_none_or(|(code, _)| *code != Code::NotGated);
-        let decision = if let Some(error) = &global_error {
-            run_decision(Code::Error, error.clone())
-        } else if run::env_flag("STOOP_FULL") || run::env_flag("STOOP_OFF") {
-            run_decision(Code::Full, "STOOP_FULL or STOOP_OFF enabled")
-        } else if (spec.blocked.is_some() || spec.key.is_none())
-            && gate
-                .as_ref()
-                .is_none_or(|(code, _)| *code != Code::NotGated)
-        {
-            eval::decide(spec, &mut ctx)
-        } else if let Some((code, detail)) = gate {
-            run_decision(code, detail)
-        } else {
-            eval::decide(spec, &mut ctx)
-        };
+        let decision =
+            if !graph_error && (run::env_flag("STOOP_FULL") || run::env_flag("STOOP_OFF")) {
+                run_decision(Code::Full, "STOOP_FULL or STOOP_OFF enabled")
+            } else if let Some(error) = &global_error {
+                run_decision(Code::Error, error.clone())
+            } else if (spec.blocked.is_some() || spec.key.is_none())
+                && gate
+                    .as_ref()
+                    .is_none_or(|(code, _)| *code != Code::NotGated)
+            {
+                eval::decide(spec, &mut ctx)
+            } else if let Some((code, detail)) = gate {
+                run_decision(code, detail)
+            } else {
+                eval::decide(spec, &mut ctx)
+            };
         if decision.skip {
             skip.push(spec.job.clone());
         }
@@ -564,6 +588,7 @@ mod tests {
                 .env("GITHUB_ACTIONS", "true")
                 .env("GITHUB_REPOSITORY", a::REPO)
                 .env("GITHUB_WORKFLOW_REF", a::WORKFLOW)
+                .env("STOOP_JOB_WORKFLOW_REF", a::WORKFLOW)
                 .env("GITHUB_REPOSITORY_ID", a::REPO_ID)
                 .env("GITHUB_REPOSITORY_OWNER_ID", a::OWNER_ID)
                 .env("GITHUB_SHA", &sha)

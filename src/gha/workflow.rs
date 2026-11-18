@@ -182,6 +182,21 @@ fn stoop_settings(layers: &[Option<&Value>]) -> Result<Option<u64>, String> {
 fn static_workflow_settings(w: &Workflow) -> Result<Value, String> {
     let mut settings = Map::new();
     for (name, value) in object(w.root.get("env"), "workflow env")? {
+        if name.starts_with("STOOP_") {
+            if let Some(text) = value.as_str().filter(|s| s.contains("${{")) {
+                let normalized: String = text
+                    .chars()
+                    .filter(|c| c.is_ascii_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect();
+                if normalized.contains("githubjob")
+                    || normalized.contains("githubaction")
+                    || (text.to_ascii_lowercase().contains("github") && text.contains('['))
+                {
+                    return Err(format!("{name} depends on job or action context"));
+                }
+            }
+        }
         if ["STOOP_FULL", "STOOP_OFF", "STOOP_MAX_AGE"].contains(&name.as_str())
             && !value.as_str().is_some_and(|s| s.contains("${{"))
         {
@@ -596,6 +611,18 @@ fn build(
             }
         }
         let workflow_settings = static_workflow_settings(w)?;
+        if let Some(options) = j.get("container").and_then(|c| c.get("options")) {
+            match options {
+                Value::Null => {}
+                Value::String(s) if s.trim().is_empty() => {}
+                _ => {
+                    return Err(
+                        "container options may set environment variables and are not plannable"
+                            .into(),
+                    )
+                }
+            }
+        }
         stoop_settings(&[Some(&workflow_settings)])?;
         let container_env = j.get("container").and_then(|c| c.get("env"));
         stoop_settings(&[Some(&workflow_settings), container_env, j.get("env")])?;
@@ -798,6 +825,9 @@ fn step_key(
         if seen_traced {
             return Err("neutral marker after traced step".into());
         }
+        if run.to_ascii_uppercase().contains("GITHUB_ENV") {
+            return Err("neutral run references GITHUB_ENV and may change planner controls".into());
+        }
         return Ok(Some((
             json!({"neutral":{"run":run,"env":e,"if":true,"shell":shell_text,"working-directory":wd}}),
             StepSpec::Neutral {
@@ -982,6 +1012,8 @@ mod tests {
         assert!(matches!(s.steps.get(1), Some(StepSpec::Traced { .. })));
         let s = spec(&fixture("", "      - uses: actions/checkout@v4\n        with: {ref: other}\n        env: {STOOP_PLAN: neutral}\n      - run: cargo test\n"));
         assert!(s.blocked.unwrap().detail.contains("checkout ref"));
+        let s = spec(&fixture("", "      - shell: bash\n        run: echo STOOP_FULL=1 >> \"$GITHUB_ENV\"\n        env: {STOOP_PLAN: neutral}\n      - run: cargo test\n"));
+        assert!(s.blocked.unwrap().detail.contains("GITHUB_ENV"));
     }
     #[test]
     fn review_blockers_and_checkout_safety() {
@@ -1320,5 +1352,86 @@ mod tests {
             .unwrap()
             .detail
             .contains("STOOP_ALLOW_USES"));
+    }
+
+    #[test]
+    fn working_directories_separate_traced_keys_and_match_recorder() {
+        let text = fixture(
+            "    defaults: {run: {working-directory: a}}\n",
+            "      - run: 'npm test'\n      - run: 'npm test'\n        working-directory: b\n",
+        );
+        let s = spec(&text);
+        assert!(s.blocked.is_none(), "{:?}", s.blocked);
+        let keys: Vec<_> = s
+            .steps
+            .iter()
+            .filter_map(|step| match step {
+                StepSpec::Traced { key, .. } => Some(key.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+        let dir = std::env::temp_dir().join(format!("stoop-cwd-keys-{}", std::process::id()));
+        let store = crate::proof::Store::new(dir.clone());
+        let proof = crate::proof::Proof {
+            created: crate::proof::now(),
+            argv: vec![],
+            env: BTreeMap::new(),
+            inputs: vec![],
+            outputs: vec![],
+            removed: vec![],
+            ignore: Some(vec![]),
+            priors: Some(vec![]),
+            unplannable: vec![],
+            probes: BTreeMap::new(),
+        };
+        store.save(keys[0], proof).unwrap();
+        assert_eq!(store.load(keys[0]).len(), 1);
+        assert!(store.load(keys[1]).is_empty());
+        assert_ne!(
+            crate::stepkey::sh_key(b"cd a && npm test", "fixture", "test", "", None),
+            crate::stepkey::sh_key(b"cd b && npm test", "fixture", "test", "", None)
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        let root = Path::new("/repo");
+        for (key, dir) in keys.iter().zip(["a", "b"]) {
+            let actual_cwd = root.join(dir);
+            let recorder_cwd = crate::pathutil::to_key(root, &actual_cwd);
+            assert_eq!(
+                *key,
+                crate::stepkey::sh_key(b"npm test", "fixture", "test", &recorder_cwd, None)
+            );
+        }
+        let root_default = spec(&fixture("", "      - run: 'npm test'\n"));
+        let key = root_default
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                StepSpec::Traced { key, .. } => Some(key),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            key,
+            &crate::stepkey::sh_key(b"npm test", "fixture", "test", "", None)
+        );
+        let workflow_default = fixture("", "      - run: 'npm test'\n").replace(
+            "    shell: stoop sh {0}\n",
+            "    shell: stoop sh {0}\n    working-directory: a\n",
+        );
+        let wf_spec = spec(&workflow_default);
+        let wf_key = wf_spec
+            .steps
+            .iter()
+            .find_map(|s| match s {
+                StepSpec::Traced { key, .. } => Some(key),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(
+            wf_key,
+            &crate::stepkey::sh_key(b"npm test", "fixture", "test", "a", None)
+        );
     }
 }

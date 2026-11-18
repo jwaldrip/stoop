@@ -200,6 +200,10 @@ fn github_workflow_override_is_refused() {
             "GITHUB_WORKFLOW_REF",
             "owner/repo/.github/workflows/other.yml@refs/heads/main",
         )
+        .env(
+            "STOOP_JOB_WORKFLOW_REF",
+            "owner/repo/.github/workflows/other.yml@refs/heads/main",
+        )
         .env("GITHUB_SHA", String::from_utf8(sha.stdout).unwrap().trim())
         .env_remove("GITHUB_EVENT_PATH")
         .env_remove("GITHUB_OUTPUT")

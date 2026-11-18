@@ -190,7 +190,13 @@ fn probe_child() {
     let mut plan = json!({"schema":"stoop.plan/1","workflow":"","path":path,"rev":"","plan_job":o.plan_job,"full":run::env_flag("STOOP_FULL"),"skip":[],"jobs":[]});
     if let Ok(warning) = std::env::var("PROBE_WARNING") {
         output::emit(&plan, &o.format, None, false, Some(&warning)).unwrap();
-        println!("PLANJSON {}", serde_json::to_string(&plan).unwrap());
+        println!(
+            "PLANJSON {}",
+            serde_json::to_string(&plan)
+                .unwrap()
+                .replace("##[", "#\\u0023[")
+                .replace("::", "\\u003a\\u003a")
+        );
         return;
     }
     let result = build(&o, &root, &path, &mut plan, |policy, now, age| {
@@ -205,7 +211,13 @@ fn probe_child() {
         warning.as_deref(),
     )
     .unwrap();
-    println!("PLANJSON {}", serde_json::to_string(&plan).unwrap());
+    println!(
+        "PLANJSON {}",
+        serde_json::to_string(&plan)
+            .unwrap()
+            .replace("##[", "#\\u0023[")
+            .replace("::", "\\u003a\\u003a")
+    );
 }
 
 struct Out {
@@ -235,6 +247,10 @@ fn plan(r: &Repo, args: &[&str], env: &[(&str, &str)]) -> Out {
     .env(
         "GITHUB_WORKFLOW_REF",
         format!("{}/{CI}@refs/heads/main", a::REPO),
+    )
+    .env(
+        "STOOP_JOB_WORKFLOW_REF",
+        format!("{}/{CI}@refs/heads/main", a::REPO),
     );
     for k in [
         "GITHUB_OUTPUT",
@@ -251,7 +267,11 @@ fn plan(r: &Repo, args: &[&str], env: &[(&str, &str)]) -> Out {
         c.env_remove(k);
     }
     for (k, v) in env {
-        c.env(k, v);
+        if *k == "GITHUB_WORKFLOW_REF" && v.is_empty() {
+            c.env_remove(k);
+        } else {
+            c.env(k, v);
+        }
     }
     let out = c.output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -342,7 +362,7 @@ fn warning_escapes_workflow_command_characters() {
         &["--format", "github"],
         &[("PROBE_WARNING", "bad%\r\n::error::forged")],
     );
-    assert!(o.stderr.contains("bad%25%0D%0A::error::forged"));
+    assert!(o.stderr.contains("bad%25%0D%0A%3A%3Aerror%3A%3Aforged"));
     assert!(!o.stderr.lines().any(|line| line.starts_with("::error::")));
 }
 
@@ -564,10 +584,16 @@ fn workflow_flag_cannot_plan_a_different_workflow() {
     ]);
     let now = proof::now();
     record(&r, rec(&ci, now, now)).unwrap();
-    let running = [(
-        "GITHUB_WORKFLOW_REF",
-        "owner/repo/.github/workflows/release.yml@refs/heads/main",
-    )];
+    let running = [
+        (
+            "GITHUB_WORKFLOW_REF",
+            "owner/repo/.github/workflows/release.yml@refs/heads/main",
+        ),
+        (
+            "STOOP_JOB_WORKFLOW_REF",
+            "owner/repo/.github/workflows/release.yml@refs/heads/main",
+        ),
+    ];
     let control = plan(&r, &["--format", "json"], &running);
     report("release.yml plans itself", &control);
     assert_eq!(code(&control, "a"), "no-record");
@@ -761,4 +787,197 @@ fn control_allowlisted_floating_action_under_strict() {
         &o,
     );
     assert_eq!(code(&o, "a"), "unresolved-action");
+}
+
+#[test]
+fn container_options_and_job_dependent_workflow_settings_fail_wide() {
+    let now = proof::now();
+    let control = workflow("", "    container:\n      image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n", "");
+    let r = Repo::new(&[(CI, &control), ("a.txt", "a\n")]);
+    record(&r, rec(&control, now, now)).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+    for option in [
+        "-e STOOP_FULL=1",
+        "-eSTOOP_FULL=1",
+        "--env STOOP_FULL=1",
+        "--env=STOOP_FULL=1",
+        "--env-file /tmp/env",
+    ] {
+        let w = workflow("", &format!("    container:\n      image: alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n      options: {option}\n"), "");
+        let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+        assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "blocked");
+    }
+    for expression in [
+        "github.job",
+        "github['job']",
+        "github.action",
+        "github.action_path",
+    ] {
+        for name in ["STOOP_FULL", "STOOP_SYNC", "STOOP_ENV_SALT"] {
+            let w = workflow(
+                &format!("env:\n  {name}: ${{{{ {expression} == 'a' && '1' || '' }}}}\n"),
+                "",
+                "",
+            );
+            let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+            let o = plan(&r, &["--format", "json"], &[]);
+            assert_eq!(code(&o, "a"), "blocked", "{name} {expression}");
+            assert!(o.plan["skip"].as_array().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn top_level_workflow_identity_is_required() {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+    for env in [
+        vec![("STOOP_JOB_WORKFLOW_REF", "")],
+        vec![(
+            "STOOP_JOB_WORKFLOW_REF",
+            "owner/repo/.github/workflows/called.yml@refs/heads/main",
+        )],
+        vec![("GITHUB_WORKFLOW_REF", "")],
+    ] {
+        let o = plan(&r, &["--format", "json", "--workflow", CI], &env);
+        assert_eq!(code(&o, "a"), "error");
+        assert!(o.plan["skip"].as_array().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn differently_cased_and_string_needs_cannot_consume_another_gate() {
+    let baseline = workflow("", "", "");
+    let r = Repo::new(&[(CI, &baseline), ("a.txt", "a\n")]);
+    let now = proof::now();
+    record(&r, rec(&baseline, now, now)).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+    for needs in ["[Stoop-Plan]", "stoop-plan"] {
+        let lint = format!("  lint:\n    needs: {needs}\n    if: ${{{{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',a,') }}}}\n    runs-on: ubuntu-latest\n    steps: []\n");
+        let w = workflow("", "", &lint);
+        let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+        record(&r, rec(&w, now, now)).unwrap();
+        let o = plan(&r, &["--format", "json"], &[]);
+        assert_eq!(code(&o, "a"), "error");
+    }
+}
+
+#[test]
+fn inherited_age_limits_signed_attestations() {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now - 2 * DAY)).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+    let o = plan(&r, &["--format", "json"], &[("STOOP_MAX_AGE", "1h")]);
+    assert_eq!(code(&o, "a"), "unattested");
+}
+
+#[test]
+fn plan_output_relay_is_refused() {
+    let relay = "  relay:\n    needs: [stoop-plan]\n    if: ${{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',relay,') }}\n    outputs: {skip: '${{ needs.stoop-plan.outputs.skip }}'}\n    runs-on: ubuntu-latest\n    steps: []\n";
+    let w = workflow("", "", relay);
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    let o = plan(&r, &["--format", "json"], &[]);
+    assert_eq!(code(&o, "a"), "error");
+    assert_eq!(o.plan["skip"], json!([]));
+}
+
+#[test]
+fn legacy_commands_and_markdown_are_inert_in_output() {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    let mut x = rec(&w, now, now);
+    x.inputs = vec![input::Input {
+        path: "x##[error]message::warning::[link](https:/example.invalid)".into(),
+        id: "f:000".into(),
+    }];
+    record(&r, x).unwrap();
+    let summary = r.base.join("summary");
+    let o = plan(
+        &r,
+        &["--format", "json", "--explain"],
+        &[("GITHUB_STEP_SUMMARY", summary.to_str().unwrap())],
+    );
+    assert!(!o.stderr.contains("##["));
+    assert!(!o.stdout.contains("##["));
+    assert!(!o.stderr.contains("::warning::[link]"));
+    let g = plan(
+        &r,
+        &["--format", "github"],
+        &[("GITHUB_STEP_SUMMARY", summary.to_str().unwrap())],
+    );
+    assert!(!g.stderr.contains("##["));
+    let rendered = std::fs::read_to_string(summary).unwrap();
+    assert!(
+        rendered.contains("`step 2: x##[error]message::warning::[link](https:/example.invalid)")
+    );
+}
+
+#[test]
+fn strict_actions_rejects_a_resolvable_floating_ref() {
+    let w = workflow("", "    env:\n      STOOP_ALLOW_USES: example/tool\n", "").replace(
+        "      - run: cat a.txt",
+        "      - uses: example/tool@v1\n      - run: cat a.txt",
+    );
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let source = r.base.join("action-source");
+    let bare = r.base.join("server/example/tool.git");
+    std::fs::create_dir_all(&source).unwrap();
+    std::fs::create_dir_all(&bare).unwrap();
+    git(&source, &["init", "-q"]);
+    std::fs::write(source.join("action.yml"), "name: test\n").unwrap();
+    git(&source, &["add", "."]);
+    git(&source, &["commit", "-qm", "fixture"]);
+    git(&bare, &["init", "--bare", "-q"]);
+    git(
+        &source,
+        &["push", "-q", bare.to_str().unwrap(), "HEAD:refs/tags/v1"],
+    );
+    let sha = String::from_utf8(
+        Command::new("git")
+            .current_dir(&source)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string();
+    let now = proof::now();
+    let key = record(&r, rec(&w, now, now)).unwrap();
+    let jobs = job::JobStore::new(r.store());
+    let mut record = jobs.load(&key).remove(0);
+    record.actions.insert("example/tool@v1".into(), sha);
+    let mut claims = a::claims(&record);
+    claims["aud"] = json!(attest::audience(&key, &record).unwrap());
+    claims["sha"] = json!(r.sha);
+    claims["iat"] = json!(now);
+    claims["nbf"] = json!(now);
+    record.attest = Some(a::token(
+        &a::header("test-key-1"),
+        &claims,
+        &a::pair(a::KEY_1),
+    ));
+    assert!(jobs.forget(&key).unwrap());
+    jobs.save(&key, record).unwrap();
+    let server = format!("file://{}", r.base.join("server").display());
+    let normal = plan(&r, &["--format", "json"], &[("GITHUB_SERVER_URL", &server)]);
+    assert_eq!(code(&normal, "a"), "proved");
+    let strict = plan(
+        &r,
+        &["--format", "json"],
+        &[
+            ("GITHUB_SERVER_URL", &server),
+            ("STOOP_STRICT_ACTIONS", "1"),
+        ],
+    );
+    assert_eq!(code(&strict, "a"), "unresolved-action");
 }
