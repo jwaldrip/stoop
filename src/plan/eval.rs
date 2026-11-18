@@ -230,6 +230,11 @@ fn known_github(name: &str) -> bool {
     name == "GITHUB_JOB" || crate::gha::context::VERIFIED_VARS.contains(&name)
 }
 
+/// Recorder semantics older than this floor may produce unsound plan proofs.
+/// When recorder changes make earlier proofs unsound, bump this floor and
+/// `TRACER_VERSION` together. This is not the planner runner's runtime version.
+const MIN_PLANNABLE_RECORDER_VERSION: u32 = 3;
+
 /// Resolve only runner labels whose platform is known without executing the job.
 fn declared_platform(runs_on: &serde_json::Value) -> Option<(&'static str, &'static str)> {
     let label = runs_on.as_str().or_else(|| {
@@ -251,6 +256,9 @@ fn declared_platform(runs_on: &serde_json::Value) -> Option<(&'static str, &'sta
 
 fn proof_platform(proof: &Proof, spec: &JobSpec, record: &JobRecord) -> Result<(), &'static str> {
     let p = proof.provenance.as_ref().ok_or("proof lacks provenance")?;
+    if p.version < MIN_PLANNABLE_RECORDER_VERSION {
+        return Err("recorder too old: re-record");
+    }
     if p.os != "linux"
         || p.tracer != "ptrace-seccomp"
         || !matches!(p.arch.as_str(), "x86_64" | "aarch64")
@@ -999,7 +1007,7 @@ mod tests {
                 os: "linux".into(),
                 arch: "x86_64".into(),
                 tracer: "ptrace-seccomp".into(),
-                version: 2,
+                version: MIN_PLANNABLE_RECORDER_VERSION,
             }),
             env: BTreeMap::new(),
             inputs,
@@ -1085,7 +1093,7 @@ mod tests {
                 os: os.into(),
                 arch: arch.into(),
                 tracer: tracer.into(),
-                version: 1,
+                version: MIN_PLANNABLE_RECORDER_VERSION,
             });
             f.install(vec![p]);
             if let Some((os, arch)) = host {
@@ -1097,6 +1105,33 @@ mod tests {
             let result = f.decide(BTreeMap::new());
             assert_eq!(result.code, expected, "{label}: {}", result.detail);
         }
+    }
+
+    #[test]
+    fn older_recorder_semantics_are_not_plannable() {
+        for (version, expected) in [(2, Code::ProofPlatform), (3, Code::Proved)] {
+            let mut f = Fixture::new();
+            let mut p = proof(vec![]);
+            p.provenance.as_mut().unwrap().version = version;
+            f.install(vec![p]);
+            let result = f.decide(BTreeMap::new());
+            assert_eq!(
+                result.code, expected,
+                "version {version}: {}",
+                result.detail
+            );
+            if version == 2 {
+                assert!(result.detail.contains("recorder too old: re-record"));
+            }
+        }
+    }
+
+    #[test]
+    fn recorder_semantics_floor_tracks_the_production_tracer_version() {
+        assert_eq!(
+            MIN_PLANNABLE_RECORDER_VERSION,
+            crate::trace::version::TRACER_VERSION
+        );
     }
 
     #[test]

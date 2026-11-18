@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 
 pub const UNAVAILABLE: &str = "tracing needs Linux x86-64 or arm64 (ptrace and seccomp)";
 const TRACER: &str = "ptrace-seccomp";
-mod version;
+pub(crate) mod version;
 use version::TRACER_VERSION;
 
 pub fn supported() -> bool {

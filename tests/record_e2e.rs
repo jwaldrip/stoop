@@ -1252,3 +1252,38 @@ fn concurrent_alias_retargets_do_not_leave_stale_cached_parents() {
         );
     }
 }
+
+#[test]
+fn executing_an_unkeyable_memfd_refuses_recording() {
+    let w = Ws::new("fexecve-memfd");
+    let script = "python3 -c 'import os; f=os.memfd_create(\"stoop\", 0); os.write(f, open(\"/bin/sh\", \"rb\").read()); os.execve(f, [\"sh\", \"-c\", \"exit 0\"], os.environ)'";
+    let (status, err) = w.sh(script);
+    assert_eq!(status, 0, "{err}");
+    assert!(
+        err.contains("not recorded") && err.contains("unkeyable file descriptor"),
+        "{err}"
+    );
+}
+
+#[test]
+fn absolute_dot_components_do_not_enter_recorded_keys() {
+    let w = Ws::new("absolute-dot-key");
+    let p = recorded(&w, "cat \"$PWD/./in.txt\" >/dev/null");
+    let inputs = pairs(&p, "inputs");
+    assert!(inputs.iter().any(|(key, _)| key == "in.txt"), "{inputs:?}");
+    assert!(
+        !inputs
+            .iter()
+            .any(|(key, _)| key.contains("/./") || key.starts_with("./")),
+        "{inputs:?}"
+    );
+}
+
+#[test]
+fn repository_root_symlink_does_not_create_empty_input_key() {
+    let w = Ws::new("root-symlink-key");
+    std::os::unix::fs::symlink(".", w.root.join("selfref")).unwrap();
+    let p = recorded(&w, "cat selfref/in.txt >/dev/null");
+    let inputs = pairs(&p, "inputs");
+    assert!(!inputs.iter().any(|(key, _)| key.is_empty()), "{inputs:?}");
+}

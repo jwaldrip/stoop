@@ -614,10 +614,8 @@ pub fn run<'a>(
         wait_failed = false;
         // A namespace syscall runs after its entry stop. Clear again when that
         // tracee next stops or exits, after the kernel has applied the change.
-        if (libc::WIFSTOPPED(st) || libc::WIFEXITED(st) || libc::WIFSIGNALED(st))
-            && tr.pending_topology.remove(&p)
-        {
-            tr.clear_topology();
+        if libc::WIFSTOPPED(st) || libc::WIFEXITED(st) || libc::WIFSIGNALED(st) {
+            tr.after_topology_stop(p);
         }
         if libc::WIFEXITED(st) {
             if p == pid {
@@ -1391,6 +1389,12 @@ impl Tracer<'_> {
         self.pending_topology.insert(pid);
     }
 
+    fn after_topology_stop(&mut self, pid: i32) {
+        if self.pending_topology.remove(&pid) {
+            self.clear_topology();
+        }
+    }
+
     /// Sockets that name services use. A shell or libc touches these on startup, and
     /// what they answer is the machine's identity data, not the job's behavior.
     fn check_connect(&mut self, pid: i32, args: &[u64; 6]) {
@@ -1678,5 +1682,33 @@ impl Tracer<'_> {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn topology_cache_is_cleared_again_on_the_changing_process_stop() {
+        let mut tracer = Tracer {
+            ops: HashMap::new(),
+            cwds: HashMap::new(),
+            magic_epoch: 0,
+            magic_cache: HashMap::new(),
+            pending_topology: HashSet::new(),
+            syscall: 0,
+            allow_network: false,
+            rec: None,
+            t: Trace::default(),
+        };
+        tracer.topology_changed(42);
+        assert_eq!(tracer.magic_epoch, 1);
+        tracer.after_topology_stop(43);
+        assert_eq!(tracer.magic_epoch, 1);
+        tracer.after_topology_stop(42);
+        assert_eq!(tracer.magic_epoch, 2);
+        tracer.after_topology_stop(42);
+        assert_eq!(tracer.magic_epoch, 2);
     }
 }
