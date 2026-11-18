@@ -45,6 +45,7 @@ function readPage(file) {
   return { meta: JSON.parse(m[1]), body: src.slice(m[0].length) };
 }
 
+const TOGGLE = `<button class="theme-toggle" type="button" data-theme-toggle hidden></button>`;
 const head = ({ title, description, root, canonical }) => `<!doctype html>
 <html lang="en">
 <head>
@@ -54,6 +55,7 @@ const head = ({ title, description, root, canonical }) => `<!doctype html>
 <meta name="description" content="${description}">
 <meta name="theme-color" content="#eef2f5" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#0d1216" media="(prefers-color-scheme: dark)">
+<script>try{var t=localStorage.getItem("stoop-theme");if(t==="light"||t==="dark"){document.documentElement.dataset.theme=t;document.querySelectorAll('meta[name="theme-color"]').forEach(function(m){m.dataset.orig=m.content;m.content=t==="dark"?"#0d1216":"#eef2f5"})}}catch(e){}</script>
 <link rel="canonical" href="https://jwaldrip.github.io/stoop/${canonical}">
 <link rel="icon" href="${root}assets/stoop-app.svg" type="image/svg+xml">
 <link rel="icon" href="${root}assets/favicon-32.png" sizes="32x32" type="image/png">
@@ -92,6 +94,7 @@ function docsPage(slug, meta, body) {
       ${rail}
     </ol>
     <div class="out">
+      ${TOGGLE}
       <a href="https://github.com/jwaldrip/stoop">Source on GitHub</a>
       <a href="https://github.com/jwaldrip/stoop/issues">Report a problem</a>
     </div>
@@ -122,7 +125,7 @@ ${body.trim()}
 {
   const { meta, body } = readPage(join(here, "pages", "index.html"));
   const html = head({ title: meta.title, description: meta.description, root: "", canonical: "" }) +
-    "\n" + body.replaceAll("{{logo}}", LOGO).replaceAll("{{root}}", "");
+    "\n" + body.replaceAll("{{logo}}", LOGO).replaceAll("{{toggle}}", TOGGLE).replaceAll("{{root}}", "");
   writeFileSync(join(out, "index.html"), html);
 }
 // Docs

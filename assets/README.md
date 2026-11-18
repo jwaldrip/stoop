@@ -12,7 +12,8 @@ The mark is a peregrine in its stoop: wings folded, head down, the yellow eye-ri
 | `stoop-app.svg`, `stoop-app-512.png` | Square app mark on its own sky ground; safe on any background |
 | `favicon-32.png`, `apple-touch-icon.png` | Browser and home-screen icons |
 | `social-preview.png` | 1280x640 card for the repository's social preview and link unfurls |
-| `readme-hero.jpg`, `demo-terminal.png` | README imagery; the terminal is rendered from a captured run |
+| `readme-hero-light.jpg`, `readme-hero-dark.jpg` | README hero, daylight and blue hour. The dark one is a tonal grade of the light one (exposure about half, cold blue cast, a faint warm band at the horizon), not a separate scene |
+| `demo-terminal-light.png`, `demo-terminal-dark.png` | README terminal capture, one theme each, rendered from the same template. The transcript is a captured run, with only cargo's progress lines cut |
 
 In Markdown that renders on both themes, pair the light and dark files:
 
