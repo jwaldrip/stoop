@@ -446,4 +446,37 @@ mod tests {
             .any(|r| r.run.as_deref() == Some("9/1") && r.status == Some(RecordStatus::Failed)));
         assert!(!records.iter().any(|r| r.run.as_deref() == Some("10/1")));
     }
+    #[test]
+    fn import_retains_failure_at_equal_start() {
+        let store = store("import-equal-start");
+        let mut failed = record(9);
+        failed.started = 1000;
+        failed.run = Some("9/1".into());
+        failed.status = Some(RecordStatus::Failed);
+        let mut passed = record(10);
+        passed.started = 1000;
+        passed.run = Some("10/1".into());
+        passed.status = Some(RecordStatus::Passed);
+        let mut records = vec![failed, passed];
+        for i in 2000..2007 {
+            let mut r = record(i);
+            r.started = i;
+            r.status = Some(RecordStatus::Running);
+            records.push(r);
+        }
+        let snapshot = serde_json::to_vec(&JobFile {
+            v: 1,
+            kind: "job".into(),
+            key: "job-a".into(),
+            records,
+        })
+        .unwrap();
+        store.import("job-a", &snapshot).unwrap();
+        let records = store.load("job-a");
+        assert_eq!(records.len(), 8);
+        assert!(records
+            .iter()
+            .any(|r| r.run.as_deref() == Some("9/1") && r.status == Some(RecordStatus::Failed)));
+        assert!(!records.iter().any(|r| r.run.as_deref() == Some("10/1")));
+    }
 }

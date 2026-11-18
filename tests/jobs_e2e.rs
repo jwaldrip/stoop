@@ -579,6 +579,15 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
 
 #[test]
 fn concurrent_same_step_publications_keep_both_proofs() {
+    concurrent_proof_race(false);
+}
+
+#[test]
+fn proof_only_writer_cannot_erase_a_concurrent_proof() {
+    concurrent_proof_race(true);
+}
+
+fn concurrent_proof_race(proof_only: bool) {
     use std::os::unix::fs::PermissionsExt;
     use std::time::{Duration, Instant};
     #[derive(serde::Deserialize, serde::Serialize)]
@@ -598,7 +607,14 @@ fn concurrent_same_step_publications_keep_both_proofs() {
         unplannable: Vec<String>,
     }
     let script = "cat in.txt > /dev/null\n";
-    let old = Ws::new("proof-race", &[script]);
+    let old = Ws::new(
+        if proof_only {
+            "proof-only-race"
+        } else {
+            "proof-race"
+        },
+        &[script],
+    );
     let newer = old.second_runner();
     fs::write(newer.root.join("in.txt"), "different input\n").unwrap();
     let bin = old.temp.join("bin");
@@ -627,16 +643,47 @@ fn concurrent_same_step_publications_keep_both_proofs() {
         let _ = child.kill();
         panic!("old push did not reach the barrier");
     }
-    let out = newer
-        .command(script, "1")
-        .env("GITHUB_RUN_ID", "200")
-        .output()
-        .unwrap();
+    let mut competitor = newer.command(script, "1");
+    competitor.env("GITHUB_RUN_ID", "200");
+    if proof_only {
+        competitor.env_remove("GITHUB_ACTIONS");
+    }
+    let out = competitor.output().unwrap();
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(script.as_bytes());
+    hasher.update(b"fixture\0test\0");
+    let key = format!("sh-{}", &hasher.finalize().to_hex()[..20]);
+    let competing_file: Value = serde_json::from_str(&git(
+        &old.remote,
+        &["cat-file", "blob", &format!("refs/stoop/{key}")],
+    ))
+    .unwrap();
+    let competing_proofs: Vec<Proof> =
+        serde_json::from_value(competing_file["proofs"].clone()).unwrap();
+    assert!(!competing_proofs.is_empty());
+    let digest = |p: &Proof| {
+        let bytes = serde_json::to_vec(&(
+            &p.inputs,
+            &p.outputs,
+            &p.removed,
+            &p.env,
+            &p.probes,
+            &p.ignore,
+            &p.priors,
+            &p.unplannable,
+        ))
+        .unwrap();
+        format!("p-{}", &blake3::hash(&bytes).to_hex()[..32])
+    };
+    let competing: Vec<_> = competing_proofs.iter().map(digest).collect();
+    if proof_only {
+        assert!(old.records().is_empty());
+    }
     fs::write(release, "go").unwrap();
     let out = child.wait_with_output().unwrap();
     assert!(
@@ -646,36 +693,26 @@ fn concurrent_same_step_publications_keep_both_proofs() {
     );
     let files = old.records();
     let records = files[0]["records"].as_array().unwrap();
-    assert_eq!(records.len(), 2);
-    let key = records[0]["steps"][0]["key"].as_str().unwrap();
+    assert_eq!(records.len(), if proof_only { 1 } else { 2 });
+    assert_eq!(records[0]["steps"][0]["key"], key);
     let raw = git(
         &old.remote,
         &["cat-file", "blob", &format!("refs/stoop/{key}")],
     );
     let file: Value = serde_json::from_str(&raw).unwrap();
     let proofs: Vec<Proof> = serde_json::from_value(file["proofs"].clone()).unwrap();
-    let digests: Vec<String> = proofs
-        .iter()
-        .map(|p| {
-            let bytes = serde_json::to_vec(&(
-                &p.inputs,
-                &p.outputs,
-                &p.removed,
-                &p.env,
-                &p.probes,
-                &p.ignore,
-                &p.priors,
-                &p.unplannable,
-            ))
-            .unwrap();
-            format!("p-{}", &blake3::hash(&bytes).to_hex()[..32])
-        })
-        .collect();
+    let digests: Vec<String> = proofs.iter().map(digest).collect();
     let first = records[0]["steps"][0]["proof"].as_str().unwrap();
-    let second = records[1]["steps"][0]["proof"].as_str().unwrap();
-    assert_ne!(first, second);
     assert!(digests.iter().any(|d| d == first));
-    assert!(digests.iter().any(|d| d == second));
+    assert!(competing.iter().all(|d| digests.contains(d)));
+    if proof_only {
+        assert!(competing.iter().any(|d| d != first));
+    }
+    if !proof_only {
+        let second = records[1]["steps"][0]["proof"].as_str().unwrap();
+        assert_ne!(first, second);
+        assert!(digests.iter().any(|d| d == second));
+    }
 }
 
 #[test]
@@ -710,4 +747,31 @@ fn blocked_job_reports_initialization_error_only_once() {
         errors.push_str(&String::from_utf8_lossy(&out.stderr));
     }
     assert_eq!(errors.matches("job record not written").count(), 1);
+}
+
+#[test]
+fn rejected_push_retries_three_times_without_failing_step() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = Ws::new("bounded-push", &["true\n"]);
+    let count = w.temp.join("attempts");
+    let hook = w.remote.join("hooks/update");
+    fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ncase \"$1\" in refs/stoop/job-*) echo x >> '{}'; exit 1;; esac\nexit 0\n",
+            count.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let out = w.run("true\n", "1");
+    assert!(out.status.success());
+    assert_eq!(fs::read_to_string(count).unwrap().lines().count(), 3);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr)
+            .matches("stoop: journal:")
+            .count(),
+        1
+    );
+    assert!(w.records().is_empty());
 }
