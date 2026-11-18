@@ -1005,4 +1005,52 @@ mod tests {
         f.install(vec![proof(vec![input("dir", &id)])]);
         assert_eq!(f.decide(BTreeMap::new()).code, Code::Proved);
     }
+    #[test]
+    fn newest_failure_is_reported() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![input("dir/a", &file_id(b"old"))])]);
+        let mut newer = f.jobs.load("job-test").remove(0);
+        newer.created = 101;
+        newer.run = Some("2/1".into());
+        newer.steps[0].proof = "missing".into();
+        f.jobs.save("job-test", newer).unwrap();
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::ProofMissing);
+    }
+    #[test]
+    fn implicit_overlay_directory_exists() {
+        let mut f = Fixture::new();
+        let mut first = proof(vec![]);
+        first.outputs.push(input("gen/x", &file_id(b"x")));
+        f.install(vec![first, proof(vec![input("gen", "d")])]);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Proved);
+    }
+    #[test]
+    fn exact_age_limit_is_enforced() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        f.spec.steps[0] = StepSpec::Traced {
+            index: 1,
+            key: "sh-0".into(),
+            max_age: Some(9),
+        };
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Expired);
+    }
+    #[test]
+    fn replaced_directory_cannot_resurrect_children() {
+        let mut f = Fixture::new();
+        let mut first = proof(vec![]);
+        first.outputs.push(input("dir", &file_id(b"file")));
+        let mut second = proof(vec![]);
+        second.outputs.push(input("dir", "d"));
+        f.install(vec![first, second, proof(vec![input("dir/a", "a")])]);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Proved);
+    }
+    #[test]
+    fn malformed_output_path_is_rejected() {
+        let mut f = Fixture::new();
+        let mut first = proof(vec![]);
+        first.outputs.push(input("../escape", &file_id(b"x")));
+        f.install(vec![first]);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::InputChanged);
+    }
 }
