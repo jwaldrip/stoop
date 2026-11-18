@@ -805,7 +805,7 @@ fn authenticated_time_limits_records_and_exposes_verified_iat() {
     let record = record();
     let token = signed(&record, |_| {}, "test-key-1", KEY_1);
     let published = attested(&record, token);
-    assert_eq!(verifier().verify(&spec(), &published).unwrap().iat, NOW);
+    assert_eq!(verifier().verify(&spec(), &published).unwrap().iat(), NOW);
     for (iat, reason) in [
         (json!(1_700_000_000u64), "outside the plan window"),
         (json!(NOW + 301), "outside the plan window"),
@@ -918,6 +918,13 @@ fn curl_sends_bearer_on_stdin_not_argv() {
         return;
     }
     let dir = std::env::temp_dir().join(format!("stoop-curl-argv-{}", std::process::id()));
+    struct TempDir(std::path::PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = TempDir(dir.clone());
     std::fs::create_dir_all(&dir).unwrap();
     let script = dir.join("curl");
     std::fs::write(&script, "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$STOOP_CURL_CAPTURE/args\"\n/bin/cat > \"$STOOP_CURL_CAPTURE/stdin\"\nprintf '{}'\n").unwrap();
@@ -941,5 +948,96 @@ fn curl_sends_bearer_on_stdin_not_argv() {
     let stdin = std::fs::read_to_string(dir.join("stdin")).unwrap();
     assert!(!args.contains(TOKEN), "bearer leaked into argv");
     assert!(stdin.contains(TOKEN), "bearer missing from stdin");
-    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn issuance_time_and_start_boundaries() {
+    let verify = verifier();
+    for (iat, accepted) in [
+        (NOW + 300, true),
+        (NOW + 301, false),
+        (NOW - CEILING, true),
+        (NOW - CEILING - 1, false),
+    ] {
+        let mut record = record();
+        // Make this independent of the check under test: created is attacker-controlled.
+        record.created = iat;
+        record.started = iat * 1000;
+        let token = signed(
+            &record,
+            |claims| claims["iat"] = json!(iat),
+            "test-key-1",
+            KEY_1,
+        );
+        let result = verify.verify(&spec(), &attested(&record, token));
+        assert_eq!(result.is_ok(), accepted, "iat {iat}: {result:?}");
+    }
+
+    let iat = NOW - 1200;
+    for (started, accepted) in [((iat + 300) * 1000, true), ((iat + 300) * 1000 + 1, false)] {
+        let mut record = record();
+        record.started = started;
+        let token = signed(
+            &record,
+            |claims| claims["iat"] = json!(iat),
+            "test-key-1",
+            KEY_1,
+        );
+        let result = verify.verify(&spec(), &attested(&record, token));
+        assert_eq!(result.is_ok(), accepted, "started {started}: {result:?}");
+        if accepted {
+            assert_eq!(result.unwrap().iat(), iat);
+        }
+    }
+
+    let record = record();
+    let token = signed(&record, |_| {}, "test-key-1", KEY_1);
+    let zero = Verifier::new(
+        Policy::default_branch(REPO, REPO_ID, OWNER_ID, "main"),
+        Fixed(published()),
+        NOW,
+        0,
+    );
+    refused_with(
+        &zero,
+        &attested(&record, token),
+        "ceiling must be greater than zero",
+    );
+    let token = signed(
+        &record,
+        |claims| claims["iat"] = json!(1763400000.5),
+        "test-key-1",
+        KEY_1,
+    );
+    refused_with(&verify, &attested(&record, token), "integer iat");
+    let token = signed(
+        &record,
+        |claims| claims["nbf"] = json!(NOW + 301),
+        "test-key-1",
+        KEY_1,
+    );
+    refused_with(&verify, &attested(&record, token), "not yet valid");
+}
+
+#[test]
+fn empty_expected_repository_ids_are_rejected() {
+    let record = record();
+    for (repo_id, owner_id, claim) in [
+        ("", OWNER_ID, "repository_id"),
+        (REPO_ID, "", "repository_owner_id"),
+    ] {
+        let verify = Verifier::new(
+            Policy::default_branch(REPO, repo_id, owner_id, "main"),
+            Fixed(published()),
+            NOW,
+            CEILING,
+        );
+        let token = signed(
+            &record,
+            |claims| claims[claim] = json!(""),
+            "test-key-1",
+            KEY_1,
+        );
+        refused_with(&verify, &attested(&record, token), claim);
+    }
 }

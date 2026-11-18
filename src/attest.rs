@@ -338,6 +338,9 @@ impl<S: KeySource> Verifier<S> {
             .get("iat")
             .and_then(Value::as_u64)
             .ok_or("token has no integer iat")?;
+        if self.ceiling == 0 {
+            return Err("plan ceiling must be greater than zero".into());
+        }
         if iat > self.now.saturating_add(300) || self.now.saturating_sub(iat) > self.ceiling {
             return Err("token issue time is outside the plan window".into());
         }
@@ -412,7 +415,13 @@ impl<S: KeySource> Verifier<S> {
 /// when enforcing that step's maximum age. Obtain only via `verify`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VerifiedAttestation {
-    pub iat: u64,
+    iat: u64,
+}
+
+impl VerifiedAttestation {
+    pub fn iat(&self) -> u64 {
+        self.iat
+    }
 }
 
 impl<S: KeySource> Verifier<S> {
