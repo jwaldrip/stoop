@@ -256,4 +256,21 @@ mod tests {
         let r = par_map(&v, |x| x * 2);
         assert!(r.iter().enumerate().all(|(i, x)| *x == i * 2));
     }
+
+    #[test]
+    fn file_identity_includes_executable_mode_without_changing_hash() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmp("exec-mode");
+        let path = d.join("script");
+        fs::write(&path, "same bytes").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        let plain = identify(&path, true, false).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o711)).unwrap();
+        let executable = identify(&path, true, false).unwrap();
+        assert!(plain.starts_with("f:"));
+        assert!(executable.starts_with("x:"));
+        assert_eq!(&plain[2..], &executable[2..]);
+        assert_ne!(plain, executable);
+        fs::remove_dir_all(d).unwrap();
+    }
 }

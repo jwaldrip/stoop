@@ -613,3 +613,20 @@ fn bind_mount_alias_of_unwritten_repo_file_is_a_documented_residual() {
         second.1
     );
 }
+
+#[test]
+fn proof_stores_effective_ignore_patterns() {
+    let w = Ws::new("ignore-patterns");
+    w.write(".stoopignore", "# ignored comment\nbuild/\n*.log\n");
+    let p = recorded(&w, "cat in.txt >/dev/null");
+    let patterns: Vec<&str> = p["ignore"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    assert!(patterns.contains(&"build"));
+    assert!(patterns.contains(&"*.log"));
+    assert!(patterns.contains(&"/tmp"));
+    assert!(!patterns.contains(&"# ignored comment"));
+}
