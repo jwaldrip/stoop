@@ -10,20 +10,23 @@
 
 use crate::job::JobStore;
 use crate::proof::{now, Store};
-use std::io::Write;
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
 pub struct Remote {
     remote: String,
     repo: PathBuf,
+    listed: RefCell<Option<BTreeMap<String, String>>>,
     /// Writing needs an explicit yes: only trusted runs (the default branch) should
     /// publish proofs, because a proof is a claim that lets later runs skip checks.
     pub write: bool,
 }
 
 /// `refs/stoop/<key>`. Dots become underscores so the name is always a valid ref.
-fn ref_name(key: &str) -> String {
+pub fn ref_name(key: &str) -> String {
     format!("refs/stoop/{}", key.replace('.', "_"))
 }
 
@@ -45,6 +48,7 @@ impl Remote {
                 .unwrap_or("origin")
                 .to_string(),
             repo: repo.to_path_buf(),
+            listed: RefCell::new(None),
             write,
         })
     }
@@ -89,6 +93,112 @@ impl Remote {
                 .trim()
                 .to_string())
         }
+    }
+
+    /// List published stoop refs once for a targeted synchronization run.
+    pub fn list_refs(&self) -> Result<BTreeMap<String, String>, String> {
+        let listing = self.ok(&["ls-remote", "--", &self.remote, "refs/stoop/*"], None)?;
+        let text = std::str::from_utf8(&listing).map_err(|_| "invalid ref listing")?;
+        let mut refs = BTreeMap::new();
+        for line in text.lines() {
+            let (oid, name) = line.split_once('\t').ok_or("invalid ref listing")?;
+            if !matches!(oid.len(), 40 | 64)
+                || !oid
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+                || !name.starts_with("refs/stoop/")
+                || name.len() == "refs/stoop/".len()
+                || name.chars().any(char::is_control)
+                || refs.insert(name.to_string(), oid.to_string()).is_some()
+            {
+                return Err("invalid ref listing".into());
+            }
+        }
+        *self.listed.borrow_mut() = Some(refs.clone());
+        Ok(refs)
+    }
+
+    /// Fetch only refs from the last listing, then read their blobs in one batch.
+    pub fn fetch_refs(&self, refs: &[String]) -> Result<Vec<(String, Vec<u8>)>, String> {
+        if refs.is_empty() {
+            return Ok(Vec::new());
+        }
+        if self.listed.borrow().is_none() {
+            self.list_refs()?;
+        }
+        let listing = self.listed.borrow();
+        let listed = listing.as_ref().ok_or("missing ref listing")?;
+        if refs.iter().any(|name| !listed.contains_key(name)) {
+            return Err("requested ref was not listed".into());
+        }
+        for chunk in refs.chunks(500) {
+            let specs: Vec<_> = chunk.iter().map(|name| format!("+{name}:{name}")).collect();
+            let mut args = vec!["fetch", "--quiet", "--no-tags", "--", self.remote.as_str()];
+            args.extend(specs.iter().map(String::as_str));
+            self.ok(&args, None)?;
+        }
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&self.repo)
+            .args(["cat-file", "--batch"])
+            .env("GIT_NO_LAZY_FETCH", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        let mut stdin = child.stdin.take().ok_or("missing batch input")?;
+        let mut stdout = BufReader::new(child.stdout.take().ok_or("missing batch output")?);
+        let result = (|| {
+            let mut blobs = Vec::with_capacity(refs.len());
+            for name in refs {
+                writeln!(stdin, "{name}")
+                    .and_then(|()| stdin.flush())
+                    .map_err(|e| e.to_string())?;
+                let mut header = String::new();
+                stdout.read_line(&mut header).map_err(|e| e.to_string())?;
+                let mut fields = header.split_whitespace();
+                let oid = fields.next().ok_or("missing batch object")?;
+                if listed.get(name).map(String::as_str) != Some(oid)
+                    || fields.next() != Some("blob")
+                {
+                    return Err(format!("ref {name} changed or is not a blob"));
+                }
+                let size: usize = fields
+                    .next()
+                    .ok_or("missing blob size")?
+                    .parse()
+                    .map_err(|_| "invalid blob size")?;
+                if fields.next().is_some() {
+                    return Err("invalid batch header".into());
+                }
+                let mut bytes = Vec::new();
+                bytes
+                    .try_reserve_exact(size)
+                    .map_err(|_| "blob too large for memory")?;
+                bytes.resize(size, 0);
+                stdout.read_exact(&mut bytes).map_err(|e| e.to_string())?;
+                let mut delimiter = [0];
+                stdout
+                    .read_exact(&mut delimiter)
+                    .map_err(|e| e.to_string())?;
+                if delimiter != *b"\n" {
+                    return Err("invalid batch delimiter".into());
+                }
+                blobs.push((name.clone(), bytes));
+            }
+            Ok(blobs)
+        })();
+        drop(stdin);
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        let status = child.wait().map_err(|e| e.to_string())?;
+        if !status.success() && result.is_ok() {
+            return Err("git cat-file failed".into());
+        }
+        result
     }
 
     /// Fetch this key's proofs from the remote and merge them into the local store.
@@ -290,5 +400,62 @@ mod tests {
     fn ref_names_are_valid_refs() {
         assert_eq!(ref_name("sh-abc.def"), "refs/stoop/sh-abc_def");
         assert!(!ref_name("a..b").contains(".."));
+    }
+
+    #[test]
+    fn targeted_fetch_refuses_unlisted_and_deleted_refs() {
+        let base = std::env::temp_dir().join(format!("stoop-b7-refs-{}", std::process::id()));
+        let local = base.join("local");
+        let remote = base.join("remote.git");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::create_dir_all(&remote).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(dir)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_string()
+        };
+        git(&local, &["init", "-q"]);
+        git(&remote, &["init", "--bare", "-q"]);
+        git(
+            &local,
+            &["remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        let blob = base.join("blob");
+        std::fs::write(&blob, b"fixture").unwrap();
+        let oid = git(&remote, &["hash-object", "-w", blob.to_str().unwrap()]);
+        let name = "refs/stoop/job-test";
+        git(&remote, &["update-ref", name, &oid]);
+        let client = Remote::from_spec("git", &local, false).unwrap();
+        assert_eq!(client.list_refs().unwrap().get(name), Some(&oid));
+        git(&remote, &["update-ref", "refs/stoop/job-other", &oid]);
+        assert!(client.fetch_refs(&["refs/stoop/job-other".into()]).is_err());
+        let local_other = Command::new("git")
+            .current_dir(&local)
+            .args(["rev-parse", "--verify", "refs/stoop/job-other"])
+            .output()
+            .unwrap();
+        assert!(!local_other.status.success(), "unlisted ref was fetched");
+        git(&remote, &["update-ref", "-d", name]);
+        assert!(client.fetch_refs(&[name.into()]).is_err());
+        let raced = Remote::from_spec("git", &local, false).unwrap();
+        assert_eq!(
+            raced.list_refs().unwrap().get("refs/stoop/job-other"),
+            Some(&oid)
+        );
+        std::fs::write(&blob, b"changed").unwrap();
+        let changed = git(&remote, &["hash-object", "-w", blob.to_str().unwrap()]);
+        git(&remote, &["update-ref", "refs/stoop/job-other", &changed]);
+        assert!(raced.fetch_refs(&["refs/stoop/job-other".into()]).is_err());
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

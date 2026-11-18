@@ -241,6 +241,58 @@ pub fn cmd(args: &[String]) -> i32 {
     0
 }
 
+fn sync_plan(
+    remote: &sync::Remote,
+    specs: &[JobSpec],
+    proofs: &proof::Store,
+    jobs: &job::JobStore,
+) -> Result<(usize, usize), String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let listed = remote.list_refs()?;
+    let mut job_keys = BTreeMap::new();
+    for spec in specs {
+        if let Some(key) = &spec.key {
+            job_keys.insert(sync::ref_name(key), key.clone());
+        }
+    }
+    let wanted_jobs: Vec<_> = job_keys
+        .keys()
+        .filter(|name| listed.contains_key(*name))
+        .cloned()
+        .collect();
+    for (name, bytes) in remote.fetch_refs(&wanted_jobs)? {
+        let key = job_keys.get(&name).ok_or("unexpected job ref")?;
+        jobs.import(key, &bytes).map_err(|e| e.to_string())?;
+    }
+    let mut proof_keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for key in job_keys.values() {
+        for record in jobs.load(key) {
+            for step in record.steps {
+                proof_keys
+                    .entry(sync::ref_name(&step.key))
+                    .or_default()
+                    .insert(step.key);
+            }
+        }
+    }
+    let wanted_proofs: Vec<_> = proof_keys
+        .keys()
+        .filter(|name| listed.contains_key(*name))
+        .cloned()
+        .collect();
+    for (name, bytes) in remote.fetch_refs(&wanted_proofs)? {
+        let key = proof::Store::key_of(&bytes).ok_or("invalid proof ref")?;
+        if !proof_keys
+            .get(&name)
+            .is_some_and(|keys| keys.contains(&key))
+        {
+            return Err("proof ref does not match a requested key".into());
+        }
+        proofs.import(&key, &bytes).map_err(|e| e.to_string())?;
+    }
+    Ok((wanted_jobs.len() + wanted_proofs.len(), listed.len()))
+}
+
 fn build<S: attest::KeySource>(
     o: &Options,
     root: &Path,
@@ -372,10 +424,20 @@ fn build<S: attest::KeySource>(
     let proofs = proof::Store::new(dir.clone());
     let jobs = job::JobStore::new(dir);
     if let Some(remote) = o.sync.clone().or_else(|| run::env_str("STOOP_SYNC")) {
-        if let Err(e) = sync::Remote::from_spec(&remote, root, false)
-            .and_then(|r| r.pull_all(&proofs, &jobs).map(|_| ()))
+        let sync_started =
+            (o.explain && run::env_flag("STOOP_DEBUG")).then(std::time::Instant::now);
+        match sync::Remote::from_spec(&remote, root, false)
+            .and_then(|r| sync_plan(&r, &specs, &proofs, &jobs))
         {
-            global_error = Some(format!("sync: {e}"));
+            Ok((fetched, total)) => {
+                if o.explain {
+                    eprintln!("stoop: sync: fetched {fetched} of {total} stoop refs");
+                }
+            }
+            Err(e) => global_error = Some(format!("sync: {e}")),
+        }
+        if let Some(started) = sync_started {
+            eprintln!("stoop: time: sync {} ms", started.elapsed().as_millis());
         }
     }
     let now = proof::now();
