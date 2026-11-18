@@ -2031,6 +2031,7 @@ mod tests {
             syscall: 0,
             allow_network: false,
             rec: None,
+            execs: None,
             t: Trace::default(),
         };
         tracer.topology_changed(42);

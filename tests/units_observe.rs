@@ -1,8 +1,9 @@
 //! Exercise diagnostic observations against real traced processes, without runner installs.
-#![cfg(all(
+#[cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
+mod linux {
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;

@@ -490,8 +490,10 @@ mod tests {
             diagnostic(&events).as_deref(),
             Some("stoop: observed jest via sh > npm, pytest via sh (diagnostic only)")
         );
-        let mut invalid = events;
-        invalid[0].parent = Some(3);
+        let invalid = vec![
+            event(Some(1), "pytest", &["pytest"]),
+            event(None, "make", &["make"]),
+        ];
         assert!(diagnostic(&invalid).is_none());
     }
 }
