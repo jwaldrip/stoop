@@ -55,7 +55,20 @@ impl Ws {
     }
 
     fn sh_in(&self, script: &str, cwd: &std::path::Path) -> (i32, String) {
-        let out = Command::new(env!("CARGO_BIN_EXE_stoop"))
+        self.sh_with_affinity(script, cwd, false)
+    }
+
+    fn sh_with_affinity(&self, script: &str, cwd: &std::path::Path, pin: bool) -> (i32, String) {
+        let mut cmd = if pin {
+            let cpu = unsafe { libc::sched_getcpu() };
+            assert!(cpu >= 0);
+            let mut cmd = Command::new("taskset");
+            cmd.args(["-c", &cpu.to_string(), env!("CARGO_BIN_EXE_stoop")]);
+            cmd
+        } else {
+            Command::new(env!("CARGO_BIN_EXE_stoop"))
+        };
+        let out = cmd
             .args([
                 "run",
                 "--root",
@@ -1332,6 +1345,49 @@ fn mount_api_and_namespace_clone_attempts_are_not_recorded() {
         assert_eq!(status, 0, "{op}: {err}");
         assert!(err.contains("not recorded"), "{op}: {err}");
         assert!(!w.store().join("proofs/t.json").exists(), "{op}: {err}");
+    }
+}
+
+#[test]
+fn pinned_concurrent_retarget_has_no_stale_output_after_changer_sleeps_or_exits() {
+    use std::os::unix::fs::symlink;
+    for variant in ["sleep", "exit"] {
+        for trial in 0..40 {
+            let w = Ws::new(&format!("pending-{variant}-{trial}"));
+            w.write("sub/keep", "keep");
+            let outside = w.root.with_extension("pending");
+            let _ = fs::remove_dir_all(&outside);
+            fs::create_dir(&outside).unwrap();
+            let x = outside.join("x");
+            let y = outside.join("y");
+            fs::create_dir(&y).unwrap();
+            symlink(&y, &x).unwrap();
+            symlink(&w.root, y.join("alias")).unwrap();
+            let delay = if variant == "sleep" {
+                "time.sleep(0.4)"
+            } else {
+                ""
+            };
+            let change = format!(
+                "import os,time; time.sleep(0.03); os.symlink({:?}, {:?}); os.replace({:?}, {:?}); {delay}",
+                w.root.join("sub"), y.join("next"), y.join("next"), y.join("alias")
+            );
+            let script = format!(
+                "(i=0; while [ ! -e stop ] && [ $i -lt 50000 ]; do echo x > {}/alias/b; i=$((i+1)); done) & B=$!; python3 -c '{}' & A=$!; while [ \"$(readlink {}/alias)\" != \"$PWD/sub\" ]; do sleep 0.005; done; : > stop; wait $B; echo g > {}/alias/g; wait $A",
+                x.display(), change, y.display(), x.display()
+            );
+            let (status, err) = w.sh_with_affinity(&script, &w.root, true);
+            assert_eq!(status, 0, "{variant} trial {trial}: {err}");
+            assert!(err.contains("recorded"), "{variant} trial {trial}: {err}");
+            let p = w.proof();
+            assert!(
+                pairs(&p, "outputs").iter().any(|(key, _)| key == "sub/g"),
+                "{variant} trial {trial}: {:?}; removed {:?}",
+                pairs(&p, "outputs"),
+                removed(&p)
+            );
+            let _ = fs::remove_dir_all(outside);
+        }
     }
 }
 

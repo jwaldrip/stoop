@@ -112,6 +112,10 @@ enum Op {
     },
     /// Something this tracer cannot see through.
     Unsound(&'static str),
+    /// clone-family calls are unsound only when they create a namespace.
+    Clone {
+        modern: bool,
+    },
     /// A connection: what is on the other side is not a file.
     Connect,
 }
@@ -236,6 +240,8 @@ fn table() -> Vec<(i64, Vec<Op>)> {
         ),
         (s(libc::SYS_truncate), vec![Truncate { path: 0 }]),
         (s(libc::SYS_connect), vec![Connect]),
+        (s(libc::SYS_clone), vec![Clone { modern: false }]),
+        (s(libc::SYS_clone3), vec![Clone { modern: true }]),
         (
             s(libc::SYS_mount),
             vec![Unsound("it attempted to change mount topology")],
@@ -576,6 +582,7 @@ pub fn run<'a>(
         | libc::PTRACE_O_TRACEVFORK
         | libc::PTRACE_O_TRACECLONE
         | libc::PTRACE_O_TRACEEXEC
+        | libc::PTRACE_O_TRACESYSGOOD
         | libc::PTRACE_O_EXITKILL;
     if unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS as _, pid, 0, opts as libc::c_long) } < 0 {
         let e = io::Error::last_os_error();
@@ -612,9 +619,10 @@ pub fn run<'a>(
             }
         }
         wait_failed = false;
-        // A namespace syscall runs after its entry stop. Clear again when that
-        // tracee next stops or exits, after the kernel has applied the change.
-        if libc::WIFSTOPPED(st) || libc::WIFEXITED(st) || libc::WIFSIGNALED(st) {
+        // Topology syscalls resume with PTRACE_SYSCALL, so their next syscall
+        // stop occurs after the kernel has applied or rejected the mutation.
+        let syscall_exit = libc::WIFSTOPPED(st) && libc::WSTOPSIG(st) == (libc::SIGTRAP | 0x80);
+        if syscall_exit || libc::WIFEXITED(st) || libc::WIFSIGNALED(st) {
             tr.after_topology_stop(p);
         }
         if libc::WIFEXITED(st) {
@@ -640,16 +648,16 @@ pub fn run<'a>(
         match (st >> 16) & 0xff {
             0 => {
                 // A fresh tracee announces itself with SIGSTOP; swallow that one.
-                let pass = if sig == libc::SIGSTOP || sig == libc::SIGTRAP {
+                let pass = if sig == libc::SIGSTOP || sig == libc::SIGTRAP || syscall_exit {
                     0
                 } else {
                     sig
                 };
-                cont(p, pass);
+                resume(p, pass, tr.pending_topology.contains(&p));
             }
             e if e == libc::PTRACE_EVENT_SECCOMP => {
                 tr.on_syscall(p);
-                cont(p, 0);
+                resume(p, 0, tr.pending_topology.contains(&p));
             }
             _ => cont(p, 0),
         }
@@ -683,6 +691,16 @@ fn kill_and_reap(pid: i32) -> Option<i32> {
 fn cont(pid: i32, sig: libc::c_int) {
     unsafe {
         libc::ptrace(libc::PTRACE_CONT as _, pid, 0, sig as libc::c_long);
+    }
+}
+
+fn resume(pid: i32, sig: libc::c_int, syscall_exit: bool) {
+    if syscall_exit {
+        unsafe {
+            libc::ptrace(libc::PTRACE_SYSCALL as _, pid, 0, sig as libc::c_long);
+        }
+    } else {
+        cont(pid, sig);
     }
 }
 
@@ -1199,7 +1217,9 @@ impl Tracer<'_> {
             if special
                 && (!target.is_absolute() || target.as_os_str().as_bytes().ends_with(b" (deleted)"))
             {
-                if self.syscall == libc::SYS_linkat
+                if matches!(self.syscall, libc::SYS_execve | libc::SYS_execveat) {
+                    self.flag("it executed an unkeyable file descriptor");
+                } else if self.syscall == libc::SYS_linkat
                     && target.as_os_str().as_bytes().ends_with(b" (deleted)")
                 {
                     self.flag("it accessed an unkeyable descriptor alias");
@@ -1290,12 +1310,20 @@ impl Tracer<'_> {
     }
 
     fn touch(&mut self, lex: PathBuf, read: bool) {
+        let mut path = lex;
         if let Some(rec) = &mut self.rec {
-            for link in rec.links_below_root(&lex).unwrap_or_default() {
+            for link in rec.links_below_root(&path).unwrap_or_default() {
                 self.t.touched.entry(link).or_default().read = true;
             }
+            if read {
+                if let Some(loc) = rec.phys.locate(&path) {
+                    if loc.redirected && rec.phys.repo_rel(&loc.path).is_some() {
+                        path = loc.path;
+                    }
+                }
+            }
         }
-        self.t.touched.entry(lex).or_default().read |= read;
+        self.t.touched.entry(path).or_default().read |= read;
     }
 
     /// The kernel loads shebang and ELF interpreters without a traceable open syscall.
@@ -1675,6 +1703,20 @@ impl Tracer<'_> {
                     }
                 }
                 Op::Unsound(why) => self.flag(why),
+                Op::Clone { modern } => {
+                    let flags = if modern {
+                        read_mem(pid, args[0], 8)
+                            .and_then(|bytes| <[u8; 8]>::try_from(bytes).ok())
+                            .map(u64::from_ne_bytes)
+                    } else {
+                        Some(args[0])
+                    };
+                    // CLONE_NEWTIME and all CLONE_NEW* namespace bits.
+                    const NAMESPACE_FLAGS: u64 = 0x0000_0080 | 0x7e02_0000;
+                    if flags.is_none_or(|f| f & NAMESPACE_FLAGS != 0) {
+                        self.flag("it attempted to change namespaces");
+                    }
+                }
                 Op::Connect => {
                     if !self.allow_network {
                         self.check_connect(pid, &args);

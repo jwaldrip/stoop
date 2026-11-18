@@ -39,7 +39,7 @@ stoop: skip sh-c98f8f9c8fef6d65: 71 inputs unchanged since 0s ago (100ms)</code>
 
 <h2 id="links">Writes through links</h2>
 <p>A write through a symbolic link changes its target. The proof marks the run unplannable. A dangling link's target may not be captured as an output, so a runtime skip may not check it.</p>
-<p>With concurrent processes, stoop clears path caches when a namespace change starts and again when that process next stops. A racing call can still be observed before the kernel finishes the other process's change. Avoid concurrent link retargeting when the result affects the command.</p>
+<p>With concurrent processes, stoop clears path caches when a topology change starts and again at that syscall's exit. Another process can still race the kernel's change before that exit. Avoid concurrent link retargeting when the result affects the command.</p>
 
 <h2 id="metadata">Metadata</h2>
 <p>Only a file's bytes and its executable bit are compared. Modification times, owners and the other permission bits are not, so a tool that decides by timestamp is outside what a proof can show. A hard link to a repository file is not detected: a write through the link changes the file without the proof naming it.</p>
