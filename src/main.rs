@@ -1,5 +1,7 @@
 #[allow(dead_code)]
 mod gha;
+#[allow(dead_code)]
+mod gittree;
 mod ignore;
 mod input;
 #[allow(dead_code)]
