@@ -247,7 +247,6 @@ fn flag_cannot_change_allowlist_in_github_output_mode() {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "needs S2a"]
 fn real_recorder_records_plannable_prior_states() {
     let r = Repo::new(WORKFLOW);
     let temp = r.0.join("runner");

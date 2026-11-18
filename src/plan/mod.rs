@@ -547,6 +547,14 @@ mod tests {
         let proof = proof::Proof {
             created: now,
             argv: vec![],
+            cwd: Some(String::new()),
+            scope: None,
+            provenance: Some(crate::trace::Provenance {
+                os: "linux".into(),
+                arch: "x86_64".into(),
+                tracer: "ptrace-seccomp".into(),
+                version: 2,
+            }),
             env: BTreeMap::new(),
             inputs: vec![input::Input {
                 path: "a.txt".into(),

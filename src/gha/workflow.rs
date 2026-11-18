@@ -1508,6 +1508,9 @@ mod tests {
         let proof = crate::proof::Proof {
             created: crate::proof::now(),
             argv: vec![],
+            cwd: Some(String::new()),
+            scope: None,
+            provenance: Some(crate::trace::Provenance::current()),
             env: BTreeMap::new(),
             inputs: vec![],
             outputs: vec![],
@@ -1521,8 +1524,8 @@ mod tests {
         assert_eq!(store.load(keys[0]).len(), 1);
         assert!(store.load(keys[1]).is_empty());
         assert_ne!(
-            crate::stepkey::sh_key(b"cd a && npm test", "fixture", "test", "", None),
-            crate::stepkey::sh_key(b"cd b && npm test", "fixture", "test", "", None)
+            crate::stepkey::sh_key(b"cd a && npm test", "fixture", "test", "", &[], None),
+            crate::stepkey::sh_key(b"cd b && npm test", "fixture", "test", "", &[], None)
         );
         std::fs::remove_dir_all(dir).unwrap();
         let root = Path::new("/repo");
@@ -1531,7 +1534,7 @@ mod tests {
             let recorder_cwd = crate::pathutil::to_key(root, &actual_cwd);
             assert_eq!(
                 *key,
-                crate::stepkey::sh_key(b"npm test", "fixture", "test", &recorder_cwd, None)
+                crate::stepkey::sh_key(b"npm test", "fixture", "test", &recorder_cwd, &[], None)
             );
         }
         let root_default = spec(&fixture("", "      - run: 'npm test'\n"));
@@ -1545,7 +1548,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             key,
-            &crate::stepkey::sh_key(b"npm test", "fixture", "test", "", None)
+            &crate::stepkey::sh_key(b"npm test", "fixture", "test", "", &[], None)
         );
         let workflow_default = fixture("", "      - run: 'npm test'\n").replace(
             "    shell: stoop sh {0}\n",
@@ -1562,7 +1565,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             wf_key,
-            &crate::stepkey::sh_key(b"npm test", "fixture", "test", "a", None)
+            &crate::stepkey::sh_key(b"npm test", "fixture", "test", "a", &[], None)
         );
     }
     #[test]

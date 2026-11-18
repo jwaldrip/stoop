@@ -121,6 +121,14 @@ fn record(r: &Repo, x: Rec<'_>) -> Option<String> {
             let p = proof::Proof {
                 created: x.created,
                 argv: vec![],
+                cwd: Some(String::new()),
+                scope: None,
+                provenance: Some(crate::trace::Provenance {
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                    tracer: "ptrace-seccomp".into(),
+                    version: 2,
+                }),
                 env: BTreeMap::new(),
                 inputs: x.inputs.clone(),
                 outputs: vec![],
@@ -674,6 +682,14 @@ fn control_break_it_fixtures_all_run() {
     let weak = proof::Proof {
         created: now,
         argv: vec![],
+        cwd: Some(String::new()),
+        scope: None,
+        provenance: Some(crate::trace::Provenance {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            tracer: "ptrace-seccomp".into(),
+            version: 2,
+        }),
         env: BTreeMap::new(),
         inputs: vec![],
         outputs: vec![],

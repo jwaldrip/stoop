@@ -70,7 +70,7 @@ fn current() -> serde_json::Value {
         "os": std::env::consts::OS,
         "arch": std::env::consts::ARCH,
         "tracer": "ptrace-seccomp",
-        "version": 1
+        "version": 2
     })
 }
 

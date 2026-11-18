@@ -106,6 +106,10 @@ impl Fixture {
         store.import("t", &fs::read(proof_file).unwrap()).unwrap();
         let proof = store.load("t").remove(0);
         let created = proof.created;
+        let runner = match proof.provenance.as_ref().map(|p| p.arch.as_str()) {
+            Some("aarch64") => "ubuntu-24.04-arm",
+            _ => "ubuntu-latest",
+        };
         let jobs = JobStore::new(root.join("store"));
         jobs.save(
             "job-test",
@@ -136,7 +140,7 @@ impl Fixture {
             job: "test".into(),
             leg: None,
             key: Some("job-test".into()),
-            runs_on: serde_json::json!("ubuntu-latest"),
+            runs_on: serde_json::json!(runner),
             needs: vec![],
             if_text: None,
             steps: vec![StepSpec::Traced {

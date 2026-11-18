@@ -86,7 +86,7 @@ fn write_proof(store: &Path, key: &str, cwd: Option<&str>) {
             "os": std::env::consts::OS,
             "arch": std::env::consts::ARCH,
             "tracer": "ptrace-seccomp",
-            "version": 1
+            "version": 2
         },
         "env": {"PATH": blake3::hash(b"/usr/bin:/bin").to_hex().to_string()},
         "inputs": [],
