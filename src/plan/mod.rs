@@ -156,6 +156,7 @@ fn show(root: &Path, rev: &str, path: &str) -> Result<String, String> {
     let out = std::process::Command::new("git")
         .current_dir(root)
         .env("GIT_NO_LAZY_FETCH", "1")
+        .env("GIT_NO_REPLACE_OBJECTS", "1")
         .env_remove("GIT_DIR")
         .env_remove("GIT_WORK_TREE")
         .env_remove("GIT_INDEX_FILE")

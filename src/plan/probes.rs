@@ -570,6 +570,31 @@ fn two_attested_jobs_plan_only_the_unchanged_input() {
 }
 
 #[test]
+fn workflow_show_ignores_replaced_blob() {
+    let original = workflow("", "", "");
+    let replacement = "name: replaced workflow\njobs: {}\n";
+    let r = Repo::new(&[(CI, &original), ("replacement.yml", replacement)]);
+    let oid = |path: &str| {
+        let out = Command::new("git")
+            .current_dir(&r.root)
+            .args(["rev-parse", &format!("HEAD:{path}")])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&r.root, &["replace", &oid(CI), &oid("replacement.yml")]);
+    let unguarded = Command::new("git")
+        .current_dir(&r.root)
+        .args(["show", &format!("{}:{CI}", r.sha)])
+        .output()
+        .unwrap();
+    assert!(unguarded.status.success());
+    assert_eq!(String::from_utf8(unguarded.stdout).unwrap(), replacement);
+    assert_eq!(show(&r.root, &r.sha, CI).unwrap(), original);
+}
+
+#[test]
 fn ungated_job_never_enters_skip_output() {
     let w = workflow(
         "",

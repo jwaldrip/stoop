@@ -828,7 +828,10 @@ mod partial_tests {
     #[test]
     fn fetched_older_commit_has_the_same_tree_as_the_source() {
         let f = Fixture::new();
-        let older = ok(&f.source, &["rev-parse", "HEAD~2"]);
+        let older = ok(&f.source, &["rev-parse", "HEAD~1"]);
+        let old_oid = ok(&f.source, &["rev-parse", "HEAD~1:root.txt"]);
+        let head_oid = ok(&f.source, &["rev-parse", "HEAD:root.txt"]);
+        assert_ne!(old_oid, head_oid);
         ok(
             &f.full,
             &[
@@ -842,6 +845,9 @@ mod partial_tests {
         );
         let clone = GitTree::load(&f.full, &older).unwrap();
         let source = GitTree::load(&f.source, &older).unwrap();
+        assert!(
+            matches!(clone.entry("root.txt"), Some(Entry::Blob { oid, .. }) if oid == &old_oid)
+        );
         assert_eq!(
             format!("{:?}", clone.entries),
             format!("{:?}", source.entries)
