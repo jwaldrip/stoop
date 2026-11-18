@@ -906,6 +906,7 @@ mod tests {
             argv: vec![],
             cwd: Some(String::new()),
             scope: None,
+            provenance: Some(crate::trace::Provenance::current()),
             env: BTreeMap::new(),
             inputs,
             outputs: vec![],

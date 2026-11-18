@@ -6,6 +6,14 @@ use std::{
     process::{Command, Output},
 };
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct RecordedProvenance {
+    os: String,
+    arch: String,
+    tracer: String,
+    version: u32,
+}
+
 struct Ws {
     root: PathBuf,
     remote: PathBuf,
@@ -656,6 +664,7 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
         unplannable: Vec<String>,
         cwd: Option<String>,
         scope: Option<String>,
+        provenance: Option<RecordedProvenance>,
     }
     let scripts = ["cat in.txt > /dev/null\n", "true\n"];
     let w = Ws::new("remote-digests", &scripts);
@@ -686,6 +695,7 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
                 &p.unplannable,
                 &p.cwd,
                 &p.scope,
+                &p.provenance,
             ))
             .unwrap();
             step["proof"] == format!("p-{}", &blake3::hash(&bytes).to_hex()[..32])
@@ -723,6 +733,7 @@ fn concurrent_proof_race(proof_only: bool) {
         unplannable: Vec<String>,
         cwd: Option<String>,
         scope: Option<String>,
+        provenance: Option<RecordedProvenance>,
     }
     let script = "cat in.txt > /dev/null\n";
     let old = Ws::new(
@@ -793,6 +804,7 @@ fn concurrent_proof_race(proof_only: bool) {
             &p.unplannable,
             &p.cwd,
             &p.scope,
+            &p.provenance,
         ))
         .unwrap();
         format!("p-{}", &blake3::hash(&bytes).to_hex()[..32])

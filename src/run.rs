@@ -376,7 +376,7 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
                 "stoop: would run {key}: not traced ({}); no proof can be used",
                 trace::UNAVAILABLE
             );
-            return 1;
+            return Outcome { status: 1, key, how: How::Untraced };
         }
         if !o.quiet {
             eprintln!("stoop: run {key}: no compatible tracer");
@@ -385,7 +385,7 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
                 trace::UNAVAILABLE
             );
         }
-        return plain(&o.argv);
+        return Outcome { status: plain(&o.argv), key, how: How::Untraced };
     }
     let full = env_flag("STOOP_FULL");
     let max_age = o
