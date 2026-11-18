@@ -12,6 +12,10 @@ pub struct JobSpec {
     pub if_text: Option<String>,
     pub steps: Vec<StepSpec>,
     pub blocked: Option<Blocker>,
+    /// `uses:` references of the steps the job runs, as written. Resolved by `gha::resolve`.
+    pub actions: Vec<String>,
+    /// Container and service image references of the job, as written.
+    pub images: Vec<String>,
 }
 #[derive(Clone, Debug)]
 pub enum StepSpec {

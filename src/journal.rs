@@ -1,4 +1,4 @@
-use crate::gha::{context::GhCtx, workflow};
+use crate::gha::{context::GhCtx, resolve, workflow};
 use crate::job::{JobRecord, JobStore, RecordStatus, StepHow, StepRecord};
 use crate::plan::spec::StepSpec;
 use crate::proof::{now, Store};
@@ -16,6 +16,14 @@ pub struct Journal {
     expected: Vec<String>,
     record: JobRecord,
     blocked: bool,
+    /// Workspace the action lookups run in, so git reads its credentials.
+    #[serde(default)]
+    root: PathBuf,
+    /// `uses:` references of the job, resolved once per run before the first publish.
+    #[serde(default)]
+    refs: Vec<String>,
+    #[serde(default)]
+    resolved: bool,
 }
 
 impl Journal {
@@ -76,6 +84,7 @@ impl Journal {
             return Err(blocked.detail);
         }
         let key = spec.key.ok_or("job has no key")?;
+        let refs = spec.actions.clone();
         let expected = spec
             .steps
             .into_iter()
@@ -125,6 +134,9 @@ impl Journal {
             key,
             expected,
             blocked: false,
+            root: root.to_path_buf(),
+            refs,
+            resolved: false,
             record: JobRecord {
                 created: 0,
                 started,
@@ -167,6 +179,21 @@ impl Journal {
     }
     pub fn eligible(&self) -> bool {
         !self.blocked
+    }
+    /// Resolves the job's `uses:` references the first time this run publishes. The
+    /// journal persists `resolved`, so later steps of the run never look them up again.
+    fn record_actions(&mut self, resolver: &dyn resolve::Resolver) {
+        if self.resolved {
+            return;
+        }
+        self.resolved = true;
+        let (actions, failures) = resolve::resolve_all(&self.refs, resolver);
+        self.record.actions = actions;
+        for failure in failures {
+            eprintln!(
+                "stoop: sync: action not resolved, so the planner will run this job: {failure}"
+            );
+        }
     }
 
     pub fn after(
@@ -220,6 +247,8 @@ impl Journal {
             }
         };
         if let Some(remote) = remote.filter(|r| r.write) {
+            let git = resolve::Git::from_env(&self.root);
+            self.record_actions(&git);
             let timestamp = now().max(self.record.created.saturating_add(1));
             self.record.created = timestamp;
             if publish_proof && run::env_str(run::SALT_VAR).is_none() {
@@ -271,5 +300,66 @@ impl Journal {
             self.save()?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gha::resolve::fake::Fake;
+
+    const A: &str = "1111111111111111111111111111111111111111";
+
+    fn journal(refs: &[&str]) -> Journal {
+        Journal {
+            path: PathBuf::from("unused.json"),
+            key: "job-x".into(),
+            expected: vec![],
+            blocked: false,
+            root: PathBuf::new(),
+            refs: refs.iter().map(|s| s.to_string()).collect(),
+            resolved: false,
+            record: JobRecord {
+                created: 0,
+                started: 0,
+                status: None,
+                failed: None,
+                actions: BTreeMap::new(),
+                commit: None,
+                host: BTreeMap::new(),
+                event_path: None,
+                run: None,
+                steps: vec![],
+                attest: None,
+                workflow_ref: None,
+                job_workflow_ref: None,
+            },
+        }
+    }
+
+    #[test]
+    fn publishing_resolves_each_action_once_and_keeps_failures_out_of_the_record() {
+        let fake = Fake::new();
+        fake.set("actions/checkout@v4", Ok(A));
+        fake.set("x/y@v9", Err("no such ref"));
+        let mut j = journal(&["actions/checkout@v4", "x/y@v9"]);
+        j.record_actions(&fake);
+        assert_eq!(fake.calls(), 2);
+        // Each step reloads the journal from disk, so the flag must survive a save.
+        let mut j: Journal = serde_json::from_str(&serde_json::to_string(&j).unwrap()).unwrap();
+        j.record_actions(&fake);
+        assert_eq!(
+            fake.calls(),
+            2,
+            "a later step must not look the actions up again"
+        );
+        assert_eq!(
+            j.record
+                .actions
+                .get("actions/checkout@v4")
+                .map(String::as_str),
+            Some(A)
+        );
+        assert!(!j.record.actions.contains_key("x/y@v9"));
     }
 }

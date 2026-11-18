@@ -1,0 +1,983 @@
+//! Resolves `uses:` references and container images to what they name now.
+//!
+//! A floating reference (`@v4`, `@main`) names a commit that can move. A record
+//! stores the commit each reference named when the job ran, and the planner
+//! resolves again. A different commit means the action changed, so the job runs.
+//! A reference that cannot be resolved also makes the job run: no answer, no proof.
+//!
+//! Resolution uses `git ls-remote`, not the REST API. The smart HTTP endpoint is
+//! not a REST request, so it does not draw on the REST quota. It follows
+//! `GITHUB_SERVER_URL`, so GitHub Enterprise Server works by URL. It sends the
+//! same credentials as `actions/checkout`, whose `extraheader` lives in the
+//! workspace's git config. It reports annotated tags already peeled to commits.
+//! No HTTP client is added to the crate.
+
+use crate::job::JobRecord;
+use crate::plan::spec::{Code, JobSpec, RecordCheck};
+use crate::run;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+
+/// How a `uses:` reference is resolved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Action {
+    /// `owner/repo[/path]@ref`, where `ref` is a tag, a branch or another ref name.
+    Remote {
+        owner: String,
+        repo: String,
+        reference: String,
+    },
+    /// `owner/repo[/path]@<40 lowercase hex>`. The workflow already names the commit.
+    Pinned(String),
+}
+
+/// Classifies a `uses:` value. `Err` says why it cannot be resolved here, and the job runs.
+pub fn classify(uses: &str) -> Result<Action, String> {
+    if uses.starts_with("./") || uses.starts_with(".\\") {
+        return Err("local actions are not resolved".into());
+    }
+    if uses
+        .get(..9)
+        .is_some_and(|p| p.eq_ignore_ascii_case("docker://"))
+    {
+        return Err("docker image actions are not resolved".into());
+    }
+    let (name, reference) = uses.rsplit_once('@').ok_or("action has no ref")?;
+    let parts: Vec<&str> = name.split('/').collect();
+    let (owner, repo) = match parts.as_slice() {
+        [owner, repo, rest @ ..]
+            if owner_ok(owner) && repo_ok(repo) && rest.iter().all(|p| path_ok(p)) =>
+        {
+            (*owner, *repo)
+        }
+        _ => return Err(format!("{name} is not owner/repo[/path]")),
+    };
+    if reference.is_empty() {
+        return Err("action has an empty ref".into());
+    }
+    if is_full_sha(reference) {
+        return Ok(Action::Pinned(reference.into()));
+    }
+    if reference.len() >= 4 && reference.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!(
+            "{reference} looks like a commit name that is not a full lowercase 40-character SHA; pin the full SHA"
+        ));
+    }
+    if !reference
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b"-_./+".contains(&b))
+    {
+        return Err(format!(
+            "ref {reference} has characters this planner does not resolve"
+        ));
+    }
+    Ok(Action::Remote {
+        owner: owner.into(),
+        repo: repo.into(),
+        reference: reference.into(),
+    })
+}
+
+fn owner_ok(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+fn repo_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+fn path_ok(s: &str) -> bool {
+    !s.is_empty()
+        && s != "."
+        && s != ".."
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+}
+fn is_full_sha(s: &str) -> bool {
+    // All zeros is git's null object id: it names no commit, and git prints it for
+    // a listing line whose id it could not parse.
+    s.len() == 40
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        && s.bytes().any(|b| b != b'0')
+}
+
+/// Answers what a `uses:` reference names on its server.
+pub trait Resolver {
+    /// The commit `owner/repo@reference` names now, or why that is unknown.
+    fn commit(&self, owner: &str, repo: &str, reference: &str) -> Result<String, String>;
+}
+
+/// Resolves through `git ls-remote` against `<base>/<owner>/<repo>.git`.
+pub struct Git {
+    dir: PathBuf,
+    base: String,
+    timeout: Duration,
+}
+
+impl Git {
+    /// Fifteen seconds per lookup. A slow server fails wide rather than stalling every job.
+    pub const TIMEOUT: Duration = Duration::from_secs(15);
+
+    pub fn new(dir: impl Into<PathBuf>, base: impl Into<String>, timeout: Duration) -> Self {
+        let base: String = base.into();
+        Self {
+            dir: dir.into(),
+            base: base.trim_end_matches('/').to_string(),
+            timeout,
+        }
+    }
+
+    /// The server is `GITHUB_SERVER_URL` in Actions, else github.com. `dir` is the
+    /// workspace, so git reads its credentials.
+    pub fn from_env(dir: &Path) -> Self {
+        let base = run::env_str("GITHUB_SERVER_URL").unwrap_or_else(|| "https://github.com".into());
+        Self::new(dir, base, Self::TIMEOUT)
+    }
+
+    fn ls_remote(&self, url: &str, patterns: &[String]) -> Result<String, String> {
+        let mut command = Command::new("git");
+        command
+            .current_dir(&self.dir)
+            .args(["-c", "http.followRedirects=false", "ls-remote", "--", url])
+            .args(patterns)
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        for var in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_INDEX_FILE",
+            "GIT_ATTR_SOURCE",
+        ] {
+            command.env_remove(var);
+        }
+        let mut child = command
+            .spawn()
+            .map_err(|e| format!("cannot run git: {e}"))?;
+        let out = drain(child.stdout.take());
+        let err = drain(child.stderr.take());
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+                Ok(None) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "git ls-remote timed out after {:.0}s",
+                        self.timeout.as_secs_f64()
+                    ));
+                }
+                Err(e) => {
+                    let _ = child.kill();
+                    return Err(format!("cannot wait for git: {e}"));
+                }
+            }
+        };
+        let stdout = out.join().map_err(|_| "git output reader panicked")?;
+        let stderr = err.join().map_err(|_| "git error reader panicked")?;
+        if !status.success() {
+            let text = String::from_utf8_lossy(&stderr);
+            let first = text
+                .lines()
+                .find(|l| !l.trim().is_empty())
+                .unwrap_or("no error output")
+                .trim();
+            return Err(format!("git ls-remote failed: {first}"));
+        }
+        String::from_utf8(stdout).map_err(|_| "git ls-remote output is not UTF-8".into())
+    }
+}
+
+/// Reads a reader to its end on its own thread, so a full pipe cannot stall git.
+/// A timed-out child is left to its reader, which ends when the pipe closes.
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = pipe {
+            let _ = pipe.read_to_end(&mut buf);
+        }
+        buf
+    })
+}
+
+impl Resolver for Git {
+    fn commit(&self, owner: &str, repo: &str, reference: &str) -> Result<String, String> {
+        let url = format!("{}/{owner}/{repo}.git", self.base);
+        let patterns = if reference.starts_with("refs/") {
+            vec![reference.to_string(), format!("{reference}^{{}}")]
+        } else {
+            vec![
+                format!("refs/tags/{reference}"),
+                format!("refs/tags/{reference}^{{}}"),
+                format!("refs/heads/{reference}"),
+            ]
+        };
+        pick(&self.ls_remote(&url, &patterns)?, reference)
+    }
+}
+
+/// Picks the commit `reference` names from `git ls-remote` output.
+///
+/// A tag names the commit its `^{}` line peels to; a lightweight tag names its own
+/// object. A tag and a branch of the same name must name the same commit, or the
+/// reference is ambiguous. Any malformed line fails the whole listing.
+pub fn pick(listing: &str, reference: &str) -> Result<String, String> {
+    let mut names: HashMap<&str, &str> = HashMap::new();
+    for line in listing.lines() {
+        let (sha, name) = line
+            .split_once('\t')
+            .ok_or_else(|| format!("malformed ls-remote line {line:?}"))?;
+        if !is_full_sha(sha) {
+            return Err(format!("malformed object id in ls-remote line {line:?}"));
+        }
+        if names.insert(name, sha).is_some() {
+            return Err(format!("ls-remote listed {name} twice"));
+        }
+    }
+    let commit_of = |name: &str| {
+        names
+            .get(format!("{name}^{{}}").as_str())
+            .or_else(|| names.get(name))
+            .copied()
+    };
+    let mut candidates = Vec::new();
+    if reference.starts_with("refs/") {
+        candidates.extend(commit_of(reference));
+    } else {
+        candidates.extend(commit_of(&format!("refs/tags/{reference}")));
+        candidates.extend(
+            names
+                .get(format!("refs/heads/{reference}").as_str())
+                .copied(),
+        );
+    }
+    let distinct: BTreeSet<&str> = candidates.into_iter().collect();
+    match distinct.len() {
+        0 => Err(format!("no tag or branch named {reference}")),
+        1 => Ok(distinct.into_iter().next().unwrap_or_default().to_string()),
+        _ => Err(format!(
+            "{reference} is both a tag and a branch naming different commits"
+        )),
+    }
+}
+
+/// The `(owner, repo, ref)` a lookup asks about.
+type Query = (String, String, String);
+
+/// Caches each `owner/repo@ref` answer for one run, so every distinct action costs
+/// one lookup, errors included.
+pub struct Memo<'a> {
+    inner: &'a dyn Resolver,
+    seen: RefCell<HashMap<Query, Result<String, String>>>,
+}
+
+impl<'a> Memo<'a> {
+    pub fn new(inner: &'a dyn Resolver) -> Self {
+        Self {
+            inner,
+            seen: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl Resolver for Memo<'_> {
+    fn commit(&self, owner: &str, repo: &str, reference: &str) -> Result<String, String> {
+        let key = (owner.to_string(), repo.to_string(), reference.to_string());
+        if let Some(answer) = self.seen.borrow().get(&key) {
+            return answer.clone();
+        }
+        let answer = self.inner.commit(owner, repo, reference);
+        self.seen.borrow_mut().insert(key, answer.clone());
+        answer
+    }
+}
+
+/// Resolves one `uses:` value to its commit. A full SHA needs no lookup.
+fn resolve_one(uses: &str, resolver: &dyn Resolver) -> Result<String, String> {
+    match classify(uses)? {
+        Action::Pinned(sha) => Ok(sha),
+        Action::Remote {
+            owner,
+            repo,
+            reference,
+        } => resolver.commit(&owner, &repo, &reference),
+    }
+}
+
+/// What the recorder stores in `JobRecord.actions`: the commit of every reference that
+/// resolved, and one reason for each reference that did not. A reference that did not
+/// resolve is left out, so the planner has no answer for it and the job runs.
+pub fn resolve_all(
+    uses: &[String],
+    resolver: &dyn Resolver,
+) -> (BTreeMap<String, String>, Vec<String>) {
+    let memo = Memo::new(resolver);
+    let mut actions = BTreeMap::new();
+    let mut failures = Vec::new();
+    for raw in uses.iter().collect::<BTreeSet<_>>() {
+        match resolve_one(raw, &memo) {
+            Ok(sha) => {
+                actions.insert(raw.clone(), sha);
+            }
+            Err(reason) => failures.push(format!("{raw}: {reason}")),
+        }
+    }
+    (actions, failures)
+}
+
+/// Whether an image reference is pinned to a `sha256` digest. Only a digest names
+/// the same bytes forever, and resolving a tag needs a registry client, so a tag is
+/// unresolvable here.
+pub fn image_pinned(image: &str) -> bool {
+    image.rsplit_once("@sha256:").is_some_and(|(name, digest)| {
+        !name.is_empty()
+            && digest.len() == 64
+            && digest
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    })
+}
+
+/// The plan-time check. For each record that would otherwise prove, every action must
+/// resolve now to the commit the record stored, and every image must be pinned.
+pub struct ActionCheck<'a> {
+    memo: Memo<'a>,
+}
+
+impl<'a> ActionCheck<'a> {
+    pub fn new(resolver: &'a dyn Resolver) -> Self {
+        Self {
+            memo: Memo::new(resolver),
+        }
+    }
+}
+
+impl RecordCheck for ActionCheck<'_> {
+    fn check(&self, spec: &JobSpec, record: &JobRecord) -> Result<(), (Code, String)> {
+        for image in &spec.images {
+            if !image_pinned(image) {
+                return Err((
+                    Code::UnresolvedAction,
+                    format!(
+                        "image {image} is not pinned to a digest, so it cannot be resolved here"
+                    ),
+                ));
+            }
+        }
+        for raw in spec.actions.iter().collect::<BTreeSet<_>>() {
+            let now = resolve_one(raw, &self.memo)
+                .map_err(|e| (Code::UnresolvedAction, format!("action {raw}: {e}")))?;
+            match record.actions.get(raw) {
+                None => {
+                    return Err((
+                        Code::UnresolvedAction,
+                        format!("record has no resolution for action {raw}"),
+                    ))
+                }
+                Some(recorded) if *recorded != now => {
+                    return Err((
+                        Code::InputChanged,
+                        format!("action {raw} resolves to {now}, recorded as {recorded}"),
+                    ))
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub mod fake {
+    use super::Resolver;
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+
+    /// A resolver with fixed answers, counting every lookup it receives.
+    #[derive(Default)]
+    pub struct Fake {
+        answers: RefCell<HashMap<String, Result<String, String>>>,
+        calls: Cell<usize>,
+    }
+
+    impl Fake {
+        pub fn new() -> Self {
+            Self::default()
+        }
+        /// Sets the answer for `owner/repo@reference`.
+        pub fn set(&self, owner_repo_ref: &str, answer: Result<&str, &str>) {
+            self.answers.borrow_mut().insert(
+                owner_repo_ref.into(),
+                answer.map(String::from).map_err(String::from),
+            );
+        }
+        pub fn calls(&self) -> usize {
+            self.calls.get()
+        }
+    }
+
+    impl Resolver for Fake {
+        fn commit(&self, owner: &str, repo: &str, reference: &str) -> Result<String, String> {
+            self.calls.set(self.calls.get() + 1);
+            let key = format!("{owner}/{repo}@{reference}");
+            self.answers
+                .borrow()
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| Err(format!("no fake answer for {key}")))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fake::Fake;
+    use super::*;
+    use crate::plan::spec::JobSpec;
+    use std::net::TcpListener;
+    use std::process::Command as Cmd;
+
+    const A: &str = "1111111111111111111111111111111111111111";
+    const B: &str = "2222222222222222222222222222222222222222";
+    const TAG_OBJECT: &str = "3333333333333333333333333333333333333333";
+    const DIGEST: &str = "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn spec(actions: &[&str], images: &[&str]) -> JobSpec {
+        JobSpec {
+            workflow: "ci".into(),
+            path: ".github/workflows/ci.yml".into(),
+            job: "test".into(),
+            leg: None,
+            key: Some("job-x".into()),
+            runs_on: serde_json::Value::Null,
+            needs: vec![],
+            if_text: None,
+            steps: vec![],
+            blocked: None,
+            actions: actions.iter().map(|s| s.to_string()).collect(),
+            images: images.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    fn record(actions: &[(&str, &str)]) -> JobRecord {
+        JobRecord {
+            created: 1,
+            started: 1,
+            status: None,
+            failed: None,
+            actions: actions
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            commit: None,
+            host: BTreeMap::new(),
+            event_path: None,
+            run: None,
+            steps: vec![],
+            attest: None,
+            workflow_ref: None,
+            job_workflow_ref: None,
+        }
+    }
+
+    #[test]
+    fn classify_separates_remote_pinned_and_unresolvable_forms() {
+        let remote = |o: &str, r: &str, rf: &str| Action::Remote {
+            owner: o.into(),
+            repo: r.into(),
+            reference: rf.into(),
+        };
+        assert_eq!(
+            classify("actions/checkout@v4"),
+            Ok(remote("actions", "checkout", "v4"))
+        );
+        assert_eq!(
+            classify("actions/checkout@main"),
+            Ok(remote("actions", "checkout", "main"))
+        );
+        assert_eq!(
+            classify("github/codeql-action/init@refs/tags/v3"),
+            Ok(remote("github", "codeql-action", "refs/tags/v3"))
+        );
+        assert_eq!(
+            classify(&format!("actions/checkout@{A}")),
+            Ok(Action::Pinned(A.into()))
+        );
+        // Reusable workflow paths resolve against their repository.
+        assert_eq!(
+            classify("owner/repo/.github/workflows/x.yml@v1"),
+            Ok(remote("owner", "repo", "v1"))
+        );
+        for bad in [
+            "actions/checkout@abcd",                                     // short SHA
+            "actions/checkout@1234567",                                  // short SHA, all digits
+            "actions/checkout@ABCDEF0123456789ABCDEF0123456789ABCDEF01", // uppercase full SHA is not pinned
+            "./local@v1",
+            "docker://alpine:3.19",
+            "ghe.example.com/owner/repo@v1", // host-qualified
+            "actions/checkout",              // no ref
+            "actions/checkout@",             // empty ref
+            "actions/checkout@v1 x",         // odd characters
+            "owner/repo/../x@v1",            // traversal
+        ] {
+            assert!(classify(bad).is_err(), "{bad} must not resolve");
+        }
+    }
+
+    #[test]
+    fn pick_peels_annotated_tags_and_rejects_ambiguity() {
+        let peeled = format!("{A}\trefs/tags/v2\n{TAG_OBJECT}\trefs/tags/v2^{{}}\n");
+        // Annotated tag: the commit is the peeled line, not the tag object.
+        assert_eq!(
+            pick(
+                &format!("{TAG_OBJECT}\trefs/tags/v2\n{A}\trefs/tags/v2^{{}}\n"),
+                "v2"
+            ),
+            Ok(A.into())
+        );
+        assert_eq!(pick(&format!("{A}\trefs/tags/v1\n"), "v1"), Ok(A.into()));
+        assert_eq!(
+            pick(&format!("{A}\trefs/heads/main\n"), "main"),
+            Ok(A.into())
+        );
+        // A tag and a branch naming the same commit agree; different commits are ambiguous.
+        assert_eq!(
+            pick(&format!("{A}\trefs/tags/x\n{A}\trefs/heads/x\n"), "x"),
+            Ok(A.into())
+        );
+        assert!(pick(&format!("{A}\trefs/tags/x\n{B}\trefs/heads/x\n"), "x").is_err());
+        assert!(pick(&peeled, "v9").is_err(), "missing ref");
+        assert!(pick("", "v1").is_err(), "empty listing");
+        assert!(pick("garbage\n", "v1").is_err(), "no tab");
+        assert!(
+            pick("notahash\trefs/tags/v1\n", "v1").is_err(),
+            "bad object id"
+        );
+        assert!(
+            pick(&format!("{A}\trefs/tags/v1\n{B}\trefs/tags/v1\n"), "v1").is_err(),
+            "duplicate"
+        );
+        let null_id = "0".repeat(40);
+        assert!(
+            pick(&format!("{null_id}\trefs/tags/v1\n"), "v1").is_err(),
+            "null object id"
+        );
+        assert!(
+            classify(&format!("actions/checkout@{null_id}")).is_err(),
+            "null pinned SHA"
+        );
+    }
+
+    fn bare_remote(root: &Path, owner: &str, repo: &str) -> PathBuf {
+        let work = root.join(format!("work-{owner}-{repo}"));
+        std::fs::create_dir_all(&work).unwrap();
+        git(&work, &["init", "-q", "-b", "main"]);
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "one"]);
+        git(&work, &["tag", "v1"]);
+        git(&work, &["tag", "-a", "-m", "annotated", "v2"]);
+        let owner_dir = root.join(owner);
+        std::fs::create_dir_all(&owner_dir).unwrap();
+        let bare = owner_dir.join(format!("{repo}.git"));
+        git(
+            &work,
+            &["clone", "-q", "--bare", ".", bare.to_str().unwrap()],
+        );
+        bare
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let out = Cmd::new("git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "tag.gpgsign=false",
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+            ])
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_string()
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("stoop-resolve-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn file_resolver(root: &Path) -> Git {
+        Git::new(
+            root,
+            format!("file://{}", root.display()),
+            Duration::from_secs(60),
+        )
+    }
+
+    #[test]
+    fn git_resolves_tags_branches_and_peels_annotated_tags() {
+        let root = scratch("local");
+        let bare = bare_remote(&root, "acme", "tool");
+        let _ = bare;
+        let r = file_resolver(&root);
+        let head = git(&root.join("work-acme-tool"), &["rev-parse", "HEAD"]);
+        let tag_object = git(&root.join("work-acme-tool"), &["rev-parse", "refs/tags/v2"]);
+        assert_ne!(
+            tag_object, head,
+            "v2 is annotated, so its tag object differs from HEAD"
+        );
+        assert_eq!(r.commit("acme", "tool", "v1").unwrap(), head);
+        assert_eq!(
+            r.commit("acme", "tool", "v2").unwrap(),
+            head,
+            "peeled to the commit"
+        );
+        assert_eq!(r.commit("acme", "tool", "main").unwrap(), head);
+        assert!(
+            r.commit("acme", "tool", "nope").is_err(),
+            "missing ref fails wide"
+        );
+        assert!(
+            r.commit("acme", "missing", "v1").is_err(),
+            "missing repository fails wide"
+        );
+    }
+
+    #[test]
+    fn git_detects_a_moved_tag_and_a_deleted_one() {
+        let root = scratch("moved");
+        bare_remote(&root, "acme", "tool");
+        let work = root.join("work-acme-tool");
+        let r = file_resolver(&root);
+        let before = r.commit("acme", "tool", "v1").unwrap();
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        let moved = git(&work, &["rev-parse", "HEAD"]);
+        git(
+            &work,
+            &[
+                "push",
+                "-q",
+                "-f",
+                root.join("acme/tool.git").to_str().unwrap(),
+                "HEAD:refs/tags/v1",
+            ],
+        );
+        let after = r.commit("acme", "tool", "v1").unwrap();
+        assert_ne!(before, after, "a moved tag must not look unchanged");
+        assert_eq!(after, moved);
+        git(
+            &work,
+            &[
+                "push",
+                "-q",
+                root.join("acme/tool.git").to_str().unwrap(),
+                ":refs/tags/v1",
+            ],
+        );
+        assert!(
+            r.commit("acme", "tool", "v1").is_err(),
+            "deleted ref fails wide"
+        );
+    }
+
+    #[test]
+    fn git_fails_wide_on_tag_and_branch_naming_different_commits() {
+        let root = scratch("clash");
+        bare_remote(&root, "acme", "tool");
+        let work = root.join("work-acme-tool");
+        let bare = root.join("acme/tool.git");
+        git(&work, &["commit", "-q", "--allow-empty", "-m", "two"]);
+        git(
+            &work,
+            &["push", "-q", bare.to_str().unwrap(), "HEAD:refs/heads/v1"],
+        );
+        assert!(file_resolver(&root).commit("acme", "tool", "v1").is_err());
+    }
+
+    /// Serves a fixed response to every connection, like a dumb HTTP git server.
+    /// `hold` accepts and never answers, for timeouts.
+    fn serve(status: &'static str, body: String, hold: bool) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming().take(6) {
+                let Ok(mut stream) = stream else { return };
+                let mut request = [0u8; 4096];
+                let _ = std::io::Read::read(&mut stream, &mut request);
+                if hold {
+                    thread::sleep(Duration::from_secs(30));
+                    return;
+                }
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nLocation: http://127.0.0.1:9/elsewhere\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+        (base, handle)
+    }
+
+    /// Redirects git's smart-HTTP probe (the request carrying `service=`) to `target`,
+    /// and serves the plain listing on every other request, as a dumb server does. A
+    /// client that follows the redirect reaches a valid listing; one that refuses it fails.
+    fn serve_redirecting_probe(target: String) -> (String, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let listing = format!("{A}\trefs/tags/v1\n");
+        let handle = thread::spawn(move || {
+            for stream in listener.incoming().take(6) {
+                let Ok(mut stream) = stream else { return };
+                let mut request = [0u8; 4096];
+                let n = std::io::Read::read(&mut stream, &mut request).unwrap_or(0);
+                let head = String::from_utf8_lossy(&request[..n]).to_string();
+                let response = if head.contains("service=") {
+                    format!("HTTP/1.1 301 Moved Permanently\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                } else {
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{listing}",
+                        listing.len()
+                    )
+                };
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+        (base, handle)
+    }
+
+    /// A resolver whose working directory no other test touches.
+    fn http_resolver(base: String, timeout: Duration) -> Git {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Git::new(scratch(&format!("http-{n}")), base, timeout)
+    }
+
+    #[test]
+    fn git_reads_a_dumb_listing_with_peeled_tags() {
+        let body = format!("{A}\trefs/tags/v2\n{B}\trefs/tags/v2^{{}}\n{A}\trefs/heads/main\n");
+        let (base, _h) = serve("200 OK", body, false);
+        assert_eq!(
+            http_resolver(base, Duration::from_secs(10))
+                .commit("o", "r", "v2")
+                .unwrap(),
+            B
+        );
+    }
+
+    #[test]
+    fn git_fails_wide_on_every_error_class() {
+        let bad_id = format!("{}\trefs/tags/v1\n", "x".repeat(40));
+        let duplicate = format!("{A}\trefs/tags/v1\n{B}\trefs/tags/v1\n");
+        // Each case must fail wide: 401 must not prompt, and a listing that is not a
+        // listing is never trusted.
+        let cases: [(&str, &str); 7] = [
+            ("429 Too Many Requests", "slow down"),
+            ("500 Internal Server Error", "boom"),
+            ("401 Unauthorized", "no"),
+            ("200 OK", "not a listing\n"),
+            ("200 OK", bad_id.as_str()),
+            ("200 OK", duplicate.as_str()),
+            ("200 OK", "<html>captive portal</html>\n"),
+        ];
+        for (status, body) in cases {
+            let (base, _h) = serve(status, body.to_string(), false);
+            let result = http_resolver(base, Duration::from_secs(10)).commit("o", "r", "v1");
+            assert!(
+                result.is_err(),
+                "{status} with {body:?} must fail wide, got {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_does_not_follow_a_redirect_to_a_valid_listing() {
+        // The target serves a valid listing on every request, so a client that follows
+        // the redirect succeeds. Only refusing the redirect makes this fail wide.
+        let (target, _t) = serve("200 OK", format!("{A}\trefs/tags/v1\n"), false);
+        let target = format!("{target}/moved/o/r.git/info/refs?service=git-upload-pack");
+        let (base, _h) = serve_redirecting_probe(target);
+        let result = http_resolver(base, Duration::from_secs(10)).commit("o", "r", "v1");
+        assert!(result.is_err(), "a redirect must fail wide, got {result:?}");
+    }
+
+    #[test]
+    fn git_times_out_instead_of_stalling_a_plan() {
+        let (base, _h) = serve("200 OK", String::new(), true);
+        let started = Instant::now();
+        let result = http_resolver(base, Duration::from_millis(800)).commit("o", "r", "v1");
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "stalled for {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[test]
+    fn git_fails_wide_when_the_server_is_unreachable() {
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let r = http_resolver(format!("http://127.0.0.1:{port}"), Duration::from_secs(10));
+        assert!(r.commit("o", "r", "v1").is_err());
+    }
+
+    #[test]
+    fn full_sha_needs_no_lookup_and_memo_asks_once_per_action() {
+        let fake = Fake::new();
+        fake.set("actions/checkout@v4", Ok(A));
+        fake.set("actions/setup-node@v4", Err("no such ref"));
+        let (actions, failures) = resolve_all(
+            &[
+                "actions/checkout@v4".into(),
+                "actions/checkout@v4".into(),
+                format!("actions/cache@{B}"),
+                "actions/setup-node@v4".into(),
+            ],
+            &fake,
+        );
+        assert_eq!(fake.calls(), 2, "one lookup per distinct action");
+        assert_eq!(
+            actions.get("actions/checkout@v4").map(String::as_str),
+            Some(A)
+        );
+        assert_eq!(
+            actions
+                .get(&format!("actions/cache@{B}"))
+                .map(String::as_str),
+            Some(B)
+        );
+        assert!(
+            !actions.contains_key("actions/setup-node@v4"),
+            "a failed lookup is not stored"
+        );
+        assert_eq!(failures.len(), 1);
+    }
+
+    #[test]
+    fn record_then_plan_accepts_the_same_commits() {
+        let fake = Fake::new();
+        fake.set("actions/checkout@v4", Ok(A));
+        fake.set("actions/setup-node@v4", Ok(B));
+        let (actions, _) = resolve_all(
+            &["actions/checkout@v4".into(), "actions/setup-node@v4".into()],
+            &fake,
+        );
+        let rec = JobRecord {
+            actions,
+            ..record(&[])
+        };
+        let check = ActionCheck::new(&fake);
+        assert!(check
+            .check(
+                &spec(&["actions/checkout@v4", "actions/setup-node@v4"], &[]),
+                &rec
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn a_moved_action_fails_as_an_input_change() {
+        let fake = Fake::new();
+        fake.set("actions/checkout@v4", Ok(A));
+        let rec = record(&[("actions/checkout@v4", A)]);
+        fake.set("actions/checkout@v4", Ok(B)); // the tag moved after the record
+        let check = ActionCheck::new(&fake);
+        let (code, detail) = check
+            .check(&spec(&["actions/checkout@v4"], &[]), &rec)
+            .unwrap_err();
+        assert_eq!(code, Code::InputChanged);
+        assert!(detail.contains(B) && detail.contains(A), "{detail}");
+    }
+
+    #[test]
+    fn a_resolution_error_is_unresolved_not_unchanged() {
+        let fake = Fake::new();
+        fake.set("actions/checkout@v4", Err("git ls-remote timed out"));
+        let rec = record(&[("actions/checkout@v4", A)]);
+        let check = ActionCheck::new(&fake);
+        let (code, _) = check
+            .check(&spec(&["actions/checkout@v4"], &[]), &rec)
+            .unwrap_err();
+        assert_eq!(
+            code,
+            Code::UnresolvedAction,
+            "an error must never read as unchanged"
+        );
+    }
+
+    #[test]
+    fn a_record_without_the_action_cannot_prove_it() {
+        let fake = Fake::new();
+        fake.set("actions/checkout@v4", Ok(A));
+        let check = ActionCheck::new(&fake);
+        let (code, _) = check
+            .check(&spec(&["actions/checkout@v4"], &[]), &record(&[]))
+            .unwrap_err();
+        assert_eq!(
+            code,
+            Code::UnresolvedAction,
+            "records from before resolution have no answer"
+        );
+    }
+
+    #[test]
+    fn unresolvable_forms_and_floating_images_run_the_job() {
+        let fake = Fake::new();
+        let rec = record(&[]);
+        let check = ActionCheck::new(&fake);
+        for s in [
+            spec(&["actions/checkout@abcd"], &[]),
+            spec(&["./local@v1"], &[]),
+            spec(&[], &["node:20"]),
+            spec(&[], &["ghcr.io/acme/app:latest"]),
+        ] {
+            let (code, _) = check.check(&s, &rec).unwrap_err();
+            assert_eq!(code, Code::UnresolvedAction);
+        }
+        assert_eq!(fake.calls(), 0, "classification never reaches the network");
+        assert!(ActionCheck::new(&fake)
+            .check(&spec(&[], &[&format!("node@{DIGEST}")]), &rec)
+            .is_ok());
+        assert!(image_pinned(&format!("node@{DIGEST}")));
+        assert!(!image_pinned("node@sha256:short"));
+        assert!(!image_pinned("node@md5:0123"));
+    }
+
+    #[test]
+    fn check_asks_once_per_distinct_action_across_records() {
+        let fake = Fake::new();
+        fake.set("actions/checkout@v4", Ok(A));
+        let check = ActionCheck::new(&fake);
+        let s = spec(&["actions/checkout@v4", "actions/checkout@v4"], &[]);
+        for _ in 0..3 {
+            let _ = check.check(&s, &record(&[("actions/checkout@v4", A)]));
+        }
+        assert_eq!(fake.calls(), 1);
+    }
+}
