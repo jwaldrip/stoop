@@ -39,8 +39,6 @@ jobs:
       - run: cargo test
       - name: Verify blob IDs above 2 GiB
         run: cargo test --release --test record_e2e sparse_input_over_two_gib_keeps_its_blob_oid -- --ignored --nocapture
-      - name: Measure blob-id recording fixture
-        run: STOOP_DEBUG=1 cargo test --test record_e2e recorder_oid_timing_fixture -- --nocapture
 
   linux-arm:
     name: tests (Linux arm64)
