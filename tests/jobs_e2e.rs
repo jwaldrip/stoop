@@ -195,11 +195,15 @@ impl Ws {
         self.command(script, write).output().unwrap()
     }
     fn command(&self, script: &str, write: &str) -> Command {
+        self.command_with_options(script, write, &[])
+    }
+    fn command_with_options(&self, script: &str, write: &str, options: &[&str]) -> Command {
         let path = self.temp.join("script.sh");
         fs::write(&path, script).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_stoop"));
         command
             .arg("sh")
+            .args(options)
             .arg(path)
             .current_dir(&self.root)
             .env("GITHUB_ACTIONS", "true")
@@ -1244,6 +1248,7 @@ fn clean_children_still_publish_an_attestation_the_planner_verifies() {
     let configure = |command: &mut Command| {
         command
             .env("PATH", &path)
+            .env("CI", "true")
             .env("ACTIONS_ID_TOKEN_REQUEST_URL", &token.url)
             .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "fixture-bearer")
             .env("STOOP_TEST_TOKEN_URL", &token.url)
@@ -1340,4 +1345,73 @@ fn clean_children_still_publish_an_attestation_the_planner_verifies() {
     let result: Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(result["jobs"][0]["code"], "unattested", "{result}");
     assert_eq!(result["skip"], serde_json::json!([]));
+}
+
+#[test]
+fn allowed_step_blocks_later_publication_after_an_attested_running_record() {
+    use std::os::unix::fs::PermissionsExt;
+    let first = "true\n";
+    let allowed =
+        "test -f \"$RUNNER_TEMP/stoop/journal.blocked\" && env > \"$RUNNER_TEMP/allowed.env\"\n";
+    let last = "echo last\n";
+    let w = Ws::new("oidc-opt-in", &[first, allowed, last]);
+    let token = TokenApi::new(w.sha.clone());
+    let bin = w.temp.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let curl = bin.join("curl");
+    fs::write(&curl, "#!/bin/sh\nif [ \"$1\" = -q ]; then\n  config=$(cat)\n  case \"$config\" in\n    *\"$STOOP_TEST_TOKEN_URL\"*) printf '%s\\n' \"$config\" | /usr/bin/curl \"$@\" --noproxy '*' --proto '=http,https' ;;\n    *) exit 81 ;;\n  esac\nelse\n  case \"$*\" in\n    *\"$STOOP_TEST_ACTION_API/repos/actions/checkout/tarball/\"*) exec /usr/bin/curl \"$@\" --noproxy '*' ;;\n    *) exit 82 ;;\n  esac\nfi\n").unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+    let configure = |command: &mut Command| {
+        command
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("ACTIONS_ID_TOKEN_REQUEST_URL", &token.url)
+            .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "fixture-bearer")
+            .env("STOOP_TEST_TOKEN_URL", &token.url)
+            .env("STOOP_TEST_ACTION_API", &w.api.url)
+            .env_remove("STOOP_PASS_ENV");
+    };
+    let mut command = w.command(first, "1");
+    configure(&mut command);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let before = w.records();
+    assert_eq!(before[0]["records"][0]["status"], "running");
+    assert!(before[0]["records"][0]["attest"].as_str().is_some());
+    let requests = token.requests.load(Ordering::Relaxed);
+    assert!(requests > 0);
+
+    let mut command = w.command_with_options(allowed, "1", &["--allow-id-token"]);
+    configure(&mut command);
+    command.env(
+        "STOOP_PASS_ENV",
+        "ACTIONS_ID_TOKEN_REQUEST_URL,ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    );
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let env = fs::read(w.temp.join("allowed.env")).unwrap();
+    assert!(env
+        .windows(b"ACTIONS_ID_TOKEN_REQUEST_TOKEN=fixture-bearer".len())
+        .any(|v| v == b"ACTIONS_ID_TOKEN_REQUEST_TOKEN=fixture-bearer"));
+    assert!(w.temp.join("stoop/journal.blocked").is_file());
+    assert_eq!(w.records(), before);
+    assert_eq!(token.requests.load(Ordering::Relaxed), requests);
+
+    let mut command = w.command(last, "1");
+    configure(&mut command);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(w.records(), before);
+    assert_eq!(token.requests.load(Ordering::Relaxed), requests);
 }

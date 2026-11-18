@@ -336,20 +336,23 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
     ];
     argv.extend(rest.iter().cloned());
     o.argv = argv;
-    let remote = sync_for(o).ok();
     let blocked =
         run::env_str("RUNNER_TEMP").map(|t| PathBuf::from(t).join("stoop/journal.blocked"));
-    if !o.pass_env.is_empty() && run::env_flag("GITHUB_ACTIONS") {
-        if let Some(path) = &blocked {
-            let result =
-                std::fs::create_dir_all(path.parent().expect("journal marker has a parent"))
-                    .and_then(|()| std::fs::write(path, b"OIDC request credentials passed"));
-            if let Err(error) = result {
-                eprintln!("stoop: cannot block job journal before passing OIDC request credentials: {error}");
-                return 2;
+    if !o.pass_env.is_empty() {
+        if run::env_flag("GITHUB_ACTIONS") {
+            if let Some(path) = &blocked {
+                let result =
+                    std::fs::create_dir_all(path.parent().expect("journal marker has a parent"))
+                        .and_then(|()| std::fs::write(path, b"OIDC request credentials passed"));
+                if let Err(error) = result {
+                    eprintln!("stoop: cannot block job journal before passing OIDC request credentials: {error}");
+                    return 2;
+                }
             }
         }
+        return run::run_outcome(std::mem::take(o), false).status;
     }
+    let remote = sync_for(o).ok();
     let mut journal = if blocked.as_ref().is_some_and(|p| p.exists()) {
         None
     } else {

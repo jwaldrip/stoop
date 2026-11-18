@@ -156,13 +156,72 @@ fn allowed_shell_blocks_journal_before_launch_and_fails_closed_if_it_cannot() {
         "test -f \"$RUNNER_TEMP/stoop/journal.blocked\"\nexec /usr/bin/env\n",
     )
     .unwrap();
-    let out = f
-        .command(&["sh", "--allow-id-token", script.to_str().unwrap()])
-        .env("GITHUB_ACTIONS", "true")
-        .env("RUNNER_TEMP", &f.0)
-        .env("STOOP_PASS_ENV", TOKEN)
-        .output()
-        .unwrap();
+    let workflow = f.0.join(".github/workflows/ci.yml");
+    fs::create_dir_all(workflow.parent().unwrap()).unwrap();
+    fs::write(&workflow, "name: fixture\ndefaults:\n  run:\n    shell: stoop sh {0}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@1111111111111111111111111111111111111111\n      - run: |\n          test -f \"$RUNNER_TEMP/stoop/journal.blocked\"\n          exec /usr/bin/env\n").unwrap();
+    for args in [
+        &["init", "-q", "-b", "main"][..],
+        &["add", ".github/workflows/ci.yml"][..],
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.org",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "fixture",
+        ][..],
+    ] {
+        let out = Command::new("git")
+            .current_dir(&f.0)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let context = |command: &mut Command, temp: &std::path::Path| {
+        command
+            .env("GITHUB_ACTIONS", "true")
+            .env("STOOP_TEST_OTHER", "fixture")
+            .env("GITHUB_REPOSITORY", "owner/repo")
+            .env(
+                "GITHUB_WORKFLOW_REF",
+                "owner/repo/.github/workflows/ci.yml@refs/heads/main",
+            )
+            .env("GITHUB_WORKFLOW", "fixture")
+            .env("GITHUB_JOB", "test")
+            .env("GITHUB_RUN_ID", "123")
+            .env("GITHUB_RUN_ATTEMPT", "1")
+            .env("RUNNER_TEMP", temp);
+    };
+    let baseline_temp = f.0.join("baseline");
+    let mut baseline = f.command(&["sh", script.to_str().unwrap()]);
+    context(&mut baseline, &baseline_temp);
+    let baseline = baseline.output().unwrap();
+    assert_eq!(
+        baseline.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    assert!(
+        baseline_temp.join("stoop/journal.json").is_file(),
+        "the normal journal did not open: {}",
+        String::from_utf8_lossy(&baseline.stderr)
+    );
+    assert!(!baseline_temp.join("stoop/journal.blocked").exists());
+    let mut allowed = f.command(&["sh", "--allow-id-token", script.to_str().unwrap()]);
+    context(&mut allowed, &f.0);
+    allowed.env("STOOP_PASS_ENV", TOKEN);
+    let out = allowed.output().unwrap();
     success(&out);
     assert!(env_has(&out.stdout, TOKEN, TOKEN_VALUE));
     assert!(f.0.join("stoop/journal.blocked").is_file());
