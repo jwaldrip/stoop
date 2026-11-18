@@ -97,8 +97,16 @@ impl JobStore {
             .join(format!("{}.json", sanitize(key)))
     }
     fn parse(bytes: &[u8]) -> Option<JobFile> {
-        let f: JobFile = serde_json::from_slice(bytes).ok()?;
-        (f.v == 1 && f.kind == "job" && f.key.starts_with("job-")).then_some(f)
+        let mut f: JobFile = serde_json::from_slice(bytes).ok()?;
+        if !matches!(f.v, 1 | 2) || f.kind != "job" || !f.key.starts_with("job-") {
+            return None;
+        }
+        if f.v == 1 {
+            for record in &mut f.records {
+                record.actions.remove(crate::gha::actions::WITNESS_KEY);
+            }
+        }
+        Some(f)
     }
     pub fn load(&self, key: &str) -> Vec<JobRecord> {
         fs::read(self.file(key))
@@ -126,7 +134,7 @@ impl JobStore {
             let _ = fs::write(ignore, "*\n");
         }
         let bytes = serde_json::to_vec(&JobFile {
-            v: 1,
+            v: 2,
             kind: "job".into(),
             key: key.into(),
             records,
@@ -164,7 +172,7 @@ impl JobStore {
         records.truncate(MAX_RECORDS);
         records.sort_by(|a, b| b.order_key().cmp(&a.order_key()));
         serde_json::to_vec(&JobFile {
-            v: 1,
+            v: 2,
             kind: "job".into(),
             key: key.into(),
             records,
@@ -261,6 +269,24 @@ mod tests {
         assert_eq!(record.status, None);
         assert_eq!(record.failed, None);
         assert!(record.actions.is_empty());
+    }
+    #[test]
+    fn legacy_job_files_cannot_supply_action_tree_witnesses() {
+        let mut legacy = record(1);
+        legacy
+            .actions
+            .insert(crate::gha::actions::WITNESS_KEY.into(), "forged".into());
+        let bytes = serde_json::to_vec(&JobFile {
+            v: 1,
+            kind: "job".into(),
+            key: "job-a".into(),
+            records: vec![legacy],
+        })
+        .unwrap();
+        let decoded = JobStore::parse(&bytes).unwrap();
+        assert!(!decoded.records[0]
+            .actions
+            .contains_key(crate::gha::actions::WITNESS_KEY));
     }
     #[test]
     fn round_trip() {

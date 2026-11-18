@@ -3,7 +3,7 @@ use super::*;
 use crate::attest::tests as a;
 use crate::job::{JobRecord, RecordStatus, StepHow, StepRecord};
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -44,6 +44,7 @@ struct Repo {
     root: PathBuf,
     sha: String,
     event: PathBuf,
+    api: Option<gha::actions::FixtureServer>,
 }
 
 impl Repo {
@@ -82,11 +83,16 @@ impl Repo {
         .to_string();
         let event = base.join("event.json");
         std::fs::write(&event, r#"{"repository":{"default_branch":"main"}}"#).unwrap();
+        let archive = base.join(format!("api/repos/actions/checkout/tarball/{PIN}"));
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(archive, crate::gha::actions::fixture_archive()).unwrap();
+        let api = gha::actions::FixtureServer::new(base.join("api"));
         Repo {
             base,
             root,
             sha,
             event,
+            api: Some(api),
         }
     }
     fn store(&self) -> PathBuf {
@@ -96,6 +102,7 @@ impl Repo {
 
 impl Drop for Repo {
     fn drop(&mut self) {
+        drop(self.api.take());
         if std::env::var_os("PROBE_KEEP").is_none() {
             let _ = std::fs::remove_dir_all(&self.base);
         }
@@ -106,6 +113,48 @@ fn file(path: &str, bytes: &[u8]) -> input::Input {
     input::Input {
         path: path.into(),
         id: format!("f:{}", blake3::hash(bytes).to_hex()),
+    }
+}
+
+struct RecordingSource {
+    fake: gha::resolve::fake::Fake,
+    git: gha::resolve::Git,
+}
+impl gha::resolve::Resolver for RecordingSource {
+    fn commit(&self, owner: &str, repo: &str, reference: &str) -> Result<String, String> {
+        self.fake.commit(owner, repo, reference)
+    }
+    fn action_tree(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+        deadline: std::time::Instant,
+    ) -> Result<std::rc::Rc<gha::actions::Tree>, String> {
+        self.fake.action_tree(owner, repo, sha, deadline)
+    }
+    fn runner_copy(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+        deadline: std::time::Instant,
+    ) -> Result<gha::actions::Tree, String> {
+        self.fake.runner_copy(owner, repo, reference, deadline)
+    }
+    fn local_tree(
+        &self,
+        path: &str,
+        deadline: std::time::Instant,
+    ) -> Result<(String, std::rc::Rc<gha::actions::Tree>), String> {
+        self.git.local_tree(path, deadline)
+    }
+    fn local_copy(
+        &self,
+        path: &str,
+        deadline: std::time::Instant,
+    ) -> Result<gha::actions::Tree, String> {
+        self.git.local_copy(path, deadline)
     }
 }
 
@@ -171,11 +220,19 @@ fn record(r: &Repo, x: Rec<'_>) -> Option<String> {
     rec.commit = Some(r.sha.clone());
     rec.event_path = Some(r.event.to_string_lossy().into_owned());
     rec.workflow_ref = Some(workflow_ref.clone());
-    rec.actions = spec
-        .actions
-        .iter()
-        .map(|u| (u.clone(), u.rsplit_once('@').unwrap().1.to_string()))
-        .collect();
+    let source = RecordingSource {
+        fake: gha::resolve::fake::Fake::new(),
+        git: gha::resolve::Git::new(
+            &r.root,
+            "https://github.com",
+            std::time::Duration::from_secs(5),
+        )
+        .with_revision(r.sha.clone()),
+    };
+    for raw in &spec.actions {
+        source.fake.set(raw, Ok(PIN));
+    }
+    rec.actions = gha::actions::capture(&spec.actions, &source, false).unwrap();
     rec.steps = steps;
     if x.attested {
         let mut claims = a::claims(&rec);
@@ -301,6 +358,9 @@ fn plan(r: &Repo, args: &[&str], env: &[(&str, &str)]) -> Out {
     .env("GITHUB_REPOSITORY_OWNER_ID", a::OWNER_ID)
     .env("GITHUB_SHA", &r.sha)
     .env("GITHUB_EVENT_PATH", &r.event)
+    .env("GITHUB_API_URL", &r.api.as_ref().unwrap().url)
+    .env("NO_PROXY", "127.0.0.1,localhost")
+    .env("no_proxy", "127.0.0.1,localhost")
     .env(
         "GITHUB_WORKFLOW_REF",
         format!("{}/{CI}@refs/heads/main", a::REPO),
@@ -354,6 +414,263 @@ fn code(o: &Out, job: &str) -> String {
         .find(|j| j["id"] == job)
         .map(|j| j["code"].as_str().unwrap().to_string())
         .unwrap_or_else(|| "absent".into())
+}
+
+#[test]
+fn legacy_action_witness_is_cold_next_to_a_witnessed_positive_control() {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    let key = record(&r, rec(&w, now, now)).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+    let jobs = job::JobStore::new(r.store());
+    let mut record = jobs.load(&key).remove(0);
+    record.actions.remove(gha::actions::WITNESS_KEY);
+    let mut claims = a::claims(&record);
+    claims["aud"] = json!(attest::audience(&key, &record).unwrap());
+    claims["sha"] = json!(r.sha);
+    claims["iat"] = json!(now);
+    claims["nbf"] = json!(now);
+    record.attest = Some(a::token(
+        &a::header("test-key-1"),
+        &claims,
+        &a::pair(a::KEY_1),
+    ));
+    jobs.save(&key, record).unwrap();
+    let mut file: Value = serde_json::from_slice(&jobs.export(&key).unwrap()).unwrap();
+    file["v"] = json!(1);
+    std::fs::write(
+        r.store()
+            .join("jobs")
+            .join(format!("{}.json", proof::sanitize(&key))),
+        serde_json::to_vec(&file).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        code(&plan(&r, &["--format", "json"], &[]), "a"),
+        "action-unverifiable"
+    );
+}
+
+#[test]
+fn tampered_action_archive_is_reported_by_the_plan() {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut archive = tar::Builder::new(gz);
+    for (name, bytes) in [
+        (
+            "action.yml",
+            &b"runs:\n  using: node20\n  main: index.js\n"[..],
+        ),
+        ("index.js", &b"tampered\n"[..]),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, format!("repo-sha/{name}"), bytes)
+            .unwrap();
+    }
+    let bytes = archive.into_inner().unwrap().finish().unwrap();
+    std::fs::write(
+        r.base
+            .join(format!("api/repos/actions/checkout/tarball/{PIN}")),
+        bytes,
+    )
+    .unwrap();
+    let plan = plan(&r, &["--format", "json"], &[]);
+    assert_eq!(code(&plan, "a"), "action-content-changed");
+    assert!(plan.plan["skip"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn unusable_disk_cache_does_not_block_a_valid_plan() {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    let cache = r.root.join("unusable-cache");
+    let result = plan(
+        &r,
+        &["--format", "json"],
+        &[("XDG_CACHE_HOME", cache.to_str().unwrap())],
+    );
+    assert_eq!(code(&result, "a"), "proved", "{}", result.plan);
+    assert!(!cache.exists());
+}
+
+fn malformed_archive_is_unverifiable(bytes: &[u8]) {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+    std::fs::write(
+        r.base
+            .join(format!("api/repos/actions/checkout/tarball/{PIN}")),
+        bytes,
+    )
+    .unwrap();
+    let result = plan(&r, &["--format", "json"], &[]);
+    assert_eq!(code(&result, "a"), "action-unverifiable", "{}", result.plan);
+    assert!(result.plan["skip"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn bad_archive_truncated_gzip_is_unverifiable() {
+    let mut bytes = gha::actions::fixture_archive();
+    bytes.truncate(bytes.len() - 8);
+    malformed_archive_is_unverifiable(&bytes);
+}
+
+#[test]
+fn bad_archive_crc_is_unverifiable() {
+    let mut bytes = gha::actions::fixture_archive();
+    let offset = bytes.len() - 8;
+    bytes[offset] ^= 1;
+    malformed_archive_is_unverifiable(&bytes);
+}
+
+#[test]
+fn bad_archive_isize_is_unverifiable() {
+    let mut bytes = gha::actions::fixture_archive();
+    let offset = bytes.len() - 4;
+    bytes[offset] ^= 1;
+    malformed_archive_is_unverifiable(&bytes);
+}
+
+#[test]
+fn bad_archive_trailing_bytes_are_unverifiable() {
+    let mut bytes = gha::actions::fixture_archive();
+    bytes.extend_from_slice(b"garbage");
+    malformed_archive_is_unverifiable(&bytes);
+}
+
+#[test]
+fn bad_archive_excess_padding_is_unverifiable() {
+    let source = gha::actions::fixture_archive();
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(&source[..])
+        .read_to_end(&mut tar)
+        .unwrap();
+    tar.resize(tar.len() + 64 * 1024 + 512, 0);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar).unwrap();
+    malformed_archive_is_unverifiable(&encoder.finish().unwrap());
+}
+
+#[test]
+fn bad_archive_incomplete_tar_end_is_unverifiable() {
+    let source = gha::actions::fixture_archive();
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(&source[..])
+        .read_to_end(&mut tar)
+        .unwrap();
+    tar.truncate(tar.len() - 512);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar).unwrap();
+    malformed_archive_is_unverifiable(&encoder.finish().unwrap());
+}
+
+#[test]
+fn bad_archive_nonzero_tar_suffix_is_unverifiable() {
+    let source = gha::actions::fixture_archive();
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(&source[..])
+        .read_to_end(&mut tar)
+        .unwrap();
+    tar.extend_from_slice(&[1u8; 512]);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar).unwrap();
+    malformed_archive_is_unverifiable(&encoder.finish().unwrap());
+}
+
+#[test]
+fn bad_archive_decompression_cap_is_unverifiable() {
+    fn file(encoder: &mut flate2::write::GzEncoder<Vec<u8>>, name: &str, bytes: &[u8]) {
+        let mut header = tar::Header::new_ustar();
+        header.set_path(name).unwrap();
+        header.set_mode(0o644);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        encoder.write_all(header.as_bytes()).unwrap();
+        encoder.write_all(bytes).unwrap();
+        encoder
+            .write_all(&vec![0; (512 - bytes.len() % 512) % 512])
+            .unwrap();
+    }
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    file(
+        &mut encoder,
+        "repo-sha/action.yml",
+        b"runs:\n  using: node20\n  main: index.js\n",
+    );
+    file(&mut encoder, "repo-sha/index.js", b"fixture\n");
+    let mut directory = tar::Header::new_ustar();
+    directory.set_path("repo-sha/padding/").unwrap();
+    directory.set_entry_type(tar::EntryType::Directory);
+    directory.set_mode(0o755);
+    directory.set_size(gha::actions::MAX_TAR - 2560);
+    directory.set_cksum();
+    encoder.write_all(directory.as_bytes()).unwrap();
+    std::io::copy(
+        &mut std::io::repeat(0).take(gha::actions::MAX_TAR - 2560),
+        &mut encoder,
+    )
+    .unwrap();
+    file(&mut encoder, "repo-sha/hidden", b"x");
+    encoder.write_all(&[0u8; 1024]).unwrap();
+    malformed_archive_is_unverifiable(&encoder.finish().unwrap());
+}
+
+#[test]
+fn local_action_uses_the_requested_revision_instead_of_head() {
+    let w = workflow("", "", "").replace(
+        "      - run: cat a.txt",
+        "      - uses: ./.github/actions/check\n        env: {STOOP_PLAN: neutral}\n      - run: cat a.txt",
+    );
+    let r = Repo::new(&[
+        (CI, &w),
+        ("a.txt", "a\n"),
+        (
+            ".github/actions/check/action.yml",
+            "runs:\n  using: node20\n  main: index.js\n",
+        ),
+        (".github/actions/check/index.js", "first\n"),
+    ]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    std::fs::write(r.root.join(".github/actions/check/index.js"), "changed\n").unwrap();
+    git(&r.root, &["commit", "-qam", "change action"]);
+    let new_sha = String::from_utf8(
+        Command::new("git")
+            .current_dir(&r.root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let old_target = plan(
+        &r,
+        &["--format", "json", "--rev", &r.sha],
+        &[("GITHUB_ACTIONS", ""), ("GITHUB_SHA", "")],
+    );
+    assert_eq!(code(&old_target, "a"), "proved");
+    let new_target = plan(
+        &r,
+        &["--format", "json", "--rev", &new_sha],
+        &[("GITHUB_ACTIONS", ""), ("GITHUB_SHA", "")],
+    );
+    assert_eq!(code(&new_target, "a"), "action-moved");
 }
 
 fn report(name: &str, o: &Out) {
@@ -1153,7 +1470,7 @@ fn control_allowlisted_floating_action_under_strict() {
         "allowlisted example/tool@v1 under STOOP_STRICT_ACTIONS=1",
         &o,
     );
-    assert_eq!(code(&o, "a"), "unresolved-action");
+    assert_eq!(code(&o, "a"), "action-unverifiable");
 }
 
 #[test]
@@ -1244,7 +1561,14 @@ fn inherited_age_limits_signed_attestations() {
     let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
     let now = proof::now();
     record(&r, rec(&w, now, now - 2 * DAY)).unwrap();
-    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+    let baseline = plan(&r, &["--format", "json"], &[]);
+    assert_eq!(
+        code(&baseline, "a"),
+        "proved",
+        "plan: {}; stderr: {}",
+        baseline.plan,
+        baseline.stderr
+    );
     let o = plan(&r, &["--format", "json"], &[("STOOP_MAX_AGE", "1h")]);
     assert_eq!(code(&o, "a"), "unattested");
 }
@@ -1305,7 +1629,12 @@ fn strict_actions_rejects_a_resolvable_floating_ref() {
     std::fs::create_dir_all(&source).unwrap();
     std::fs::create_dir_all(&bare).unwrap();
     git(&source, &["init", "-q"]);
-    std::fs::write(source.join("action.yml"), "name: test\n").unwrap();
+    std::fs::write(
+        source.join("action.yml"),
+        "runs:\n  using: node20\n  main: index.js\n",
+    )
+    .unwrap();
+    std::fs::write(source.join("index.js"), "fixture\n").unwrap();
     git(&source, &["add", "."]);
     git(&source, &["commit", "-qm", "fixture"]);
     git(&bare, &["init", "--bare", "-q"]);
@@ -1328,7 +1657,17 @@ fn strict_actions_rejects_a_resolvable_floating_ref() {
     let key = record(&r, rec(&w, now, now)).unwrap();
     let jobs = job::JobStore::new(r.store());
     let mut record = jobs.load(&key).remove(0);
-    record.actions.insert("example/tool@v1".into(), sha);
+    let archive = r.base.join(format!("api/repos/example/tool/tarball/{sha}"));
+    std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    std::fs::write(archive, gha::actions::fixture_archive()).unwrap();
+    let fake = gha::resolve::fake::Fake::new();
+    fake.set("example/tool@v1", Ok(&sha));
+    record.actions = gha::actions::capture(
+        &[format!("actions/checkout@{PIN}"), "example/tool@v1".into()],
+        &fake,
+        false,
+    )
+    .unwrap();
     let mut claims = a::claims(&record);
     claims["aud"] = json!(attest::audience(&key, &record).unwrap());
     claims["sha"] = json!(r.sha);
@@ -1352,7 +1691,7 @@ fn strict_actions_rejects_a_resolvable_floating_ref() {
             ("STOOP_STRICT_ACTIONS", "1"),
         ],
     );
-    assert_eq!(code(&strict, "a"), "unresolved-action");
+    assert_eq!(code(&strict, "a"), "action-unverifiable");
 }
 
 #[test]

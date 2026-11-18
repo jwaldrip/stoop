@@ -2595,6 +2595,24 @@ mod tests {
                 self.1.set(self.1.get() + 1);
                 Ok(self.0.borrow().clone())
             }
+            fn action_tree(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: std::time::Instant,
+            ) -> Result<std::rc::Rc<crate::gha::actions::Tree>, String> {
+                Ok(std::rc::Rc::new(crate::gha::actions::fixture_tree()))
+            }
+            fn runner_copy(
+                &self,
+                _: &str,
+                _: &str,
+                _: &str,
+                _: std::time::Instant,
+            ) -> Result<crate::gha::actions::Tree, String> {
+                Ok(crate::gha::actions::fixture_tree())
+            }
         }
         let mut f = Fixture::new();
         let mut p = proof(vec![input("dir/a", &file_id(b"tracked"))]);
@@ -2613,15 +2631,13 @@ mod tests {
         let mut record = a::record();
         record.steps[0].key = "sh-0".into();
         record.steps[0].proof = p.digest();
-        record.actions.insert(
-            "example/tool@v1".into(),
-            "1111111111111111111111111111111111111111".into(),
-        );
         let verifier = a::verifier();
         let resolver = Local(
             RefCell::new("1111111111111111111111111111111111111111".into()),
             Cell::new(0),
         );
+        record.actions = crate::gha::actions::capture(&f.spec.actions, &resolver, false).unwrap();
+        resolver.1.set(0);
         let evaluate = |f: &mut Fixture, record: &JobRecord, resolver: &Local| {
             f.jobs.save(a::JOB, record.clone()).unwrap();
             let actions = ActionCheck::new(resolver);
@@ -2661,7 +2677,7 @@ mod tests {
         assert_eq!(evaluate(&mut f, &record, &resolver).code, Code::Proved);
         *resolver.0.borrow_mut() = "2222222222222222222222222222222222222222".into();
         let d = evaluate(&mut f, &record, &resolver);
-        assert_eq!(d.code, Code::InputChanged);
+        assert_eq!(d.code, Code::ActionMoved);
         assert!(d.detail.contains("would otherwise prove"));
         *resolver.0.borrow_mut() = "1111111111111111111111111111111111111111".into();
         assert_eq!(evaluate(&mut f, &record, &resolver).code, Code::Proved);
@@ -2685,10 +2701,9 @@ mod tests {
         let mut newer = record.clone();
         newer.run = Some("124/1".into());
         newer.started = a::NOW * 1000;
-        newer.actions.insert(
-            "example/tool@v1".into(),
-            "2222222222222222222222222222222222222222".into(),
-        );
+        *resolver.0.borrow_mut() = "2222222222222222222222222222222222222222".into();
+        newer.actions = crate::gha::actions::capture(&f.spec.actions, &resolver, false).unwrap();
+        *resolver.0.borrow_mut() = "1111111111111111111111111111111111111111".into();
         newer.attest = Some(a::signed(
             &newer,
             |claims| claims["run_id"] = serde_json::json!("124"),

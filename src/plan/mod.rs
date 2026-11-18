@@ -489,7 +489,7 @@ fn build<S: attest::KeySource>(
         branch,
     );
     let verifier = verifier_factory(policy, now, ceiling);
-    let resolver = gha::resolve::Git::from_env(root);
+    let resolver = gha::resolve::Git::from_env(root).with_revision(tree.commit());
     let actions =
         gha::resolve::ActionCheck::with_strict(&resolver, run::env_flag("STOOP_STRICT_ACTIONS"));
     let check = Composite {
@@ -656,6 +656,13 @@ mod tests {
         .to_string();
         let event = root.join("event.json");
         std::fs::write(&event, r#"{"repository":{"default_branch":"main"}}"#).unwrap();
+        let api_root =
+            std::env::temp_dir().join(format!("stoop-injected-action-api-{}", std::process::id()));
+        let archive = api_root
+            .join("repos/actions/checkout/tarball/1111111111111111111111111111111111111111");
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(archive, gha::actions::fixture_archive()).unwrap();
+        let api = gha::actions::FixtureServer::new(api_root.clone());
         let workflow = gha::workflow::parse(path, workflow_text).unwrap();
         let cx = gha::context::GhCtx::from_parts(BTreeMap::new(), Value::Null);
         let spec = gha::workflow::job_spec(&workflow, &cx, "a", None);
@@ -701,10 +708,8 @@ mod tests {
         record.status = Some(RecordStatus::Passed);
         record.commit = Some(sha.clone());
         record.event_path = Some(event.to_string_lossy().into_owned());
-        record.actions = BTreeMap::from([(
-            "actions/checkout@1111111111111111111111111111111111111111".into(),
-            "1111111111111111111111111111111111111111".into(),
-        )]);
+        record.actions =
+            gha::actions::capture(&spec.actions, &gha::resolve::fake::Fake::new(), false).unwrap();
         record.steps = vec![StepRecord {
             key: step.clone(),
             proof: proof.digest(),
@@ -740,6 +745,9 @@ mod tests {
                 .env("GITHUB_REPOSITORY_OWNER_ID", a::OWNER_ID)
                 .env("GITHUB_SHA", &sha)
                 .env("GITHUB_EVENT_PATH", &event)
+                .env("GITHUB_API_URL", &api.url)
+                .env("NO_PROXY", "127.0.0.1,localhost")
+                .env("no_proxy", "127.0.0.1,localhost")
                 .env_remove("STOOP_SYNC")
                 .env_remove("STOOP_FULL")
                 .env_remove("STOOP_ENV_SALT")
@@ -764,6 +772,8 @@ mod tests {
             String::from_utf8_lossy(&child.stdout),
             String::from_utf8_lossy(&child.stderr)
         );
+        drop(api);
+        std::fs::remove_dir_all(api_root).unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -1,5 +1,5 @@
 use crate::attest;
-use crate::gha::{context::GhCtx, resolve, workflow};
+use crate::gha::{actions, context::GhCtx, resolve, workflow};
 use crate::job::{JobRecord, JobStore, RecordStatus, StepHow, StepRecord};
 use crate::plan::spec::StepSpec;
 use crate::proof::{now, Store};
@@ -297,16 +297,14 @@ fn record_actions(
     resolver: &dyn resolve::Resolver,
     strict: bool,
 ) -> BTreeMap<String, String> {
-    let eligible: Vec<String> = refs
-        .iter()
-        .filter(|raw| !strict || resolve::require_pinned(std::slice::from_ref(*raw)).is_ok())
-        .cloned()
-        .collect();
-    let (actions, failures) = resolve::resolve_all(&eligible, resolver);
-    for failure in failures {
-        eprintln!("stoop: action unresolved at journal open: {failure}");
+    let memo = resolve::Memo::new(resolver);
+    match actions::capture(refs, &memo, strict) {
+        Ok(actions) => actions,
+        Err(reason) => {
+            eprintln!("stoop: action unverifiable at journal open: {reason}");
+            BTreeMap::new()
+        }
     }
-    actions
 }
 
 #[cfg(test)]
@@ -315,25 +313,150 @@ mod tests {
     use crate::gha::resolve::fake::Fake;
     const A: &str = "1111111111111111111111111111111111111111";
     #[test]
-    fn open_records_resolved_actions_and_omits_failures() {
+    fn a_failed_action_prevents_a_witness_for_the_entire_job() {
         let fake = Fake::new();
         fake.set("actions/checkout@v4", Ok(A));
         fake.set("x/y@v9", Err("unavailable"));
         let refs = vec!["actions/checkout@v4".into(), "x/y@v9".into()];
         let actions = record_actions(&refs, &fake, false);
-        assert_eq!(
-            actions.get("actions/checkout@v4").map(String::as_str),
-            Some(A)
-        );
-        assert!(!actions.contains_key("x/y@v9"));
+        assert!(actions.is_empty());
         assert_eq!(fake.calls(), 2);
     }
     #[test]
-    fn strict_recording_omits_floating_refs_without_network() {
+    fn strict_recording_refuses_floating_refs_without_network() {
         let fake = Fake::new();
         let pin = format!("actions/checkout@{A}");
         let actions = record_actions(&["actions/checkout@v4".into(), pin.clone()], &fake, true);
-        assert_eq!(actions.get(&pin).map(String::as_str), Some(A));
+        assert!(actions.is_empty());
         assert_eq!(fake.calls(), 0);
+    }
+
+    #[test]
+    fn local_action_recording_requires_matching_workspace_copy() {
+        const CHILD: &str = "STOOP_LOCAL_RECORD_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "journal::tests::local_action_recording_requires_matching_workspace_copy",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .env("HOME", std::env::temp_dir())
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let base = std::env::temp_dir().join(format!("stoop-local-record-{}", std::process::id()));
+        let root = base.join("work/repo");
+        let action = root.join(".github/actions/local");
+        std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        std::fs::create_dir_all(&action).unwrap();
+        let workflow_path = ".github/workflows/ci.yml";
+        let text = format!("name: fixture\ndefaults:\n  run:\n    shell: stoop sh {{0}}\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@{A}\n      - uses: ./.github/actions/local\n        env: {{STOOP_PLAN: neutral}}\n      - run: echo ok\n");
+        std::fs::write(root.join(workflow_path), &text).unwrap();
+        std::fs::write(
+            action.join("action.yml"),
+            "runs:\n  using: node20\n  main: index.js\n",
+        )
+        .unwrap();
+        std::fs::write(action.join("index.js"), "original\n").unwrap();
+        let git = |args: &[&str]| {
+            let out = Command::new("git")
+                .current_dir(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.org",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8(out.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["add", "."]);
+        git(&["commit", "-qm", "fixture"]);
+        let sha = git(&["rev-parse", "HEAD"]);
+
+        let api_root = base.join("api");
+        let archive = api_root.join(format!("repos/actions/checkout/tarball/{A}"));
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(archive, actions::fixture_archive()).unwrap();
+        let api = actions::FixtureServer::new(api_root);
+        let runner_copy = base.join(format!("work/_actions/actions/checkout/{A}"));
+        std::fs::create_dir_all(&runner_copy).unwrap();
+        std::fs::write(
+            runner_copy.join("action.yml"),
+            "runs:\n  using: node20\n  main: index.js\n",
+        )
+        .unwrap();
+        std::fs::write(runner_copy.join("index.js"), "fixture\n").unwrap();
+        for (name, value) in [
+            ("GITHUB_ACTIONS", "true".to_owned()),
+            ("GITHUB_REPOSITORY", "owner/repo".to_owned()),
+            (
+                "GITHUB_WORKFLOW_REF",
+                format!("owner/repo/{workflow_path}@refs/heads/main"),
+            ),
+            ("GITHUB_WORKFLOW", "fixture".to_owned()),
+            ("GITHUB_JOB", "test".to_owned()),
+            ("GITHUB_SHA", sha.clone()),
+            ("GITHUB_RUN_ID", "123".to_owned()),
+            ("GITHUB_RUN_ATTEMPT", "1".to_owned()),
+            ("GITHUB_API_URL", api.url.clone()),
+            ("GITHUB_SERVER_URL", api.url.clone()),
+            ("RUNNER_WORKSPACE", root.display().to_string()),
+        ] {
+            std::env::set_var(name, value);
+        }
+        let capture = |temp: &Path| {
+            std::env::set_var("RUNNER_TEMP", temp);
+            let mut journal = Journal::open(&root, None, true).unwrap().unwrap();
+            let key = journal.expected.first().unwrap().clone();
+            journal.before(&key).unwrap();
+            let saved: Journal =
+                serde_json::from_slice(&std::fs::read(temp.join("stoop/journal.json")).unwrap())
+                    .unwrap();
+            saved.record
+        };
+        let matched = capture(&base.join("first"));
+        let witness: serde_json::Value =
+            serde_json::from_str(&matched.actions[actions::WITNESS_KEY]).unwrap();
+        assert_eq!(witness["items"]["./.github/actions/local"]["sha"], sha);
+
+        std::fs::write(action.join("index.js"), "tampered\n").unwrap();
+        let changed = capture(&base.join("second"));
+        assert!(
+            changed.actions.is_empty(),
+            "a changed local action must not produce a witness"
+        );
+        let workflow = workflow::parse(workflow_path, &text).unwrap();
+        let spec = workflow::job_spec(&workflow, &GhCtx::from_env().unwrap(), "test", None);
+        let resolver = resolve::Git::from_env(&root).with_revision(sha);
+        let check = resolve::ActionCheck::new(&resolver);
+        let (code, _) = crate::plan::spec::RecordCheck::check(&check, &spec, &changed).unwrap_err();
+        assert_eq!(code, crate::plan::spec::Code::ActionUnverifiable);
+        drop(api);
+        std::fs::remove_dir_all(base).unwrap();
     }
 }

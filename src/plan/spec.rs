@@ -59,6 +59,9 @@ pub enum Code {
     RulesChanged,
     Unattested,
     UnresolvedAction,
+    ActionMoved,
+    ActionContentChanged,
+    ActionUnverifiable,
 }
 #[derive(Clone, Debug)]
 pub struct Decision {
