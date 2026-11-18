@@ -133,6 +133,7 @@
 <ul>
   <li><code>--sync git</code> (or <code>STOOP_SYNC=git</code>) uses the remote named <code>origin</code>; <code>git:NAME</code> picks another.</li>
   <li>On a miss, stoop fetches <code>refs/stoop/&lt;key&gt;</code> for that one key and checks again. <code>stoop pull</code> fetches every published proof once, which is cheaper at the start of a job that runs many steps.</li>
+  <li>The planner lists <code>refs/stoop/*</code> once, then fetches records for planned jobs and proofs named by eligible, matching records. If sync takes more than 60 seconds, the listing exceeds 100,000 refs or 16 MiB, a ref exceeds 64 MiB, or fetched refs exceed 512 MiB in total, every job runs. The byte limits apply to the listing and declared blob sizes, not to Git's network download.</li>
   <li>With <code>--sync-write</code> (or <code>STOOP_SYNC_WRITE=1</code>), a recorded run publishes its proofs, merged with what is already there.</li>
   <li><code>stoop prune</code> deletes published proofs older than <code>--max-age</code> (default 7 days). It needs write access; a scheduled job on main is the place for it.</li>
   <li>Shallow checkouts are fine: the proof refs are fetched on their own.</li>

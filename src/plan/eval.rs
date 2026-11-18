@@ -6,6 +6,21 @@ use crate::proof::{Proof, Store};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+pub(crate) fn steps_match<'a>(
+    mut expected: impl Iterator<Item = &'a str>,
+    saved: &[crate::job::StepRecord],
+) -> bool {
+    if saved.is_empty() {
+        return false;
+    }
+    for step in saved {
+        if expected.next() != Some(step.key.as_str()) {
+            return false;
+        }
+    }
+    expected.next().is_none()
+}
+
 pub struct PlanCtx<'a> {
     pub tree: &'a mut GitTree,
     pub proofs: &'a Store,
@@ -407,13 +422,7 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
             _ => None,
         })
         .collect();
-    if steps.is_empty()
-        || steps.len() != record.steps.len()
-        || steps
-            .iter()
-            .zip(&record.steps)
-            .any(|((_, key, _), r)| *key != &r.key)
-    {
+    if !steps_match(steps.iter().map(|(_, key, _)| key.as_str()), &record.steps) {
         return decision(
             Code::Incomplete,
             "record does not match traced steps".into(),
