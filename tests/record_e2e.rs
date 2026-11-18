@@ -793,3 +793,51 @@ fn regenerate_planner_recorder_fixtures() {
         fs::copy(w.store().join("proofs/t.json"), fixture.join("proof.json")).unwrap();
     }
 }
+
+#[test]
+fn invalidating_an_outside_alias_parent_prevents_stale_physical_keys() {
+    let w = Ws::new("outside-cache");
+    w.write("other/keep", "k");
+    let alias = std::env::temp_dir().join(format!("stoop-cache-alias-{}", std::process::id()));
+    let _ = fs::remove_file(&alias);
+    std::os::unix::fs::symlink(&w.root, &alias).unwrap();
+    let path = alias.display();
+    let script = format!("mkdir {path}/d; echo a > {path}/d/f; rm -r {path}/d; ln -s other {path}/d; echo b > {path}/d/g");
+    let p = recorded(&w, &script);
+    let _ = fs::remove_file(alias);
+    assert!(
+        pairs(&p, "outputs").iter().any(|(key, _)| key == "other/g"),
+        "{:?}",
+        pairs(&p, "outputs")
+    );
+}
+
+#[test]
+fn unlinkat_removedir_of_nonempty_directory_is_unplannable() {
+    let w = Ws::new("unlinkat-rmdir");
+    w.syscall_probe();
+    w.write("d/keep", "k");
+    let p = recorded(&w, "./syscall-probe unlinkat-rmdir d");
+    assert!(
+        has_reason(&p, "removed the non-empty directory d"),
+        "{:?}",
+        reasons(&p)
+    );
+}
+
+#[test]
+fn reading_written_file_through_outside_directory_alias_is_unplannable() {
+    let w = Ws::new("dir-alias-written");
+    let alias = std::env::temp_dir().join(format!("stoop-written-dir-{}", std::process::id()));
+    let _ = fs::remove_file(&alias);
+    std::os::unix::fs::symlink(&w.root, &alias).unwrap();
+    let p = recorded(
+        &w,
+        &format!(
+            "cat {}/in.txt >/dev/null; echo new > in.txt",
+            alias.display()
+        ),
+    );
+    let _ = fs::remove_file(alias);
+    assert!(has_reason(&p, "and also wrote it"), "{:?}", reasons(&p));
+}

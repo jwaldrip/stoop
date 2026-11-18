@@ -182,7 +182,7 @@ impl Fixture {
                 check: &Accept,
                 now: self.created + 1,
                 max_age: 86400,
-                github_vars: BTreeMap::new(),
+                github_vars: BTreeMap::from([("CI".into(), "true".into())]),
                 salt: None,
                 event_path: None,
                 event: None,
@@ -220,11 +220,12 @@ fn real_recorded_proofs_reject_changed_input_and_prior_states() {
         }
         f.commit();
         let changed = f.decision();
-        assert!(
-            !changed.skip && changed.code != Code::Proved,
-            "{case}: {}",
-            changed.detail
-        );
+        let expected = match case {
+            "mkdir" => Code::InputChanged,
+            "eol" => Code::Unplannable,
+            _ => Code::PriorChanged,
+        };
+        assert_eq!(changed.code, expected, "{case}: {}", changed.detail);
     }
 }
 

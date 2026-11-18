@@ -42,6 +42,9 @@ int main(int argc, char **argv) {
         close(fd);
         return result != 0;
     }
+    if (!strcmp(op, "unlinkat-rmdir")) {
+        return unlinkat(AT_FDCWD, argv[2], AT_REMOVEDIR) == 0 ? 3 : 0;
+    }
     if (!strcmp(op, "deleted-dirfd")) {
         int fd = open(argv[2], O_DIRECTORY | O_RDONLY);
         if (fd < 0 || rmdir(argv[2])) return 3;

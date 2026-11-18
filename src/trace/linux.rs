@@ -95,10 +95,9 @@ enum Op {
         to: usize,
         flags: Option<usize>,
     },
-    /// truncate. `len` is the length argument.
+    /// truncate.
     Truncate {
         path: usize,
-        len: usize,
     },
     /// chmod family. Calls follow links unless `flags` carries AT_SYMLINK_NOFOLLOW.
     Chmod {
@@ -234,7 +233,7 @@ fn table() -> Vec<(i64, Vec<Op>)> {
                 },
             ],
         ),
-        (s(libc::SYS_truncate), vec![Truncate { path: 0, len: 1 }]),
+        (s(libc::SYS_truncate), vec![Truncate { path: 0 }]),
         (s(libc::SYS_connect), vec![Connect]),
         (
             s(libc::SYS_fchmodat),
@@ -758,9 +757,9 @@ impl Rec<'_> {
         Some(found)
     }
 
-    /// Record a write to `raw` (absolute, possibly with `..`). `keeps`: the write keeps the
-    /// old bytes. `follows`: a symlink at `raw` is followed. Returns the key, when in scope.
-    fn write(&mut self, t: &mut Trace, raw: &Path, keeps: bool, follows: bool) -> Option<String> {
+    /// Record a write to `raw` (absolute, possibly with `..`). `follows` indicates
+    /// whether a symlink at `raw` is followed. Returns the key when in scope.
+    fn write(&mut self, t: &mut Trace, raw: &Path, follows: bool) -> Option<String> {
         let lex = absolutize(Path::new("/"), raw);
         let mut target = raw.to_path_buf();
         if follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink()) {
@@ -797,8 +796,7 @@ impl Rec<'_> {
             // A create fails when its parent is missing or is not a directory. A later commit
             // that adds the parent would change that outcome, so the parent's state is recorded.
             self.parent_prior(t, &loc.path);
-            let lex_target = absolutize(Path::new("/"), &target);
-            if let Some(id) = self.prior_id(t, &loc.path, &key, &lex_target, keeps) {
+            if let Some(id) = self.prior_id(t, &loc.path, &key) {
                 t.priors.insert(key.clone(), id);
             }
         }
@@ -819,7 +817,7 @@ impl Rec<'_> {
                 t.priors.insert(pkey, "a".to_string());
             }
             Ok(m) if m.is_file() => {
-                if let Some(id) = self.prior_id(t, parent, &pkey, parent, false) {
+                if let Some(id) = self.prior_id(t, parent, &pkey) {
                     t.priors.insert(pkey, id);
                 }
             }
@@ -829,14 +827,7 @@ impl Rec<'_> {
 
     /// What `phys` holds right now, in the id form a proof uses. `None` when it cannot be
     /// stated (and the run is then unplannable with a reason).
-    fn prior_id(
-        &mut self,
-        t: &mut Trace,
-        phys: &Path,
-        key: &str,
-        _lex: &Path,
-        _keeps: bool,
-    ) -> Option<String> {
+    fn prior_id(&mut self, t: &mut Trace, phys: &Path, key: &str) -> Option<String> {
         let m = match fs::symlink_metadata(phys) {
             Ok(m) => m,
             Err(e) if is_absent(&e) => return Some("a".to_string()),
@@ -997,7 +988,7 @@ impl Tracer<'_> {
     }
 
     /// Record a write, and what the path held before the first one. Returns the key when in scope.
-    fn write(&mut self, raw: &Path, keeps: bool, follows: bool) -> Option<String> {
+    fn write(&mut self, raw: &Path, follows: bool) -> Option<String> {
         self.rec.as_ref()?;
         // A write through a link changes what the link points to, not the link itself.
         let through_link =
@@ -1008,7 +999,7 @@ impl Tracer<'_> {
             self.touch(raw.to_path_buf(), true);
         }
         let rec = self.rec.as_mut()?;
-        rec.write(&mut self.t, raw, keeps, follows)
+        rec.write(&mut self.t, raw, follows)
     }
 
     /// Sockets that name services use. A shell or libc touches these on startup, and
@@ -1071,9 +1062,9 @@ impl Tracer<'_> {
             Some(f) if f & libc::O_TMPFILE == libc::O_TMPFILE => {
                 self.touch(p, false);
             }
-            // creat truncates, so the old bytes do not survive.
+            // creat truncates the named file.
             None => {
-                self.write(&p, false, true);
+                self.write(&p, true);
             }
             Some(f) => {
                 let writes = f
@@ -1084,10 +1075,9 @@ impl Tracer<'_> {
                         | libc::O_APPEND)
                     != 0;
                 if writes {
-                    let keeps = f & libc::O_TRUNC == 0;
                     let creates_exclusively = f & libc::O_CREAT != 0 && f & libc::O_EXCL != 0;
                     let follows = f & libc::O_NOFOLLOW == 0 && !creates_exclusively;
-                    self.write(&p, keeps, follows);
+                    self.write(&p, follows);
                 } else {
                     self.touch(p, true);
                 }
@@ -1108,7 +1098,7 @@ impl Tracer<'_> {
             }
             self.t.created_dirs.push(absolutize(Path::new("/"), &p));
         }
-        self.write(&p, false, false);
+        self.write(&p, false);
     }
 
     fn remove(
@@ -1125,7 +1115,7 @@ impl Tracer<'_> {
         };
         let removes_dir = dir || flags.is_some_and(|i| args[i] as i32 & AT_REMOVEDIR != 0);
         // Read the directory's contents before the call, while they are still there.
-        let key = self.write(&p, false, false);
+        let key = self.write(&p, false);
         if let Some(key) = key.filter(|_| removes_dir && is_dir(&p)) {
             if let Ok(mut entries) = fs::read_dir(&p) {
                 if entries.next().is_some() {
@@ -1154,9 +1144,8 @@ impl Tracer<'_> {
         };
         let exchange = flags.is_some_and(|i| args[i] as u32 & RENAME_EXCHANGE != 0);
         let directory = is_dir(&a) || (exchange && is_dir(&b));
-        // The source's bytes move with it; the destination's survive only an exchange.
-        let ka = self.write(&a, true, false);
-        let kb = self.write(&b, exchange, false);
+        let ka = self.write(&a, false);
+        let kb = self.write(&b, false);
         if directory && (ka.is_some() || kb.is_some()) {
             let name = |k: Option<String>, p: &Path| {
                 k.unwrap_or_else(|| absolutize(Path::new("/"), p).to_string_lossy().into_owned())
@@ -1178,7 +1167,7 @@ impl Tracer<'_> {
         match fs::symlink_metadata(raw) {
             Ok(m) if m.is_dir() => self.touch(raw.to_path_buf(), false),
             Ok(_) => {
-                self.write(raw, true, follows);
+                self.write(raw, follows);
             }
             Err(_) => {}
         }
@@ -1232,10 +1221,9 @@ impl Tracer<'_> {
                     to,
                     flags,
                 } => self.rename(pid, &args, (from_dirfd, from), (to_dirfd, to), flags),
-                Op::Truncate { path, len } => {
+                Op::Truncate { path } => {
                     if let Some(p) = self.resolve(pid, &args, None, path) {
-                        // Truncating to zero drops the old bytes; any other length keeps some.
-                        self.write(&p, (args[len] as i64) > 0, true);
+                        self.write(&p, true);
                     }
                 }
                 Op::Chmod { dirfd, path, flags } => {
