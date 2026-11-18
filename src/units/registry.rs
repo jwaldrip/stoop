@@ -255,6 +255,40 @@ fn is_python(name: Option<&str>) -> bool {
         .is_some_and(|suffix| suffix.bytes().all(|c| c.is_ascii_digit() || c == b'.'))
 }
 
+fn shell_command(args: &[std::ffi::OsString]) -> bool {
+    let mut args = args.iter().skip(1);
+    while let Some(arg) = args.next() {
+        let Some(arg) = arg.to_str() else {
+            return false;
+        };
+        if arg == "--" {
+            return false;
+        }
+        if arg.starts_with("--") {
+            if matches!(arg, "--rcfile" | "--init-file") && args.next().is_none() {
+                return false;
+            }
+            continue;
+        }
+        if arg == "+o" {
+            if args.next().is_none() {
+                return false;
+            }
+            continue;
+        }
+        let Some(short) = arg.strip_prefix('-').filter(|short| !short.is_empty()) else {
+            return false;
+        };
+        if short.contains('c') {
+            return true;
+        }
+        if short.ends_with('o') && args.next().is_none() {
+            return false;
+        }
+    }
+    false
+}
+
 fn matches(row: &Row, event: &ExecEvent) -> bool {
     let name = base(event.requested.as_os_str());
     let args = &event.argv;
@@ -281,15 +315,7 @@ fn matches(row: &Row, event: &ExecEvent) -> bool {
             named(name, &["node", "nodejs"])
                 && args.get(1).is_some_and(|entry| named(base(entry), names))
         }
-        Match::Shell => {
-            named(name, &["sh", "dash", "bash", "zsh", "ash"])
-                && args
-                    .iter()
-                    .skip(1)
-                    .filter_map(|a| a.to_str())
-                    .take_while(|a| a.starts_with('-') && *a != "--")
-                    .any(|a| a[1..].contains('c'))
-        }
+        Match::Shell => named(name, &["sh", "dash", "bash", "zsh", "ash"]) && shell_command(args),
     }
 }
 
@@ -493,6 +519,38 @@ mod tests {
             assert_eq!(
                 diagnostic(&events),
                 Some(format!("stoop: observed jest via {name} (diagnostic only)"))
+            );
+        }
+    }
+
+    #[test]
+    fn shell_wrapper_requires_a_real_command_option() {
+        for args in [
+            vec!["bash", "--norc", "script"],
+            vec!["bash", "--", "-c", "script"],
+            vec!["bash", "-o", "pipefail", "script"],
+        ] {
+            let events = vec![
+                event(None, "bash", &args),
+                event(Some(0), "pytest", &["pytest"]),
+            ];
+            assert_eq!(
+                diagnostic(&events).as_deref(),
+                Some("stoop: observed pytest (diagnostic only)")
+            );
+        }
+        for args in [
+            vec!["bash", "-o", "pipefail", "-c", "pytest"],
+            vec!["bash", "--norc", "-lc", "pytest"],
+            vec!["bash", "--rcfile", "rc", "-c", "pytest"],
+        ] {
+            let events = vec![
+                event(None, "bash", &args),
+                event(Some(0), "pytest", &["pytest"]),
+            ];
+            assert_eq!(
+                diagnostic(&events).as_deref(),
+                Some("stoop: observed pytest via sh (diagnostic only)")
             );
         }
     }

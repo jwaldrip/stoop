@@ -705,6 +705,12 @@ pub fn run<'a>(
         let sig = libc::WSTOPSIG(st);
         match (st >> 16) & 0xff {
             0 => {
+                // A child can report its initial stop before waitpid delivers its
+                // parent's fork event. Hold that already-stopped child until its
+                // inherited image is known; it has not executed user code yet.
+                if sig == libc::SIGSTOP && tr.execs.as_mut().is_some_and(|execs| execs.defer(p)) {
+                    continue;
+                }
                 // A fresh tracee announces itself with SIGSTOP; swallow that one.
                 let pass = if sig == libc::SIGSTOP || sig == libc::SIGTRAP || syscall_exit {
                     0
@@ -832,33 +838,58 @@ struct ExecObserver {
     // The current image for each traced task; a fork inherits its parent's image.
     tasks: HashMap<i32, Option<usize>>,
     pending: HashMap<i32, Option<PendingExec>>,
+    deferred: HashSet<i32>,
     events: Vec<ExecEvent>,
     valid: bool,
+    collecting: bool,
 }
 
 impl ExecObserver {
     fn new(root: i32) -> Self {
         Self {
             tasks: HashMap::from([(root, None)]),
+            deferred: HashSet::new(),
             pending: HashMap::new(),
             events: Vec::new(),
             valid: true,
+            collecting: true,
+        }
+    }
+
+    fn stop_collecting(&mut self) {
+        self.collecting = false;
+        self.tasks.clear();
+        self.pending.clear();
+        // Never leave a tracee stopped solely for diagnostic collection.
+        for pid in self.deferred.drain() {
+            cont(pid, 0);
         }
     }
 
     fn invalidate(&mut self) {
+        self.stop_collecting();
         self.valid = false;
-        self.tasks.clear();
-        self.pending.clear();
         self.events.clear();
     }
 
+    fn defer(&mut self, pid: i32) -> bool {
+        if !self.collecting || self.tasks.contains_key(&pid) {
+            return false;
+        }
+        if self.deferred.len() >= MAX_EXEC_TASKS {
+            self.stop_collecting();
+            return false;
+        }
+        self.deferred.insert(pid);
+        true
+    }
+
     fn enter(&mut self, pid: i32, nr: i64, args: &[u64; 6]) {
-        if !self.valid {
+        if !self.collecting {
             return;
         }
         if !self.tasks.contains_key(&pid) {
-            self.invalidate();
+            self.stop_collecting();
             return;
         }
         let (path, argv) = if nr == libc::SYS_execve {
@@ -888,36 +919,49 @@ impl ExecObserver {
     }
 
     fn fork(&mut self, parent: i32) {
-        if !self.valid {
+        if !self.collecting {
             return;
         }
-        let child = event_message(parent);
-        let inherited = self.tasks.get(&parent).copied();
-        match (child, inherited) {
-            (Some(child), Some(image)) if self.tasks.len() < MAX_EXEC_TASKS => {
-                self.tasks.insert(child, image);
-                self.pending.remove(&child);
-            }
-            _ => self.invalidate(),
+        let Some(child) = event_message(parent) else {
+            self.stop_collecting();
+            return;
+        };
+        if self.register_child(parent, child) {
+            cont(child, 0);
         }
     }
 
+    // Returns whether this child stopped before the fork event and must now resume.
+    fn register_child(&mut self, parent: i32, child: i32) -> bool {
+        let Some(image) = self.tasks.get(&parent).copied() else {
+            self.stop_collecting();
+            return false;
+        };
+        if self.tasks.len() >= MAX_EXEC_TASKS {
+            self.stop_collecting();
+            return false;
+        }
+        self.tasks.insert(child, image);
+        self.pending.remove(&child);
+        self.deferred.remove(&child)
+    }
+
     fn exec(&mut self, pid: i32) {
-        if !self.valid {
+        if !self.collecting {
             return;
         }
         // A non-leader thread takes the leader's TID at exec. Linux reports its former
         // TID in the event message, which identifies the pending entry and ancestry.
         let Some(former) = event_message(pid) else {
-            self.invalidate();
+            self.stop_collecting();
             return;
         };
         let Some(parent) = self.tasks.remove(&former) else {
-            self.invalidate();
+            self.stop_collecting();
             return;
         };
         let Some(Some(pending)) = self.pending.remove(&former) else {
-            self.invalidate();
+            self.stop_collecting();
             return;
         };
         if former != pid {
@@ -925,11 +969,10 @@ impl ExecObserver {
             self.pending.remove(&pid);
         }
         let Some((executable, effective_argv, cwd)) = exec_image(pid) else {
-            self.invalidate();
+            self.stop_collecting();
             return;
         };
-        if self.events.len() >= MAX_EXEC_EVENTS {
-            self.invalidate();
+        if !self.reserve_event() {
             return;
         }
         let index = self.events.len();
@@ -944,9 +987,18 @@ impl ExecObserver {
         self.tasks.insert(pid, Some(index));
     }
 
+    fn reserve_event(&mut self) -> bool {
+        if self.events.len() >= MAX_EXEC_EVENTS {
+            self.stop_collecting();
+            return false;
+        }
+        true
+    }
+
     fn exit(&mut self, pid: i32) {
         self.tasks.remove(&pid);
         self.pending.remove(&pid);
+        self.deferred.remove(&pid);
     }
 
     fn finish(self) -> Option<Vec<ExecEvent>> {
@@ -978,6 +1030,7 @@ fn read_exec_argv(pid: i32, address: u64) -> Option<Vec<OsString>> {
     let pointers = read_mem(pid, address, (MAX_EXEC_ARGS + 1) * 8)?;
     let mut argv = Vec::new();
     let mut bytes = 0;
+    let mut mem = None;
     for raw in pointers.as_chunks::<8>().0.iter().take(MAX_EXEC_ARGS + 1) {
         let pointer = u64::from_ne_bytes(*raw);
         if pointer == 0 {
@@ -986,14 +1039,59 @@ fn read_exec_argv(pid: i32, address: u64) -> Option<Vec<OsString>> {
         if argv.len() == MAX_EXEC_ARGS {
             return None;
         }
-        let mut arg = read_mem(pid, pointer, MAX_EXEC_ARG_BYTES.checked_sub(bytes)? + 1)?;
-        let end = arg.iter().position(|byte| *byte == 0)?;
-        bytes += end + 1;
-        if bytes > MAX_EXEC_ARG_BYTES {
+        let arg = read_exec_arg(
+            pid,
+            pointer,
+            MAX_EXEC_ARG_BYTES.checked_sub(bytes)?,
+            &mut mem,
+        )?;
+        bytes += arg.len() + 1;
+        argv.push(OsString::from_vec(arg));
+    }
+    None
+}
+
+// Read short arguments into a stack buffer instead of allocating and copying the
+// entire remaining argv budget for each one.
+fn read_exec_arg(
+    pid: i32,
+    mut address: u64,
+    mut remaining: usize,
+    mem: &mut Option<fs::File>,
+) -> Option<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+
+    let mut arg = Vec::new();
+    let mut buffer = [0u8; 256];
+    while remaining > 0 {
+        let len = remaining.min(buffer.len());
+        let local = libc::iovec {
+            iov_base: buffer.as_mut_ptr().cast(),
+            iov_len: len,
+        };
+        let remote = libc::iovec {
+            iov_base: address as *mut libc::c_void,
+            iov_len: len,
+        };
+        let result = unsafe { libc::process_vm_readv(pid, &local, 1, &remote, 1, 0) };
+        let n = if result > 0 {
+            result as usize
+        } else {
+            if mem.is_none() {
+                *mem = Some(fs::File::open(format!("/proc/{pid}/mem")).ok()?);
+            }
+            mem.as_ref()?.read_at(&mut buffer[..len], address).ok()?
+        };
+        if n == 0 {
             return None;
         }
-        arg.truncate(end);
-        argv.push(OsString::from_vec(arg));
+        if let Some(end) = buffer[..n].iter().position(|byte| *byte == 0) {
+            arg.extend_from_slice(&buffer[..end]);
+            return Some(arg);
+        }
+        arg.extend_from_slice(&buffer[..n]);
+        remaining -= n;
+        address = address.checked_add(n as u64)?;
     }
     None
 }
@@ -2048,5 +2146,79 @@ mod tests {
         assert_eq!(tracer.magic_epoch, 2);
         tracer.after_topology_stop(42);
         assert_eq!(tracer.magic_epoch, 2);
+    }
+
+    fn sample_exec() -> ExecEvent {
+        ExecEvent {
+            parent: None,
+            requested: PathBuf::from("/bin/pytest"),
+            argv: vec![OsString::from("pytest")],
+            executable: PathBuf::from("/bin/sh"),
+            effective_argv: vec![OsString::from("sh")],
+            cwd: PathBuf::from("/"),
+        }
+    }
+
+    #[test]
+    fn child_stop_before_fork_preserves_its_inherited_image() {
+        let mut observer = ExecObserver::new(10);
+        observer.events.push(sample_exec());
+        observer.tasks.insert(10, Some(0));
+        assert!(observer.defer(11));
+        assert!(observer.register_child(10, 11));
+        assert_eq!(observer.tasks.get(&11), Some(&Some(0)));
+        assert!(!observer.defer(11));
+        assert!(!observer.deferred.contains(&11));
+    }
+
+    #[test]
+    fn argument_reads_stop_at_nul_across_chunk_boundaries() {
+        let pid = unsafe { libc::getpid() };
+        let mut bytes = vec![b'x'; 257];
+        bytes[256] = 0;
+        let address = bytes.as_ptr() as u64;
+        assert_eq!(
+            read_exec_arg(pid, address, 257, &mut None).unwrap(),
+            vec![b'x'; 256]
+        );
+        assert!(read_exec_arg(pid, address, 256, &mut None).is_none());
+        bytes[4] = 0;
+        assert_eq!(
+            read_exec_arg(pid, address, 257, &mut None).unwrap(),
+            vec![b'x'; 4]
+        );
+    }
+
+    #[test]
+    fn exec_event_cap_keeps_the_completed_prefix() {
+        let mut observer = ExecObserver::new(10);
+        observer
+            .events
+            .extend((1..MAX_EXEC_EVENTS).map(|_| sample_exec()));
+        assert!(observer.reserve_event());
+        observer.events.push(sample_exec());
+        assert!(!observer.reserve_event());
+        assert!(!observer.collecting);
+        assert_eq!(observer.finish().unwrap().len(), MAX_EXEC_EVENTS);
+    }
+
+    #[test]
+    fn live_task_cap_and_exit_cleanup_are_bounded() {
+        let mut observer = ExecObserver::new(10);
+        for child in 11..(10 + MAX_EXEC_TASKS as i32) {
+            assert!(!observer.register_child(10, child));
+            assert!(observer.collecting);
+        }
+        assert_eq!(observer.tasks.len(), MAX_EXEC_TASKS);
+        assert!(!observer.register_child(10, 100_000));
+        assert!(!observer.collecting);
+
+        let mut observer = ExecObserver::new(10);
+        for child in 11..(11 + MAX_EXEC_TASKS as i32 * 2) {
+            assert!(!observer.register_child(10, child));
+            observer.exit(child);
+        }
+        assert!(observer.collecting);
+        assert_eq!(observer.tasks.len(), 1);
     }
 }
