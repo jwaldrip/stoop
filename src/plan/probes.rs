@@ -3,6 +3,7 @@ use super::*;
 use crate::attest::tests as a;
 use crate::job::{JobRecord, RecordStatus, StepHow, StepRecord};
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -16,6 +17,13 @@ fn git(root: &Path, args: &[&str]) {
         .current_dir(root)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_ATTR_SOURCE")
         .args([
             "-c",
             "user.name=t",
@@ -36,6 +44,7 @@ struct Repo {
     root: PathBuf,
     sha: String,
     event: PathBuf,
+    api: Option<gha::actions::FixtureServer>,
 }
 
 impl Repo {
@@ -55,6 +64,15 @@ impl Repo {
         let sha = String::from_utf8(
             Command::new("git")
                 .current_dir(&root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_ALLOW_PROTOCOL", "file")
+                .env_remove("GIT_CONFIG_COUNT")
+                .env_remove("GIT_CONFIG_PARAMETERS")
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_INDEX_FILE")
+                .env_remove("GIT_ATTR_SOURCE")
                 .args(["rev-parse", "HEAD"])
                 .output()
                 .unwrap()
@@ -65,11 +83,16 @@ impl Repo {
         .to_string();
         let event = base.join("event.json");
         std::fs::write(&event, r#"{"repository":{"default_branch":"main"}}"#).unwrap();
+        let archive = base.join(format!("api/repos/actions/checkout/tarball/{PIN}"));
+        std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+        std::fs::write(archive, crate::gha::actions::fixture_archive()).unwrap();
+        let api = gha::actions::FixtureServer::new(base.join("api"));
         Repo {
             base,
             root,
             sha,
             event,
+            api: Some(api),
         }
     }
     fn store(&self) -> PathBuf {
@@ -79,6 +102,7 @@ impl Repo {
 
 impl Drop for Repo {
     fn drop(&mut self) {
+        drop(self.api.take());
         if std::env::var_os("PROBE_KEEP").is_none() {
             let _ = std::fs::remove_dir_all(&self.base);
         }
@@ -91,6 +115,48 @@ fn file(path: &str, bytes: &[u8]) -> input::Input {
         id: format!("f:{}", blake3::hash(bytes).to_hex()),
         oid: None,
         oid_basis: None,
+    }
+}
+
+struct RecordingSource {
+    fake: gha::resolve::fake::Fake,
+    git: gha::resolve::Git,
+}
+impl gha::resolve::Resolver for RecordingSource {
+    fn commit(&self, owner: &str, repo: &str, reference: &str) -> Result<String, String> {
+        self.fake.commit(owner, repo, reference)
+    }
+    fn action_tree(
+        &self,
+        owner: &str,
+        repo: &str,
+        sha: &str,
+        deadline: std::time::Instant,
+    ) -> Result<std::rc::Rc<gha::actions::Tree>, String> {
+        self.fake.action_tree(owner, repo, sha, deadline)
+    }
+    fn runner_copy(
+        &self,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+        deadline: std::time::Instant,
+    ) -> Result<gha::actions::Tree, String> {
+        self.fake.runner_copy(owner, repo, reference, deadline)
+    }
+    fn local_tree(
+        &self,
+        path: &str,
+        deadline: std::time::Instant,
+    ) -> Result<(String, std::rc::Rc<gha::actions::Tree>), String> {
+        self.git.local_tree(path, deadline)
+    }
+    fn local_copy(
+        &self,
+        path: &str,
+        deadline: std::time::Instant,
+    ) -> Result<gha::actions::Tree, String> {
+        self.git.local_copy(path, deadline)
     }
 }
 
@@ -156,11 +222,19 @@ fn record(r: &Repo, x: Rec<'_>) -> Option<String> {
     rec.commit = Some(r.sha.clone());
     rec.event_path = Some(r.event.to_string_lossy().into_owned());
     rec.workflow_ref = Some(workflow_ref.clone());
-    rec.actions = spec
-        .actions
-        .iter()
-        .map(|u| (u.clone(), u.rsplit_once('@').unwrap().1.to_string()))
-        .collect();
+    let source = RecordingSource {
+        fake: gha::resolve::fake::Fake::new(),
+        git: gha::resolve::Git::new(
+            &r.root,
+            "https://github.com",
+            std::time::Duration::from_secs(5),
+        )
+        .with_revision(r.sha.clone()),
+    };
+    for raw in &spec.actions {
+        source.fake.set(raw, Ok(PIN));
+    }
+    rec.actions = gha::actions::capture(&spec.actions, &source, false).unwrap();
     rec.steps = steps;
     if x.attested {
         let mut claims = a::claims(&rec);
@@ -209,7 +283,31 @@ fn probe_child() {
         );
         return;
     }
-    let result = build(&o, &root, &path, &mut plan, |policy, now, age| {
+    let mut limits = sync::Limits::PLAN;
+    if let Some(value) = std::env::var_os("PROBE_SYNC_LIMITS") {
+        let value: Value = serde_json::from_str(value.to_str().unwrap()).unwrap();
+        let number = |field: &str| {
+            value
+                .get(field)
+                .map(|v| v.as_u64().expect("limit must be an unsigned integer"))
+        };
+        if let Some(n) = number("deadline_ms") {
+            limits.deadline = std::time::Duration::from_millis(n);
+        }
+        if let Some(n) = number("listing_bytes") {
+            limits.listing_bytes = n;
+        }
+        if let Some(n) = number("refs") {
+            limits.refs = usize::try_from(n).expect("refs limit does not fit usize");
+        }
+        if let Some(n) = number("blob_bytes") {
+            limits.blob_bytes = n;
+        }
+        if let Some(n) = number("total_bytes") {
+            limits.total_bytes = n;
+        }
+    }
+    let result = build(&o, &root, &path, &mut plan, limits, |policy, now, age| {
         attest::Verifier::new(policy, a::Fixed(a::published()), now, age)
     });
     let warning = result.err();
@@ -247,6 +345,14 @@ fn plan(r: &Repo, args: &[&str], env: &[(&str, &str)]) -> Out {
     .current_dir(&r.root)
     .env("PROBE_ROOT", &r.root)
     .env("PROBE_ARGS", serde_json::to_string(args).unwrap())
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env_remove("GIT_CONFIG_COUNT")
+    .env_remove("GIT_CONFIG_PARAMETERS")
+    .env_remove("GIT_DIR")
+    .env_remove("GIT_WORK_TREE")
+    .env_remove("GIT_INDEX_FILE")
+    .env_remove("GIT_ATTR_SOURCE")
     .env("GITHUB_JOB", "stoop-plan")
     .env("GITHUB_ACTIONS", "true")
     .env("GITHUB_REPOSITORY", a::REPO)
@@ -254,6 +360,9 @@ fn plan(r: &Repo, args: &[&str], env: &[(&str, &str)]) -> Out {
     .env("GITHUB_REPOSITORY_OWNER_ID", a::OWNER_ID)
     .env("GITHUB_SHA", &r.sha)
     .env("GITHUB_EVENT_PATH", &r.event)
+    .env("GITHUB_API_URL", &r.api.as_ref().unwrap().url)
+    .env("NO_PROXY", "127.0.0.1,localhost")
+    .env("no_proxy", "127.0.0.1,localhost")
     .env(
         "GITHUB_WORKFLOW_REF",
         format!("{}/{CI}@refs/heads/main", a::REPO),
@@ -265,6 +374,8 @@ fn plan(r: &Repo, args: &[&str], env: &[(&str, &str)]) -> Out {
     for k in [
         "GITHUB_OUTPUT",
         "GITHUB_STEP_SUMMARY",
+        "PROBE_SYNC_LIMITS",
+        "PROBE_WARNING",
         "STOOP_SYNC",
         "STOOP_FULL",
         "STOOP_OFF",
@@ -305,6 +416,263 @@ fn code(o: &Out, job: &str) -> String {
         .find(|j| j["id"] == job)
         .map(|j| j["code"].as_str().unwrap().to_string())
         .unwrap_or_else(|| "absent".into())
+}
+
+#[test]
+fn legacy_action_witness_is_cold_next_to_a_witnessed_positive_control() {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    let key = record(&r, rec(&w, now, now)).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+    let jobs = job::JobStore::new(r.store());
+    let mut record = jobs.load(&key).remove(0);
+    record.actions.remove(gha::actions::WITNESS_KEY);
+    let mut claims = a::claims(&record);
+    claims["aud"] = json!(attest::audience(&key, &record).unwrap());
+    claims["sha"] = json!(r.sha);
+    claims["iat"] = json!(now);
+    claims["nbf"] = json!(now);
+    record.attest = Some(a::token(
+        &a::header("test-key-1"),
+        &claims,
+        &a::pair(a::KEY_1),
+    ));
+    jobs.save(&key, record).unwrap();
+    let mut file: Value = serde_json::from_slice(&jobs.export(&key).unwrap()).unwrap();
+    file["v"] = json!(1);
+    std::fs::write(
+        r.store()
+            .join("jobs")
+            .join(format!("{}.json", proof::sanitize(&key))),
+        serde_json::to_vec(&file).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        code(&plan(&r, &["--format", "json"], &[]), "a"),
+        "action-unverifiable"
+    );
+}
+
+#[test]
+fn tampered_action_archive_is_reported_by_the_plan() {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    let mut archive = tar::Builder::new(gz);
+    for (name, bytes) in [
+        (
+            "action.yml",
+            &b"runs:\n  using: node20\n  main: index.js\n"[..],
+        ),
+        ("index.js", &b"tampered\n"[..]),
+    ] {
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, format!("repo-sha/{name}"), bytes)
+            .unwrap();
+    }
+    let bytes = archive.into_inner().unwrap().finish().unwrap();
+    std::fs::write(
+        r.base
+            .join(format!("api/repos/actions/checkout/tarball/{PIN}")),
+        bytes,
+    )
+    .unwrap();
+    let plan = plan(&r, &["--format", "json"], &[]);
+    assert_eq!(code(&plan, "a"), "action-content-changed");
+    assert!(plan.plan["skip"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn unusable_disk_cache_does_not_block_a_valid_plan() {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    let cache = r.root.join("unusable-cache");
+    let result = plan(
+        &r,
+        &["--format", "json"],
+        &[("XDG_CACHE_HOME", cache.to_str().unwrap())],
+    );
+    assert_eq!(code(&result, "a"), "proved", "{}", result.plan);
+    assert!(!cache.exists());
+}
+
+fn malformed_archive_is_unverifiable(bytes: &[u8]) {
+    let w = workflow("", "", "");
+    let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+    std::fs::write(
+        r.base
+            .join(format!("api/repos/actions/checkout/tarball/{PIN}")),
+        bytes,
+    )
+    .unwrap();
+    let result = plan(&r, &["--format", "json"], &[]);
+    assert_eq!(code(&result, "a"), "action-unverifiable", "{}", result.plan);
+    assert!(result.plan["skip"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn bad_archive_truncated_gzip_is_unverifiable() {
+    let mut bytes = gha::actions::fixture_archive();
+    bytes.truncate(bytes.len() - 8);
+    malformed_archive_is_unverifiable(&bytes);
+}
+
+#[test]
+fn bad_archive_crc_is_unverifiable() {
+    let mut bytes = gha::actions::fixture_archive();
+    let offset = bytes.len() - 8;
+    bytes[offset] ^= 1;
+    malformed_archive_is_unverifiable(&bytes);
+}
+
+#[test]
+fn bad_archive_isize_is_unverifiable() {
+    let mut bytes = gha::actions::fixture_archive();
+    let offset = bytes.len() - 4;
+    bytes[offset] ^= 1;
+    malformed_archive_is_unverifiable(&bytes);
+}
+
+#[test]
+fn bad_archive_trailing_bytes_are_unverifiable() {
+    let mut bytes = gha::actions::fixture_archive();
+    bytes.extend_from_slice(b"garbage");
+    malformed_archive_is_unverifiable(&bytes);
+}
+
+#[test]
+fn bad_archive_excess_padding_is_unverifiable() {
+    let source = gha::actions::fixture_archive();
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(&source[..])
+        .read_to_end(&mut tar)
+        .unwrap();
+    tar.resize(tar.len() + 64 * 1024 + 512, 0);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar).unwrap();
+    malformed_archive_is_unverifiable(&encoder.finish().unwrap());
+}
+
+#[test]
+fn bad_archive_incomplete_tar_end_is_unverifiable() {
+    let source = gha::actions::fixture_archive();
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(&source[..])
+        .read_to_end(&mut tar)
+        .unwrap();
+    tar.truncate(tar.len() - 512);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar).unwrap();
+    malformed_archive_is_unverifiable(&encoder.finish().unwrap());
+}
+
+#[test]
+fn bad_archive_nonzero_tar_suffix_is_unverifiable() {
+    let source = gha::actions::fixture_archive();
+    let mut tar = Vec::new();
+    flate2::read::GzDecoder::new(&source[..])
+        .read_to_end(&mut tar)
+        .unwrap();
+    tar.extend_from_slice(&[1u8; 512]);
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(&tar).unwrap();
+    malformed_archive_is_unverifiable(&encoder.finish().unwrap());
+}
+
+#[test]
+fn bad_archive_decompression_cap_is_unverifiable() {
+    fn file(encoder: &mut flate2::write::GzEncoder<Vec<u8>>, name: &str, bytes: &[u8]) {
+        let mut header = tar::Header::new_ustar();
+        header.set_path(name).unwrap();
+        header.set_mode(0o644);
+        header.set_size(bytes.len() as u64);
+        header.set_cksum();
+        encoder.write_all(header.as_bytes()).unwrap();
+        encoder.write_all(bytes).unwrap();
+        encoder
+            .write_all(&vec![0; (512 - bytes.len() % 512) % 512])
+            .unwrap();
+    }
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    file(
+        &mut encoder,
+        "repo-sha/action.yml",
+        b"runs:\n  using: node20\n  main: index.js\n",
+    );
+    file(&mut encoder, "repo-sha/index.js", b"fixture\n");
+    let mut directory = tar::Header::new_ustar();
+    directory.set_path("repo-sha/padding/").unwrap();
+    directory.set_entry_type(tar::EntryType::Directory);
+    directory.set_mode(0o755);
+    directory.set_size(gha::actions::MAX_TAR - 2560);
+    directory.set_cksum();
+    encoder.write_all(directory.as_bytes()).unwrap();
+    std::io::copy(
+        &mut std::io::repeat(0).take(gha::actions::MAX_TAR - 2560),
+        &mut encoder,
+    )
+    .unwrap();
+    file(&mut encoder, "repo-sha/hidden", b"x");
+    encoder.write_all(&[0u8; 1024]).unwrap();
+    malformed_archive_is_unverifiable(&encoder.finish().unwrap());
+}
+
+#[test]
+fn local_action_uses_the_requested_revision_instead_of_head() {
+    let w = workflow("", "", "").replace(
+        "      - run: cat a.txt",
+        "      - uses: ./.github/actions/check\n        env: {STOOP_PLAN: neutral}\n      - run: cat a.txt",
+    );
+    let r = Repo::new(&[
+        (CI, &w),
+        ("a.txt", "a\n"),
+        (
+            ".github/actions/check/action.yml",
+            "runs:\n  using: node20\n  main: index.js\n",
+        ),
+        (".github/actions/check/index.js", "first\n"),
+    ]);
+    let now = proof::now();
+    record(&r, rec(&w, now, now)).unwrap();
+    std::fs::write(r.root.join(".github/actions/check/index.js"), "changed\n").unwrap();
+    git(&r.root, &["commit", "-qam", "change action"]);
+    let new_sha = String::from_utf8(
+        Command::new("git")
+            .current_dir(&r.root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_owned();
+    let old_target = plan(
+        &r,
+        &["--format", "json", "--rev", &r.sha],
+        &[("GITHUB_ACTIONS", ""), ("GITHUB_SHA", "")],
+    );
+    assert_eq!(code(&old_target, "a"), "proved");
+    let new_target = plan(
+        &r,
+        &["--format", "json", "--rev", &new_sha],
+        &[("GITHUB_ACTIONS", ""), ("GITHUB_SHA", "")],
+    );
+    assert_eq!(code(&new_target, "a"), "action-moved");
 }
 
 fn report(name: &str, o: &Out) {
@@ -523,6 +891,31 @@ fn two_attested_jobs_plan_only_the_unchanged_input() {
 }
 
 #[test]
+fn workflow_show_ignores_replaced_blob() {
+    let original = workflow("", "", "");
+    let replacement = "name: replaced workflow\njobs: {}\n";
+    let r = Repo::new(&[(CI, &original), ("replacement.yml", replacement)]);
+    let oid = |path: &str| {
+        let out = Command::new("git")
+            .current_dir(&r.root)
+            .args(["rev-parse", &format!("HEAD:{path}")])
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    };
+    git(&r.root, &["replace", &oid(CI), &oid("replacement.yml")]);
+    let unguarded = Command::new("git")
+        .current_dir(&r.root)
+        .args(["show", &format!("{}:{CI}", r.sha)])
+        .output()
+        .unwrap();
+    assert!(unguarded.status.success());
+    assert_eq!(String::from_utf8(unguarded.stdout).unwrap(), replacement);
+    assert_eq!(show(&r.root, &r.sha, CI).unwrap(), original);
+}
+
+#[test]
 fn ungated_job_never_enters_skip_output() {
     let w = workflow(
         "",
@@ -569,6 +962,185 @@ fn sync_failure_refuses_a_provable_record() {
     assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
     let o = plan(&r, &["--format", "json", "--sync", "git:missing"], &[]);
     assert_eq!(code(&o, "a"), "error");
+}
+
+struct SyncFixture {
+    repo: Repo,
+    job_keys: Vec<String>,
+    proof_keys: Vec<String>,
+    job_bytes: u64,
+}
+
+fn put_remote_ref(remote: &Path, key: &str, bytes: &[u8]) {
+    let mut child = Command::new("git")
+        .current_dir(remote)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_ALLOW_PROTOCOL", "file")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_ATTR_SOURCE")
+        .args(["hash-object", "-w", "--stdin"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(bytes).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success());
+    let oid = std::str::from_utf8(&output.stdout).unwrap().trim();
+    git(remote, &["update-ref", &sync::ref_name(key), oid]);
+}
+
+fn sync_fixture() -> SyncFixture {
+    let b = format!("  b:\n    needs: [stoop-plan]\n    if: ${{{{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',b,') }}}}\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@{PIN}\n      - run: cat b.txt > /dev/null\n");
+    let w = workflow("", "", &b);
+    let repo = Repo::new(&[(CI, &w), ("a.txt", "a\n"), ("b.txt", "b\n")]);
+    let now = proof::now();
+    let a_key = record(&repo, rec(&w, now, now)).unwrap();
+    let mut b_record = rec(&w, now, now);
+    b_record.job = "b";
+    b_record.inputs = vec![file("b.txt", b"b\n")];
+    let b_key = record(&repo, b_record).unwrap();
+    let job_keys = vec![a_key, b_key];
+    let jobs = job::JobStore::new(repo.store());
+    let proofs = proof::Store::new(repo.store());
+    let remote = repo.base.join("origin.git");
+    git(
+        &repo.root,
+        &["init", "--bare", "-q", remote.to_str().unwrap()],
+    );
+    git(
+        &repo.root,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    let mut job_bytes = 0;
+    let mut proof_keys = Vec::new();
+    for key in &job_keys {
+        let bytes = jobs.export(key).unwrap();
+        job_bytes += bytes.len() as u64;
+        put_remote_ref(&remote, key, &bytes);
+        for step in &jobs.load(key)[0].steps {
+            let bytes = proofs.export(&step.key).unwrap();
+            put_remote_ref(&remote, &step.key, &bytes);
+            proof_keys.push(step.key.clone());
+        }
+    }
+    std::fs::remove_dir_all(repo.store()).unwrap();
+    SyncFixture {
+        repo,
+        job_keys,
+        proof_keys,
+        job_bytes,
+    }
+}
+
+fn assert_sync_error(out: &Out, detail: &str) {
+    assert_eq!(out.plan["skip"], json!([]), "{}", out.stderr);
+    let jobs = out.plan["jobs"].as_array().unwrap();
+    assert_eq!(jobs.len(), 2, "{}", out.plan);
+    for job in jobs {
+        assert_eq!(job["decision"], "run", "{job}");
+        assert_eq!(job["code"], "error", "{job}");
+        assert_eq!(job["detail"], detail, "{job}");
+    }
+}
+
+#[test]
+fn sync_snapshot_proves_signed_records_from_bare_remote() {
+    let f = sync_fixture();
+    let out = plan(&f.repo, &["--format", "json", "--sync", "git"], &[]);
+    assert_eq!(out.plan["skip"], json!(["a", "b"]), "{}", out.stderr);
+    assert_eq!(code(&out, "a"), "proved");
+    assert_eq!(code(&out, "b"), "proved");
+}
+
+#[test]
+fn sync_snapshot_limits_fail_every_job() {
+    for limit in ["refs", "listing_bytes", "blob_bytes", "total_bytes"] {
+        let f = sync_fixture();
+        let (value, detail) = match limit {
+            "refs" => (
+                json!({"refs": 1}),
+                "sync: ref listing exceeds 1 refs".to_string(),
+            ),
+            "listing_bytes" => (
+                json!({"listing_bytes": 64}),
+                "sync: ref listing exceeds 64 bytes".to_string(),
+            ),
+            "blob_bytes" => (
+                json!({"blob_bytes": 16}),
+                "sync: a stoop ref exceeds 16 bytes".to_string(),
+            ),
+            "total_bytes" => (
+                json!({"total_bytes": f.job_bytes}),
+                format!("sync: stoop refs exceed {} bytes in total", f.job_bytes),
+            ),
+            _ => unreachable!(),
+        };
+        let limit_json = value.to_string();
+        let out = plan(
+            &f.repo,
+            &["--format", "json", "--sync", "git"],
+            &[("PROBE_SYNC_LIMITS", &limit_json)],
+        );
+        assert_sync_error(&out, &detail);
+        if limit == "total_bytes" {
+            let jobs = job::JobStore::new(f.repo.store());
+            let proofs = proof::Store::new(f.repo.store());
+            assert!(f.job_keys.iter().all(|key| !jobs.load(key).is_empty()));
+            assert!(f.proof_keys.iter().all(|key| proofs.load(key).is_empty()));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_snapshot_deadline_kills_stalled_upload_pack() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+
+    let f = sync_fixture();
+    let helper = f.repo.base.join("stall-upload-pack");
+    let pid_file = f.repo.base.join("stall.pid");
+    std::fs::write(
+        &helper,
+        "#!/bin/sh\nprintf '%s\\n' \"$$\" > \"$PROBE_STALL_PID\"\nexec sleep 8\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let upload_pack = format!("'{}'", helper.to_str().unwrap().replace('\'', "'\\''"));
+    git(
+        &f.repo.root,
+        &["config", "remote.origin.uploadpack", &upload_pack],
+    );
+    let started = Instant::now();
+    let out = plan(
+        &f.repo,
+        &["--format", "json", "--sync", "git"],
+        &[
+            ("PROBE_SYNC_LIMITS", r#"{"deadline_ms":1000}"#),
+            ("PROBE_STALL_PID", pid_file.to_str().unwrap()),
+        ],
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "deadline did not stop the transport"
+    );
+    assert_sync_error(&out, "sync: remote did not finish within 1s");
+    let pid = std::fs::read_to_string(pid_file).unwrap();
+    let status = Command::new("ps")
+        .args(["-o", "stat=", "-p", pid.trim()])
+        .output()
+        .unwrap();
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.trim().is_empty() || status.trim().starts_with('Z'),
+        "transport still alive: {status}"
+    );
 }
 
 #[test]
@@ -906,7 +1478,7 @@ fn control_allowlisted_floating_action_under_strict() {
         "allowlisted example/tool@v1 under STOOP_STRICT_ACTIONS=1",
         &o,
     );
-    assert_eq!(code(&o, "a"), "unresolved-action");
+    assert_eq!(code(&o, "a"), "action-unverifiable");
 }
 
 #[test]
@@ -997,7 +1569,14 @@ fn inherited_age_limits_signed_attestations() {
     let r = Repo::new(&[(CI, &w), ("a.txt", "a\n")]);
     let now = proof::now();
     record(&r, rec(&w, now, now - 2 * DAY)).unwrap();
-    assert_eq!(code(&plan(&r, &["--format", "json"], &[]), "a"), "proved");
+    let baseline = plan(&r, &["--format", "json"], &[]);
+    assert_eq!(
+        code(&baseline, "a"),
+        "proved",
+        "plan: {}; stderr: {}",
+        baseline.plan,
+        baseline.stderr
+    );
     let o = plan(&r, &["--format", "json"], &[("STOOP_MAX_AGE", "1h")]);
     assert_eq!(code(&o, "a"), "unattested");
 }
@@ -1060,7 +1639,12 @@ fn strict_actions_rejects_a_resolvable_floating_ref() {
     std::fs::create_dir_all(&source).unwrap();
     std::fs::create_dir_all(&bare).unwrap();
     git(&source, &["init", "-q"]);
-    std::fs::write(source.join("action.yml"), "name: test\n").unwrap();
+    std::fs::write(
+        source.join("action.yml"),
+        "runs:\n  using: node20\n  main: index.js\n",
+    )
+    .unwrap();
+    std::fs::write(source.join("index.js"), "fixture\n").unwrap();
     git(&source, &["add", "."]);
     git(&source, &["commit", "-qm", "fixture"]);
     git(&bare, &["init", "--bare", "-q"]);
@@ -1083,7 +1667,17 @@ fn strict_actions_rejects_a_resolvable_floating_ref() {
     let key = record(&r, rec(&w, now, now)).unwrap();
     let jobs = job::JobStore::new(r.store());
     let mut record = jobs.load(&key).remove(0);
-    record.actions.insert("example/tool@v1".into(), sha);
+    let archive = r.base.join(format!("api/repos/example/tool/tarball/{sha}"));
+    std::fs::create_dir_all(archive.parent().unwrap()).unwrap();
+    std::fs::write(archive, gha::actions::fixture_archive()).unwrap();
+    let fake = gha::resolve::fake::Fake::new();
+    fake.set("example/tool@v1", Ok(&sha));
+    record.actions = gha::actions::capture(
+        &[format!("actions/checkout@{PIN}"), "example/tool@v1".into()],
+        &fake,
+        false,
+    )
+    .unwrap();
     let mut claims = a::claims(&record);
     claims["aud"] = json!(attest::audience(&key, &record).unwrap());
     claims["sha"] = json!(r.sha);
@@ -1107,7 +1701,7 @@ fn strict_actions_rejects_a_resolvable_floating_ref() {
             ("STOOP_STRICT_ACTIONS", "1"),
         ],
     );
-    assert_eq!(code(&strict, "a"), "unresolved-action");
+    assert_eq!(code(&strict, "a"), "action-unverifiable");
 }
 
 #[test]
