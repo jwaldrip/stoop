@@ -1147,6 +1147,45 @@ mod tests {
     }
 
     #[test]
+    fn passing_request_credentials_never_produces_a_recorded_outcome() {
+        const CHILD: &str = "STOOP_TOKEN_OUTCOME_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "run::tests::passing_request_credentials_never_produces_a_recorded_outcome",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        for (program, status) in [("/usr/bin/true", 0), ("/usr/bin/false", 1)] {
+            let outcome = run_outcome(
+                Opts {
+                    argv: vec![program.to_owned()],
+                    pass_env: vec![ID_TOKEN_VARS[0]],
+                    ..Default::default()
+                },
+                false,
+            );
+            assert_eq!(outcome.status, status);
+            assert!(
+                matches!(outcome.how, How::Unrecorded(_)),
+                "token-enabled runs must not be recorded or skipped"
+            );
+        }
+    }
+
+    #[test]
     fn captured_credentials_survive_a_later_thread_without_entering_its_environment() {
         const CHILD: &str = "STOOP_TOKEN_CAPTURE_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
