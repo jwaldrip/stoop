@@ -74,7 +74,10 @@ stoop_install() {
     echo 'gh not found; provenance verification skipped.'
   fi
   tar -xzf "$tmp/$archive" -C "$tmp" stoop
-  [ -f "$tmp/stoop" ] && [ ! -L "$tmp/stoop" ] || { echo 'Invalid archive.' >&2; return 1; }
+  if [ ! -f "$tmp/stoop" ] || [ -L "$tmp/stoop" ]; then
+    echo 'Invalid archive.' >&2
+    return 1
+  fi
   mkdir -p "$dir"
   staged=$(mktemp "$dir/.stoop.XXXXXX")
   trap 'rm -f "$staged"; rm -rf "$tmp"' EXIT HUP INT TERM

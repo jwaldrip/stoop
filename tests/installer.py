@@ -24,7 +24,7 @@ def check(condition, message):
 
 
 def run(shell, script, env, *args):
-    return subprocess.run([shell, '-s', '--', *args], input=script, text=True,
+    return subprocess.run([shutil.which(shell), '-s', '--', *args], input=script, text=True,
                           capture_output=True, env=env)
 
 
@@ -50,10 +50,13 @@ with tempfile.TemporaryDirectory(prefix='stoop-installer-test-') as temp:
         try:
             tools = root / 'tools'
             tools.mkdir()
-            for tool in ('uname', 'curl', 'sha256sum', 'shasum', 'grep', 'awk', 'tar', 'mkdir', 'mktemp', 'cat', 'chmod', 'mv', 'rm', 'sed', 'head', 'touch'):
+            for tool in ('curl', 'sha256sum', 'shasum', 'grep', 'awk', 'tar', 'mkdir', 'mktemp', 'cat', 'chmod', 'mv', 'rm', 'sed', 'head', 'touch'):
                 path = shutil.which(tool)
                 if path:
                     (tools / tool).symlink_to(path)
+            uname = tools / 'uname'
+            uname.write_text('#!/bin/sh\ncase "$1" in -s) echo Linux;; -m) echo x86_64;; esac\n')
+            uname.chmod(0o755)
             base = f'http://127.0.0.1:{server.server_address[1]}'
             for shell in ('dash', 'bash'):
                 dest = root / shell / 'bin'
