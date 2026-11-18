@@ -230,26 +230,7 @@ fn known_github(name: &str) -> bool {
 }
 
 fn sort_records(records: &mut [JobRecord]) {
-    records.sort_by(|a, b| {
-        let (_, arun, aattempt, acreated, araw) = a.order_key();
-        let (_, brun, battempt, bcreated, braw) = b.order_key();
-        (
-            b.started,
-            b.status == Some(RecordStatus::Failed),
-            brun,
-            battempt,
-            bcreated,
-            braw,
-        )
-            .cmp(&(
-                a.started,
-                a.status == Some(RecordStatus::Failed),
-                arun,
-                aattempt,
-                acreated,
-                araw,
-            ))
-    });
+    records.sort_by(|a, b| b.retention_key().cmp(&a.retention_key()));
 }
 
 pub fn decide(spec: &JobSpec, ctx: &mut PlanCtx<'_>) -> Decision {
@@ -698,6 +679,8 @@ mod tests {
     fn git(root: &Path, args: &[&str]) {
         let output = Command::new("git")
             .current_dir(root)
+            .env("HOME", root)
+            .env("XDG_CONFIG_HOME", root.join(".git/stoop-test-home"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .args([
@@ -789,6 +772,8 @@ mod tests {
             let mut records = vec![];
             let listed = Command::new("git")
                 .current_dir(&self.root)
+                .env("HOME", &self.root)
+                .env("XDG_CONFIG_HOME", self.root.join(".git/stoop-test-home"))
                 .env("GIT_CONFIG_GLOBAL", "/dev/null")
                 .env("GIT_CONFIG_NOSYSTEM", "1")
                 .args(["ls-tree", "-r", "-t", "-z", "HEAD"])
@@ -1795,6 +1780,8 @@ mod tests {
         let mut f = Fixture::new();
         let oid = Command::new("git")
             .current_dir(&f.root)
+            .env("HOME", &f.root)
+            .env("XDG_CONFIG_HOME", f.root.join(".git/stoop-test-home"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .args(["hash-object", "-w", "dir/a"])
@@ -1806,6 +1793,8 @@ mod tests {
         cache.extend_from_slice(b",dir/z\xff");
         let output = Command::new("git")
             .current_dir(&f.root)
+            .env("HOME", &f.root)
+            .env("XDG_CONFIG_HOME", f.root.join(".git/stoop-test-home"))
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .args(["update-index", "--add", "--cacheinfo"])
@@ -2257,14 +2246,10 @@ mod tests {
     #[test]
     fn global_attributes_macro_is_checked() {
         let mut f = Fixture::new();
-        let attrs = f.root.join(".git/global-attributes");
-        let config = f.root.join(".git/global-config");
+        let home = f.root.join(".git/macro-home");
+        let attrs = home.join(".config/git/attributes");
+        fs::create_dir_all(attrs.parent().unwrap()).unwrap();
         fs::write(&attrs, b"[attr]winscript text eol=crlf\n").unwrap();
-        fs::write(
-            &config,
-            format!("[core]\n attributesfile = {}\n", attrs.display()),
-        )
-        .unwrap();
         fs::write(f.root.join(".gitattributes"), b"dir/a winscript\n").unwrap();
         git(&f.root, &["add", ".gitattributes"]);
         git(
@@ -2280,7 +2265,7 @@ mod tests {
             ],
         );
         f.tree = GitTree::load(&f.root, "HEAD").unwrap();
-        f.tree.set_test_global_config(config);
+        f.tree.set_test_home(home);
         f.install(vec![proof(vec![input("dir/a", &file_id(b"tracked"))])]);
         let d = f.decide(BTreeMap::new());
         assert_eq!(d.code, Code::Unplannable);

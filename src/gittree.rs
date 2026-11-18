@@ -34,7 +34,7 @@ impl Drop for TempDir {
     }
 }
 static NEXT: AtomicU64 = AtomicU64::new(0);
-fn git() -> Command {
+fn git(root: &Path) -> Command {
     let mut command = Command::new("git");
     command.env("GIT_NO_LAZY_FETCH", "1");
     command
@@ -44,8 +44,12 @@ fn git() -> Command {
         .env_remove("GIT_INDEX_FILE");
     #[cfg(test)]
     command
+        .env("HOME", root)
+        .env("XDG_CONFIG_HOME", root.join(".git/stoop-test-home"))
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1");
+    #[cfg(not(test))]
+    let _ = root;
     command
 }
 
@@ -60,7 +64,7 @@ pub struct GitTree {
     conversions: Option<BTreeMap<Vec<u8>, String>>,
     attr_error: Option<String>,
     #[cfg(test)]
-    test_global_config: Option<PathBuf>,
+    test_home: Option<PathBuf>,
 }
 impl GitTree {
     pub fn load(root: &Path, rev: &str) -> Result<Self, GitError> {
@@ -68,7 +72,7 @@ impl GitTree {
             return Err(GitError("invalid revision".into()));
         }
         let run = |args: &[&str]| -> Result<Vec<u8>, GitError> {
-            let out = git()
+            let out = git(root)
                 .current_dir(root)
                 .env("GIT_NO_LAZY_FETCH", "1")
                 .args(args)
@@ -144,12 +148,12 @@ impl GitTree {
             conversions: None,
             attr_error: None,
             #[cfg(test)]
-            test_global_config: None,
+            test_home: None,
         })
     }
     #[cfg(test)]
-    pub fn set_test_global_config(&mut self, path: PathBuf) {
-        self.test_global_config = Some(path);
+    pub fn set_test_home(&mut self, path: PathBuf) {
+        self.test_home = Some(path);
     }
     pub fn commit(&self) -> &str {
         &self.commit
@@ -220,7 +224,7 @@ impl GitTree {
         read: impl FnOnce(&mut dyn Read) -> Result<T, GitError>,
     ) -> Result<T, GitError> {
         if self.batch.is_none() {
-            let mut child = git()
+            let mut child = git(&self.root)
                 .current_dir(&self.root)
                 .env("GIT_NO_LAZY_FETCH", "1")
                 .args(["cat-file", "--batch"])
@@ -336,7 +340,7 @@ impl GitTree {
             std::fs::create_dir(&dir).map_err(|e| GitError(e.to_string()))?;
             let tmp = TempDir(dir);
             let index = tmp.0.join("index");
-            let status = git()
+            let status = git(&self.root)
                 .current_dir(&self.root)
                 .env("GIT_NO_LAZY_FETCH", "1")
                 .env("GIT_INDEX_FILE", &index)
@@ -353,10 +357,12 @@ impl GitTree {
                 .filter(|(_, e)| matches!(e, Entry::Blob { .. }))
                 .flat_map(|(p, _)| p.iter().copied().chain(std::iter::once(0)))
                 .collect();
-            let mut command = git();
+            let mut command = git(&self.root);
             #[cfg(test)]
-            if let Some(config) = &self.test_global_config {
-                command.env("GIT_CONFIG_GLOBAL", config);
+            if let Some(home) = &self.test_home {
+                command
+                    .env("HOME", home)
+                    .env("XDG_CONFIG_HOME", home.join(".config"));
             }
             let mut child = command
                 .current_dir(&self.root)

@@ -65,7 +65,7 @@ impl JobRecord {
             raw,
         )
     }
-    fn retention_key(&self) -> (u64, bool, u64, u64, u64, &str) {
+    pub fn retention_key(&self) -> (u64, bool, u64, u64, u64, &str) {
         let (started, run, attempt, created, raw) = self.order_key();
         (
             started,
