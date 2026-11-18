@@ -740,7 +740,10 @@ fn proc_magic_link(path: &Path) -> bool {
     }
     let mut index = 3;
     if parts.get(index) == Some(&"task") {
-        if !parts.get(index + 1).is_some_and(|s| s.bytes().all(|b| b.is_ascii_digit())) {
+        if !parts
+            .get(index + 1)
+            .is_some_and(|s| s.bytes().all(|b| b.is_ascii_digit()))
+        {
             return false;
         }
         index += 2;
@@ -841,10 +844,15 @@ impl Rec<'_> {
     }
 
     fn forget_walks(&mut self, path: &Path) {
-        let keys: Vec<PathBuf> = self.link_walks.range(path.to_path_buf()..)
+        let keys: Vec<PathBuf> = self
+            .link_walks
+            .range(path.to_path_buf()..)
             .take_while(|(key, _)| key.starts_with(path))
-            .map(|(key, _)| key.clone()).collect();
-        for key in keys { self.link_walks.remove(&key); }
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in keys {
+            self.link_walks.remove(&key);
+        }
     }
 
     /// Record a write to `raw` (absolute, possibly with `..`). `follows` indicates
@@ -1010,9 +1018,13 @@ impl Tracer<'_> {
         {
             return Some(raw);
         }
-        let mut parts: VecDeque<OsString> = raw.as_os_str().as_bytes().split(|b| *b == b'/')
+        let mut parts: VecDeque<OsString> = raw
+            .as_os_str()
+            .as_bytes()
+            .split(|b| *b == b'/')
             .filter(|part| !part.is_empty() && *part != b".")
-            .map(|part| OsString::from_vec(part.to_vec())).collect();
+            .map(|part| OsString::from_vec(part.to_vec()))
+            .collect();
         let mut current = PathBuf::from("/");
         let mut magic = false;
         let mut links = 0;
@@ -1021,20 +1033,27 @@ impl Tracer<'_> {
                 current.pop();
                 continue;
             }
-            if current == Path::new("/proc") && (part.as_bytes() == b"self" || part.as_bytes() == b"thread-self") {
+            if current == Path::new("/proc")
+                && (part.as_bytes() == b"self" || part.as_bytes() == b"thread-self")
+            {
                 current.push(pid.to_string());
             } else {
                 current.push(part);
             }
-            if !fs::symlink_metadata(&current).is_ok_and(|m| m.file_type().is_symlink()) {
-                continue;
+            let special = proc_magic_link(&current);
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.file_type().is_symlink() => {}
+                _ if special => {
+                    self.flag("could not resolve a process path alias");
+                    return None;
+                }
+                _ => continue,
             }
             links += 1;
             if links > 40 {
                 self.flag("too many links while resolving a path");
                 return None;
             }
-            let special = proc_magic_link(&current);
             if special {
                 magic = true;
             } else if let Some(rec) = &self.rec {
@@ -1050,21 +1069,37 @@ impl Tracer<'_> {
                 }
                 Err(_) => return Some(raw),
             };
-            if special && (!target.is_absolute() || target.as_os_str().as_bytes().ends_with(b" (deleted)")) {
-                if self.syscall == libc::SYS_linkat as i64 && target.as_os_str().as_bytes().ends_with(b" (deleted)") {
+            if special
+                && (!target.is_absolute() || target.as_os_str().as_bytes().ends_with(b" (deleted)"))
+            {
+                if self.syscall == libc::SYS_linkat as i64
+                    && target.as_os_str().as_bytes().ends_with(b" (deleted)")
+                {
                     self.flag("it accessed an unkeyable descriptor alias");
                 }
                 return None;
             }
             current.pop();
-            if target.is_absolute() { current = PathBuf::from("/"); }
-            let expanded: Vec<OsString> = target.as_os_str().as_bytes().split(|b| *b == b'/')
+            if target.is_absolute() {
+                current = PathBuf::from("/");
+            }
+            let expanded: Vec<OsString> = target
+                .as_os_str()
+                .as_bytes()
+                .split(|b| *b == b'/')
                 .filter(|part| !part.is_empty() && *part != b".")
-                .map(|part| OsString::from_vec(part.to_vec())).collect();
-            for part in expanded.into_iter().rev() { parts.push_front(part); }
+                .map(|part| OsString::from_vec(part.to_vec()))
+                .collect();
+            for part in expanded.into_iter().rev() {
+                parts.push_front(part);
+            }
         }
         self.magic_cache.insert(parent, (self.magic_epoch, magic));
-        if magic { Some(current) } else { Some(raw) }
+        if magic {
+            Some(current)
+        } else {
+            Some(raw)
+        }
     }
 
     /// The path a call names, joined onto its directory. Not normalized: the kernel
@@ -1129,14 +1164,23 @@ impl Tracer<'_> {
         use std::io::Read;
         self.touch(path.clone(), true);
         let mut bytes = [0u8; 256];
-        let Ok(mut file) = fs::File::open(&path) else { return };
+        let Ok(mut file) = fs::File::open(&path) else {
+            return;
+        };
         let Ok(n) = file.read(&mut bytes) else { return };
-        let Some(rest) = bytes[..n].strip_prefix(b"#!") else { return };
+        let Some(rest) = bytes[..n].strip_prefix(b"#!") else {
+            return;
+        };
         let rest = rest.split(|b| *b == b'\n').next().unwrap_or_default();
         let start = rest.iter().position(|b| !matches!(*b, b' ' | b'\t'));
         let Some(start) = start else { return };
-        let name = rest[start..].split(|b| matches!(*b, b' ' | b'\t' | b'\r')).next().unwrap_or_default();
-        if name.is_empty() { return; }
+        let name = rest[start..]
+            .split(|b| matches!(*b, b' ' | b'\t' | b'\r'))
+            .next()
+            .unwrap_or_default();
+        if name.is_empty() {
+            return;
+        }
         let interpreter = PathBuf::from(OsString::from_vec(name.to_vec()));
         let absolute = if interpreter.is_absolute() {
             interpreter

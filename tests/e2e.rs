@@ -1029,7 +1029,10 @@ fn proc_cwd_alias_reads_recheck_the_actual_file() {
         ("root", "cat /proc/thread-self/root$PWD/in.txt >/dev/null"),
         ("task", "cat /proc/$$/task/$$/cwd/in.txt >/dev/null"),
         ("dotdot", "cat /proc/self/../$$/cwd/in.txt >/dev/null"),
-        ("relative", "P=$$; (cd /proc && cat $P/cwd/in.txt >/dev/null)"),
+        (
+            "relative",
+            "P=$$; (cd /proc && cat $P/cwd/in.txt >/dev/null)",
+        ),
     ] {
         let w = Ws::new(&format!("proc-{name}"));
         let (status, first) = w.sh(script);
@@ -1085,7 +1088,10 @@ fn reopened_regular_descriptor_is_recorded() {
 #[test]
 fn cargo_build_with_jobserver_descriptors_is_recordable() {
     let w = Ws::new("cargo-jobserver");
-    w.write("Cargo.toml", "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n");
+    w.write(
+        "Cargo.toml",
+        "[package]\nname = \"sample\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    );
     w.write("src/main.rs", "fn main() {}\n");
     w.write(".stoopignore", "target/\n");
     let (status, err) = w.sh("cargo build --offline");
@@ -1105,9 +1111,30 @@ fn changing_a_repository_shebang_interpreter_reruns() {
     let (status, err) = w.sh(script);
     assert_eq!(status, 0, "{err}");
     assert!(skipped(&w.sh(script).1));
-    fs::OpenOptions::new().append(true).open(w.root.join("interp")).unwrap().write_all(&[0]).unwrap();
+    fs::OpenOptions::new()
+        .append(true)
+        .open(w.root.join("interp"))
+        .unwrap()
+        .write_all(&[0])
+        .unwrap();
     let (_, err) = w.sh(script);
     assert!(!skipped(&err), "{err}");
+}
+
+#[test]
+fn outside_symlink_to_proc_self_cwd_uses_tracee_directory() {
+    let w = Ws::new("proc-symlink-cwd");
+    w.write("sub/config.txt", "old");
+    let alias = std::env::temp_dir().join(format!("stoop-proc-cwd-{}", std::process::id()));
+    let _ = fs::remove_file(&alias);
+    std::os::unix::fs::symlink("/proc/self/cwd", &alias).unwrap();
+    let script = format!("cd sub && cat {}/config.txt >/dev/null", alias.display());
+    let (status, first) = w.sh(&script);
+    assert_eq!(status, 0, "{first}");
+    w.write("sub/config.txt", "new");
+    let (_, second) = w.sh(&script);
+    let _ = fs::remove_file(alias);
+    assert!(!skipped(&second), "{second}");
 }
 
 #[allow(dead_code)]

@@ -136,7 +136,7 @@ impl Fixture {
             job: "test".into(),
             leg: None,
             key: Some("job-test".into()),
-            runs_on: serde_json::Value::Null,
+            runs_on: serde_json::json!("ubuntu-latest"),
             needs: vec![],
             if_text: None,
             steps: vec![StepSpec::Traced {
