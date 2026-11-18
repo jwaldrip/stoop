@@ -153,11 +153,46 @@ impl Physical {
                     redirected: canon != spelled,
                 })
             }
-            None => Some(Location {
-                path: self.fallback(&absolutize(Path::new("/"), raw)),
-                redirected: false,
-            }),
+            None => {
+                let spelled = absolutize(Path::new("/"), raw);
+                Some(match self.missing_location(dir, name) {
+                    Some(path) => Location {
+                        redirected: path != spelled,
+                        path,
+                    },
+                    None => Location {
+                        path: self.fallback(&spelled),
+                        redirected: false,
+                    },
+                })
+            }
         }
+    }
+
+    /// Resolve the existing prefix of a missing parent physically. If `..` follows
+    /// a missing name, the missing name itself is what the call observed.
+    fn missing_location(&mut self, dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
+        let parts: Vec<Component> = dir.components().collect();
+        for cut in (1..parts.len()).rev() {
+            let head: PathBuf = parts[..cut].iter().collect();
+            let Some(mut out) = self.canonical_dir(&head) else {
+                continue;
+            };
+            let mut first_missing = None;
+            for part in &parts[cut..] {
+                match part {
+                    Component::Normal(n) => {
+                        out.push(n);
+                        first_missing.get_or_insert_with(|| out.clone());
+                    }
+                    Component::CurDir => {}
+                    _ => return first_missing,
+                }
+            }
+            out.push(name);
+            return Some(out);
+        }
+        None
     }
 
     /// A parent that does not exist cannot be resolved. A path inside the root keeps its
@@ -273,6 +308,22 @@ mod tests {
         let loc = p.locate(&root.join("nope/deeper/f")).unwrap();
         assert_eq!(loc.path, root.join("nope/deeper/f"));
         assert!(!loc.redirected);
+    }
+
+    #[test]
+    fn missing_parents_follow_existing_links_and_stop_before_missing_dotdot() {
+        let root = scratch("missing-link");
+        fs::create_dir_all(root.join("sub/d1")).unwrap();
+        std::os::unix::fs::symlink("sub/d1", root.join("link")).unwrap();
+        let mut p = Physical::new(&root, &root);
+        assert_eq!(
+            p.locate(&root.join("link/../missing/file")).unwrap().path,
+            root.join("sub/missing/file")
+        );
+        assert_eq!(
+            p.locate(&root.join("link/missing/../file")).unwrap().path,
+            root.join("sub/d1/missing")
+        );
     }
 
     #[test]

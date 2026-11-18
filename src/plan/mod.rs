@@ -566,7 +566,7 @@ mod tests {
                 os: "linux".into(),
                 arch: "x86_64".into(),
                 tracer: "ptrace-seccomp".into(),
-                version: 3,
+                version: 4,
             }),
             env: BTreeMap::new(),
             inputs: vec![input::Input {

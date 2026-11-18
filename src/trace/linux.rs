@@ -138,6 +138,12 @@ fn table() -> Vec<(i64, Vec<Op>)> {
             vec![Unsound("it used openat2, which the tracer cannot follow")],
         ),
         (
+            s(libc::SYS_open_by_handle_at),
+            vec![Unsound(
+                "it opened a file by handle, which the tracer cannot follow",
+            )],
+        ),
+        (
             s(libc::SYS_execve),
             vec![Exec {
                 dirfd: None,
@@ -1345,9 +1351,10 @@ impl Tracer<'_> {
             for link in rec.links_below_root(&path).unwrap_or_default() {
                 self.t.touched.entry(link).or_default().read = true;
             }
-            if read {
-                if let Some(loc) = rec.phys.locate(&path) {
-                    if loc.redirected && rec.phys.repo_rel(&loc.path).is_some() {
+            // Record observations where the call resolved them, not after the run.
+            if let Some(loc) = rec.phys.locate(&path) {
+                if loc.path != path && rec.phys.repo_rel(&loc.path).is_some() {
+                    if read && loc.redirected {
                         if let Some(key) = rec.key_of(&loc.path, &mut self.t) {
                             if self.t.keys.contains_key(&loc.path) {
                                 push_reason(
@@ -1359,8 +1366,8 @@ impl Tracer<'_> {
                             }
                             rec.redirected_reads.insert(key);
                         }
-                        path = loc.path;
                     }
+                    path = loc.path;
                 }
             }
         }
