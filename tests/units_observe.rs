@@ -189,7 +189,21 @@ mod linux {
             "exec pytest",
         ]);
         one_observation(&command, "stoop: observed pytest via sh (diagnostic only)");
-        assert_eq!(f.log(), "pytest\npytest\n");
+        for flag in ["-O", "+O"] {
+            let output = f.run(&[
+                "run",
+                "--root",
+                ".",
+                "--",
+                "bash",
+                flag,
+                "extglob",
+                "-c",
+                "exec pytest",
+            ]);
+            one_observation(&output, "stoop: observed pytest via sh (diagnostic only)");
+        }
+        assert_eq!(f.log(), "pytest\npytest\npytest\npytest\n");
     }
 
     #[test]
@@ -522,6 +536,105 @@ pid_t waitpid(pid_t pid, int *status, int options) {
         one_observation(&output, "stoop: observed pytest via sh (diagnostic only)");
         assert_eq!(fs::read_to_string(f.root.join("order-log")).unwrap(), "x");
         assert_eq!(f.log(), "pytest\n");
+    }
+
+    #[test]
+    fn missing_parent_event_releases_child_without_rerunning() {
+        use std::process::Stdio;
+        use std::time::{Duration, Instant};
+
+        let f = Fixture::new();
+        compile(
+            &f,
+            r#"
+#include <fcntl.h>
+#include <stdlib.h>
+#include <sys/wait.h>
+#include <unistd.h>
+int main(void) {
+    int fd = open(getenv("LOG"), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (fd < 0) return 1;
+    if (write(fd, "pytest\n", 7) != 7) return 2;
+    pid_t child = fork();
+    if (child < 0) return 3;
+    if (child == 0) {
+        usleep(200000);
+        if (write(fd, "child\n", 6) != 6) _exit(4);
+        _exit(0);
+    }
+    waitpid(child, 0, 0);
+    write(fd, "parent-survived\n", 16);
+    return 0;
+}
+"#,
+            "bin/pytest",
+            &[],
+        );
+        let interposer = compile(
+            &f,
+            r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <sys/ptrace.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
+pid_t waitpid(pid_t pid, int *status, int options) {
+    static pid_t (*real_waitpid)(pid_t, int *, int);
+    static pid_t root;
+    static int injected;
+    if (!real_waitpid) real_waitpid = dlsym(RTLD_NEXT, "waitpid");
+    if ((options & __WALL) && pid > 0 && !root) root = pid;
+    pid_t result = real_waitpid(pid, status, options);
+    if ((options & __WALL) && pid == -1 && result == root && !injected
+        && WIFSTOPPED(*status)) {
+        int event = (*status >> 16) & 255;
+        if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
+            injected = 1;
+            kill(root, SIGKILL);
+            const char *path = getenv("DROP_LOG");
+            int fd = path ? open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600) : -1;
+            if (fd >= 0) { write(fd, "x", 1); close(fd); }
+            return real_waitpid(pid, status, options);
+        }
+    }
+    return result;
+}
+"#,
+            "drop-fork",
+            &["-shared", "-fPIC", "-ldl"],
+        );
+        let mut child = f
+            .command()
+            .env("LD_PRELOAD", &interposer)
+            .env("DROP_LOG", f.root.join("drop-log"))
+            .args(["run", "--root", ".", "--", "pytest"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!("held child never released: {}", stderr(&output));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        let err = stderr(&output);
+        assert_eq!(output.status.code(), Some(137), "{err}");
+        assert_eq!(fs::read_to_string(f.root.join("drop-log")).unwrap(), "x");
+        assert_eq!(f.log(), "pytest\nchild\n");
+        assert!(!err.contains("stoop: observed "), "{err}");
+        assert!(!err.contains("not traced"), "{err}");
     }
 
     #[test]
