@@ -1,13 +1,15 @@
 pub mod eval;
 mod graph;
 mod output;
+#[cfg(test)]
+mod probes;
 pub mod spec;
 
 use crate::{attest, gha, input, job, proof, run, sync};
 use serde_json::{json, Value};
 use spec::{Code, Decision, JobSpec, RecordCheck, StepSpec};
 use std::path::{Path, PathBuf};
-const HELP: &str = "stoop plan [--workflow PATH] [--rev REV] [--plan-job ID] [--format human|json|github] [--output FILE] [--root DIR] [--store DIR] [--sync git[:REMOTE]] [--max-age DUR] [--allow-uses OWNER/REPO[@REF]] [--explain] [--quiet]\nPlan-time skips are experimental. --max-age defaults to 7d and must be positive.\n";
+const HELP: &str = "stoop plan [--workflow PATH] [--rev REV] [--plan-job ID] [--format human|json|github] [--output FILE] [--root DIR] [--store DIR] [--sync git[:REMOTE]] [--max-age DUR] [--allow-uses OWNER/REPO[@REF]] [--explain] [--quiet]\nPlan-time skips are experimental. --max-age must be positive and at most 7d. --allow-uses is for local dry runs only.\n";
 struct Options {
     workflow: Option<String>,
     rev: String,
@@ -84,8 +86,8 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
     {
         return Err("--allow-uses is only available for local dry runs".into());
     }
-    if o.max_age == 0 {
-        return Err("--max-age must be positive".into());
+    if o.max_age == 0 || o.max_age > run::DEFAULT_MAX_AGE {
+        return Err("--max-age must be positive and no greater than 7d".into());
     }
     Ok(Some(o))
 }
@@ -189,7 +191,12 @@ fn plan_override(w: &gha::workflow::Workflow, id: &str) -> Result<(), String> {
     }
     for layer in layers.into_iter().flatten() {
         let env = layer.as_object().ok_or("plan job env must be an object")?;
-        for name in ["STOOP_FULL", "STOOP_OFF", "STOOP_MAX_AGE"] {
+        for name in [
+            "STOOP_FULL",
+            "STOOP_OFF",
+            "STOOP_MAX_AGE",
+            "STOOP_STRICT_ACTIONS",
+        ] {
             if env.contains_key(name) {
                 return Err(format!("plan job overrides {name}"));
             }
@@ -224,7 +231,10 @@ pub fn cmd(args: &[String]) -> i32 {
         o.quiet,
         warning.as_deref(),
     ) {
-        eprintln!("::warning::stoop plan: cannot write output: {e}");
+        eprintln!(
+            "::warning::stoop plan: cannot write output: {}",
+            output::escape(&e)
+        );
     }
     0
 }
@@ -257,6 +267,47 @@ fn build<S: attest::KeySource>(
     {
         global_error = Some("planned revision differs from GITHUB_SHA".into());
     }
+    if run::env_flag("GITHUB_ACTIONS") {
+        let running = std::env::var("GITHUB_REPOSITORY")
+            .ok()
+            .zip(std::env::var("GITHUB_WORKFLOW_REF").ok())
+            .and_then(|(repo, reference)| {
+                reference
+                    .strip_prefix(&format!("{repo}/"))
+                    .and_then(|s| s.rsplit_once('@'))
+                    .map(|(p, _)| p.to_string())
+            });
+        if running.as_deref() != Some(path) {
+            global_error = Some("planned workflow differs from GITHUB_WORKFLOW_REF".into());
+        }
+    }
+    for spec in &specs {
+        if spec
+            .needs
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&o.plan_job))
+            && matches!(
+                graph::check(&workflow, spec, &o.plan_job),
+                Some((Code::NotGated, _))
+            )
+        {
+            global_error = Some(format!(
+                "job {} needs the planner without its own recognized gate",
+                spec.job
+            ));
+        }
+    }
+    let ceiling = match run::env_str("STOOP_MAX_AGE") {
+        Some(raw) => match run::parse_age(&raw) {
+            Ok(0) => o.max_age,
+            Ok(age) => o.max_age.min(age),
+            Err(error) => {
+                global_error = Some(format!("STOOP_MAX_AGE: {error}"));
+                o.max_age
+            }
+        },
+        None => o.max_age,
+    };
     let dir = o
         .store
         .clone()
@@ -283,7 +334,7 @@ fn build<S: attest::KeySource>(
         &std::env::var("GITHUB_REPOSITORY_OWNER_ID").unwrap_or_default(),
         branch,
     );
-    let verifier = verifier_factory(policy, now, o.max_age);
+    let verifier = verifier_factory(policy, now, ceiling);
     let resolver = gha::resolve::Git::from_env(root);
     let actions =
         gha::resolve::ActionCheck::with_strict(&resolver, run::env_flag("STOOP_STRICT_ACTIONS"));
@@ -292,7 +343,7 @@ fn build<S: attest::KeySource>(
         actions: &actions,
         proofs: &proofs,
         now,
-        ceiling: o.max_age,
+        ceiling,
     };
     let event_path = run::env_str("GITHUB_EVENT_PATH");
     let event = event_path
@@ -304,7 +355,7 @@ fn build<S: attest::KeySource>(
         jobs: &jobs,
         check: &check,
         now,
-        max_age: o.max_age,
+        max_age: ceiling,
         github_vars: cx.verified_vars(&o.plan_job),
         salt: run::env_str("STOOP_ENV_SALT"),
         event_path,
@@ -315,11 +366,13 @@ fn build<S: attest::KeySource>(
     let mut skip = Vec::new();
     for spec in &specs {
         let gate = graph::check(&workflow, spec, &o.plan_job);
-        let gated = gate.is_none();
-        let decision = if run::env_flag("STOOP_FULL") {
-            run_decision(Code::Full, "STOOP_FULL enabled")
-        } else if let Some(error) = &global_error {
+        let gated = gate
+            .as_ref()
+            .is_none_or(|(code, _)| *code != Code::NotGated);
+        let decision = if let Some(error) = &global_error {
             run_decision(Code::Error, error.clone())
+        } else if run::env_flag("STOOP_FULL") || run::env_flag("STOOP_OFF") {
+            run_decision(Code::Full, "STOOP_FULL or STOOP_OFF enabled")
         } else if (spec.blocked.is_some() || spec.key.is_none())
             && gate
                 .as_ref()
@@ -331,11 +384,6 @@ fn build<S: attest::KeySource>(
         } else {
             eval::decide(spec, &mut ctx)
         };
-        if o.explain {
-            for (step, path, why) in &decision.mismatches {
-                eprintln!("stoop: step {step}: {path}: {why}");
-            }
-        }
         if decision.skip {
             skip.push(spec.job.clone());
         }
@@ -398,7 +446,16 @@ mod tests {
         let workflow_text = "name: fixture\ndefaults:\n  run:\n    shell: stoop sh {0}\njobs:\n  stoop-plan:\n    runs-on: ubuntu-latest\n    steps: []\n  a:\n    needs: [stoop-plan]\n    if: ${{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',a,') }}\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@1111111111111111111111111111111111111111\n      - run: cat a.txt > /dev/null\n";
         let path = ".github/workflows/ci.yml";
         std::fs::write(root.join(path), workflow_text).unwrap();
-        std::fs::write(root.join("a.txt"), "a\n").unwrap();
+        std::fs::write(
+            root.join("a.txt"),
+            include_bytes!("../../tests/fixtures/plan/a.txt"),
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("b.txt"),
+            include_bytes!("../../tests/fixtures/plan/b.txt"),
+        )
+        .unwrap();
         for args in [
             &["init", "-q"][..],
             &["add", "."][..],
@@ -451,7 +508,10 @@ mod tests {
             env: BTreeMap::new(),
             inputs: vec![input::Input {
                 path: "a.txt".into(),
-                id: format!("f:{}", blake3::hash(b"a\n").to_hex()),
+                id: format!(
+                    "f:{}",
+                    blake3::hash(include_bytes!("../../tests/fixtures/plan/a.txt")).to_hex()
+                ),
             }],
             outputs: vec![],
             removed: vec![],
@@ -503,6 +563,7 @@ mod tests {
                 .env("GITHUB_JOB", "stoop-plan")
                 .env("GITHUB_ACTIONS", "true")
                 .env("GITHUB_REPOSITORY", a::REPO)
+                .env("GITHUB_WORKFLOW_REF", a::WORKFLOW)
                 .env("GITHUB_REPOSITORY_ID", a::REPO_ID)
                 .env("GITHUB_REPOSITORY_OWNER_ID", a::OWNER_ID)
                 .env("GITHUB_SHA", &sha)

@@ -36,6 +36,7 @@ fn valid_path(p: &str) -> bool {
     p == "."
         || (!p.is_empty()
             && !p.contains('\u{fffd}')
+            && !p.chars().any(char::is_control)
             && !p.starts_with('/')
             && p.split('/').all(|s| !s.is_empty() && s != "." && s != ".."))
 }
@@ -248,6 +249,12 @@ pub fn decide(spec: &JobSpec, ctx: &mut PlanCtx<'_>) -> Decision {
     let mut newest = None;
     for record in &records {
         if record.started == 0 {
+            if ctx.explain {
+                eprintln!(
+                    "stoop: record {}: legacy record has no start time",
+                    super::output::escape(record.run.as_deref().unwrap_or("unknown"))
+                );
+            }
             if newest.is_none() {
                 newest = Some(decision(
                     Code::Incomplete,
@@ -258,6 +265,13 @@ pub fn decide(spec: &JobSpec, ctx: &mut PlanCtx<'_>) -> Decision {
         }
         let result = match record.status {
             Some(RecordStatus::Failed) => {
+                if ctx.explain {
+                    eprintln!(
+                        "stoop: record {}: failed at step {}; earlier records no longer count",
+                        super::output::escape(record.run.as_deref().unwrap_or("unknown")),
+                        super::output::escape(record.failed.as_deref().unwrap_or("unknown"))
+                    );
+                }
                 return decision(
                     Code::Stale,
                     format!(
@@ -265,7 +279,7 @@ pub fn decide(spec: &JobSpec, ctx: &mut PlanCtx<'_>) -> Decision {
                         record.run.as_deref().unwrap_or("unknown"),
                         record.failed.as_deref().unwrap_or("unknown")
                     ),
-                )
+                );
             }
             Some(RecordStatus::Passed) => {
                 let result = evaluate(spec, ctx, record);
@@ -282,6 +296,20 @@ pub fn decide(spec: &JobSpec, ctx: &mut PlanCtx<'_>) -> Decision {
             }
             _ => decision(Code::Incomplete, "record has not passed".into()),
         };
+        if ctx.explain && !result.skip {
+            eprintln!(
+                "stoop: record {}: {}",
+                super::output::escape(record.run.as_deref().unwrap_or("unknown")),
+                super::output::escape(&result.detail)
+            );
+            for (step, path, why) in &result.mismatches {
+                eprintln!(
+                    "stoop: step {step}: {}: {}",
+                    super::output::escape(path),
+                    super::output::escape(why)
+                );
+            }
+        }
         if result.code == Code::Error {
             return result;
         }
@@ -389,6 +417,7 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
     for ((index, _, _), proof) in steps.iter().zip(&proofs) {
         for input in &proof.inputs {
             if input.path.contains('\u{fffd}')
+                || input.path.chars().any(char::is_control)
                 || !(input.id == "a"
                     || input.id == "d"
                     || input.id.starts_with("dl:")
@@ -660,7 +689,7 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
     Decision {
         skip: true,
         code: Code::Proved,
-        detail: "all inputs match".into(),
+        detail: "repository inputs match; outside inputs and environment are assumed".into(),
         evidence: Some(evidence),
         mismatches: Vec::new(),
     }
@@ -2290,6 +2319,13 @@ mod tests {
         let mut p = proof(vec![input("dir/a", &file_id(b"tracked"))]);
         p.created = a::NOW;
         f.install(vec![p.clone()]);
+        f.spec.steps.insert(
+            0,
+            StepSpec::Neutral {
+                index: 1,
+                what: "actions/checkout@v4".into(),
+            },
+        );
         f.spec.key = Some(a::JOB.into());
         f.spec.path = a::PATH.into();
         f.spec.actions = vec!["example/tool@v1".into()];
@@ -2348,7 +2384,7 @@ mod tests {
         assert!(d.detail.contains("would otherwise prove"));
         *resolver.0.borrow_mut() = "1111111111111111111111111111111111111111".into();
         assert_eq!(evaluate(&mut f, &record, &resolver).code, Code::Proved);
-        if let StepSpec::Traced { max_age, .. } = &mut f.spec.steps[0] {
+        if let StepSpec::Traced { max_age, .. } = &mut f.spec.steps[1] {
             *max_age = Some(60);
         }
         record.attest = Some(a::signed(
@@ -2361,7 +2397,7 @@ mod tests {
             a::KEY_1,
         ));
         assert_eq!(evaluate(&mut f, &record, &resolver).code, Code::Expired);
-        if let StepSpec::Traced { max_age, .. } = &mut f.spec.steps[0] {
+        if let StepSpec::Traced { max_age, .. } = &mut f.spec.steps[1] {
             *max_age = None;
         }
         record.attest = Some(a::signed(&record, |_| {}, "test-key-1", a::KEY_1));

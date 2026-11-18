@@ -196,7 +196,10 @@ fn plan_job_override(w: &Workflow, plan_job: &str) -> Result<Option<String>, Str
         return Ok(None);
     };
     let job = job.as_object().ok_or("plan job must be an object")?;
-    let mut envs = vec![job.get("env")];
+    let mut envs = vec![
+        job.get("env"),
+        job.get("container").and_then(|c| c.get("env")),
+    ];
     if let Some(steps) = job.get("steps") {
         for step in steps.as_array().ok_or("plan job steps must be an array")? {
             envs.push(
@@ -208,7 +211,12 @@ fn plan_job_override(w: &Workflow, plan_job: &str) -> Result<Option<String>, Str
     }
     for layer in envs {
         let map = object(layer, "plan job env")?;
-        for name in ["STOOP_FULL", "STOOP_OFF", "STOOP_MAX_AGE"] {
+        for name in [
+            "STOOP_FULL",
+            "STOOP_OFF",
+            "STOOP_MAX_AGE",
+            "STOOP_STRICT_ACTIONS",
+        ] {
             if map.contains_key(name) {
                 return Ok(Some(format!("plan job overrides {name}")));
             }
@@ -536,6 +544,24 @@ fn build(
             .get(job)
             .and_then(Value::as_object)
             .ok_or("job missing or not an object")?;
+        let needs = match j.get("needs") {
+            None => vec![],
+            Some(Value::String(s)) => vec![s.clone()],
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(str::to_string)
+                        .ok_or("needs must contain strings".to_string())
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            _ => return Err("invalid needs".into()),
+        };
+        spec.needs = needs;
+        spec.if_text = j.get("if").map(|v| match v {
+            Value::String(s) => s.clone(),
+            _ => v.to_string(),
+        });
         if let Some(k) = j.keys().find(|k| {
             ![
                 "runs-on",
@@ -571,25 +597,8 @@ fn build(
         }
         let workflow_settings = static_workflow_settings(w)?;
         stoop_settings(&[Some(&workflow_settings)])?;
-        stoop_settings(&[Some(&workflow_settings), j.get("env")])?;
-        let needs = match j.get("needs") {
-            None => vec![],
-            Some(Value::String(s)) => vec![s.clone()],
-            Some(Value::Array(a)) => a
-                .iter()
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_string)
-                        .ok_or("needs must contain strings".to_string())
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-            _ => return Err("invalid needs".into()),
-        };
-        spec.needs = needs;
-        spec.if_text = j.get("if").map(|v| match v {
-            Value::String(s) => s.clone(),
-            _ => v.to_string(),
-        });
+        let container_env = j.get("container").and_then(|c| c.get("env"));
+        stoop_settings(&[Some(&workflow_settings), container_env, j.get("env")])?;
         spec.images = images_of(j)?;
         if j.contains_key("uses") {
             return Err("reusable uses is not supported".into());
@@ -634,7 +643,10 @@ fn build(
                 &defaults,
                 (&w.name, job),
                 leg.as_deref(),
-                (&[Some(&workflow_settings), j.get("env")], allowed),
+                (
+                    &[Some(&workflow_settings), container_env, j.get("env")],
+                    allowed,
+                ),
                 seen_traced,
             );
             match result {
@@ -1272,6 +1284,10 @@ mod tests {
         .blocked
         .is_some());
         assert_ne!(ok.key, make("example/tool@v2", "", &allowed).key);
+        assert_ne!(
+            make("example/tool@v1", "        with: {mode: alpha}\n", &allowed).key,
+            make("example/tool@v1", "        with: {mode: beta}\n", &allowed).key
+        );
         assert!(make("example/tool@v2", "", &["example/tool@v1".into()])
             .blocked
             .is_some());

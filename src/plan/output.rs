@@ -2,6 +2,12 @@ use super::spec::Decision;
 use serde_json::{json, Value};
 use std::io::Write;
 
+pub fn escape(s: &str) -> String {
+    s.replace('%', "%25")
+        .replace('\r', "%0D")
+        .replace('\n', "%0A")
+}
+
 pub fn job(id: &str, gated: bool, decision: &Decision, key: Option<&str>) -> Value {
     let evidence = decision.evidence.as_ref();
     let leg = json!({"matrix": null, "key": key, "decision": if decision.skip {"skip"} else {"run"},
@@ -37,18 +43,16 @@ pub fn emit(
                     job["detail"].as_str().unwrap_or("error").to_string()
                 };
                 eprintln!(
-                    "stoop: {} {}: {detail}",
-                    job["decision"].as_str().unwrap_or("run"),
-                    job["id"].as_str().unwrap_or("?")
+                    "stoop: {} {}: {}",
+                    escape(job["decision"].as_str().unwrap_or("run")),
+                    escape(job["id"].as_str().unwrap_or("?")),
+                    escape(&detail)
                 );
             }
         }
     }
     if let Some(warning) = warning {
-        eprintln!(
-            "::warning::stoop plan: {}; every job runs",
-            warning.replace(['\r', '\n'], " ")
-        );
+        eprintln!("::warning::stoop plan: {}; every job runs", escape(warning));
     }
     let output = match format {
         "github" => {
@@ -101,7 +105,7 @@ pub fn emit(
                     ));
                 }
                 if let Err(e) = append(&path, &summary) {
-                    eprintln!("::warning::stoop plan: summary: {e}");
+                    eprintln!("::warning::stoop plan: summary: {}", escape(&e));
                 }
             }
             out
@@ -109,14 +113,12 @@ pub fn emit(
         "json" => format!("{json}\n"),
         _ => String::new(),
     };
-    let destination = dest.map(str::to_owned).or_else(|| {
-        if format == "github" {
-            std::env::var("GITHUB_OUTPUT").ok()
-        } else {
-            None
-        }
-    });
-    if let Some(path) = destination {
+    if let Some(path) = dest {
+        std::fs::write(path, &output).map_err(|e| e.to_string())
+    } else if let Some(path) = (format == "github")
+        .then(|| std::env::var("GITHUB_OUTPUT").ok())
+        .flatten()
+    {
         append(&path, &output)
     } else {
         print!("{output}");

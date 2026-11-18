@@ -66,3 +66,55 @@ pub fn check(w: &Workflow, spec: &JobSpec, plan: &str) -> Option<(Code, String)>
     }
     None
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gha::{context::GhCtx, workflow};
+    use serde_json::Value;
+    use std::collections::BTreeMap;
+
+    fn check_fixture(extra: &str, gate: &str, needs: &str) -> Option<(Code, String)> {
+        let text = format!("name: fixture\ndefaults: {{run: {{shell: 'stoop sh {{0}}'}}}}\njobs:\n  p:\n    runs-on: ubuntu-latest\n    steps: []\n  a:\n    needs: {needs}\n    if: \"{gate}\"\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@1111111111111111111111111111111111111111\n      - run: true\n{extra}");
+        let workflow = workflow::parse("ci.yml", &text).unwrap();
+        let cx = GhCtx::from_parts(BTreeMap::new(), Value::Null);
+        let spec = workflow::job_spec(&workflow, &cx, "a", None);
+        check(&workflow, &spec, "p")
+    }
+
+    #[test]
+    fn exact_gate_needs_and_dependents_are_required() {
+        let gate = "!cancelled() && !contains(needs.p.outputs.skip, ',a,')";
+        assert!(check_fixture("", gate, "[p]").is_none());
+        assert_eq!(
+            check_fixture("", "!contains(needs.p.outputs.skip, ',a,')", "[p]")
+                .unwrap()
+                .0,
+            Code::NotGated
+        );
+        assert_eq!(
+            check_fixture("", gate, "[p, other]").unwrap().0,
+            Code::Graph
+        );
+        assert_eq!(
+            check_fixture(
+                "  c:\n    needs: [A]\n    runs-on: ubuntu-latest\n    steps: []\n",
+                gate,
+                "[p]"
+            )
+            .unwrap()
+            .0,
+            Code::Graph
+        );
+        assert_eq!(
+            check_fixture(
+                "  A:\n    runs-on: ubuntu-latest\n    steps: []\n",
+                gate,
+                "[p]"
+            )
+            .unwrap()
+            .0,
+            Code::NotGated
+        );
+    }
+}

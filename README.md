@@ -82,7 +82,9 @@ Set `STOOP_ALLOW_USES` in workflow or job environment to a comma- or newline-sep
 | GitHub event payload and known GitHub variables | Compared with the plan job's values |
 | Probe or unknown setup | The job runs |
 
-The default maximum age is seven days; `stoop plan --max-age` sets a positive ceiling. A trusted full run should re-prove jobs regularly. The planner does not restore outputs or run probes.
+The default maximum age is seven days; `stoop plan --max-age` can set a shorter, positive ceiling. A trusted full run should re-prove jobs regularly. The planner does not restore outputs or run probes.
+
+JSON output has schema `stoop.plan/1`: top-level `workflow`, `path`, `rev`, `plan_job`, `full`, `skip` and `jobs`. Each job has `id`, `gated`, `decision`, `code`, `detail` and `legs`. Each leg includes its key, decision, record, checked counts, assumed input counts and the first mismatch when available. In GitHub format, `skip` is a comma-delimited output such as `,test,`; the full JSON is also emitted when it fits the output limit.
 
 ## Install
 

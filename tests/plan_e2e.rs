@@ -95,7 +95,7 @@ fn ungated_job_and_dependent_run() {
     ));
     let v: serde_json::Value =
         serde_json::from_slice(&r.plan(&["--format", "json"], false).stdout).unwrap();
-    assert_eq!(v["jobs"][0]["code"], "not-gated");
+    assert_eq!(v["jobs"][0]["code"], "error");
     let text = format!("{WORKFLOW}  c:\n    needs: a\n    runs-on: ubuntu-latest\n    steps: []\n");
     let r = Repo::new(&text);
     let v: serde_json::Value =
@@ -130,6 +130,13 @@ fn missing_workflow_fails_wide_and_bad_age_is_usage_error() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("skip=,"));
     assert!(String::from_utf8_lossy(&out.stderr).contains("::warning::"));
     assert_eq!(r.plan(&["--max-age", "0"], false).status.code(), Some(2));
+    assert_eq!(r.plan(&["--max-age", "8d"], false).status.code(), Some(2));
+    assert_eq!(
+        r.plan(&["--max-age", "213503982334602d"], false)
+            .status
+            .code(),
+        Some(2)
+    );
 }
 #[test]
 fn plan_job_container_override_fails_wide() {
@@ -141,6 +148,84 @@ fn plan_job_container_override_fails_wide() {
         serde_json::from_slice(&r.plan(&["--format", "json"], false).stdout).unwrap();
     assert_eq!(v["jobs"][0]["code"], "error");
     assert_eq!(v["skip"], serde_json::json!([]));
+}
+
+#[test]
+fn copied_gate_refuses_every_skip() {
+    let text = format!("{WORKFLOW}  lint:\n    needs: [stoop-plan]\n    if: ${{{{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',a,') }}}}\n    runs-on: ubuntu-latest\n    steps: []\n");
+    let r = Repo::new(&text);
+    let v: serde_json::Value =
+        serde_json::from_slice(&r.plan(&["--format", "json"], false).stdout).unwrap();
+    assert_eq!(v["skip"], serde_json::json!([]));
+    assert!(v["jobs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|job| job["code"] == "error"));
+}
+
+#[test]
+fn container_stoop_switches_block_job() {
+    for name in ["STOOP_OFF", "STOOP_FULL"] {
+        let text = WORKFLOW.replace("  a:\n", &format!("  a:\n    container:\n      image: image@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n      env: {{{name}: '1'}}\n"));
+        let r = Repo::new(&text);
+        let v: serde_json::Value =
+            serde_json::from_slice(&r.plan(&["--format", "json"], false).stdout).unwrap();
+        assert_eq!(v["jobs"][0]["code"], "blocked");
+        assert!(v["jobs"][0]["detail"].as_str().unwrap().contains(name));
+    }
+}
+
+#[test]
+fn github_workflow_override_is_refused() {
+    let r = Repo::new(WORKFLOW);
+    let sha = Command::new("git")
+        .current_dir(&r.0)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_stoop"))
+        .current_dir(&r.0)
+        .args([
+            "plan",
+            "--workflow",
+            ".github/workflows/ci.yml",
+            "--format",
+            "json",
+        ])
+        .env("GITHUB_ACTIONS", "true")
+        .env("GITHUB_JOB", "stoop-plan")
+        .env("GITHUB_REPOSITORY", "owner/repo")
+        .env(
+            "GITHUB_WORKFLOW_REF",
+            "owner/repo/.github/workflows/other.yml@refs/heads/main",
+        )
+        .env("GITHUB_SHA", String::from_utf8(sha.stdout).unwrap().trim())
+        .env_remove("GITHUB_EVENT_PATH")
+        .env_remove("GITHUB_OUTPUT")
+        .env_remove("STOOP_SYNC")
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["jobs"][0]["code"], "error");
+    assert_eq!(v["skip"], serde_json::json!([]));
+}
+
+#[test]
+fn json_output_replaces_previous_file() {
+    let r = Repo::new(WORKFLOW);
+    let path = r.0.join("plan.json");
+    for _ in 0..2 {
+        assert!(r
+            .plan(
+                &["--format", "json", "--output", path.to_str().unwrap()],
+                false
+            )
+            .status
+            .success());
+    }
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+    assert_eq!(value["schema"], "stoop.plan/1");
 }
 
 #[test]
