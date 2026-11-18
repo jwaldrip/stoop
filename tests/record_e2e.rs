@@ -1113,6 +1113,7 @@ fn reads_before_final_symlink_changes_keep_call_time_target() {
 #[test]
 fn every_read_through_a_retargeted_directory_keeps_its_call_time_target() {
     use std::os::unix::fs::{symlink, PermissionsExt};
+    let mut missing = Vec::new();
     for spelling in ["plain", "dotdot", "outside", "exec"] {
         for position in ["first", "second"] {
             let w = Ws::new(&format!("directory-target-{spelling}-{position}"));
@@ -1149,11 +1150,16 @@ fn every_read_through_a_retargeted_directory_keeps_its_call_time_target() {
             } else {
                 format!("cat {prefix}/{target} >/dev/null")
             };
-            let setup = format!("test -e {prefix}/a.txt");
-            let ordered = if position == "first" {
-                format!("{read}; {setup}")
+            let ordered = if spelling == "exec" {
+                if position == "first" {
+                    format!("{read}; test -e {prefix}/a.txt")
+                } else {
+                    format!("test -e {prefix}/a.txt; {read}")
+                }
+            } else if position == "first" {
+                format!("cat {prefix}/{target} {prefix}/a.txt >/dev/null")
             } else {
-                format!("{setup}; {read}")
+                format!("cat {prefix}/a.txt {prefix}/{target} >/dev/null")
             };
             let retarget = if spelling == "outside" {
                 format!("ln -sfn \"$PWD/d2\" {prefix}")
@@ -1162,40 +1168,46 @@ fn every_read_through_a_retargeted_directory_keeps_its_call_time_target() {
             };
             let p = recorded(&w, &format!("{ordered}; {retarget}"));
             let key = format!("d1/{target}");
-            assert!(
-                pairs(&p, "inputs").iter().any(|(path, _)| path == &key),
-                "{spelling} {position}: {:?}",
-                pairs(&p, "inputs")
-            );
+            if !pairs(&p, "inputs").iter().any(|(path, _)| path == &key) {
+                missing.push(format!("{spelling} {position}: {:?}", pairs(&p, "inputs")));
+            }
             let _ = fs::remove_dir_all(outside);
         }
     }
+    assert!(missing.is_empty(), "{}", missing.join("\n"));
+}
+
+fn assert_unkeyable_proc_fd_is_not_recorded(method: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    let w = Ws::new(&format!("procfd-{method}"));
+    w.write("interp", "#!/bin/sh\nexit 0\n");
+    w.write("prog.sh", "#!./interp\n");
+    for f in ["interp", "prog.sh"] {
+        fs::set_permissions(w.root.join(f), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let setup = if method == "memfd" {
+        "f=os.memfd_create(\"x\", 0); os.write(f, open(\"prog.sh\", \"rb\").read())"
+    } else {
+        "f=os.open(\"prog.sh\", os.O_RDONLY); os.unlink(\"prog.sh\")"
+    };
+    let (status, err) = w.sh(&format!(
+        "python3 -c 'import os; {setup}; os.execv(\"/proc/self/fd/%d\" % f, [\"x\"])'"
+    ));
+    assert_eq!(status, 0, "{method}: {err}");
+    assert!(
+        err.contains("not recorded") && err.contains("unkeyable file descriptor"),
+        "{method}: {err}"
+    );
 }
 
 #[test]
-fn execve_through_unkeyable_proc_fd_is_not_recorded() {
-    use std::os::unix::fs::PermissionsExt;
-    for method in ["memfd", "deleted"] {
-        let w = Ws::new(&format!("procfd-{method}"));
-        w.write("interp", "#!/bin/sh\nexit 0\n");
-        w.write("prog.sh", "#!./interp\n");
-        for f in ["interp", "prog.sh"] {
-            fs::set_permissions(w.root.join(f), fs::Permissions::from_mode(0o755)).unwrap();
-        }
-        let setup = if method == "memfd" {
-            "f=os.memfd_create(\"x\", 0); os.write(f, open(\"prog.sh\", \"rb\").read())"
-        } else {
-            "f=os.open(\"prog.sh\", os.O_RDONLY); os.unlink(\"prog.sh\")"
-        };
-        let (status, err) = w.sh(&format!(
-            "python3 -c 'import os; {setup}; os.execv(\"/proc/self/fd/%d\" % f, [\"x\"])'"
-        ));
-        assert_eq!(status, 0, "{method}: {err}");
-        assert!(
-            err.contains("not recorded") && err.contains("unkeyable file descriptor"),
-            "{method}: {err}"
-        );
-    }
+fn execve_memfd_script_through_proc_fd_is_not_recorded() {
+    assert_unkeyable_proc_fd_is_not_recorded("memfd");
+}
+
+#[test]
+fn execve_deleted_script_through_proc_fd_is_not_recorded() {
+    assert_unkeyable_proc_fd_is_not_recorded("deleted");
 }
 
 #[test]

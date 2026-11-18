@@ -500,6 +500,7 @@ struct Rec<'a> {
     root: PathBuf,
     hashed: u64,
     link_walks: BTreeMap<PathBuf, Vec<PathBuf>>,
+    redirected_reads: HashSet<String>,
 }
 
 struct Tracer<'a> {
@@ -581,6 +582,7 @@ pub fn run<'a>(
             root: s.root.to_path_buf(),
             hashed: 0,
             link_walks: BTreeMap::new(),
+            redirected_reads: HashSet::new(),
         }),
         t: Trace {
             status: 1,
@@ -1346,6 +1348,17 @@ impl Tracer<'_> {
             if read {
                 if let Some(loc) = rec.phys.locate(&path) {
                     if loc.redirected && rec.phys.repo_rel(&loc.path).is_some() {
+                        if let Some(key) = rec.key_of(&loc.path, &mut self.t) {
+                            if self.t.keys.contains_key(&loc.path) {
+                                push_reason(
+                                    &mut self.t,
+                                    format!(
+                                        "it read {key} through a directory alias and also wrote it"
+                                    ),
+                                );
+                            }
+                            rec.redirected_reads.insert(key);
+                        }
                         path = loc.path;
                     }
                 }
@@ -1428,7 +1441,14 @@ impl Tracer<'_> {
             self.touch(raw.to_path_buf(), true);
         }
         let rec = self.rec.as_mut()?;
-        rec.write(&mut self.t, raw, follows)
+        let key = rec.write(&mut self.t, raw, follows)?;
+        if rec.redirected_reads.contains(&key) {
+            push_reason(
+                &mut self.t,
+                format!("it read {key} through a directory alias and also wrote it"),
+            );
+        }
+        Some(key)
     }
 
     /// An alias topology change invalidates cache entries under every spelling.
