@@ -1,8 +1,10 @@
 <!--meta {"title": "Getting started", "description": "Install stoop, wrap your first command, and read what it tells you.", "lede": "Install it, wrap one command, and read what it tells you. Five minutes, most of them spent waiting on the first run.", "image": "03-ledge", "alt": "A peregrine on a limestone ledge, watching the valley below."}-->
 <h2 id="install">Install</h2>
-<p>stoop is a single Rust binary. Until prebuilt releases are published, install it from source with cargo:</p>
-<pre><code><span class="p">$</span> cargo install --locked --git https://github.com/jwaldrip/stoop</code></pre>
-<p>Or build it from a clone:</p>
+<p>Install the prebuilt binary without Rust:</p>
+<pre><code><span class="p">$</span> curl -fsSL https://stoop.build/install.sh | sh</code></pre>
+<p>By default the installer uses <code>~/.local/bin</code>. Set <code>STOOP_INSTALL_DIR</code> to another user-owned directory or <code>STOOP_VERSION=v0.1.0</code> to pin a release. It also supports <code>--help</code>, <code>--dry-run</code> and <code>--uninstall</code> when saved and run locally. <code>STOOP_RELEASE_BASE</code> is for local loopback testing only.</p>
+<p>The installer checks the archive against the release's SHA-256 checksum, which detects corruption or a tampered mirror. An attacker who controls the release can change both the archive and checksum. If <code>gh</code> is installed, the installer also verifies GitHub build provenance and fails on verification errors; otherwise it says the check was skipped. Attestation verifies the artifact's claimed build provenance, not that the source or build is safe. Piping the installer into a shell trusts stoop.build and TLS to deliver the script.</p>
+<p>To build it yourself instead, from a clone:</p>
 <pre><code><span class="p">$</span> git clone https://github.com/jwaldrip/stoop &amp;&amp; cd stoop
 <span class="p">$</span> cargo build --release      <span class="c"># binary at target/release/stoop</span></code></pre>
 <div class="note">

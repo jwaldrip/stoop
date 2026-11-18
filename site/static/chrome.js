@@ -154,12 +154,61 @@
     });
   }
 
+  const THEMES = ["system", "light", "dark"];
+  const ICONS = {
+    system: '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="3" width="12" height="8" rx="1"/><path d="M6 14h4M8 11v3"/></svg>',
+    light: '<svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="3"/><path d="M8 1.5v1.6M8 12.9v1.6M1.5 8h1.6M12.9 8h1.6M3.4 3.4l1.1 1.1M11.5 11.5l1.1 1.1M3.4 12.6l1.1-1.1M11.5 4.5l1.1-1.1"/></svg>',
+    dark: '<svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 9.6A5.5 5.5 0 0 1 6.4 3 5.5 5.5 0 1 0 13 9.6z"/></svg>',
+  };
+  const LABELS = { system: "System", light: "Light", dark: "Dark" };
+
+  function initTheme() {
+    const root = document.documentElement;
+    const buttons = document.querySelectorAll("[data-theme-toggle]");
+    if (buttons.length === 0) return;
+
+    function stored() {
+      try {
+        const v = localStorage.getItem("stoop-theme");
+        return v === "light" || v === "dark" ? v : "system";
+      } catch (e) { return "system"; }
+    }
+
+    function apply(theme) {
+      if (theme === "system") root.removeAttribute("data-theme");
+      else root.setAttribute("data-theme", theme);
+      document.querySelectorAll('meta[name="theme-color"]').forEach(m => {
+        if (m.dataset.orig === undefined) m.dataset.orig = m.content;
+        m.content = theme === "system" ? m.dataset.orig : (theme === "dark" ? "#0d1216" : "#eef2f5");
+      });
+      const next = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+      for (const b of buttons) {
+        b.innerHTML = ICONS[theme] + "<span>Theme: " + LABELS[theme] + "</span>";
+        b.setAttribute("aria-label", "Theme: " + LABELS[theme].toLowerCase() + ". Switch to " + LABELS[next].toLowerCase() + ".");
+        b.hidden = false;
+      }
+    }
+
+    let current = stored();
+    apply(current);
+    for (const b of buttons) {
+      b.addEventListener("click", () => {
+        current = THEMES[(THEMES.indexOf(current) + 1) % THEMES.length];
+        try {
+          if (current === "system") localStorage.removeItem("stoop-theme");
+          else localStorage.setItem("stoop-theme", current);
+        } catch (e) { /* storage blocked: the choice lasts for this page only */ }
+        apply(current);
+      });
+    }
+  }
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", () => {
       initProgress();
       initToc();
       initLightbox();
       initReducedMotion();
+      initTheme();
       initKeyboard();
     });
   } else {
@@ -167,6 +216,7 @@
     initToc();
     initLightbox();
     initReducedMotion();
+    initTheme();
     initKeyboard();
   }
 })();

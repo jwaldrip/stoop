@@ -113,8 +113,13 @@ fn real_main(mut args: Vec<String>) -> i32 {
     match cmd.as_str() {
         "ls" => {
             let store = store_for(&o);
-            for (key, n, created, inputs) in store.list() {
-                println!("{key}\t{n} proofs\t{inputs} inputs\tcreated {created}");
+            for (key, n, created, inputs, dirs) in store.list() {
+                let dirs = dirs
+                    .iter()
+                    .map(|dir| format!("{dir:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("{key}\t{n} proofs\t{inputs} inputs\tcreated {created}\tdir {dirs}");
             }
             for (key, n, created, steps) in jobs_for(&o).list() {
                 println!("{key}\t{n} records\t{steps} steps\tcreated {created}");
@@ -197,7 +202,7 @@ fn real_main(mut args: Vec<String>) -> i32 {
 
 fn sync_for(o: &Opts) -> Result<sync::Remote, String> {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let root = o.root.clone().unwrap_or_else(|| run::find_root(&cwd));
+    let root = run::root_for(o, &cwd);
     let spec = o
         .sync
         .clone()
@@ -209,24 +214,14 @@ fn sync_for(o: &Opts) -> Result<sync::Remote, String> {
 
 fn store_for(o: &Opts) -> proof::Store {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let root = o.root.clone().unwrap_or_else(|| run::find_root(&cwd));
-    proof::Store::new(
-        o.store
-            .clone()
-            .or_else(|| run::env_str("STOOP_STORE").map(PathBuf::from))
-            .unwrap_or_else(|| root.join(".stoop")),
-    )
+    let root = run::root_for(o, &cwd);
+    proof::Store::new(run::store_for(o, &cwd, &root))
 }
 
 fn jobs_for(o: &Opts) -> job::JobStore {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let root = o.root.clone().unwrap_or_else(|| run::find_root(&cwd));
-    job::JobStore::new(
-        o.store
-            .clone()
-            .or_else(|| run::env_str("STOOP_STORE").map(PathBuf::from))
-            .unwrap_or_else(|| root.join(".stoop")),
-    )
+    let root = run::root_for(o, &cwd);
+    job::JobStore::new(run::store_for(o, &cwd, &root))
 }
 
 fn parse(args: &[String]) -> Result<(Opts, Vec<String>), String> {
@@ -280,9 +275,8 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
         }
     };
     let cwd = std::env::current_dir().unwrap_or_default();
-    let root = o.root.clone().unwrap_or_else(|| run::find_root(&cwd));
-    let matrix = match stepkey::canonical_matrix(&std::env::var("STOOP_MATRIX").unwrap_or_default())
-    {
+    let root = run::root_for(o, &cwd);
+    let matrix = match stepkey::canonical_matrix(&std::env::var("STOOP_MATRIX").unwrap_or_default()) {
         Ok(matrix) => matrix,
         Err(error) => {
             eprintln!("stoop: invalid STOOP_MATRIX: {error}");
@@ -293,10 +287,11 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
         &body,
         &std::env::var("GITHUB_WORKFLOW").unwrap_or_default(),
         &std::env::var("GITHUB_JOB").unwrap_or_default(),
-        &pathutil::to_key(&root, &cwd),
+        &pathutil::cwd_key(&root, &cwd),
+        rest,
         matrix.as_deref(),
     ));
-    // The script's name changes with every run; it excludes, but a proof never stores it.
+    o.shell_key = true;
     o.transient.push(script.to_string());
     o.transient
         .push(pathutil::to_key(&root, std::path::Path::new(script)));
