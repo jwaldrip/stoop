@@ -41,16 +41,11 @@ jobs:
           if python3 .github/check-release-version.py "v$VERSION-extra"; then exit 1; fi
       - name: Install musl tools
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y musl-tools shellcheck
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
       - name: Configure Rust target
         run: rustup target add '${{ matrix.target }}'
       - name: Test
         run: cargo test --locked
-      - name: Installer tests
-        if: matrix.target == 'x86_64-unknown-linux-musl'
-        run: |
-          shellcheck -s sh site/install.sh
-          python3 tests/installer.py
       - name: Build release
         run: cargo build --release --locked --target '${{ matrix.target }}'
       - name: Package release
@@ -62,9 +57,18 @@ jobs:
           name: ${{ matrix.target }}
           path: dist/*.tar.gz
           if-no-files-found: error
+  installer:
+    name: Installer (dash and bash)
+    runs-on: ubuntu-24.04
+    container: rust:1-slim-bookworm
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: apt-get update && apt-get install -y python3 curl shellcheck
+      - run: shellcheck -s sh site/install.sh
+      - run: python3 tests/installer.py
   publish:
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: build
+    needs: [build, installer]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
