@@ -85,6 +85,9 @@ impl Journal {
         }
         let key = spec.key.ok_or("job has no key")?;
         let refs = spec.actions.clone();
+        if run::env_flag("STOOP_STRICT_ACTIONS") {
+            resolve::require_pinned(&refs)?;
+        }
         let (actions, failures) = resolve::resolve_all(&refs, &resolve::Git::from_env(root));
         if !failures.is_empty() {
             return Err(format!("action resolution at journal open failed: {}", failures.join("; ")));
@@ -189,6 +192,9 @@ impl Journal {
     fn check_actions(&self, resolver: &dyn resolve::Resolver) -> Result<(), String> {
         if !self.resolved {
             return Err("action resolution at journal open is missing".into());
+        }
+        if run::env_flag("STOOP_STRICT_ACTIONS") {
+            resolve::require_pinned(&self.refs)?;
         }
         let (actions, failures) = resolve::resolve_all(&self.refs, resolver);
         if !failures.is_empty() {

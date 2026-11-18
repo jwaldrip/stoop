@@ -314,6 +314,16 @@ fn resolve_one(uses: &str, resolver: &dyn Resolver) -> Result<String, String> {
         } => resolver.commit(&owner, &repo, &reference),
     }
 }
+/// In strict mode, only a complete commit ID is eligible for a job record.
+pub fn require_pinned(uses: &[String]) -> Result<(), String> {
+    for raw in uses {
+        if !matches!(classify(raw), Ok(Action::Pinned(_))) {
+            return Err(format!("action {raw} is not pinned to a full commit SHA"));
+        }
+    }
+    Ok(())
+}
+
 
 /// What the recorder stores in `JobRecord.actions`: the commit of every reference that
 /// resolved, and one reason for each reference that did not. A reference that did not
@@ -353,18 +363,27 @@ pub fn image_pinned(image: &str) -> bool {
 /// resolve now to the commit the record stored, and every image must be pinned.
 pub struct ActionCheck<'a> {
     memo: Memo<'a>,
+    strict: bool,
 }
 
 impl<'a> ActionCheck<'a> {
     pub fn new(resolver: &'a dyn Resolver) -> Self {
         Self {
             memo: Memo::new(resolver),
+            strict: run::env_flag("STOOP_STRICT_ACTIONS"),
         }
+    }
+    /// Explicit policy for callers that obtain strictness from a plan option.
+    pub fn with_strict(resolver: &'a dyn Resolver, strict: bool) -> Self {
+        Self { memo: Memo::new(resolver), strict }
     }
 }
 
 impl RecordCheck for ActionCheck<'_> {
     fn check(&self, spec: &JobSpec, record: &JobRecord) -> Result<(), (Code, String)> {
+        if self.strict {
+            require_pinned(&spec.actions).map_err(|e| (Code::UnresolvedAction, e))?;
+        }
         for image in &spec.images {
             if !image_pinned(image) {
                 return Err((
@@ -979,5 +998,19 @@ mod tests {
             let _ = check.check(&s, &record(&[("actions/checkout@v4", A)]));
         }
         assert_eq!(fake.calls(), 1);
+    }
+    #[test]
+    fn strict_policy_refuses_floating_actions_but_accepts_pins() {
+        let fake = Fake::new();
+        fake.set("actions/checkout@v4", Ok(A));
+        let floating = spec(&["actions/checkout@v4"], &[]);
+        let rec = record(&[("actions/checkout@v4", A)]);
+        assert_eq!(ActionCheck::with_strict(&fake, true).check(&floating, &rec).unwrap_err().0, Code::UnresolvedAction);
+        assert_eq!(fake.calls(), 0);
+        assert!(ActionCheck::with_strict(&fake, false).check(&floating, &rec).is_ok());
+        let pin = format!("actions/checkout@{A}");
+        assert!(require_pinned(std::slice::from_ref(&pin)).is_ok());
+        assert!(require_pinned(&["actions/checkout@v4".into()]).is_err());
+        assert!(ActionCheck::with_strict(&fake, true).check(&spec(&[&pin], &[]), &record(&[(&pin, A)])).is_ok());
     }
 }
