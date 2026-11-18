@@ -24,7 +24,7 @@ stoop_install() {
     Linux:aarch64|Linux:arm64) target=aarch64-unknown-linux-musl ;;
     Darwin:x86_64) target=x86_64-apple-darwin ;;
     Darwin:arm64) target=aarch64-apple-darwin ;;
-    *) echo 'Unsupported OS or architecture. Try cargo install --locked --git https://github.com/jwaldrip/stoop' >&2; return 1 ;;
+    *) echo 'Unsupported OS or architecture. Prebuilt binaries: https://github.com/jwaldrip/stoop/releases' >&2; return 1 ;;
   esac
   # STOOP_RELEASE_BASE is for tests only. Plain HTTP is limited to loopback.
   base=${STOOP_RELEASE_BASE:-https://github.com/jwaldrip/stoop/releases/download}

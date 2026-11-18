@@ -180,6 +180,7 @@ ${body.trim()}
       </article>
       ${toc}
     </div>
+    <footer class="made"><a class="maker" href="https://withbushido.ai"><span class="seal" aria-hidden="true"></span><span>A Bushido Collective project</span></a></footer>
   </main>
 </div>
 </body>

@@ -1,8 +1,6 @@
 <p align="center">
-  <a href="https://stoop.build/">
-    <img alt="stoop" src="assets/stoop-logo-on-light.svg#gh-light-mode-only" width="300">
-    <img alt="stoop" src="assets/stoop-logo-on-dark.svg#gh-dark-mode-only" width="300">
-  </a>
+  <img alt="stoop" src="assets/stoop-logo-on-light.svg#gh-light-mode-only" width="300">
+  <img alt="stoop" src="assets/stoop-logo-on-dark.svg#gh-dark-mode-only" width="300">
 </p>
 
 <h3 align="center">Run only what matters.</h3>
@@ -76,8 +74,6 @@ The installer places the binary in `~/.local/bin`. Set `STOOP_INSTALL_DIR` to an
 
 The SHA-256 check detects corruption and a tampered mirror, but a compromised release could replace both the archive and its checksum. When `gh` is installed, the installer verifies GitHub build provenance; otherwise it reports that the check was skipped. Provenance identifies the build, not whether its source is safe. `curl | sh` trusts the domain and TLS to deliver the installer.
 
-Alternatively, install from source with `cargo install --locked --git https://github.com/jwaldrip/stoop`.
-
 Tracing needs Linux on x86-64 or arm64. On macOS stoop runs the command untraced, never records, and never skips.
 
 ```sh
@@ -143,3 +139,10 @@ cargo test        # the end-to-end tests need Linux
 ```
 
 MIT licensed.
+
+<p align="center">
+  <img alt="The Bushido Collective seal" src="assets/bushido-seal-on-light.svg#gh-light-mode-only" width="72">
+  <img alt="The Bushido Collective seal" src="assets/bushido-seal-on-dark.svg#gh-dark-mode-only" width="72">
+  <br>
+  <sub>A <a href="https://withbushido.ai">Bushido Collective</a> project</sub>
+</p>

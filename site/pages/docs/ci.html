@@ -75,7 +75,8 @@
   <span class="k">variables</span>:
     <span class="k">STOOP_SYNC</span>: git
   <span class="k">before_script</span>:
-    - cargo install --locked --git https://github.com/jwaldrip/stoop
+    - curl -fsSL https://stoop.build/install.sh | sh
+    - export PATH="$HOME/.local/bin:$PATH"
     - if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then export STOOP_SYNC_WRITE=1; fi
     - stoop pull
   <span class="k">script</span>:
@@ -92,7 +93,7 @@
       - <span class="k">image</span>: rust:1
     <span class="k">steps</span>:
       - checkout
-      - <span class="k">run</span>: cargo install --locked --git https://github.com/jwaldrip/stoop
+      - <span class="k">run</span>: curl -fsSL https://stoop.build/install.sh | sh &amp;&amp; echo 'export PATH="$HOME/.local/bin:$PATH"' &gt;&gt; "$BASH_ENV"
       - <span class="k">restore_cache</span>:
           <span class="k">keys</span>:
             - stoop-main-
