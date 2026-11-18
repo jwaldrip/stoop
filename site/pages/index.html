@@ -20,7 +20,7 @@
     <h1>Run only what matters.</h1>
     <p class="lede"><strong>stoop</strong> wraps a command and watches every file it reads. The next time, if none of those files changed, it skips the command. If one did, it runs it and learns again. There are no input lists to write and none to keep current.</p>
     <div class="install">
-      <pre><code><span class="p">$</span> cargo install --locked --git https://github.com/jwaldrip/stoop</code></pre>
+      <pre><code><span class="p">$</span> curl -fsSL https://stoop.build/install.sh | sh</code></pre>
       <p>Tracing needs Linux on x86-64 or arm64. On macOS stoop builds and runs the command untraced, and records nothing.</p>
     </div>
     <p class="onward"><a href="docs/getting-started.html">Start with the field guide</a></p>

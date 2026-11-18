@@ -2,8 +2,7 @@
 //   node site/build.mjs
 // Pages in pages/ start with <!--meta {json}-->. Docs pages are fragments wrapped in
 // the docs layout; the home page is a whole document. {{root}} becomes the relative
-// path back to the site root, so the site works under any base path (GitHub Pages
-// serves it at /stoop/).
+// path back to the site root, so links also work when hosted under a prefix.
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, cpSync, rmSync, statSync } from "node:fs";
 import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,6 +14,8 @@ rmSync(out, { recursive: true, force: true });
 mkdirSync(out, { recursive: true });
 cpSync(join(here, "static"), out, { recursive: true });
 cpSync(join(repo, "assets"), join(out, "assets"), { recursive: true });
+cpSync(join(here, "install.sh"), join(out, "install.sh"));
+writeFileSync(join(out, "CNAME"), "stoop.build\n");
 
 // The lockup and mark, inlined so their ink follows the page theme.
 const inline = (file) =>
@@ -56,14 +57,14 @@ const head = ({ title, description, root, canonical }) => `<!doctype html>
 <meta name="theme-color" content="#eef2f5" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#0d1216" media="(prefers-color-scheme: dark)">
 <script>try{var t=localStorage.getItem("stoop-theme");if(t==="light"||t==="dark"){document.documentElement.dataset.theme=t;document.querySelectorAll('meta[name="theme-color"]').forEach(function(m){m.dataset.orig=m.content;m.content=t==="dark"?"#0d1216":"#eef2f5"})}}catch(e){}</script>
-<link rel="canonical" href="https://jwaldrip.github.io/stoop/${canonical}">
+<link rel="canonical" href="https://stoop.build/${canonical}">
 <link rel="icon" href="${root}assets/stoop-app.svg" type="image/svg+xml">
 <link rel="icon" href="${root}assets/favicon-32.png" sizes="32x32" type="image/png">
 <link rel="apple-touch-icon" href="${root}assets/apple-touch-icon.png">
 <meta property="og:type" content="website">
 <meta property="og:title" content="${title}">
 <meta property="og:description" content="${description}">
-<meta property="og:image" content="https://jwaldrip.github.io/stoop/assets/social-preview.png">
+<meta property="og:image" content="https://stoop.build/assets/social-preview.png">
 <meta property="og:image:width" content="1280">
 <meta property="og:image:height" content="640">
 <meta name="twitter:card" content="summary_large_image">
@@ -203,6 +204,8 @@ for (const [slug] of DOCS) {
 writeFileSync(join(out, "docs", "index.html"),
   `<!doctype html><meta charset="utf-8"><title>stoop docs</title><meta http-equiv="refresh" content="0; url=getting-started.html"><link rel="canonical" href="getting-started.html"><a href="getting-started.html">Getting started</a>\n`);
 writeFileSync(join(out, ".nojekyll"), "");
+writeFileSync(join(out, "robots.txt"), "User-agent: *\nAllow: /\nSitemap: https://stoop.build/sitemap.xml\n");
+writeFileSync(join(out, "sitemap.xml"), `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">${["", ...DOCS.map(([slug]) => `docs/${slug}.html`)].map((path) => `<url><loc>https://stoop.build/${path}</loc></url>`).join("")}</urlset>\n`);
 
 // Every local link and asset reference must resolve.
 const missing = [];
