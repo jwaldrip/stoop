@@ -21,13 +21,15 @@
     <tr><td>Outputs</td><td>What the run left inside the repository, with hashes. A skip needs them still in place. Paths the run created and then removed again are listed as removed.</td></tr>
     <tr><td>Probes</td><td>For each <code>--probe</code> command, a hash of what it printed.</td></tr>
     <tr><td>Directory and repository</td><td>The working directory relative to the root and, for an external store, a repository identity.</td></tr>
+    <tr><td>Platform</td><td>The operating system, architecture, tracer and tracer version that observed the command.</td></tr>
   </tbody>
 </table>
 <p>Inputs and outputs inside the root are stored as relative paths, so a proof stored with the checkout can move with it. Paths outside the root stay absolute. A failing run records nothing. Neither does a run started with <code>--no-record</code>.</p>
 <p>Before the run first writes a path, stoop also notes what that path held: absent, a directory, a link and its target, or a file with its content hash. A skip does not read this record.</p>
+<p>Proofs are specific to that platform and tracer. A Linux x86-64 proof cannot skip a Linux arm64 command, even when they share a store or Git remote. Proofs without platform information are treated as cold; run the command on a supported Linux platform to record a fresh one. New proofs use a format older stoop versions cannot read, so update runners sharing a store. <code>stoop ls</code> shows the recorded platforms. macOS has no tracer, so it runs commands without recording or skipping; <code>stoop explain</code> reports that they would run.</p>
 
 <h2 id="compare">The comparison</h2>
-<p>Next time, before running anything, stoop loads the proofs for the key, newest first, and checks each in turn: not expired, same environment, every input still the same, every output still in place, every probe still printing the same thing. The first proof that passes means a skip. If none passes, the command runs and the reason given is what differed from the newest proof. <code>stoop explain</code> prints what differed in each proof it checked.</p>
+<p>Next time, before running anything, stoop loads the proofs for the key, newest first, and checks each in turn: same platform and tracer, not expired, same environment, every input still the same, every output still in place, every probe still printing the same thing. The first proof that passes means a skip. If none passes, the command runs and the reason given is what differed from the newest proof. <code>stoop explain</code> prints what differed in each proof it checked.</p>
 <p>Checking costs one hash of every recorded input. For the cargo build in the <a href="getting-started.html">getting started</a> transcript that was 668 inputs, the Rust toolchain included, in 289 ms. Every file is hashed byte for byte, with no sampling and no trust in timestamps.</p>
 <p>Executable bits are part of a file's identity, so a proof recorded by an earlier stoop has no <code>x:</code> ids and a command that read an executable runs again once after upgrading. The new proof then skips as usual.</p>
 
@@ -63,7 +65,7 @@
     <tr><td>The command read <code>.git</code></td><td>Not recorded: a skip could hide a history change. Add <code>.git</code> to <code>.stoopignore</code> if that read cannot change the result.</td></tr>
     <tr><td>The command used the network or a local service</td><td>Not recorded, naming the destination, unless a <code>--probe</code> covers it or <code>--allow-network</code> is set.</td></tr>
     <tr><td>A probe failed, or changed while the command ran</td><td>Not recorded.</td></tr>
-    <tr><td>Tracing is unavailable (not Linux)</td><td>Runs untraced; not recorded.</td></tr>
+    <tr><td>Tracing is unavailable (including macOS)</td><td>Runs untraced; never skips or records.</td></tr>
     <tr><td><code>STOOP_OFF=1</code></td><td>Runs the command directly; no tracing, no skipping.</td></tr>
   </tbody>
 </table>

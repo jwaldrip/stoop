@@ -113,13 +113,23 @@ fn real_main(mut args: Vec<String>) -> i32 {
     match cmd.as_str() {
         "ls" => {
             let store = store_for(&o);
-            for (key, n, created, inputs, dirs) in store.list() {
-                let dirs = dirs
+            for proof in store.list() {
+                let dirs = proof
+                    .dirs
                     .iter()
                     .map(|dir| format!("{dir:?}"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                println!("{key}\t{n} proofs\t{inputs} inputs\tcreated {created}\tdir {dirs}");
+                let platforms = proof
+                    .platforms
+                    .iter()
+                    .map(|platform| format!("{platform:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!(
+                    "{}\t{} proofs\t{} inputs\tcreated {}\tdir {dirs}\tplatform {platforms}",
+                    proof.key, proof.count, proof.inputs, proof.created
+                );
             }
             for (key, n, created, steps) in jobs_for(&o).list() {
                 println!("{key}\t{n} records\t{steps} steps\tcreated {created}");

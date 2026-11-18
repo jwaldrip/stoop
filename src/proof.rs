@@ -1,6 +1,7 @@
 //! Proofs: the inputs a command read the last time it passed.
 
 use crate::input::Input;
+use crate::trace::Provenance;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fs;
@@ -21,6 +22,9 @@ pub struct Proof {
     /// Repository identity when proofs can share a store across roots.
     #[serde(default)]
     pub scope: Option<String>,
+    /// The operating system, architecture and tracer that made the observation.
+    #[serde(default)]
+    pub provenance: Option<Provenance>,
     /// Hashes of the effective environment captured for the run.
     pub env: BTreeMap<String, String>,
     pub inputs: Vec<Input>,
@@ -60,6 +64,7 @@ impl Proof {
             &self.unplannable,
             &self.cwd,
             &self.scope,
+            &self.provenance,
         ))
         .expect("proof fields serialize");
         format!("p-{}", &blake3::hash(&bytes).to_hex()[..32])
@@ -71,6 +76,31 @@ struct ProofFile {
     v: u32,
     key: String,
     proofs: Vec<Proof>,
+}
+
+impl ProofFile {
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let mut file: Self = serde_json::from_slice(bytes).ok()?;
+        match file.v {
+            1 => {
+                for proof in &mut file.proofs {
+                    proof.provenance = None;
+                }
+            }
+            2 => {}
+            _ => return None,
+        }
+        Some(file)
+    }
+}
+
+pub struct ProofSummary {
+    pub key: String,
+    pub count: usize,
+    pub created: u64,
+    pub inputs: usize,
+    pub dirs: Vec<String>,
+    pub platforms: Vec<String>,
 }
 
 pub struct Store {
@@ -92,6 +122,7 @@ pub fn sanitize(key: &str) -> String {
 fn same_proof(a: &Proof, b: &Proof) -> bool {
     a.cwd == b.cwd
         && a.scope == b.scope
+        && a.provenance == b.provenance
         && a.inputs == b.inputs
         && a.outputs == b.outputs
         && a.removed == b.removed
@@ -126,8 +157,8 @@ impl Store {
         let Ok(bytes) = fs::read(self.file(key)) else {
             return Vec::new();
         };
-        match serde_json::from_slice::<ProofFile>(&bytes) {
-            Ok(f) if f.v == 1 && f.key == key => f.proofs,
+        match ProofFile::decode(&bytes) {
+            Some(f) if f.key == key => f.proofs,
             _ => Vec::new(),
         }
     }
@@ -148,7 +179,7 @@ impl Store {
             let _ = fs::write(ignore, "*\n");
         }
         let body = serde_json::to_vec(&ProofFile {
-            v: 1,
+            v: 2,
             key: key.to_string(),
             proofs,
         })
@@ -167,8 +198,8 @@ impl Store {
     /// proofs were new. A file for another key or an unknown version is refused.
     pub fn import(&self, key: &str, bytes: &[u8]) -> io::Result<usize> {
         let bad = || io::Error::new(io::ErrorKind::InvalidData, "not a proof file for this key");
-        let theirs = serde_json::from_slice::<ProofFile>(bytes).map_err(|_| bad())?;
-        if theirs.v != 1 || theirs.key != key {
+        let theirs = ProofFile::decode(bytes).ok_or_else(bad)?;
+        if theirs.key != key {
             return Err(bad());
         }
         let mut proofs = self.load(key);
@@ -205,8 +236,7 @@ impl Store {
         }
     }
 
-    /// (key, proof count, newest created, newest input count, working directories)
-    pub fn list(&self) -> Vec<(String, usize, u64, usize, Vec<String>)> {
+    pub fn list(&self) -> Vec<ProofSummary> {
         let mut out = Vec::new();
         let Ok(rd) = fs::read_dir(self.dir.join("proofs")) else {
             return out;
@@ -215,7 +245,7 @@ impl Store {
             let Ok(bytes) = fs::read(e.path()) else {
                 continue;
             };
-            if let Ok(f) = serde_json::from_slice::<ProofFile>(&bytes) {
+            if let Some(f) = ProofFile::decode(&bytes) {
                 if let Some(p) = f.proofs.first() {
                     let dirs = f
                         .proofs
@@ -228,17 +258,30 @@ impl Store {
                         .collect::<std::collections::BTreeSet<_>>()
                         .into_iter()
                         .collect();
-                    out.push((
-                        f.key.clone(),
-                        f.proofs.len(),
-                        p.created,
-                        p.inputs.len(),
+                    let platforms = f
+                        .proofs
+                        .iter()
+                        .map(|proof| match &proof.provenance {
+                            Some(p) => {
+                                format!("{}/{} {}/v{}", p.os, p.arch, p.tracer, p.version)
+                            }
+                            None => "unknown".to_string(),
+                        })
+                        .collect::<std::collections::BTreeSet<_>>()
+                        .into_iter()
+                        .collect();
+                    out.push(ProofSummary {
+                        key: f.key.clone(),
+                        count: f.proofs.len(),
+                        created: p.created,
+                        inputs: p.inputs.len(),
                         dirs,
-                    ));
+                        platforms,
+                    });
                 }
             }
         }
-        out.sort();
+        out.sort_by(|a, b| a.key.cmp(&b.key));
         out
     }
 }
@@ -259,6 +302,7 @@ mod tests {
             argv: vec!["x".into()],
             cwd: Some(String::new()),
             scope: None,
+            provenance: Some(Provenance::current()),
             env: BTreeMap::new(),
             inputs: vec![Input {
                 path: "a".into(),
@@ -386,6 +430,9 @@ mod tests {
         let mut v = base.clone();
         v.scope = Some("repo".into());
         variants.push(v);
+        let mut v = base.clone();
+        v.provenance = None;
+        variants.push(v);
         let mut v = base;
         v.ignore = Some(vec!["x".into()]);
         variants.push(v);
@@ -419,6 +466,50 @@ mod tests {
         }
         s.save("k", proof("f:19")).unwrap();
         assert_eq!(s.load("k").len(), MAX_PROOFS);
+    }
+
+    #[test]
+    fn syncing_keeps_identical_inputs_from_distinct_platforms() {
+        let a = store("provenance-a");
+        let b = store("provenance-b");
+        let first = proof("f:1");
+        let mut second = first.clone();
+        second.provenance.as_mut().unwrap().arch = "other-arch".into();
+        let mut legacy = first.clone();
+        legacy.provenance = None;
+        a.save("k", first).unwrap();
+        a.save("k", second).unwrap();
+        a.save("k", legacy).unwrap();
+        assert_eq!(a.load("k").len(), 3);
+        let bytes = a.export("k").unwrap();
+        let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wire["v"], 2);
+        assert_eq!(b.import("k", &bytes).unwrap(), 3);
+        assert_eq!(b.import("k", &bytes).unwrap(), 0);
+        let platforms = &b.list()[0].platforms;
+        assert!(platforms.iter().any(|p| p.contains("other-arch")));
+        assert!(platforms.iter().any(|p| p == "unknown"));
+        assert_eq!(Store::key_of(&bytes).as_deref(), Some("k"));
+        assert_eq!(Store::newest_created(&bytes), Some(1));
+    }
+
+    #[test]
+    fn legacy_format_cannot_claim_provenance() {
+        let a = store("legacy-platform-a");
+        let b = store("legacy-platform-b");
+        let file = ProofFile {
+            v: 1,
+            key: "k".into(),
+            proofs: vec![proof("f:1")],
+        };
+        let bytes = serde_json::to_vec(&file).unwrap();
+        fs::create_dir_all(a.file("k").parent().unwrap()).unwrap();
+        fs::write(a.file("k"), &bytes).unwrap();
+        assert!(a.load("k")[0].provenance.is_none());
+        assert_eq!(a.list()[0].platforms, vec!["unknown"]);
+        assert_eq!(b.import("k", &bytes).unwrap(), 1);
+        assert_eq!(Store::newest_created(&bytes), Some(1));
+        assert!(b.load("k")[0].provenance.is_none());
     }
 
     #[test]

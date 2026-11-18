@@ -487,7 +487,9 @@ pub fn run<'a>(
     }
     if pid == 0 {
         unsafe {
-            libc::ptrace(libc::PTRACE_TRACEME as _, 0, 0, 0);
+            if libc::ptrace(libc::PTRACE_TRACEME as _, 0, 0, 0) < 0 {
+                libc::_exit(126);
+            }
             libc::prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
             if libc::prctl(
                 PR_SET_SECCOMP,
@@ -527,8 +529,16 @@ pub fn run<'a>(
     tr.cwds.insert(pid, cwd.to_path_buf());
 
     let mut st: libc::c_int = 0;
-    if unsafe { libc::waitpid(pid, &mut st, libc::__WALL) } < 0 {
-        return Err(io::Error::last_os_error());
+    loop {
+        if unsafe { libc::waitpid(pid, &mut st, libc::__WALL) } >= 0 {
+            break;
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) {
+            continue;
+        }
+        let _ = kill_and_reap(pid);
+        return Err(err);
     }
     if libc::WIFEXITED(st) || libc::WIFSIGNALED(st) {
         // The child died before exec (seccomp refused, for instance).
@@ -542,26 +552,43 @@ pub fn run<'a>(
         | libc::PTRACE_O_EXITKILL;
     if unsafe { libc::ptrace(libc::PTRACE_SETOPTIONS as _, pid, 0, opts as libc::c_long) } < 0 {
         let e = io::Error::last_os_error();
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, &mut st, libc::__WALL);
-        }
+        let _ = kill_and_reap(pid);
         return Err(e);
     }
     cont(pid, 0);
+    let mut root_finished = false;
+    let mut wait_failed = false;
 
     loop {
         let p = unsafe { libc::waitpid(-1, &mut st, libc::__WALL) };
         if p < 0 {
-            match io::Error::last_os_error().raw_os_error() {
-                Some(libc::ECHILD) => break,
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::ECHILD) => {
+                    if !root_finished {
+                        tr.flag("tracer wait ended before the command exit status was observed");
+                    }
+                    break;
+                }
                 Some(libc::EINTR) => continue,
-                _ => return Err(io::Error::last_os_error()),
+                _ => {
+                    tr.flag(&format!("tracer wait failed: {err}"));
+                    if wait_failed {
+                        if !root_finished {
+                            tr.t.status = kill_and_reap(pid).unwrap_or(1);
+                        }
+                        break;
+                    }
+                    wait_failed = true;
+                    continue;
+                }
             }
         }
+        wait_failed = false;
         if libc::WIFEXITED(st) {
             if p == pid {
                 tr.t.status = libc::WEXITSTATUS(st);
+                root_finished = true;
             }
             tr.cwds.remove(&p);
             continue;
@@ -569,6 +596,7 @@ pub fn run<'a>(
         if libc::WIFSIGNALED(st) {
             if p == pid {
                 tr.t.status = 128 + libc::WTERMSIG(st);
+                root_finished = true;
             }
             tr.cwds.remove(&p);
             continue;
@@ -595,6 +623,29 @@ pub fn run<'a>(
         }
     }
     Ok(tr.t)
+}
+
+/// Stop a child and reap it after an unrecoverable tracer failure.
+fn kill_and_reap(pid: i32) -> Option<i32> {
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    loop {
+        let mut st = 0;
+        if unsafe { libc::waitpid(pid, &mut st, libc::__WALL) } < 0 {
+            if io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return None;
+        }
+        if libc::WIFEXITED(st) {
+            return Some(libc::WEXITSTATUS(st));
+        }
+        if libc::WIFSIGNALED(st) {
+            return Some(128 + libc::WTERMSIG(st));
+        }
+        if libc::WIFSTOPPED(st) {
+            cont(pid, libc::SIGKILL);
+        }
+    }
 }
 
 fn cont(pid: i32, sig: libc::c_int) {
