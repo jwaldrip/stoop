@@ -448,6 +448,7 @@ int main(void) {
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <sys/ptrace.h>
