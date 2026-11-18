@@ -18,8 +18,9 @@ use std::ffi::{CString, OsString};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 #[cfg(target_arch = "x86_64")]
@@ -515,6 +516,8 @@ struct Rec<'a> {
     root: PathBuf,
     hashed: u64,
     oids: bool,
+    /// A custom Git configuration may name attribute or config files anywhere in the repo.
+    cautious_git_config: bool,
     link_walks: BTreeMap<PathBuf, Vec<PathBuf>>,
     redirected_reads: HashSet<String>,
 }
@@ -546,6 +549,8 @@ pub fn run<'a>(
     let tbl = table();
     let nrs: Vec<i64> = tbl.iter().map(|(n, _)| *n).collect();
     let filter = bpf_filter(&nrs, &denied());
+    let cautious_git_config =
+        scope.is_some_and(|s| s.oids && cautious_git_config(s.root, &s.real_root));
     let prog = libc::sock_fprog {
         len: filter.len() as u16,
         filter: filter.as_ptr() as *mut libc::sock_filter,
@@ -600,6 +605,7 @@ pub fn run<'a>(
             ignore: s.ignore,
             root: s.root.to_path_buf(),
             oids: s.oids,
+            cautious_git_config,
             hashed: 0,
             link_walks: BTreeMap::new(),
             redirected_reads: HashSet::new(),
@@ -627,6 +633,7 @@ pub fn run<'a>(
         // The child died before exec (seccomp refused, for instance).
         return Err(io::Error::other("could not start the traced command"));
     }
+    tr.inspect_inherited_fds(pid);
     let opts = libc::PTRACE_O_TRACESECCOMP
         | libc::PTRACE_O_TRACEFORK
         | libc::PTRACE_O_TRACEVFORK
@@ -1184,6 +1191,72 @@ fn is_dir(p: &Path) -> bool {
     fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
 }
 
+/// If Git can read attribute or included config files at arbitrary in-repository
+/// names, a write to any such name must invalidate the recorded attribute state.
+fn cautious_git_config(root: &Path, real_root: &Path) -> bool {
+    // The guard isolates Git configuration under the repository in unit tests.
+    if cfg!(test) {
+        return true;
+    }
+    if std::env::vars_os().any(|(name, _)| {
+        let name = name.to_string_lossy();
+        name == "GIT_CONFIG"
+            || name.starts_with("GIT_CONFIG_")
+            || matches!(
+                name.as_ref(),
+                "GIT_DIR"
+                    | "GIT_COMMON_DIR"
+                    | "GIT_WORK_TREE"
+                    | "GIT_INDEX_FILE"
+                    | "GIT_ATTR_SOURCE"
+            )
+    }) {
+        return true;
+    }
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return true;
+    };
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    for path in [
+        home.clone(),
+        home.join(".gitconfig"),
+        xdg.clone(),
+        xdg.join("git/config"),
+        xdg.join("git/attributes"),
+        PathBuf::from("/etc/gitconfig"),
+        PathBuf::from("/etc/gitattributes"),
+    ] {
+        if !path.is_absolute()
+            || path.starts_with(root)
+            || fs::canonicalize(&path).is_ok_and(|p| p.starts_with(real_root))
+        {
+            return true;
+        }
+    }
+    let Some(mut git) = crate::oid_attrs::git(root) else {
+        return true;
+    };
+    let Ok(output) = git
+        .args(["config", "--null", "--name-only", "--list", "--includes"])
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return true;
+    };
+    if !output.status.success() {
+        return true;
+    }
+    output.stdout.split(|b| *b == 0).any(|name| {
+        let name = name.to_ascii_lowercase();
+        name == b"core.attributesfile"
+            || name.starts_with(b"include.")
+            || name.starts_with(b"includeif.")
+    })
+}
+
 /// Read an ELF PT_INTERP pathname without loading the executable into memory.
 fn elf_interpreter(file: &mut fs::File, header: &[u8]) -> io::Result<Option<PathBuf>> {
     use std::io::{Read, Seek, SeekFrom};
@@ -1307,6 +1380,57 @@ fn push_reason(t: &mut Trace, why: String) {
 }
 
 impl Rec<'_> {
+    /// Attribute files can be ignored by the proof but still affect every Git OID.
+    /// Unknown locations and ordinary writes outside the root are conservative:
+    /// Git can read config and attribute files at arbitrary external paths.
+    fn invalidates_oids(&mut self, raw: &Path, follows: bool) -> bool {
+        let link_meta = fs::symlink_metadata(raw);
+        let metadata = if follows {
+            fs::metadata(raw)
+        } else {
+            fs::symlink_metadata(raw)
+        };
+        if metadata.as_ref().is_err_and(|e| !is_absent(e)) {
+            return true;
+        }
+        if raw.file_name().is_some_and(|name| name == ".gitattributes")
+            || raw
+                .components()
+                .any(|component| component.as_os_str() == ".git")
+        {
+            return true;
+        }
+        if metadata.as_ref().is_ok_and(|m| {
+            let kind = m.file_type();
+            kind.is_char_device() || kind.is_block_device() || kind.is_fifo() || kind.is_socket()
+        }) {
+            return false;
+        }
+        let physical = if follows && link_meta.as_ref().is_ok_and(|m| m.file_type().is_symlink()) {
+            fs::canonicalize(raw).ok()
+        } else {
+            self.phys.locate(raw).map(|location| location.path)
+        };
+        let Some(physical) = physical else {
+            return true;
+        };
+        if !physical.starts_with(self.phys.real()) {
+            return true;
+        }
+        if self.cautious_git_config
+            || physical
+                .file_name()
+                .is_some_and(|name| name == ".gitattributes")
+            || physical
+                .components()
+                .any(|component| component.as_os_str() == ".git")
+        {
+            return true;
+        }
+        // An attribute file or a config file may share an inode with another name.
+        metadata.is_ok_and(|m| m.is_file() && m.nlink() > 1)
+    }
+
     fn key_text(&self, lex: &Path) -> String {
         to_key(&self.root, lex)
     }
@@ -1519,15 +1643,19 @@ impl Rec<'_> {
             // Once replay is already impossible, avoid hashing more content.
             return None;
         }
-        let hash = if self.oids {
+        let basis = (self.oids && !t.oid_attrs_changed)
+            .then(|| crate::oid_attrs::check(&self.root, key))
+            .flatten();
+        let hash = if basis.is_some() {
             hash_file_with_oid(phys)
         } else {
             hash_file(phys).map(|hash| (hash, None))
         };
         match hash {
             Ok((h, oid)) => {
-                if let Some(oid) = oid {
+                if let (Some(oid), Some(basis)) = (oid, basis) {
                     t.prior_oids.insert(key.to_owned(), oid);
+                    t.prior_oid_bases.insert(key.to_owned(), basis);
                 }
                 self.hashed += size;
                 Some(file_id(exec, &h))
@@ -1541,6 +1669,54 @@ impl Rec<'_> {
 }
 
 impl Tracer<'_> {
+    /// A tracee can write through an inherited descriptor without opening a path
+    /// under ptrace. Inspect writable regular descriptors before its first exec.
+    fn inspect_inherited_fds(&mut self, pid: i32) {
+        let Some(rec) = self.rec.as_mut().filter(|rec| rec.oids) else {
+            return;
+        };
+        let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+            self.t.oid_attrs_changed = true;
+            return;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                self.t.oid_attrs_changed = true;
+                return;
+            };
+            let Ok(metadata) = fs::metadata(entry.path()) else {
+                self.t.oid_attrs_changed = true;
+                return;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let info = PathBuf::from(format!("/proc/{pid}/fdinfo")).join(entry.file_name());
+            let flags = fs::read_to_string(info).ok().and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix("flags:"))
+                    .and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
+            });
+            let Some(flags) = flags else {
+                self.t.oid_attrs_changed = true;
+                return;
+            };
+            if flags & libc::O_ACCMODE as u32 == libc::O_RDONLY as u32
+                || flags & libc::O_CLOEXEC as u32 != 0
+            {
+                continue;
+            }
+            let Ok(path) = fs::read_link(entry.path()) else {
+                self.t.oid_attrs_changed = true;
+                return;
+            };
+            if !path.is_absolute() || metadata.nlink() > 1 || rec.invalidates_oids(&path, true) {
+                self.t.oid_attrs_changed = true;
+                return;
+            }
+        }
+    }
+
     fn flag(&mut self, why: &str) {
         if self.t.unsound.len() < 16 && !self.t.unsound.iter().any(|u| u == why) {
             self.t.unsound.push(why.to_string());
@@ -1812,6 +1988,14 @@ impl Tracer<'_> {
     /// Record a write, and what the path held before the first one. Returns the key when in scope.
     fn write(&mut self, raw: &Path, follows: bool) -> Option<String> {
         self.rec.as_ref()?;
+        if !self.t.oid_attrs_changed
+            && self
+                .rec
+                .as_mut()
+                .is_some_and(|rec| rec.oids && rec.invalidates_oids(raw, follows))
+        {
+            self.t.oid_attrs_changed = true;
+        }
         // A write through a link changes what the link points to, not the link itself.
         let through_link =
             follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink());
@@ -1970,6 +2154,9 @@ impl Tracer<'_> {
             return;
         };
         let removes_dir = dir || flags.is_some_and(|i| args[i] as i32 & AT_REMOVEDIR != 0);
+        if removes_dir && self.rec.is_some() {
+            self.t.oid_attrs_changed = true;
+        }
         if fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir() || m.file_type().is_symlink()) {
             self.topology_changed(pid);
         }
@@ -2003,6 +2190,11 @@ impl Tracer<'_> {
         };
         let exchange = flags.is_some_and(|i| args[i] as u32 & RENAME_EXCHANGE != 0);
         let directory = is_dir(&a) || (exchange && is_dir(&b));
+        // A moved directory can contain nested .gitattributes files even though
+        // neither endpoint names one directly.
+        if directory && self.rec.is_some() {
+            self.t.oid_attrs_changed = true;
+        }
         if [&a, &b].iter().any(|p| {
             fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() || m.file_type().is_symlink())
         }) {
@@ -2029,7 +2221,13 @@ impl Tracer<'_> {
             return;
         }
         match fs::symlink_metadata(raw) {
-            Ok(m) if m.is_dir() => self.touch(raw.to_path_buf(), false),
+            Ok(m) if m.is_dir() => {
+                // Directory permissions can change which attribute files Git can read.
+                if self.rec.is_some() {
+                    self.t.oid_attrs_changed = true;
+                }
+                self.touch(raw.to_path_buf(), false);
+            }
             Ok(_) => {
                 self.write(raw, follows);
             }
@@ -2166,6 +2364,51 @@ impl Tracer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oid_attribute_mutation_detection_is_conservative() {
+        let dir = std::env::temp_dir().join(format!(
+            "stoop-oid-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let root = fs::canonicalize(&dir).unwrap();
+        let ignore = Ignore::new(&[], None, &[]);
+        let mut rec = Rec {
+            phys: Physical::new(&root, &root),
+            ignore: &ignore,
+            root: root.clone(),
+            hashed: 0,
+            oids: true,
+            cautious_git_config: false,
+            link_walks: BTreeMap::new(),
+            redirected_reads: HashSet::new(),
+        };
+        let ordinary = root.join("ordinary");
+        fs::write(&ordinary, b"ordinary").unwrap();
+        assert!(!rec.invalidates_oids(&ordinary, true));
+        assert!(rec.invalidates_oids(&root.join("nested/.gitattributes"), false));
+        assert!(rec.invalidates_oids(&root.join(".git/config"), true));
+        assert!(rec.invalidates_oids(&root.parent().unwrap().join("outside"), true));
+        assert!(!rec.invalidates_oids(Path::new("/dev/null"), true));
+
+        let attrs = root.join(".gitattributes");
+        fs::write(&attrs, b"* -text\n").unwrap();
+        let link = root.join("attribute-symlink");
+        std::os::unix::fs::symlink(&attrs, &link).unwrap();
+        assert!(rec.invalidates_oids(&link, true));
+        let alias = root.join("linked-attributes");
+        fs::hard_link(attrs, &alias).unwrap();
+        assert!(rec.invalidates_oids(&alias, true));
+
+        rec.cautious_git_config = true;
+        assert!(rec.invalidates_oids(&ordinary, true));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn topology_cache_is_cleared_again_on_the_changing_process_stop() {

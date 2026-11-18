@@ -747,6 +747,7 @@ pub fn build_outputs(
                 path: key.clone(),
                 id,
                 oid: None,
+                oid_basis: None,
             }),
         }
     }
@@ -761,10 +762,25 @@ pub fn build_priors(trace: &Trace) -> Vec<Input> {
     trace
         .priors
         .iter()
-        .map(|(path, id)| Input {
-            path: path.clone(),
-            id: id.clone(),
-            oid: trace.prior_oids.get(path).cloned(),
+        .map(|(path, id)| {
+            let pair = (!trace.oid_attrs_changed)
+                .then(|| {
+                    Some((
+                        trace.prior_oids.get(path)?.clone(),
+                        trace.prior_oid_bases.get(path)?.clone(),
+                    ))
+                })
+                .flatten();
+            let (oid, oid_basis) = match pair {
+                Some((oid, basis)) => (Some(oid), Some(basis)),
+                None => (None, None),
+            };
+            Input {
+                path: path.clone(),
+                id: id.clone(),
+                oid,
+                oid_basis,
+            }
         })
         .collect()
 }
@@ -823,8 +839,8 @@ pub fn build_inputs(
     );
     let mut reasons: Vec<String> = Vec::new();
     let mut reads_git = false;
-    // (path, key, lexical inside, entries listed, physical inside)
-    let mut cands: Vec<(PathBuf, String, bool, bool, bool)> = Vec::new();
+    // (path, key, lexical inside, entries listed, repository-relative physical key)
+    let mut cands: Vec<(PathBuf, String, bool, bool, Option<String>)> = Vec::new();
     for (lex, touch) in &trace.touched {
         let inside = lex.starts_with(root);
         let key = to_key(root, lex);
@@ -847,7 +863,13 @@ pub fn build_inputs(
                         } else if written.contains(pkey) {
                             reasons.push(format!("it read {pkey} through {key} and also wrote it"));
                         } else {
-                            cands.push((pp.clone(), pkey.to_string(), true, touch.listed, true));
+                            cands.push((
+                                pp.clone(),
+                                pkey.to_string(),
+                                true,
+                                touch.listed,
+                                Some(pkey.to_string()),
+                            ));
                         }
                     }
                     Some(_) => {}
@@ -886,27 +908,13 @@ pub fn build_inputs(
             reads_git = true;
             continue;
         }
-        let physical_inside = physical
+        let physical_key = physical
             .as_deref()
-            .is_some_and(|p| phys.repo_rel(p).is_some());
-        cands.push((lex.clone(), key, inside, touch.listed, physical_inside));
-    }
-    let mut out: Vec<Input> = Vec::with_capacity(cands.len());
-    let mut seen: HashSet<String> = HashSet::new();
-    let oids = records_oids(root);
-    let ids = par_map(&cands, |(p, _, inside, listed, physical_inside)| {
-        identify_recorded(p, *inside, *listed, oids && *physical_inside)
-    });
-    for ((_, key, _, _, _), id) in cands.iter().zip(ids) {
-        if let Some((id, oid)) = id {
-            if seen.insert(key.clone()) {
-                out.push(Input {
-                    path: key.clone(),
-                    id,
-                    oid,
-                });
-            }
-        }
+            .and_then(|p| phys.repo_rel(p))
+            .and_then(Path::to_str)
+            .filter(|_| inside)
+            .map(str::to_owned);
+        cands.push((lex.clone(), key, inside, touch.listed, physical_key));
     }
     // A symlink hides a second file: record where it points, whether or not the link is
     // ignored (an alias under an ignored /tmp can point into the repository).
@@ -951,15 +959,13 @@ pub fn build_inputs(
                     ));
                     continue;
                 }
-                if let Some((id, oid)) = identify_recorded(&target, true, false, oids) {
-                    if seen.insert(tkey.to_string()) {
-                        out.push(Input {
-                            path: tkey.to_string(),
-                            id,
-                            oid,
-                        });
-                    }
-                }
+                cands.push((
+                    target.clone(),
+                    tkey.to_string(),
+                    true,
+                    false,
+                    Some(tkey.to_string()),
+                ));
             }
             _ => {
                 if target
@@ -974,20 +980,53 @@ pub fn build_inputs(
                 if ignore.is_ignored(&link_key) || ignore.is_ignored(&tk) {
                     continue;
                 }
-                if let Some(id) = identify(&target, false, false) {
-                    if seen.insert(tk.clone()) {
-                        out.push(Input {
-                            path: tk,
-                            id,
-                            oid: None,
-                        });
-                    }
-                }
+                cands.push((target.clone(), tk, false, false, None));
             }
         }
     }
     if reads_git {
         return Err("it reads .git, so a skip could hide a history change (add `.git` to .stoopignore if that read cannot change the result)".into());
+    }
+    // Check all physical keys together, before hashing. A run that touched attributes
+    // or Git metadata cannot establish the attribute state at the time of every read.
+    let attr_keys: Vec<String> = if records_oids(root) && !trace.oid_attrs_changed {
+        cands
+            .iter()
+            .filter(|(path, _, _, _, _)| {
+                std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+            })
+            .filter_map(|(_, _, _, _, key)| key.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let bases = if attr_keys.is_empty() {
+        Default::default()
+    } else {
+        crate::oid_attrs::check_many(root, &attr_keys)
+    };
+    let ids = par_map(&cands, |(path, _, inside, listed, physical_key)| {
+        let basis = physical_key.as_ref().and_then(|key| bases.get(key));
+        identify_recorded(path, *inside, *listed, basis.is_some()).map(|(id, oid)| {
+            let oid_basis = oid.as_ref().and_then(|_| basis.cloned());
+            (id, oid, oid_basis)
+        })
+    });
+    let mut out: Vec<Input> = Vec::with_capacity(cands.len());
+    let mut seen: HashSet<String> = HashSet::new();
+    for ((_, key, _, _, _), id) in cands.iter().zip(ids) {
+        if let Some((id, oid, oid_basis)) = id {
+            if seen.insert(key.clone()) {
+                out.push(Input {
+                    path: key.clone(),
+                    id,
+                    oid,
+                    oid_basis,
+                });
+            }
+        }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok((out, reasons))
@@ -1043,6 +1082,36 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn prior_oid_requires_unchanged_attributes_and_a_basis() {
+        let mut trace = Trace::default();
+        trace.priors.insert("file".into(), "f:hash".into());
+        trace.prior_oids.insert("file".into(), "sha1:blob".into());
+        let prior = build_priors(&trace).pop().unwrap();
+        assert_eq!(prior.oid, None);
+        assert_eq!(prior.oid_basis, None);
+
+        let basis = crate::oid_attrs::OidBasis {
+            text: "unspecified".into(),
+            eol: "unspecified".into(),
+            crlf: "unspecified".into(),
+            filter: "unspecified".into(),
+            ident: "unspecified".into(),
+            working_tree_encoding: "unspecified".into(),
+            export_subst: "unspecified".into(),
+            autocrlf: "unset".into(),
+        };
+        trace.prior_oid_bases.insert("file".into(), basis.clone());
+        let prior = build_priors(&trace).pop().unwrap();
+        assert_eq!(prior.oid.as_deref(), Some("sha1:blob"));
+        assert_eq!(prior.oid_basis, Some(basis));
+
+        trace.oid_attrs_changed = true;
+        let prior = build_priors(&trace).pop().unwrap();
+        assert_eq!(prior.oid, None);
+        assert_eq!(prior.oid_basis, None);
+    }
 
     #[test]
     fn non_utf8_traced_paths_are_not_recorded_lossily() {

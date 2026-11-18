@@ -14,6 +14,18 @@ struct RecordedProvenance {
     version: u32,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct RecordedOidBasis {
+    text: String,
+    eol: String,
+    filter: String,
+    ident: String,
+    working_tree_encoding: String,
+    export_subst: String,
+    crlf: String,
+    autocrlf: String,
+}
+
 struct Ws {
     root: PathBuf,
     remote: PathBuf,
@@ -118,6 +130,21 @@ impl Ws {
             .env_remove("STOOP_OFF")
             .env_remove("STOOP_MATRIX")
             .env_remove("STOOP_STORE")
+            .env("HOME", self.root.parent().unwrap().join("home"))
+            .env("XDG_CONFIG_HOME", self.root.parent().unwrap().join("xdg"))
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .env_remove("GIT_CONFIG_SYSTEM")
+            .env_remove("GIT_CONFIG_NOSYSTEM")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_ATTR_SOURCE")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             .env_remove("STOOP_ENV_SALT");
         command
     }
@@ -167,6 +194,12 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -651,8 +684,10 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
     struct Input {
         path: String,
         id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         oid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oid_basis: Option<RecordedOidBasis>,
     }
     #[derive(serde::Deserialize)]
     struct Proof {
@@ -695,6 +730,7 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
                 .oid
                 .as_deref()
                 .is_some_and(|oid| oid.starts_with("sha1:")));
+            assert!(input.oid_basis.is_some());
         }
         assert!(proofs.iter().any(|p| {
             let bytes = serde_json::to_vec(&(
@@ -733,8 +769,10 @@ fn concurrent_proof_race(proof_only: bool) {
     struct Input {
         path: String,
         id: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        #[serde(default)]
         oid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oid_basis: Option<RecordedOidBasis>,
     }
     #[derive(serde::Deserialize)]
     struct Proof {

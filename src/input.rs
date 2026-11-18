@@ -20,8 +20,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub struct Input {
     pub path: String,
     pub id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oid_basis: Option<crate::oid_attrs::OidBasis>,
 }
 
 /// Identity of a regular file: a hash of its bytes, and whether any execute bit is set.
@@ -250,6 +252,21 @@ pub fn verify(root: &Path, inputs: &[Input], all: bool) -> Vec<Mismatch> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unavailable_oid_serializes_as_null_without_a_basis() {
+        let input = Input {
+            path: "file".into(),
+            id: "f:hash".into(),
+            oid: None,
+            oid_basis: None,
+        };
+        let value = serde_json::to_value(&input).unwrap();
+        assert_eq!(value.get("oid"), Some(&serde_json::Value::Null));
+        assert!(value.get("oid_basis").is_none());
+        let legacy: Input = serde_json::from_str(r#"{"path":"file","id":"f:hash"}"#).unwrap();
+        assert_eq!(legacy, input);
+    }
+
     fn tmp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("stoop-input-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
@@ -386,6 +403,16 @@ mod tests {
             path: "data".into(),
             id: plain,
             oid: Some("sha1:0000000000000000000000000000000000000000".into()),
+            oid_basis: Some(crate::oid_attrs::OidBasis {
+                text: "unspecified".into(),
+                eol: "unspecified".into(),
+                crlf: "unspecified".into(),
+                filter: "unspecified".into(),
+                ident: "unspecified".into(),
+                working_tree_encoding: "unspecified".into(),
+                export_subst: "unspecified".into(),
+                autocrlf: "unset".into(),
+            }),
         };
         assert!(verify(&d, &[input], true).is_empty());
 
@@ -456,11 +483,13 @@ mod tests {
                 path: "a".into(),
                 id: identify(&d.join("a"), true, false).unwrap(),
                 oid: None,
+                oid_basis: None,
             },
             Input {
                 path: "gone".into(),
                 id: "a".into(),
                 oid: None,
+                oid_basis: None,
             },
         ];
         assert!(verify(&d, &inputs, true).is_empty());

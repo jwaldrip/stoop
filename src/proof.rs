@@ -12,6 +12,9 @@ use std::path::PathBuf;
 /// between branches does not evict the proof the other branch still matches.
 const MAX_PROOFS: usize = 8;
 
+/// Older proof formats may contain Git object IDs without conversion evidence.
+const PROOF_VERSION: u32 = 3;
+
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Proof {
     pub created: u64,
@@ -80,17 +83,8 @@ struct ProofFile {
 
 impl ProofFile {
     fn decode(bytes: &[u8]) -> Option<Self> {
-        let mut file: Self = serde_json::from_slice(bytes).ok()?;
-        match file.v {
-            1 => {
-                for proof in &mut file.proofs {
-                    proof.provenance = None;
-                }
-            }
-            2 => {}
-            _ => return None,
-        }
-        Some(file)
+        let file: Self = serde_json::from_slice(bytes).ok()?;
+        (file.v == PROOF_VERSION).then_some(file)
     }
 }
 
@@ -179,7 +173,7 @@ impl Store {
             let _ = fs::write(ignore, "*\n");
         }
         let body = serde_json::to_vec(&ProofFile {
-            v: 2,
+            v: PROOF_VERSION,
             key: key.to_string(),
             proofs,
         })
@@ -195,12 +189,15 @@ impl Store {
     }
 
     /// Merge a published file into the local proofs, newest first. Returns how many
-    /// proofs were new. A file for another key or an unknown version is refused.
+    /// proofs were new. Older proof files add nothing; other invalid files are refused.
     pub fn import(&self, key: &str, bytes: &[u8]) -> io::Result<usize> {
         let bad = || io::Error::new(io::ErrorKind::InvalidData, "not a proof file for this key");
-        let theirs = ProofFile::decode(bytes).ok_or_else(bad)?;
-        if theirs.key != key {
+        let theirs: ProofFile = serde_json::from_slice(bytes).map_err(|_| bad())?;
+        if theirs.key != key || theirs.v > PROOF_VERSION {
             return Err(bad());
+        }
+        if theirs.v < PROOF_VERSION {
+            return Ok(0);
         }
         let mut proofs = self.load(key);
         let mut added = 0;
@@ -289,6 +286,7 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::oid_attrs::OidBasis;
 
     fn store(name: &str) -> Store {
         let d = std::env::temp_dir().join(format!("stoop-proof-{}-{name}", std::process::id()));
@@ -308,6 +306,7 @@ mod tests {
                 path: "a".into(),
                 id: id.into(),
                 oid: None,
+                oid_basis: None,
             }],
             outputs: vec![],
             probes: BTreeMap::new(),
@@ -325,22 +324,40 @@ mod tests {
         .unwrap()
     }
 
+    fn oid_basis() -> OidBasis {
+        OidBasis {
+            text: "unspecified".into(),
+            crlf: "unspecified".into(),
+            eol: "unspecified".into(),
+            filter: "unspecified".into(),
+            ident: "unspecified".into(),
+            working_tree_encoding: "unspecified".into(),
+            export_subst: "unspecified".into(),
+            autocrlf: "unset".into(),
+        }
+    }
+
     #[test]
-    fn legacy_proof_without_oids_keeps_golden_digest() {
+    fn legacy_proof_without_oids_serializes_null_and_updates_digest() {
         let legacy = legacy_proof();
         assert_eq!(legacy.inputs[0].oid, None);
+        assert_eq!(legacy.inputs[0].oid_basis, None);
         assert_eq!(legacy.priors.as_ref().unwrap()[0].oid, None);
+        assert_eq!(legacy.priors.as_ref().unwrap()[0].oid_basis, None);
         let serialized = serde_json::to_value(&legacy).unwrap();
         assert_eq!(
             serialized["inputs"][0],
-            serde_json::json!({"path": "a", "id": "f:1"})
+            serde_json::json!({"path": "a", "id": "f:1", "oid": null})
         );
         assert_eq!(
             serialized["priors"][0],
-            serde_json::json!({"path": "prior", "id": "f:2"})
+            serde_json::json!({"path": "prior", "id": "f:2", "oid": null})
         );
-        // The pre-OID digest input is the JSON tuple of the proof fields.
-        assert_eq!(legacy.digest(), "p-0d2ac5193d1ccb16d01c21b0e61f858e");
+        let expected =
+            br#"[[{"path":"a","id":"f:1","oid":null}],[],[],{},{},null,[{"path":"prior","id":"f:2","oid":null}],[],null,null,null]"#;
+        let digest = blake3::hash(expected).to_hex();
+        assert_eq!(legacy.digest(), format!("p-{}", &digest[..32]));
+        assert_ne!(legacy.digest(), "p-0d2ac5193d1ccb16d01c21b0e61f858e");
     }
 
     #[test]
@@ -354,9 +371,13 @@ mod tests {
             if prior {
                 first.priors.as_mut().unwrap()[0].oid = Some(first_oid.clone());
                 second.priors.as_mut().unwrap()[0].oid = Some(second_oid.clone());
+                first.priors.as_mut().unwrap()[0].oid_basis = Some(oid_basis());
+                second.priors.as_mut().unwrap()[0].oid_basis = Some(oid_basis());
             } else {
                 first.inputs[0].oid = Some(first_oid.clone());
                 second.inputs[0].oid = Some(second_oid.clone());
+                first.inputs[0].oid_basis = Some(oid_basis());
+                second.inputs[0].oid_basis = Some(oid_basis());
             }
             for changed in [&first, &second] {
                 assert_ne!(legacy.digest(), changed.digest(), "prior={prior}");
@@ -372,34 +393,93 @@ mod tests {
     }
 
     #[test]
-    fn old_files_load_with_defaults() {
-        let s = store("old-defaults");
+    fn digest_and_equality_cover_input_and_prior_oid_basis() {
+        let basis = oid_basis();
+        let changes: [fn(&mut OidBasis); 8] = [
+            |b| b.text = "unset".into(),
+            |b| b.crlf = "unset".into(),
+            |b| b.eol = "unset".into(),
+            |b| b.filter = "unset".into(),
+            |b| b.ident = "unset".into(),
+            |b| b.working_tree_encoding = "unset".into(),
+            |b| b.export_subst = "unset".into(),
+            |b| b.autocrlf = "false".into(),
+        ];
+        for prior in [false, true] {
+            let mut original = legacy_proof();
+            let input = if prior {
+                &mut original.priors.as_mut().unwrap()[0]
+            } else {
+                &mut original.inputs[0]
+            };
+            input.oid = Some(format!("sha1:{}", "1".repeat(40)));
+            input.oid_basis = Some(basis.clone());
+            let serialized = serde_json::to_value(&original).unwrap();
+            let wire = if prior {
+                &serialized["priors"][0]
+            } else {
+                &serialized["inputs"][0]
+            };
+            assert_eq!(
+                wire["oid_basis"],
+                serde_json::json!({
+                    "text": "unspecified",
+                    "crlf": "unspecified",
+                    "eol": "unspecified",
+                    "filter": "unspecified",
+                    "ident": "unspecified",
+                    "working_tree_encoding": "unspecified",
+                    "export_subst": "unspecified",
+                    "autocrlf": "unset"
+                })
+            );
+            let round_trip: Proof =
+                serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+            assert!(same_proof(&original, &round_trip));
+            assert_eq!(original.digest(), round_trip.digest());
+
+            let mut missing = original.clone();
+            let input = if prior {
+                &mut missing.priors.as_mut().unwrap()[0]
+            } else {
+                &mut missing.inputs[0]
+            };
+            input.oid_basis = None;
+            assert_ne!(original.digest(), missing.digest(), "prior={prior}");
+            assert!(!same_proof(&original, &missing), "prior={prior}");
+
+            for change in changes {
+                let mut changed = original.clone();
+                let input = if prior {
+                    &mut changed.priors.as_mut().unwrap()[0]
+                } else {
+                    &mut changed.inputs[0]
+                };
+                change(input.oid_basis.as_mut().unwrap());
+                assert_ne!(original.digest(), changed.digest(), "prior={prior}");
+                assert!(!same_proof(&original, &changed), "prior={prior}");
+            }
+        }
+    }
+
+    #[test]
+    fn current_files_load_missing_optional_fields_with_defaults() {
+        let s = store("defaults");
         fs::create_dir_all(s.file("k").parent().unwrap()).unwrap();
-        fs::write(
-            s.file("k"),
-            br#"{"v":1,"key":"k","proofs":[{"created":1,"argv":["x"],"env":{},"inputs":[]}]}"#,
-        )
-        .unwrap();
+        let file = serde_json::json!({
+            "v": PROOF_VERSION,
+            "key": "k",
+            "proofs": [{"created": 1, "argv": ["x"], "env": {}, "inputs": []}]
+        });
+        fs::write(s.file("k"), serde_json::to_vec(&file).unwrap()).unwrap();
         let loaded = s.load("k");
         assert_eq!(loaded.len(), 1);
         assert!(loaded[0].removed.is_empty());
         assert_eq!(loaded[0].ignore, None);
         assert!(loaded[0].outputs.is_empty());
         assert!(loaded[0].probes.is_empty());
-    }
-
-    #[test]
-    fn old_files_load_with_no_priors() {
-        let s = store("old-priors");
-        fs::create_dir_all(s.file("k").parent().unwrap()).unwrap();
-        fs::write(
-            s.file("k"),
-            br#"{"v":1,"key":"k","proofs":[{"created":1,"argv":[],"env":{},"inputs":[]}]}"#,
-        )
-        .unwrap();
-        let p = &s.load("k")[0];
-        assert_eq!(p.priors, None);
-        assert!(p.unplannable.is_empty());
+        assert_eq!(loaded[0].priors, None);
+        assert!(loaded[0].unplannable.is_empty());
     }
 
     #[test]
@@ -410,6 +490,7 @@ mod tests {
             path: "out".into(),
             id: "a".into(),
             oid: None,
+            oid_basis: None,
         }]);
         let mut reason = base.clone();
         reason.unplannable.push("renamed a directory".into());
@@ -445,6 +526,7 @@ mod tests {
             path: "b".into(),
             id: "f:2".into(),
             oid: None,
+            oid_basis: None,
         });
         let mut variants = vec![base.clone()];
         let mut v = base.clone();
@@ -464,6 +546,7 @@ mod tests {
             path: "out".into(),
             id: "f:3".into(),
             oid: None,
+            oid_basis: None,
         });
         variants.push(v);
         let mut v = base.clone();
@@ -540,7 +623,7 @@ mod tests {
         assert_eq!(a.load("k").len(), 3);
         let bytes = a.export("k").unwrap();
         let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(wire["v"], 2);
+        assert_eq!(wire["v"], 3);
         assert_eq!(b.import("k", &bytes).unwrap(), 3);
         assert_eq!(b.import("k", &bytes).unwrap(), 0);
         let platforms = &b.list()[0].platforms;
@@ -551,22 +634,57 @@ mod tests {
     }
 
     #[test]
-    fn legacy_format_cannot_claim_provenance() {
-        let a = store("legacy-platform-a");
-        let b = store("legacy-platform-b");
+    fn older_files_are_cold_on_load_and_import() {
+        let old_store = store("legacy-cold");
+        let local = store("legacy-import");
+        local.save("k", proof("f:local")).unwrap();
+        let local_before = local.export("k").unwrap();
+        fs::create_dir_all(old_store.file("k").parent().unwrap()).unwrap();
+
+        for version in 0..PROOF_VERSION {
+            let mut old_proof = proof("f:old");
+            old_proof.inputs[0].oid = Some(format!("sha1:{}", "1".repeat(40)));
+            let file = ProofFile {
+                v: version,
+                key: "k".into(),
+                proofs: vec![old_proof],
+            };
+            let bytes = serde_json::to_vec(&file).unwrap();
+            fs::write(old_store.file("k"), &bytes).unwrap();
+            assert!(old_store.load("k").is_empty(), "version {version}");
+            assert!(old_store.list().is_empty(), "version {version}");
+            assert_eq!(Store::key_of(&bytes).as_deref(), Some("k"));
+            assert_eq!(local.import("k", &bytes).unwrap(), 0, "version {version}");
+            assert_eq!(
+                local.export("k").unwrap(),
+                local_before,
+                "version {version}"
+            );
+            assert!(local.import("wrong-key", &bytes).is_err());
+
+            old_store.save("k", proof("f:new")).unwrap();
+            let saved = old_store.load("k");
+            assert_eq!(saved.len(), 1);
+            assert_eq!(saved[0].inputs[0].id, "f:new");
+            let wire: serde_json::Value =
+                serde_json::from_slice(&old_store.export("k").unwrap()).unwrap();
+            assert_eq!(wire["v"], 3);
+        }
+    }
+
+    #[test]
+    fn future_files_are_not_loaded_or_imported() {
+        let s = store("future");
         let file = ProofFile {
-            v: 1,
+            v: PROOF_VERSION + 1,
             key: "k".into(),
             proofs: vec![proof("f:1")],
         };
         let bytes = serde_json::to_vec(&file).unwrap();
-        fs::create_dir_all(a.file("k").parent().unwrap()).unwrap();
-        fs::write(a.file("k"), &bytes).unwrap();
-        assert!(a.load("k")[0].provenance.is_none());
-        assert_eq!(a.list()[0].platforms, vec!["unknown"]);
-        assert_eq!(b.import("k", &bytes).unwrap(), 1);
-        assert_eq!(Store::newest_created(&bytes), Some(1));
-        assert!(b.load("k")[0].provenance.is_none());
+        fs::create_dir_all(s.file("k").parent().unwrap()).unwrap();
+        fs::write(s.file("k"), &bytes).unwrap();
+        assert!(s.load("k").is_empty());
+        assert!(s.import("k", &bytes).is_err());
     }
 
     #[test]

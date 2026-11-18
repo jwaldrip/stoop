@@ -36,7 +36,7 @@ impl Workspace {
             "outputs": [],
             "probes": {}
         });
-        let version = if provenance.is_some() { 2 } else { 1 };
+        let version = if provenance.is_some() { 3 } else { 1 };
         if let Some(provenance) = provenance {
             proof["provenance"] = provenance;
         }
@@ -152,7 +152,7 @@ fn a_different_tracer_or_version_cannot_use_the_proof() {
 
 #[test]
 fn legacy_proofs_without_provenance_are_cold() {
-    assert_cold(None, "provenance missing");
+    assert_cold(None, "no proof yet");
 }
 
 #[cfg(not(all(
@@ -221,5 +221,5 @@ fn ls_identifies_platforms_and_old_proofs() {
     assert!(text.contains(std::env::consts::OS), "{text}");
     assert!(text.contains(std::env::consts::ARCH), "{text}");
     assert!(text.contains("ptrace-seccomp"), "{text}");
-    assert!(text.contains("unknown"), "{text}");
+    assert!(!text.contains("legacy"), "{text}");
 }

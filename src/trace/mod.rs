@@ -98,6 +98,10 @@ pub struct Trace {
     pub priors: BTreeMap<String, String>,
     /// Blob ids captured in the same read as each content prior.
     pub prior_oids: BTreeMap<String, String>,
+    /// Attribute state under which each content prior's blob id was calculated.
+    pub prior_oid_bases: BTreeMap<String, crate::oid_attrs::OidBasis>,
+    /// Git attributes or repository metadata may have changed during the run.
+    pub oid_attrs_changed: bool,
     /// Reasons the planner cannot replay this run (at most 16, deduplicated). Not fatal.
     pub unplannable: Vec<String>,
     /// Successful execs, present only for an ordinary, traced `stoop run`.
