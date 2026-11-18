@@ -376,7 +376,11 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
                 "stoop: would run {key}: not traced ({}); no proof can be used",
                 trace::UNAVAILABLE
             );
-            return Outcome { status: 1, key, how: How::Untraced };
+            return Outcome {
+                status: 1,
+                key,
+                how: How::Untraced,
+            };
         }
         if !o.quiet {
             eprintln!("stoop: run {key}: no compatible tracer");
@@ -385,7 +389,11 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
                 trace::UNAVAILABLE
             );
         }
-        return Outcome { status: plain(&o.argv), key, how: How::Untraced };
+        return Outcome {
+            status: plain(&o.argv),
+            key,
+            how: How::Untraced,
+        };
     }
     let full = env_flag("STOOP_FULL");
     let max_age = o
@@ -777,7 +785,11 @@ pub fn build_inputs(
     if let Some(u) = trace.unsound.first() {
         return Err(u.clone());
     }
-    let paths = trace.touched.keys().chain(&trace.written).chain(&trace.created_dirs);
+    let paths = trace
+        .touched
+        .keys()
+        .chain(&trace.written)
+        .chain(&trace.created_dirs);
     for path in paths {
         if path.strip_prefix(root).unwrap_or(path).to_str().is_none() {
             return Err("a traced path is not valid UTF-8".into());
@@ -922,7 +934,12 @@ pub fn build_inputs(
                 }
             }
             _ => {
-                if target.strip_prefix(root).unwrap_or(&target).to_str().is_none() {
+                if target
+                    .strip_prefix(root)
+                    .unwrap_or(&target)
+                    .to_str()
+                    .is_none()
+                {
                     return Err("a symlink target is not valid UTF-8".into());
                 }
                 let tk = to_key(root, &target);

@@ -286,7 +286,8 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
     };
     let cwd = std::env::current_dir().unwrap_or_default();
     let root = run::root_for(o, &cwd);
-    let matrix = match stepkey::canonical_matrix(&std::env::var("STOOP_MATRIX").unwrap_or_default()) {
+    let matrix = match stepkey::canonical_matrix(&std::env::var("STOOP_MATRIX").unwrap_or_default())
+    {
         Ok(matrix) => matrix,
         Err(error) => {
             eprintln!("stoop: invalid STOOP_MATRIX: {error}");

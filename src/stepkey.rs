@@ -7,9 +7,14 @@ pub fn sh_key(
     matrix: Option<&str>,
 ) -> String {
     let mut h = blake3::Hasher::new();
-    for field in [body, workflow.as_bytes(), job.as_bytes(), cwd_key.as_bytes()]
-        .into_iter()
-        .chain(args.iter().map(|arg| arg.as_bytes()))
+    for field in [
+        body,
+        workflow.as_bytes(),
+        job.as_bytes(),
+        cwd_key.as_bytes(),
+    ]
+    .into_iter()
+    .chain(args.iter().map(|arg| arg.as_bytes()))
     {
         h.update(&(field.len() as u64).to_le_bytes());
         h.update(field);
@@ -49,8 +54,10 @@ mod tests {
             sh_key(body, "workflow", "job", "src", &args, None),
             format!("sh-{}", &expected.finalize().to_hex()[..20])
         );
-        assert_ne!(sh_key(body, "workflow", "job", "src", &args, None),
-                   sh_key(body, "workflow", "job", "src", &[], None));
+        assert_ne!(
+            sh_key(body, "workflow", "job", "src", &args, None),
+            sh_key(body, "workflow", "job", "src", &[], None)
+        );
     }
     #[test]
     fn matrix_separates_and_canonicalizes() {

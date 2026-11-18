@@ -700,8 +700,14 @@ fn step_key(
         static_value(&json!(run))?;
         if shell_text.split_whitespace().take(2).eq(["stoop", "sh"]) {
             let age = shell(shell_text)?.or(env_age);
-            let key =
-                crate::stepkey::sh_key(run.as_bytes(), identity.0, identity.1, &cwd_key(wd)?, &[], leg);
+            let key = crate::stepkey::sh_key(
+                run.as_bytes(),
+                identity.0,
+                identity.1,
+                &cwd_key(wd)?,
+                &[],
+                leg,
+            );
             return Ok(Some((
                 json!({"traced":{"key":key,"if":true,"env":e,"shell":shell_text,"working-directory":wd}}),
                 StepSpec::Traced {
