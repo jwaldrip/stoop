@@ -36,6 +36,13 @@ impl Journal {
         let repository = run::env_str("GITHUB_REPOSITORY").ok_or("missing GITHUB_REPOSITORY")?;
         let workflow_ref =
             run::env_str("GITHUB_WORKFLOW_REF").ok_or("missing GITHUB_WORKFLOW_REF")?;
+        let job_workflow_ref = run::env_str("STOOP_JOB_WORKFLOW_REF");
+        if job_workflow_ref
+            .as_ref()
+            .is_some_and(|value| value != &workflow_ref)
+        {
+            return Err("job workflow ref differs from caller workflow ref".into());
+        }
         let name = workflow_ref
             .strip_prefix(&format!("{repository}/"))
             .ok_or("workflow repository differs")?;
@@ -126,6 +133,8 @@ impl Journal {
                 run,
                 steps: Vec::new(),
                 attest: None,
+                workflow_ref: Some(workflow_ref),
+                job_workflow_ref,
             },
         }))
     }
@@ -195,6 +204,11 @@ impl Journal {
                 self.save()?;
                 return Ok(());
             }
+            How::Untraced if outcome.status != 0 => {
+                self.record.status = Some(RecordStatus::Failed);
+                self.record.failed = Some(outcome.key.clone());
+                false
+            }
             How::Untraced => {
                 self.blocked = true;
                 self.save()?;
@@ -202,23 +216,50 @@ impl Journal {
             }
         };
         if let Some(remote) = remote.filter(|r| r.write) {
-            remote.pull_job(jobs, &self.key)?;
             let timestamp = now().max(self.record.created.saturating_add(1));
             if self.record.started == 0 {
-                self.record.started = timestamp;
+                // The planner orders runs by start. Seconds can tie for two runs and
+                // let an older late update sort ahead of a newer failure.
+                self.record.started = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
+                    .unwrap_or(timestamp.saturating_mul(1000));
             }
             self.record.created = timestamp;
-            jobs.save(&self.key, self.record.clone())
-                .map_err(|e| e.to_string())?;
-            self.save()?;
             if publish_proof && run::env_str(run::SALT_VAR).is_none() {
                 eprintln!("stoop: sync: publishing environment hashes without {}. In a public repository set it from a repository secret so low-entropy values cannot be guessed offline.", run::SALT_VAR);
             }
-            remote.push_job(
-                jobs,
-                &self.key,
-                publish_proof.then_some((proofs, outcome.key.as_str())),
-            )?;
+            let mut last_error = String::new();
+            for _ in 0..3 {
+                let snapshot = match remote.pull_job(&self.key) {
+                    Ok(snapshot) => snapshot,
+                    Err(error) => {
+                        last_error = error;
+                        break;
+                    }
+                };
+                let bytes = JobStore::merge_remote(
+                    &self.key,
+                    snapshot.as_ref().map(|(_, bytes)| bytes.as_slice()),
+                    self.record.clone(),
+                )
+                .map_err(|e| e.to_string())?;
+                match remote.push_job(
+                    &self.key,
+                    &bytes,
+                    snapshot.as_ref().map(|(oid, _)| oid.as_str()),
+                    publish_proof.then_some((proofs, outcome.key.as_str())),
+                ) {
+                    Ok(()) => {
+                        jobs.import(&self.key, &bytes).map_err(|e| e.to_string())?;
+                        return self.save();
+                    }
+                    Err(error) => last_error = error,
+                }
+            }
+            self.blocked = true;
+            self.save()?;
+            return Err(last_error);
         } else {
             self.save()?;
         }

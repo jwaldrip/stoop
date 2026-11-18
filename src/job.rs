@@ -24,7 +24,9 @@ pub enum RecordStatus {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JobRecord {
+    /// Unix seconds of the latest publication.
     pub created: u64,
+    /// Unix milliseconds of first publication. Ordering key only, not an age.
     #[serde(default)]
     pub started: u64,
     #[serde(default)]
@@ -45,6 +47,24 @@ pub struct JobRecord {
     /// Reserved for the signed job attestation payload; no trust is implied by its presence.
     #[serde(default)]
     pub attest: Option<String>,
+    #[serde(default)]
+    pub workflow_ref: Option<String>,
+    #[serde(default)]
+    pub job_workflow_ref: Option<String>,
+}
+impl JobRecord {
+    /// Higher keys sort first. GitHub run identifiers and attempts are numeric.
+    pub fn order_key(&self) -> (u64, u64, u64, u64, &str) {
+        let raw = self.run.as_deref().unwrap_or("");
+        let (id, attempt) = raw.split_once('/').unwrap_or(("", ""));
+        (
+            self.started,
+            id.parse().unwrap_or(0),
+            attempt.parse().unwrap_or(0),
+            self.created,
+            raw,
+        )
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct JobFile {
@@ -85,7 +105,7 @@ impl JobStore {
         }
     }
     fn write(&self, key: &str, mut records: Vec<JobRecord>) -> io::Result<()> {
-        records.sort_by_key(|r| std::cmp::Reverse(r.created));
+        records.sort_by(|a, b| b.order_key().cmp(&a.order_key()));
         records.truncate(MAX_RECORDS);
         let path = self.file(key);
         fs::create_dir_all(path.parent().unwrap())?;
@@ -113,6 +133,32 @@ impl JobStore {
         records.insert(0, record);
         self.write(key, records)
     }
+    /// Build a publication from the remote snapshot and this run only.
+    pub fn merge_remote(key: &str, bytes: Option<&[u8]>, record: JobRecord) -> io::Result<Vec<u8>> {
+        let mut records = match bytes {
+            Some(bytes) => {
+                Self::parse(bytes)
+                    .filter(|f| f.key == key)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "not a job file for this key")
+                    })?
+                    .records
+            }
+            None => Vec::new(),
+        };
+        records.retain(|old| !Self::same(old, &record));
+        records.push(record);
+        records.sort_by(|a, b| b.order_key().cmp(&a.order_key()));
+        records.truncate(MAX_RECORDS);
+        serde_json::to_vec(&JobFile {
+            v: 1,
+            kind: "job".into(),
+            key: key.into(),
+            records,
+        })
+        .map_err(io::Error::other)
+    }
+
     pub fn export(&self, key: &str) -> Option<Vec<u8>> {
         fs::read(self.file(key)).ok()
     }
@@ -191,6 +237,8 @@ mod tests {
                 how: StepHow::Ran,
             }],
             attest: None,
+            workflow_ref: None,
+            job_workflow_ref: None,
         }
     }
     #[test]
@@ -254,5 +302,63 @@ mod tests {
         let proof = br#"{"v":1,"key":"job-a","proofs":[]}"#;
         assert!(s.import("job-a", proof).is_err());
         assert_eq!(JobStore::key_of(proof), None);
+    }
+    #[test]
+    fn retention_uses_started_before_created() {
+        let s = store("retention-started");
+        let mut passed = record(500);
+        passed.started = 100;
+        let mut failed = record(210);
+        failed.started = 200;
+        failed.status = Some(RecordStatus::Failed);
+        s.save("job-a", passed).unwrap();
+        s.save("job-a", failed).unwrap();
+        for i in 601..608 {
+            let mut r = record(i);
+            r.started = i;
+            r.status = Some(RecordStatus::Running);
+            s.save("job-a", r).unwrap();
+        }
+        let records = s.load("job-a");
+        assert_eq!(records.len(), 8);
+        assert!(records
+            .iter()
+            .any(|r| r.status == Some(RecordStatus::Failed)));
+        assert!(!records.iter().any(|r| r.started == 100));
+    }
+
+    #[test]
+    fn publish_merge_never_includes_local_records() {
+        let s = store("remote-merge-only");
+        let mut forged = record(999);
+        forged.started = 999;
+        s.save("job-a", forged).unwrap();
+        let mut actual = record(2);
+        actual.started = 2;
+        let bytes = JobStore::merge_remote("job-a", None, actual.clone()).unwrap();
+        let published = JobStore::parse(&bytes).unwrap();
+        assert_eq!(published.records, vec![actual]);
+    }
+    #[test]
+    fn equal_started_order_uses_numeric_run_then_attempt_before_created() {
+        let s = store("equal-started");
+        let mut older = record(500);
+        older.started = 1000;
+        older.run = Some("9/1".into());
+        let mut newer = record(200);
+        newer.started = 1000;
+        newer.run = Some("10/1".into());
+        let mut retry = newer.clone();
+        retry.run = Some("10/2".into());
+        retry.created = 100;
+        s.save("job-a", older).unwrap();
+        s.save("job-a", newer).unwrap();
+        s.save("job-a", retry).unwrap();
+        let runs: Vec<_> = s
+            .load("job-a")
+            .into_iter()
+            .map(|r| r.run.unwrap())
+            .collect();
+        assert_eq!(runs, ["10/2", "10/1", "9/1"]);
     }
 }

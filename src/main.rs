@@ -306,11 +306,23 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
     ];
     argv.extend(rest.iter().cloned());
     o.argv = argv;
-    let mut journal = match journal::Journal::open(&root, matrix.as_deref()) {
-        Ok(journal) => journal,
-        Err(error) => {
-            eprintln!("stoop: job record not written: {error}");
-            None
+    let blocked =
+        run::env_str("RUNNER_TEMP").map(|t| PathBuf::from(t).join("stoop/journal.blocked"));
+    let mut journal = if blocked.as_ref().is_some_and(|p| p.exists()) {
+        None
+    } else {
+        match journal::Journal::open(&root, matrix.as_deref()) {
+            Ok(journal) => journal,
+            Err(error) => {
+                eprintln!("stoop: job record not written: {error}");
+                if let Some(path) = &blocked {
+                    if let Some(parent) = path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                        let _ = std::fs::write(path, b"blocked");
+                    }
+                }
+                None
+            }
         }
     };
     let journal_error = journal

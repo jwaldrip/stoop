@@ -62,9 +62,13 @@ impl Ws {
         }
     }
     fn run(&self, script: &str, write: &str) -> Output {
+        self.command(script, write).output().unwrap()
+    }
+    fn command(&self, script: &str, write: &str) -> Command {
         let path = self.temp.join("script.sh");
         fs::write(&path, script).unwrap();
-        Command::new(env!("CARGO_BIN_EXE_stoop"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_stoop"));
+        command
             .arg("sh")
             .arg(path)
             .current_dir(&self.root)
@@ -87,9 +91,8 @@ impl Ws {
             .env_remove("STOOP_OFF")
             .env_remove("STOOP_MATRIX")
             .env_remove("STOOP_STORE")
-            .env_remove("STOOP_ENV_SALT")
-            .output()
-            .unwrap()
+            .env_remove("STOOP_ENV_SALT");
+        command
     }
     fn records(&self) -> Vec<Value> {
         let refs = git(
@@ -100,6 +103,35 @@ impl Ws {
             .filter(|s| s.starts_with("refs/stoop/job-"))
             .map(|r| serde_json::from_str(&git(&self.remote, &["cat-file", "blob", r])).unwrap())
             .collect()
+    }
+
+    fn second_runner(&self) -> Self {
+        git(
+            &self.root,
+            &["push", "-q", "origin", "HEAD:refs/heads/main"],
+        );
+        let parent = self.root.parent().unwrap();
+        let root = parent.join("second");
+        git(
+            parent,
+            &[
+                "clone",
+                "-q",
+                "-b",
+                "main",
+                self.remote.to_str().unwrap(),
+                root.to_str().unwrap(),
+            ],
+        );
+        let temp = parent.join("second-temp");
+        fs::create_dir_all(&temp).unwrap();
+        fs::write(temp.join("event.json"), "{}").unwrap();
+        Self {
+            root,
+            remote: self.remote.clone(),
+            temp,
+            sha: self.sha.clone(),
+        }
     }
 }
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -131,6 +163,11 @@ fn a_trusted_job_publishes_a_passed_record() {
     assert_eq!(record["started"], started);
     assert!(record["created"].as_u64().unwrap() > created);
     assert_eq!(record["commit"], w.sha);
+    assert_eq!(
+        record["workflow_ref"],
+        "owner/repo/.github/workflows/ci.yml@refs/heads/main"
+    );
+    assert!(record["job_workflow_ref"].is_null());
     assert_eq!(
         record["event_path"],
         w.temp.join("event.json").to_str().unwrap()
@@ -283,4 +320,250 @@ fn import_keeps_the_latest_update_of_a_run() {
         updated["records"][0]["created"],
         remote["records"][0]["created"]
     );
+}
+
+#[test]
+fn concurrent_older_push_cannot_erase_newer_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, Instant};
+    let old = Ws::new("race", &["test ! -e fail-flag\n", "true\n"]);
+    let newer = old.second_runner();
+    assert!(old
+        .command("test ! -e fail-flag\n", "1")
+        .env("GITHUB_RUN_ID", "100")
+        .output()
+        .unwrap()
+        .status
+        .success());
+    let bin = old.temp.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let marker = old.temp.join("push-waiting");
+    let release = old.temp.join("push-release");
+    let wrapper = bin.join("git");
+    fs::write(&wrapper, "#!/bin/sh\nfor arg in \"$@\"; do if [ \"$arg\" = push ]; then touch \"$WAIT_MARKER\"; while [ ! -e \"$RELEASE_MARKER\" ]; do sleep 0.02; done; break; fi; done\nexec /usr/bin/git \"$@\"\n").unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let mut child = old
+        .command("true\n", "1")
+        .env("GITHUB_RUN_ID", "100")
+        .env("PATH", path)
+        .env("WAIT_MARKER", &marker)
+        .env("RELEASE_MARKER", &release)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !marker.exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    if !marker.exists() {
+        let _ = child.kill();
+        panic!("old push did not reach the barrier");
+    }
+    fs::write(newer.root.join("fail-flag"), "x").unwrap();
+    let failure = newer
+        .command("test ! -e fail-flag\n", "1")
+        .env("GITHUB_RUN_ID", "200")
+        .output()
+        .unwrap();
+    assert!(!failure.status.success());
+    assert!(old.records()[0]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["run"] == "200/1" && r["status"] == "failed"));
+    fs::write(release, "go").unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let files = old.records();
+    let records = files[0]["records"].as_array().unwrap();
+    assert!(records
+        .iter()
+        .any(|r| r["run"] == "200/1" && r["status"] == "failed"));
+    assert!(records
+        .iter()
+        .any(|r| r["run"] == "100/1" && r["status"] == "passed"));
+}
+
+#[test]
+fn failing_untraced_command_publishes_failed_record() {
+    let w = Ws::new("untraced-failure", &["exit 1\n"]);
+    let out = w
+        .command("exit 1\n", "1")
+        .env("STOOP_OFF", "1")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert_eq!(w.records()[0]["records"][0]["status"], "failed");
+}
+
+#[test]
+fn forged_local_job_record_is_not_published() {
+    let w = Ws::new("forged", &["true\n"]);
+    assert!(w.run("true\n", "1").status.success());
+    let file = w.records().pop().unwrap();
+    let key = file["key"].as_str().unwrap();
+    let local = w.root.join(".stoop/jobs").join(format!("{key}.json"));
+    let mut forged = file;
+    forged["records"][0]["run"] = "forged/1".into();
+    forged["records"][0]["created"] = 4_102_444_800u64.into();
+    forged["records"][0]["started"] = 4_102_444_800u64.into();
+    fs::write(local, serde_json::to_vec(&forged).unwrap()).unwrap();
+    fs::remove_file(w.temp.join("stoop/journal.json")).unwrap();
+    let out = w
+        .command("true\n", "1")
+        .env("GITHUB_RUN_ID", "200")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let result = w.records();
+    assert!(!result[0]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["run"] == "forged/1"));
+    assert!(result[0]["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["run"] == "200/1"));
+}
+
+#[test]
+fn mismatched_head_is_not_recorded_as_commit() {
+    let w = Ws::new("bad-sha", &["true\n"]);
+    let out = w
+        .command("true\n", "1")
+        .env("GITHUB_SHA", "not-head")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(w.records()[0]["records"][0]["commit"].is_null());
+}
+
+#[test]
+fn supplied_job_workflow_ref_mismatch_blocks_publication() {
+    let w = Ws::new("reusable-ref", &["true\n"]);
+    let out = w
+        .command("true\n", "1")
+        .env(
+            "STOOP_JOB_WORKFLOW_REF",
+            "owner/repo/.github/workflows/other.yml@refs/heads/main",
+        )
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("job workflow ref differs"));
+    assert!(w.records().is_empty());
+}
+
+#[test]
+fn matrix_reaches_step_key() {
+    let w = Ws::new("matrix", &["true\n"]);
+    let out = w
+        .command("true\n", "1")
+        .env("STOOP_MATRIX", "{\"z\":2,\"a\":1}")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut h = blake3::Hasher::new();
+    h.update(b"true\nfixture\0test\0\0matrix\0{\"a\":1,\"z\":2}");
+    let expected = format!("sh-{}", &h.finalize().to_hex()[..20]);
+    assert!(String::from_utf8_lossy(&out.stderr).contains(&expected));
+    assert!(w.records().is_empty());
+}
+
+#[test]
+fn failed_job_fetch_never_pushes() {
+    use std::os::unix::fs::PermissionsExt;
+    let w = Ws::new("fetch-failure", &["true\n"]);
+    let bin = w.temp.join("bin");
+    fs::create_dir(&bin).unwrap();
+    let wrapper = bin.join("git");
+    fs::write(&wrapper, "#!/bin/sh\nfor arg in \"$@\"; do if [ \"$arg\" = fetch ]; then echo blocked >&2; exit 1; fi; if [ \"$arg\" = push ]; then touch \"$PUSH_MARKER\"; fi; done\nexec /usr/bin/git \"$@\"\n").unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let marker = w.temp.join("pushed");
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let out = w
+        .command("true\n", "1")
+        .env("PATH", path)
+        .env("PUSH_MARKER", &marker)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(!marker.exists());
+    assert!(w.records().is_empty());
+}
+
+#[test]
+fn recorded_step_keys_and_digests_resolve_on_remote() {
+    use std::collections::BTreeMap;
+    #[derive(serde::Deserialize, serde::Serialize)]
+    struct Input {
+        path: String,
+        id: String,
+    }
+    #[derive(serde::Deserialize)]
+    struct Proof {
+        inputs: Vec<Input>,
+        outputs: Vec<Input>,
+        removed: Vec<String>,
+        env: BTreeMap<String, String>,
+        probes: BTreeMap<String, String>,
+        ignore: Option<Vec<String>>,
+        priors: Option<Vec<Input>>,
+        unplannable: Vec<String>,
+    }
+    let scripts = ["cat in.txt > /dev/null\n", "true\n"];
+    let w = Ws::new("remote-digests", &scripts);
+    for script in scripts {
+        assert!(w.run(script, "1").status.success());
+    }
+    let files = w.records();
+    let steps = files[0]["records"][0]["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), scripts.len());
+    for (step, script) in steps.iter().zip(scripts) {
+        let mut h = blake3::Hasher::new();
+        h.update(script.as_bytes());
+        h.update(b"fixture\0test\0");
+        let key = format!("sh-{}", &h.finalize().to_hex()[..20]);
+        assert_eq!(step["key"], key);
+        let raw = git(
+            &w.remote,
+            &["cat-file", "blob", &format!("refs/stoop/{key}")],
+        );
+        let file: Value = serde_json::from_str(&raw).unwrap();
+        let proofs: Vec<Proof> = serde_json::from_value(file["proofs"].clone()).unwrap();
+        assert!(proofs.iter().any(|p| {
+            let bytes = serde_json::to_vec(&(
+                &p.inputs,
+                &p.outputs,
+                &p.removed,
+                &p.env,
+                &p.probes,
+                &p.ignore,
+                &p.priors,
+                &p.unplannable,
+            ))
+            .unwrap();
+            step["proof"] == format!("p-{}", &blake3::hash(&bytes).to_hex()[..32])
+        }));
+    }
 }

@@ -237,7 +237,7 @@ fn run_with_foo(w: &Ws, v: &str, extra: &[&str]) -> String {
     let out = Command::new(env!("CARGO_BIN_EXE_stoop"))
         .args(args)
         .current_dir(&w.root)
-        .env("STOOP_STORE", w.root.join("../env-store"))
+        .env("STOOP_STORE", w.root.with_extension("env-store"))
         .env("FOO", v)
         .env_remove("GITHUB_ACTIONS")
         .env_remove("RUNNER_TEMP")

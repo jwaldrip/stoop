@@ -152,7 +152,7 @@ impl Remote {
         Ok(added)
     }
 
-    pub fn pull_job(&self, jobs: &JobStore, key: &str) -> Result<usize, String> {
+    pub fn pull_job(&self, key: &str) -> Result<Option<(String, Vec<u8>)>, String> {
         let r = ref_name(key);
         let spec = format!("+{r}:{r}");
         let out = self.git(
@@ -162,24 +162,29 @@ impl Remote {
         if !out.status.success() {
             let error = String::from_utf8_lossy(&out.stderr);
             if error.contains("couldn't find remote ref") {
-                return Ok(0);
+                return Ok(None);
             }
             return Err(error.lines().next().unwrap_or("fetch failed").to_string());
         }
-        let blob = self.ok(&["cat-file", "blob", &r], None)?;
-        jobs.import(key, &blob).map_err(|e| e.to_string())
+        let oid = String::from_utf8(self.ok(&["rev-parse", "--verify", &r], None)?)
+            .map_err(|e| e.to_string())?
+            .trim()
+            .to_string();
+        let blob = self.ok(&["cat-file", "blob", &oid], None)?;
+        Ok(Some((oid, blob)))
     }
 
     pub fn push_job(
         &self,
-        jobs: &JobStore,
         key: &str,
+        bytes: &[u8],
+        expected: Option<&str>,
         proof: Option<(&Store, &str)>,
     ) -> Result<(), String> {
         if !self.write {
             return Ok(());
         }
-        let mut objects = vec![(key, jobs.export(key).ok_or("no local job to publish")?)];
+        let mut objects = vec![(key, bytes.to_vec())];
         if let Some((store, proof_key)) = proof {
             objects.push((
                 proof_key,
@@ -192,11 +197,15 @@ impl Remote {
                 String::from_utf8_lossy(&self.ok(&["hash-object", "-w", "--stdin"], Some(&bytes))?)
                     .trim()
                     .to_string();
-            let r = ref_name(key);
-            self.ok(&["update-ref", &r, &sha], None)?;
-            specs.push(format!("+{r}:{r}"));
+            let force = if key.starts_with("job-") { "" } else { "+" };
+            specs.push(format!("{force}{sha}:{}", ref_name(key)));
         }
-        let mut args = vec!["push", "--quiet", &self.remote];
+        let lease = format!(
+            "--force-with-lease={}:{}",
+            ref_name(key),
+            expected.unwrap_or("")
+        );
+        let mut args = vec!["push", "--quiet", "--atomic", &lease, &self.remote];
         args.extend(specs.iter().map(String::as_str));
         self.ok(&args, None)?;
         Ok(())
