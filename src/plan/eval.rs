@@ -17,6 +17,8 @@ pub struct PlanCtx<'a> {
     /// Identity of the current run's event payload, if readable.
     pub event: Option<String>,
     pub explain: bool,
+    /// A missing verifier rejects every record. The verifier checks the signed record.
+    pub verify_record: Option<&'a dyn Fn(&JobRecord) -> bool>,
 }
 
 fn decision(code: Code, detail: String) -> Decision {
@@ -37,11 +39,17 @@ fn valid_path(p: &str) -> bool {
 }
 
 #[derive(Clone)]
+enum Identity {
+    Object(String),
+    Recorded(String),
+}
+
+#[derive(Clone)]
 enum State {
     Absent,
     Dir,
-    File(String),
-    Link(String),
+    File(Identity),
+    Link(Identity),
 }
 
 struct VirtualTree<'a> {
@@ -55,8 +63,8 @@ impl VirtualTree<'_> {
             return match value {
                 None => Ok(State::Absent),
                 Some(id) if id == "d" || id.starts_with("dl:") => Ok(State::Dir),
-                Some(id) if id.starts_with("f:") => Ok(State::File(id.clone())),
-                Some(id) if id.starts_with("l:") => Ok(State::Link(id.clone())),
+                Some(id) if id.starts_with("f:") => Ok(State::File(Identity::Recorded(id.clone()))),
+                Some(id) if id.starts_with("l:") => Ok(State::Link(Identity::Recorded(id.clone()))),
                 _ => Err(format!("invalid output identity for {p}")),
             };
         }
@@ -73,14 +81,8 @@ impl VirtualTree<'_> {
         }
         match self.tree.entry(p).cloned() {
             Some(Entry::Tree | Entry::Gitlink) => Ok(State::Dir),
-            Some(Entry::Blob(oid)) => Ok(State::File(format!(
-                "f:{}",
-                blake3::hash(self.tree.blob(&oid)?).to_hex()
-            ))),
-            Some(Entry::Link(oid)) => Ok(State::Link(format!(
-                "l:{}",
-                String::from_utf8_lossy(self.tree.blob(&oid)?)
-            ))),
+            Some(Entry::Blob(oid)) => Ok(State::File(Identity::Object(oid))),
+            Some(Entry::Link(oid)) => Ok(State::Link(Identity::Object(oid))),
             None => Ok(State::Absent),
         }
     }
@@ -129,30 +131,55 @@ impl VirtualTree<'_> {
         let state = self.state(p)?;
         match state {
             State::Absent => Ok("a".into()),
-            State::File(id) | State::Link(id) => Ok(id),
+            State::File(Identity::Recorded(id)) | State::Link(Identity::Recorded(id)) => Ok(id),
+            State::File(Identity::Object(oid)) if expected.starts_with("f:") => {
+                self.tree.file_id(&oid)
+            }
+            State::File(Identity::Object(_)) => Ok("file".into()),
+            State::Link(Identity::Object(oid)) => Ok(format!(
+                "l:{}",
+                String::from_utf8_lossy(&self.tree.blob(&oid)?)
+            )),
             State::Dir if expected.starts_with("dl:") => {
+                if self.tree.partial() {
+                    return Err("git: directory listing is unprovable in a partial clone".into());
+                }
                 let prefix = if p == "." {
-                    String::new()
+                    Vec::new()
                 } else {
-                    format!("{p}/")
+                    format!("{p}/").into_bytes()
                 };
                 let mut names = BTreeSet::new();
-                for path in self.tree.paths().chain(self.overlay.keys()) {
-                    if let Some(rest) = path.strip_prefix(&prefix) {
-                        if let Some(name) = rest.split('/').next().filter(|s| !s.is_empty()) {
-                            names.insert(name.to_string());
+                for path in self
+                    .tree
+                    .paths()
+                    .chain(self.overlay.keys().map(|s| s.as_bytes()))
+                {
+                    if let Some(rest) = path.strip_prefix(prefix.as_slice()) {
+                        if let Some(name) =
+                            rest.split(|b| *b == b'/').next().filter(|s| !s.is_empty())
+                        {
+                            names.insert(name.to_vec());
                         }
                     }
                 }
                 if p == "." {
-                    names.insert(".git".into());
+                    names.insert(b".git".to_vec());
                 }
                 let mut hash = blake3::Hasher::new();
                 for name in names {
-                    let child = format!("{prefix}{name}");
-                    if !matches!(self.state(&child)?, State::Absent) {
+                    let mut child = prefix.clone();
+                    child.extend_from_slice(&name);
+                    let present = match std::str::from_utf8(&child) {
+                        Ok(child) => !matches!(self.state(child)?, State::Absent),
+                        Err(_) => !self
+                            .erased
+                            .iter()
+                            .any(|e| p == e || p.starts_with(&format!("{e}/"))),
+                    };
+                    if present {
                         hash.update(&(name.len() as u64).to_le_bytes());
-                        hash.update(name.as_bytes());
+                        hash.update(&name);
                     }
                 }
                 Ok(format!("dl:{}", hash.finalize().to_hex()))
@@ -197,6 +224,9 @@ fn known_github(name: &str) -> bool {
 }
 
 pub fn decide(spec: &JobSpec, ctx: &mut PlanCtx<'_>) -> Decision {
+    if let Some(blocked) = &spec.blocked {
+        return decision(Code::Blocked, blocked.detail.clone());
+    }
     let Some(key) = &spec.key else {
         return decision(Code::Blocked, "job has no key".into());
     };
@@ -206,7 +236,11 @@ pub fn decide(spec: &JobSpec, ctx: &mut PlanCtx<'_>) -> Decision {
     }
     let mut newest = None;
     for record in &records {
-        let result = evaluate(spec, ctx, record);
+        let result = if ctx.verify_record.is_some_and(|verify| verify(record)) {
+            evaluate(spec, ctx, record)
+        } else {
+            decision(Code::Unattested, "record has no valid attestation".into())
+        };
         if result.skip {
             return result;
         }
@@ -218,6 +252,16 @@ pub fn decide(spec: &JobSpec, ctx: &mut PlanCtx<'_>) -> Decision {
 }
 
 fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decision {
+    if record
+        .event_path
+        .as_deref()
+        .is_none_or(|path| !Path::new(path).is_absolute())
+    {
+        return decision(
+            Code::Incomplete,
+            "record has no absolute event payload path".into(),
+        );
+    }
     let steps: Vec<_> = spec
         .steps
         .iter()
@@ -317,7 +361,11 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
                 }
                 Err(err) => {
                     return decision(
-                        Code::InputChanged,
+                        if err.starts_with("git:") {
+                            Code::Error
+                        } else {
+                            Code::InputChanged
+                        },
                         format!("step {index}: {}: {err}", input.path),
                     )
                 }
@@ -427,6 +475,22 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+    fn git(root: &Path, args: &[&str]) {
+        assert!(Command::new("git")
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args([
+                "-c",
+                "core.hooksPath=/dev/null",
+                "-c",
+                "commit.gpgsign=false"
+            ])
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    }
     struct Fixture {
         root: std::path::PathBuf,
         tree: GitTree,
@@ -456,12 +520,7 @@ mod tests {
                     "init",
                 ][..],
             ] {
-                assert!(Command::new("git")
-                    .current_dir(&root)
-                    .args(args)
-                    .status()
-                    .unwrap()
-                    .success());
+                git(&root, args);
             }
             let tree = GitTree::load(&root, "HEAD").unwrap();
             let proofs = Store::new(root.join("store"));
@@ -509,7 +568,7 @@ mod tests {
                         created: 100,
                         commit: None,
                         host: BTreeMap::new(),
-                        event_path: None,
+                        event_path: Some("/tmp/event.json".into()),
                         run: Some("1/1".into()),
                         steps: records,
                         attest: None,
@@ -529,6 +588,7 @@ mod tests {
                     github_vars: vars,
                     event: None,
                     explain: false,
+                    verify_record: Some(&|_| true),
                 },
             )
         }
@@ -622,9 +682,15 @@ mod tests {
     #[test]
     fn missing_digest_runs() {
         let mut f = Fixture::new();
-        f.install(vec![proof(vec![])]);
-        f.proofs.save("sh-0", proof(vec![input("x", "a")])).unwrap();
-        fs::remove_file(f.root.join("store/proofs/sh-0.json")).unwrap();
+        let old = proof(vec![input("dir/a", &file_id(b"old"))]);
+        f.install(vec![old]);
+        f.proofs
+            .save("sh-0", proof(vec![input("dir/a", &file_id(b"tracked"))]))
+            .unwrap();
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::InputChanged);
+        let mut record = f.jobs.load("job-test").remove(0);
+        record.steps[0].proof = "p-missing".into();
+        f.jobs.save("job-test", record).unwrap();
         assert_eq!(f.decide(BTreeMap::new()).code, Code::ProofMissing);
     }
     #[test]
@@ -677,6 +743,7 @@ mod tests {
         let mut first = proof(vec![]);
         first.removed.push("dir".into());
         let mut second = proof(vec![]);
+        second.outputs.push(input("dir", "d"));
         second.outputs.push(input("dir/new", &file_id(b"new")));
         f.install(vec![
             first,
@@ -722,6 +789,7 @@ mod tests {
                 github_vars: BTreeMap::new(),
                 event: Some(file_id(b"new")),
                 explain: false,
+                verify_record: Some(&|_| true),
             },
         );
         assert_eq!(d.code, Code::InputChanged);
@@ -731,28 +799,210 @@ mod tests {
         use std::os::unix::fs::symlink;
         let mut f = Fixture::new();
         symlink("dir", f.root.join("link")).unwrap();
-        assert!(Command::new("git")
-            .current_dir(&f.root)
-            .args(["add", "link"])
-            .status()
-            .unwrap()
-            .success());
-        assert!(Command::new("git")
-            .current_dir(&f.root)
-            .args([
+        git(&f.root, &["add", "link"]);
+        git(
+            &f.root,
+            &[
                 "-c",
                 "user.name=test",
                 "-c",
                 "user.email=test@example.com",
                 "commit",
                 "-qm",
-                "link"
-            ])
-            .status()
-            .unwrap()
-            .success());
+                "link",
+            ],
+        );
         f.tree = GitTree::load(&f.root, "HEAD").unwrap();
         f.install(vec![proof(vec![input("link/missing", "a")])]);
         assert_eq!(f.decide(BTreeMap::new()).code, Code::InputChanged);
+    }
+    #[test]
+    fn incomplete_step_count_key_and_empty_are_rejected() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        f.spec.steps.push(StepSpec::Traced {
+            index: 2,
+            key: "sh-1".into(),
+            max_age: None,
+        });
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Incomplete);
+        f.spec.steps.pop();
+        f.spec.steps[0] = StepSpec::Traced {
+            index: 1,
+            key: "other".into(),
+            max_age: None,
+        };
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Incomplete);
+        f.spec.steps.clear();
+        let mut record = f.jobs.load("job-test").remove(0);
+        record.steps.clear();
+        f.jobs.save("job-test", record).unwrap();
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Incomplete);
+    }
+    #[test]
+    fn step_max_age_and_future_are_rejected() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        f.spec.steps[0] = StepSpec::Traced {
+            index: 1,
+            key: "sh-0".into(),
+            max_age: Some(5),
+        };
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Expired);
+        let mut p = proof(vec![input("x", "a")]);
+        p.created = 101;
+        f.proofs.save("sh-0", p.clone()).unwrap();
+        let mut record = f.jobs.load("job-test").remove(0);
+        record.steps[0].proof = p.digest();
+        f.jobs.save("job-test", record).unwrap();
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Expired);
+    }
+    #[test]
+    fn git_metadata_runs_and_github_job_is_pinned() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![input(".git/config", "a")])]);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::InputChanged);
+        let mut p = proof(vec![]);
+        p.env.insert(
+            "GITHUB_JOB".into(),
+            blake3::hash(b"plan").to_hex().to_string(),
+        );
+        p.env.insert(
+            "GITHUB_REF".into(),
+            blake3::hash(b"main").to_hex().to_string(),
+        );
+        f.proofs.save("sh-0", p.clone()).unwrap();
+        let mut record = f.jobs.load("job-test").remove(0);
+        record.steps[0].proof = p.digest();
+        f.jobs.save("job-test", record).unwrap();
+        let vars = BTreeMap::from([
+            ("GITHUB_JOB".into(), "plan".into()),
+            ("GITHUB_REF".into(), "main".into()),
+        ]);
+        assert_eq!(f.decide(vars.clone()).code, Code::EnvChanged);
+        p.env.insert(
+            "GITHUB_JOB".into(),
+            blake3::hash(b"test").to_hex().to_string(),
+        );
+        f.proofs.save("sh-0", p.clone()).unwrap();
+        let mut record = f.jobs.load("job-test").remove(0);
+        record.steps[0].proof = p.digest();
+        f.jobs.save("job-test", record).unwrap();
+        assert_eq!(f.decide(vars).code, Code::Proved);
+    }
+    #[test]
+    fn missing_event_path_is_incomplete_and_matching_event_passes() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![input(
+            "/tmp/event.json",
+            &file_id(b"event"),
+        )])]);
+        let mut record = f.jobs.load("job-test").remove(0);
+        record.event_path = None;
+        f.jobs.save("job-test", record.clone()).unwrap();
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Incomplete);
+        record.event_path = Some("/tmp/event.json".into());
+        f.jobs.save("job-test", record).unwrap();
+        let d = decide(
+            &f.spec,
+            &mut PlanCtx {
+                tree: &mut f.tree,
+                proofs: &f.proofs,
+                jobs: &f.jobs,
+                now: 100,
+                max_age: 50,
+                github_vars: BTreeMap::new(),
+                event: Some(file_id(b"event")),
+                explain: false,
+                verify_record: Some(&|_| true),
+            },
+        );
+        assert_eq!(d.code, Code::Proved);
+    }
+    #[test]
+    fn trust_defaults_to_reject_and_older_trusted_record_can_pass() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        let mut record = f.jobs.load("job-test").remove(0);
+        record.attest = Some("trusted".into());
+        f.jobs.save("job-test", record.clone()).unwrap();
+        record.created = 101;
+        record.run = Some("2/1".into());
+        record.attest = None;
+        f.jobs.save("job-test", record).unwrap();
+        let mut ctx = PlanCtx {
+            tree: &mut f.tree,
+            proofs: &f.proofs,
+            jobs: &f.jobs,
+            now: 100,
+            max_age: 50,
+            github_vars: BTreeMap::new(),
+            event: None,
+            explain: false,
+            verify_record: None,
+        };
+        assert_eq!(decide(&f.spec, &mut ctx).code, Code::Unattested);
+        ctx.verify_record = Some(&|r| r.attest.as_deref() == Some("trusted"));
+        assert_eq!(
+            decide(&f.spec, &mut ctx).evidence.unwrap().run.as_deref(),
+            Some("1/1")
+        );
+        f.spec.blocked = Some(super::super::spec::Blocker {
+            step: None,
+            detail: "blocked".into(),
+        });
+        assert_eq!(decide(&f.spec, &mut ctx).code, Code::Blocked);
+    }
+    #[test]
+    fn removal_discards_prior_overlay_children() {
+        let mut f = Fixture::new();
+        let mut a = proof(vec![]);
+        a.outputs = vec![input("gen", "d"), input("gen/x", &file_id(b"x"))];
+        let mut b = proof(vec![]);
+        b.removed.push("gen".into());
+        f.install(vec![a, b, proof(vec![input("gen/x", "a")])]);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Proved);
+    }
+    #[test]
+    fn tree_requires_repository_root_and_commit() {
+        let f = Fixture::new();
+        assert!(GitTree::load(&f.root.join("dir"), "HEAD").is_err());
+        assert!(GitTree::load(&f.root, "HEAD:dir").is_err());
+    }
+    #[test]
+    fn partial_clone_listing_fails_wide() {
+        let mut f = Fixture::new();
+        git(&f.root, &["config", "remote.origin.promisor", "true"]);
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        let id = crate::input::identify(&f.root.join("dir"), true, true).unwrap();
+        f.install(vec![proof(vec![input("dir", &id)])]);
+        let d = f.decide(BTreeMap::new());
+        assert_eq!(d.code, Code::Error);
+        assert!(d.detail.contains("partial clone"));
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn non_utf8_names_preserve_listing_bytes() {
+        use std::os::unix::ffi::OsStringExt;
+        let mut f = Fixture::new();
+        let name = std::ffi::OsString::from_vec(vec![b'z', 255]);
+        fs::write(f.root.join("dir").join(name), b"x").unwrap();
+        git(&f.root, &["add", "dir"]);
+        git(
+            &f.root,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "raw",
+            ],
+        );
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        let id = crate::input::identify(&f.root.join("dir"), true, true).unwrap();
+        f.install(vec![proof(vec![input("dir", &id)])]);
+        assert_eq!(f.decide(BTreeMap::new()).code, Code::Proved);
     }
 }
