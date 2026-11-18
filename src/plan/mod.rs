@@ -224,7 +224,14 @@ pub fn cmd(args: &[String]) -> i32 {
         .unwrap_or_else(|| run::find_root(&std::env::current_dir().unwrap_or_default()));
     let path = workflow_path(&o).unwrap_or_default();
     let mut plan = json!({"schema":"stoop.plan/1","workflow":"","path":path,"rev":"","plan_job":o.plan_job,"full":run::env_flag("STOOP_FULL"),"skip":[],"jobs":[]});
-    let result = build(&o, &root, &path, &mut plan, attest::github);
+    let result = build(
+        &o,
+        &root,
+        &path,
+        &mut plan,
+        sync::Limits::PLAN,
+        attest::github,
+    );
     let warning = result.err();
     if let Err(e) = output::emit(
         &plan,
@@ -246,9 +253,10 @@ fn sync_plan(
     specs: &[JobSpec],
     proofs: &proof::Store,
     jobs: &job::JobStore,
+    limits: sync::Limits,
 ) -> Result<(usize, usize), String> {
     use std::collections::{BTreeMap, BTreeSet};
-    let listed = remote.list_refs()?;
+    let snapshot = remote.snapshot(limits)?;
     let mut job_keys = BTreeMap::new();
     for spec in specs {
         if let Some(key) = &spec.key {
@@ -257,16 +265,44 @@ fn sync_plan(
     }
     let wanted_jobs: Vec<_> = job_keys
         .keys()
-        .filter(|name| listed.contains_key(*name))
+        .filter(|name| snapshot.contains(name))
         .cloned()
         .collect();
-    for (name, bytes) in remote.fetch_refs(&wanted_jobs)? {
-        let key = job_keys.get(&name).ok_or("unexpected job ref")?;
-        jobs.import(key, &bytes).map_err(|e| e.to_string())?;
-    }
+    snapshot.fetch(&wanted_jobs, |name, bytes| {
+        let key = job_keys.get(name).ok_or("unexpected job ref")?;
+        jobs.import(key, bytes).map_err(|e| e.to_string())?;
+        Ok(())
+    })?;
     let mut proof_keys: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
-    for key in job_keys.values() {
-        for record in jobs.load(key) {
+    for spec in specs {
+        if spec.blocked.is_some() {
+            continue;
+        }
+        let Some(key) = &spec.key else { continue };
+        let mut records = jobs.load(key);
+        records.sort_by(|a, b| b.retention_key().cmp(&a.retention_key()));
+        for record in records {
+            if record.started == 0 {
+                continue;
+            }
+            if record.status == Some(job::RecordStatus::Failed) {
+                break;
+            }
+            if record.status != Some(job::RecordStatus::Passed)
+                || record
+                    .event_path
+                    .as_deref()
+                    .is_none_or(|path| !Path::new(path).is_absolute())
+                || !eval::steps_match(
+                    spec.steps.iter().filter_map(|step| match step {
+                        StepSpec::Traced { key, .. } => Some(key.as_str()),
+                        _ => None,
+                    }),
+                    &record.steps,
+                )
+            {
+                continue;
+            }
             for step in record.steps {
                 proof_keys
                     .entry(sync::ref_name(&step.key))
@@ -277,20 +313,18 @@ fn sync_plan(
     }
     let wanted_proofs: Vec<_> = proof_keys
         .keys()
-        .filter(|name| listed.contains_key(*name))
+        .filter(|name| snapshot.contains(name))
         .cloned()
         .collect();
-    for (name, bytes) in remote.fetch_refs(&wanted_proofs)? {
-        let key = proof::Store::key_of(&bytes).ok_or("invalid proof ref")?;
-        if !proof_keys
-            .get(&name)
-            .is_some_and(|keys| keys.contains(&key))
-        {
+    snapshot.fetch(&wanted_proofs, |name, bytes| {
+        let key = proof::Store::key_of(bytes).ok_or("invalid proof ref")?;
+        if !proof_keys.get(name).is_some_and(|keys| keys.contains(&key)) {
             return Err("proof ref does not match a requested key".into());
         }
-        proofs.import(&key, &bytes).map_err(|e| e.to_string())?;
-    }
-    Ok((wanted_jobs.len() + wanted_proofs.len(), listed.len()))
+        proofs.import(&key, bytes).map_err(|e| e.to_string())?;
+        Ok(())
+    })?;
+    Ok((wanted_jobs.len() + wanted_proofs.len(), snapshot.len()))
 }
 
 fn build<S: attest::KeySource>(
@@ -298,6 +332,7 @@ fn build<S: attest::KeySource>(
     root: &Path,
     path: &str,
     out: &mut Value,
+    limits: sync::Limits,
     verifier_factory: impl FnOnce(attest::Policy, u64, u64) -> attest::Verifier<S>,
 ) -> Result<(), String> {
     let tree_started = (o.explain && run::env_flag("STOOP_DEBUG")).then(std::time::Instant::now);
@@ -427,7 +462,7 @@ fn build<S: attest::KeySource>(
         let sync_started =
             (o.explain && run::env_flag("STOOP_DEBUG")).then(std::time::Instant::now);
         match sync::Remote::from_spec(&remote, root, false)
-            .and_then(|r| sync_plan(&r, &specs, &proofs, &jobs))
+            .and_then(|r| sync_plan(&r, &specs, &proofs, &jobs, limits))
         {
             Ok((fetched, total)) => {
                 if o.explain {
@@ -553,6 +588,7 @@ mod tests {
                 &root,
                 ".github/workflows/ci.yml",
                 &mut plan,
+                sync::Limits::PLAN,
                 |policy, now, age| {
                     attest::Verifier::new(policy, a::Fixed(a::published()), now, age)
                 },
