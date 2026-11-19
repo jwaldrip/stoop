@@ -699,6 +699,7 @@ pid_t waitpid(pid_t pid, int *status, int options) {
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
+#[cfg(unix)]
 #[test]
 fn unsupported_platform_runs_without_observation_or_skips() {
     use std::fs;

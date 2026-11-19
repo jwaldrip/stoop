@@ -463,7 +463,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod strict_tests {
     use super::strict_actions;
     use std::ffi::OsString;

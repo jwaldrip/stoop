@@ -11,7 +11,6 @@
 use crate::job::JobStore;
 use crate::proof::{now, Store};
 use std::io::Write;
-use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
@@ -32,13 +31,23 @@ pub fn ref_name(key: &str) -> String {
     format!("refs/stoop/{}", key.replace('.', "_"))
 }
 
+#[cfg(unix)]
 fn legacy_exit(op: &str, status: std::process::ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
     if let Some(code) = status.code() {
         format!("git {op} failed with exit status {code}")
     } else if let Some(signal) = status.signal() {
         format!("git {op} ended by signal {signal}")
     } else {
         format!("unexpected output from git {op}")
+    }
+}
+
+#[cfg(windows)]
+fn legacy_exit(op: &str, status: std::process::ExitStatus) -> String {
+    match status.code() {
+        Some(code) => format!("git {op} failed with exit status {code}"),
+        None => format!("unexpected output from git {op}"),
     }
 }
 

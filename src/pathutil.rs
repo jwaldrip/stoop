@@ -3,8 +3,11 @@
 
 use crate::input::par_map;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs;
 use std::path::{Component, Path, PathBuf};
+#[cfg(windows)]
+use std::{borrow::Cow, ffi::OsString};
 
 /// Join `p` onto `base` when relative, then resolve `.` and `..` lexically.
 /// Symlinks are not followed: the tracer reports names, not inodes.
@@ -34,26 +37,83 @@ pub fn without_dots(path: &Path) -> PathBuf {
 }
 
 /// Root-relative text for paths under `root`, absolute text otherwise.
-/// A relative result never starts with `/`, so the two cannot collide.
+/// A relative result never starts with `/`, so the two cannot collide. Keys use `/` as their
+/// separator on every platform.
 pub fn to_key(root: &Path, p: &Path) -> String {
     match p.strip_prefix(root) {
-        Ok(rel) => rel.to_string_lossy().into_owned(),
-        Err(_) => p.to_string_lossy().into_owned(),
+        Ok(rel) => key_text(rel),
+        Err(_) => absolute_text(p),
     }
 }
 
-/// The relative working directory used to identify a command. Percent escapes
-/// preserve non-UTF-8 bytes without colliding with literal percent signs.
-pub fn cwd_key(root: &Path, cwd: &Path) -> String {
-    use std::fmt::Write;
-    use std::os::unix::ffi::OsStrExt;
+#[cfg(not(windows))]
+fn key_text(rel: &Path) -> String {
+    rel.to_string_lossy().into_owned()
+}
 
-    let path = cwd.strip_prefix(root).unwrap_or(cwd);
-    if let Some(text) = path.to_str() {
+#[cfg(not(windows))]
+fn absolute_text(p: &Path) -> String {
+    p.to_string_lossy().into_owned()
+}
+
+/// Windows relative key. `\` cannot occur inside a Windows name, so rewriting it as `/` is exact.
+#[cfg(windows)]
+fn key_text(rel: &Path) -> String {
+    slashes(&escaped(rel.as_os_str()))
+}
+
+/// Windows absolute key (design section 4). A `\\?\` prefix is dropped first, so one file has one
+/// key however it was spelled. A DOS path becomes `/C:/...` with the drive letter upper-cased, and
+/// a UNC path becomes `//server/share/...`. Both start with `/`, which no relative key does.
+#[cfg(windows)]
+fn absolute_text(p: &Path) -> String {
+    let unverbatim = unverbatim(p.as_os_str());
+    let text = slashes(&escaped(&unverbatim));
+    let bytes = text.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && bytes[2] == b'/' {
+        return format!(
+            "/{}{}",
+            char::from(bytes[0]).to_ascii_uppercase(),
+            &text[1..]
+        );
+    }
+    text
+}
+
+#[cfg(windows)]
+fn unverbatim(name: &OsStr) -> Cow<'_, OsStr> {
+    let Some(text) = name.to_str() else {
+        return Cow::Borrowed(name);
+    };
+    if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+        return Cow::Owned(OsString::from(format!(r"\\{rest}")));
+    }
+    match text.strip_prefix(r"\\?\") {
+        Some(rest) => Cow::Owned(OsString::from(rest)),
+        None => Cow::Borrowed(name),
+    }
+}
+
+#[cfg(windows)]
+fn slashes(text: &str) -> String {
+    text.replace('\\', "/")
+}
+
+#[cfg(not(windows))]
+fn slashes(text: &str) -> String {
+    text.to_owned()
+}
+
+/// Text for one path name. UTF-8 names keep their text, with each `%` doubled. Any other name
+/// percent-escapes every byte that is not plain ASCII, and each `%`, so no two names share a key.
+fn escaped(name: &OsStr) -> String {
+    use std::fmt::Write;
+
+    if let Some(text) = name.to_str() {
         return text.replace('%', "%25");
     }
     let mut key = String::new();
-    for &byte in path.as_os_str().as_bytes() {
+    for &byte in name.as_encoded_bytes() {
         if byte.is_ascii() && byte != b'%' {
             key.push(char::from(byte));
         } else {
@@ -63,12 +123,43 @@ pub fn cwd_key(root: &Path, cwd: &Path) -> String {
     key
 }
 
+/// The relative working directory used to identify a command. Percent escapes
+/// preserve non-UTF-8 bytes without colliding with literal percent signs.
+pub fn cwd_key(root: &Path, cwd: &Path) -> String {
+    let path = cwd.strip_prefix(root).unwrap_or(cwd);
+    slashes(&escaped(path.as_os_str()))
+}
+
+/// The path a key names: the inverse of `to_key` for paths under `root`, and of its absolute text.
 pub fn from_key(root: &Path, key: &str) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(path) = windows_absolute(key) {
+        return path;
+    }
     if key.starts_with('/') {
         PathBuf::from(key)
     } else {
+        #[cfg(windows)]
+        return root.join(key.replace('/', "\\"));
+        #[cfg(not(windows))]
         root.join(key)
     }
+}
+
+/// The Windows path an absolute key names: `/C:/x` is `C:\x`, `//server/share/x` is
+/// `\\server\share\x`, and `/x` is `\x`.
+#[cfg(windows)]
+fn windows_absolute(key: &str) -> Option<PathBuf> {
+    if let Some(unc) = key.strip_prefix("//") {
+        return Some(PathBuf::from(format!(r"\\{}", unc.replace('/', "\\"))));
+    }
+    let rest = key.strip_prefix('/')?;
+    let bytes = rest.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let tail = rest[2..].replace('/', "\\");
+        return Some(PathBuf::from(format!("{}:{tail}", char::from(bytes[0]))));
+    }
+    Some(PathBuf::from(rest.replace('/', "\\")))
 }
 
 /// Where a path physically lives: its canonical parent directory plus its own name.
@@ -285,6 +376,7 @@ mod tests {
         Scratch(fs::canonicalize(&d).unwrap())
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_parent_resolves_to_its_target_and_is_flagged() {
         let root = scratch("redirect");
@@ -299,6 +391,7 @@ mod tests {
         assert!(!direct.redirected);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_final_name_is_not_resolved() {
         let root = scratch("final");
@@ -317,6 +410,7 @@ mod tests {
         assert!(!loc.redirected);
     }
 
+    #[cfg(unix)]
     #[test]
     fn missing_parents_follow_existing_links_and_stop_before_missing_dotdot() {
         let root = scratch("missing-link");
@@ -374,6 +468,7 @@ mod tests {
         assert_eq!(p.parents.len(), 9_999);
     }
 
+    #[cfg(unix)]
     #[test]
     fn missing_parent_is_rerooted_when_lexical_root_is_a_symlink() {
         let root = scratch("reroot");
@@ -388,6 +483,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn cwd_keys_do_not_fold_non_utf8() {
         use std::ffi::OsString;
@@ -398,5 +494,76 @@ mod tests {
         let b = root.join(OsString::from_vec(b"dir-\x81".to_vec()));
         assert_ne!(cwd_key(root, &a), cwd_key(root, &b));
         assert_ne!(cwd_key(root, &a), cwd_key(root, &root.join("dir-%80")));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_keys {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    #[test]
+    fn in_root_keys_use_forward_slashes() {
+        let root = Path::new(r"C:\repo");
+        assert_eq!(
+            to_key(root, Path::new(r"C:\repo\src\main.rs")),
+            "src/main.rs"
+        );
+        assert_eq!(cwd_key(root, Path::new(r"C:\repo\src")), "src");
+        assert_eq!(from_key(root, "src/main.rs"), root.join(r"src\main.rs"));
+    }
+
+    #[test]
+    fn dos_paths_outside_the_root_get_an_upper_case_drive_key() {
+        let root = Path::new(r"C:\repo");
+        assert_eq!(
+            to_key(root, Path::new(r"c:\tools\cargo.exe")),
+            "/C:/tools/cargo.exe"
+        );
+        assert_eq!(
+            from_key(root, "/C:/tools/cargo.exe"),
+            PathBuf::from(r"C:\tools\cargo.exe")
+        );
+    }
+
+    #[test]
+    fn unc_paths_keep_their_server_and_share() {
+        let root = Path::new(r"C:\repo");
+        assert_eq!(
+            to_key(root, Path::new(r"\\server\share\dir\f")),
+            "//server/share/dir/f"
+        );
+        assert_eq!(
+            from_key(root, "//server/share/dir/f"),
+            PathBuf::from(r"\\server\share\dir\f")
+        );
+    }
+
+    #[test]
+    fn verbatim_spellings_give_the_plain_spelling_key() {
+        let root = Path::new(r"C:\repo");
+        assert_eq!(
+            to_key(root, Path::new(r"\\?\C:\tools\x")),
+            to_key(root, Path::new(r"C:\tools\x"))
+        );
+        assert_eq!(
+            to_key(root, Path::new(r"\\?\UNC\server\share\f")),
+            "//server/share/f"
+        );
+    }
+
+    #[test]
+    fn a_relative_key_never_starts_with_a_slash() {
+        let root = Path::new(r"C:\repo");
+        assert!(!to_key(root, Path::new(r"C:\repo\a\b")).starts_with('/'));
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_keeps_its_exact_bytes() {
+        // An unpaired surrogate is not UTF-16 text, so it is escaped byte by byte, as cwd keys are.
+        let root = Path::new(r"C:\repo");
+        let lone = OsString::from_wide(&[0xD800, u16::from(b'a')]);
+        assert_eq!(cwd_key(root, &root.join(lone)), "%ED%A0%80a");
     }
 }

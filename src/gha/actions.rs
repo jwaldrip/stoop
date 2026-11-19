@@ -3,6 +3,7 @@
 use crate::gha::resolve::{self, Resolver};
 use crate::gha::workflow;
 use crate::plan::spec::Code;
+use crate::platform::{self, NoFollow};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -332,23 +333,19 @@ impl Tree {
                         return Err("runner action copy exceeds the size limit".into());
                     }
                     let mut options = fs::OpenOptions::new();
-                    options.read(true);
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-                        if metadata.nlink() != 1 {
-                            return Err("runner action copy contains a hard-linked file".into());
-                        }
-                        options.custom_flags(libc::O_NOFOLLOW);
+                    options.read(true).no_follow();
+                    if platform::is_reparse_point(&metadata) {
+                        return Err("runner action copy contains a link".into());
+                    }
+                    let (identity, links) =
+                        platform::identity_at(&path).map_err(|e| e.to_string())?;
+                    if links != 1 {
+                        return Err("runner action copy contains a hard-linked file".into());
                     }
                     let mut file = options.open(&path).map_err(|e| e.to_string())?;
                     let opened = file.metadata().map_err(|e| e.to_string())?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::MetadataExt;
-                        if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
-                            return Err("runner action copy changed while opening".into());
-                        }
+                    if platform::file_id(&file).map_err(|e| e.to_string())? != identity {
+                        return Err("runner action copy changed while opening".into());
                     }
                     let bytes = read_bounded(
                         (&mut file).take(metadata.len() + 1),

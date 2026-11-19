@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Runs tests/mcp_client.py, a second MCP client written in Python with the standard library
 //! and sharing no code with the Rust harness, against the built binary. It is skipped, with a
 //! note, where python3 is not installed.

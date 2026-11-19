@@ -7,8 +7,9 @@
 //! caller and leaks nothing.
 
 use std::io::{self, Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -58,7 +59,7 @@ pub fn output(root: &Path, args: &[&str], input: &[u8], max_bytes: usize) -> Opt
     let root = root.canonicalize().ok()?;
     let mut command = Command::new("git");
     for (key, _) in std::env::vars_os() {
-        if key.as_os_str().as_bytes().starts_with(b"GIT_") {
+        if key.as_os_str().as_encoded_bytes().starts_with(b"GIT_") {
             command.env_remove(key);
         }
     }
@@ -97,6 +98,7 @@ fn run(mut command: Command, input: &[u8], max_bytes: usize, timeout: Duration) 
     collect(child, input, max_bytes, deadline)
 }
 
+#[cfg(unix)]
 fn spawn(command: &mut Command) -> io::Result<Child> {
     command
         .stdin(Stdio::piped())
@@ -108,11 +110,13 @@ fn spawn(command: &mut Command) -> io::Result<Child> {
 
 // Owns the leader until it is reaped. Its PID doubles as its process-group ID,
 // and that ID cannot be reused while the leader is unreaped.
+#[cfg(unix)]
 struct Leader {
     child: Child,
     reaped: bool,
 }
 
+#[cfg(unix)]
 impl Leader {
     fn signal_group(&self) {
         unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL) };
@@ -149,6 +153,7 @@ impl Leader {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Leader {
     fn drop(&mut self) {
         if !self.reaped {
@@ -159,6 +164,7 @@ impl Drop for Leader {
     }
 }
 
+#[cfg(unix)]
 fn nonblocking(fd: RawFd) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
@@ -167,6 +173,7 @@ fn nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn retryable(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -175,6 +182,7 @@ fn retryable(err: &io::Error) -> bool {
 }
 
 // Grows `out` for `extra` bytes that were just read, never past `max_bytes`.
+#[cfg(unix)]
 fn reserve(out: &mut Vec<u8>, extra: usize, max_bytes: usize) -> Option<()> {
     let needed = out.len().checked_add(extra)?;
     if needed > max_bytes {
@@ -187,6 +195,7 @@ fn reserve(out: &mut Vec<u8>, extra: usize, max_bytes: usize) -> Option<()> {
     Some(())
 }
 
+#[cfg(unix)]
 fn collect(child: Child, input: &[u8], max_bytes: usize, deadline: Instant) -> Option<Vec<u8>> {
     let mut leader = Leader {
         child,
@@ -310,13 +319,132 @@ fn collect(child: Child, input: &[u8], max_bytes: usize, deadline: Instant) -> O
     }
 }
 
+// Windows: the leader starts suspended and joins a Job object before it runs, so the job holds every
+// process it starts. Windows pipes block, so one thread reads stdout and another writes stdin, and
+// this thread waits for them under the same deadline and output cap as the Unix path.
+#[cfg(windows)]
+fn spawn(command: &mut Command) -> io::Result<Child> {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    crate::platform::tree::spawn_suspended(command)
+}
+
+// Owns the leader until it is reaped. Killing its job ends every process the probe started.
+#[cfg(windows)]
+struct Leader {
+    child: Child,
+    tree: crate::platform::tree::Tree,
+}
+
+#[cfg(windows)]
+impl Leader {
+    fn signal_group(&self) {
+        let _ = self.tree.kill();
+    }
+
+    // Reports whether the leader has exited. Its exit status is kept until it is read.
+    fn exited(&mut self) -> io::Result<bool> {
+        Ok(self.child.try_wait()?.is_some())
+    }
+
+    // Kills whatever remains in the job, then reaps the leader.
+    fn finish(&mut self) -> Option<ExitStatus> {
+        self.signal_group();
+        self.child.wait().ok()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Leader {
+    fn drop(&mut self) {
+        self.signal_group();
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[cfg(windows)]
+fn collect(mut child: Child, input: &[u8], max_bytes: usize, deadline: Instant) -> Option<Vec<u8>> {
+    let tree = crate::platform::tree::Tree::contain(&mut child).ok()?;
+    let mut leader = Leader { child, tree };
+    let stdin = leader.child.stdin.take().filter(|_| !input.is_empty());
+    let stdout = leader.child.stdout.take();
+    let mut writer = stdin.map(|mut pipe| {
+        let input = input.to_vec();
+        std::thread::spawn(move || pipe.write_all(&input))
+    });
+    let (chunks, received) = std::sync::mpsc::channel();
+    let mut reading = stdout.is_some();
+    if let Some(mut pipe) = stdout {
+        std::thread::spawn(move || {
+            let mut buffer = vec![0u8; CHUNK];
+            loop {
+                match pipe.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if chunks.send(Ok(buffer[..n].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = chunks.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
+    }
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if !reading {
+            match leader.exited() {
+                Ok(true) => {
+                    let status = leader.finish()?;
+                    // Killing the job closed the pipes, so a writer still blocked has returned.
+                    let written = writer
+                        .take()
+                        .is_none_or(|handle| matches!(handle.join(), Ok(Ok(()))));
+                    return (status.success() && written).then_some(out);
+                }
+                Ok(false) => {}
+                Err(_) => return None,
+            }
+        }
+        let wait = deadline
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_millis(10));
+        if reading {
+            match received.recv_timeout(wait) {
+                Ok(Ok(bytes)) => {
+                    if out.len().saturating_add(bytes.len()) > max_bytes {
+                        return None;
+                    }
+                    out.extend_from_slice(&bytes);
+                }
+                Ok(Err(_)) => return None,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => reading = false,
+            }
+        } else {
+            std::thread::sleep(wait);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
     use std::os::unix::process::CommandExt;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(unix)]
     use std::thread;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -342,8 +470,10 @@ mod tests {
     }
 
     // Kills the escaped holder even when an assertion fails first.
+    #[cfg(unix)]
     struct Holder(PathBuf);
 
+    #[cfg(unix)]
     impl Drop for Holder {
         fn drop(&mut self) {
             if let Some(pid) = read_pid(&self.0) {
@@ -352,10 +482,12 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn read_pid(path: &Path) -> Option<libc::pid_t> {
         fs::read_to_string(path).ok()?.trim().parse().ok()
     }
 
+    #[cfg(unix)]
     fn assert_reaped(pid: u32) {
         let mut status = 0;
         let rc = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
@@ -370,7 +502,7 @@ mod tests {
     fn git(dir: &Path, args: &[&str]) {
         let mut command = Command::new("git");
         for (key, _) in std::env::vars_os() {
-            if key.as_os_str().as_bytes().starts_with(b"GIT_") {
+            if key.as_os_str().as_encoded_bytes().starts_with(b"GIT_") {
                 command.env_remove(key);
             }
         }
@@ -491,6 +623,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn deadline_kills_and_reaps_a_stalled_leader() {
         let mut command = Command::new("/bin/sleep");
         command.arg("30");
@@ -509,6 +642,7 @@ mod tests {
     // leader starts a holder in its own group that inherits stdout, records
     // the holder's PID, and exits, so the holder alone keeps the pipe open.
     #[test]
+    #[cfg(unix)]
     fn held_pipe_helper() {
         match std::env::var("STOOP_GITPROBE_HELPER").as_deref() {
             Ok("escape") => {
@@ -534,6 +668,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn escaped_holder_of_stdout_cannot_extend_the_deadline() {
         let dir = Dir::new();
         let pid_path = dir.0.join("holder.pid");
@@ -563,6 +698,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn large_input_and_output_are_pipelined_without_deadlock() {
         let input: Vec<u8> = (0..1_048_576usize).map(|i| (i % 251) as u8).collect();
         let echoed = run(

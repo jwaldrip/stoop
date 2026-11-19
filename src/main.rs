@@ -10,11 +10,13 @@ mod input;
 #[allow(dead_code)]
 mod job;
 mod journal;
+#[cfg(unix)]
 mod mcp;
 mod oid_attrs;
 mod pathutil;
 #[allow(dead_code)]
 mod plan;
+mod platform;
 mod proof;
 mod run;
 mod stepkey;
@@ -134,7 +136,13 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
         return plan::cmd(&args);
     }
     if cmd == "mcp" {
+        #[cfg(unix)]
         return mcp::cmd(&args);
+        #[cfg(not(unix))]
+        {
+            eprintln!("stoop: stoop mcp is not available on Windows yet");
+            return 2;
+        }
     }
     let (mut o, rest) = match parse(&args) {
         Ok(x) => x,
@@ -499,6 +507,7 @@ fn shell_mode(o: &mut Opts, script: &OsStr, rest: &[OsString]) -> i32 {
 /// Refuses a `--status-fd` that cannot carry a report, before anything runs. Descriptors 0 to 2 are
 /// the standard streams, and stdout is the protocol stream, so a report there would corrupt it. A
 /// descriptor that is not open cannot be written, and closing it would abort the process.
+#[cfg(unix)]
 fn check_status_fd(fd: i32) -> Result<(), String> {
     if fd < 3 {
         return Err(format!(
@@ -517,6 +526,7 @@ fn check_status_fd(fd: i32) -> Result<(), String> {
 
 /// Keeps the MCP server's status descriptor from every child: close-on-exec, set before any
 /// child exists in this process.
+#[cfg(unix)]
 fn take_status_fd(fd: i32) {
     // SAFETY: fcntl on a descriptor the MCP server gave this process.
     unsafe {
@@ -526,6 +536,7 @@ fn take_status_fd(fd: i32) {
 
 /// `stoop run` for the MCP server. The decision goes to the status descriptor as one JSON line.
 /// The command's stdout and stderr stay its own, and nothing parses them for a decision.
+#[cfg(unix)]
 fn report_run(o: Opts, fd: i32) -> i32 {
     if let Err(error) = check_status_fd(fd) {
         eprintln!("stoop: {error}");
@@ -555,7 +566,14 @@ fn report_run(o: Opts, fd: i32) -> i32 {
     outcome.status
 }
 
+#[cfg(not(unix))]
+fn report_run(_o: Opts, fd: i32) -> i32 {
+    eprintln!("stoop: --status-fd {fd} is not available on Windows yet");
+    2
+}
+
 /// Writes the decision line and closes the descriptor, which ends the server's read.
+#[cfg(unix)]
 fn emit_decision(fd: i32, value: serde_json::Value) {
     use std::io::Write;
     use std::os::unix::io::FromRawFd;
@@ -570,7 +588,7 @@ fn proof_name(key: &OsStr) -> Option<String> {
     key.to_str().map(str::to_owned)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod forget_name_tests {
     use super::proof_name;
     use std::ffi::OsStr;

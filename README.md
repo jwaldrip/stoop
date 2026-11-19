@@ -52,7 +52,7 @@ By default, the proof key includes the command and its working directory relativ
 
 Proofs live in `<root>/.stoop` unless `--store DIR` or `STOOP_STORE` chooses another store. An external store includes the Git origin URL in automatic keys, keeping different repositories apart while allowing checkouts of the same origin to share proofs. Without an origin, stoop uses the root's absolute path, so moving that root gives it a cold cache in an external store. Explicit `--key` names remain unchanged, but a proof still has to match the working directory and repository scope.
 
-Proofs are specific to their operating system, architecture, tracer and tracer version. A Linux x86-64 proof cannot skip a Linux arm64 command, even in a shared store. Older proofs without this information are treated as cold; run the command on a supported Linux platform to record a fresh proof. New proofs use a format older stoop versions cannot read, so update runners sharing a store. `stoop ls` shows each proof's platform. macOS runs commands without tracing and never skips.
+Proofs are specific to their operating system, architecture, tracer and tracer version. A Linux x86-64 proof cannot skip a Linux arm64 command, even in a shared store. Older proofs without this information are treated as cold; run the command on a supported Linux platform to record a fresh proof. New proofs use a format older stoop versions cannot read, so update runners sharing a store. `stoop ls` shows each proof's platform. macOS and Windows run commands without tracing and never skip.
 
 Up to 8 proofs are kept per key, so steps that leave no output in the repository (tests, lint, type checks) can also skip after a revert.
 
@@ -104,7 +104,7 @@ The installer places the binary in `~/.local/bin`. Set `STOOP_INSTALL_DIR` to an
 
 The SHA-256 check detects corruption and a tampered mirror, but a compromised release could replace both the archive and its checksum. When `gh` is installed, the installer verifies GitHub build provenance; otherwise it reports that the check was skipped. Provenance identifies the build, not whether its source is safe. `curl | sh` trusts the domain and TLS to deliver the installer.
 
-Tracing needs Linux on x86-64 or arm64. On macOS stoop runs the command untraced, never records, and never skips.
+Tracing needs Linux on x86-64 or arm64. On macOS and Windows stoop runs the command untraced, never records, and never skips. On Windows the command runs in a job object, so stoop ends the command's processes if stoop itself dies first.
 
 ```sh
 stoop run -- cargo test        # skip or run

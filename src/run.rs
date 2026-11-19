@@ -13,7 +13,6 @@ use crate::trace::{self, Trace};
 use crate::volatile;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -212,13 +211,13 @@ pub(crate) fn shared_scope(root: &Path, store: &Path) -> Option<String> {
                 root.join(path)
             };
             let path = std::fs::canonicalize(&path).unwrap_or_else(|_| absolutize(root, &path));
-            h.update(path.as_os_str().as_bytes());
+            h.update(path.as_os_str().as_encoded_bytes());
         } else {
             h.update(remote.as_bytes());
         }
     } else {
         h.update(b"root\0");
-        h.update(root.as_os_str().as_bytes());
+        h.update(root.as_os_str().as_encoded_bytes());
     }
     Some(h.finalize().to_hex().to_string())
 }
@@ -337,7 +336,6 @@ pub fn env_key(name: &std::ffi::OsStr) -> String {
 
 /// The environment name a fingerprint key stands for: the exact inverse of `env_key`.
 pub fn env_name(key: &str) -> std::ffi::OsString {
-    use std::os::unix::ffi::OsStringExt;
     let Some(hex) = key.strip_prefix('\u{0}') else {
         return std::ffi::OsString::from(key);
     };
@@ -349,7 +347,7 @@ pub fn env_name(key: &str) -> std::ffi::OsString {
         })
         .collect();
     match bytes {
-        Some(bytes) => std::ffi::OsString::from_vec(bytes),
+        Some(bytes) => os_string_from_bytes(bytes).unwrap_or_else(|| std::ffi::OsString::from(key)),
         None => std::ffi::OsString::from(key),
     }
 }
@@ -518,18 +516,79 @@ fn plain(argv: &[std::ffi::OsString], pass_env: &[&str]) -> i32 {
             command.env(name, value);
         }
     }
+    run_untraced(command, &argv[0])
+}
+
+/// Runs the command with its standard streams inherited, and returns its status. On Unix a signal
+/// is reported as 128 plus the signal number.
+#[cfg(unix)]
+fn run_untraced(mut command: std::process::Command, program: &std::ffi::OsStr) -> i32 {
     match command.status() {
         Ok(s) => {
             use std::os::unix::process::ExitStatusExt;
             s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
         }
+        Err(e) => cannot_run(program, &e),
+    }
+}
+
+/// Runs the command in a job object. It starts suspended and joins the job before its first
+/// instruction, so every process it starts belongs to the job. The job kills them if stoop dies
+/// before the command finishes. A normal finish releases them, as Unix does. Windows reports the
+/// exit code itself, including a crash code such as 0xC0000005, which stoop returns unchanged.
+#[cfg(windows)]
+fn run_untraced(mut command: std::process::Command, program: &std::ffi::OsStr) -> i32 {
+    use crate::platform::tree::{spawn_suspended, Tree};
+    let mut child = match spawn_suspended(&mut command) {
+        Ok(child) => child,
+        Err(e) => return cannot_run(program, &e),
+    };
+    let tree = match Tree::contain(&mut child) {
+        Ok(tree) => tree,
         Err(e) => {
             eprintln!(
-                "stoop: cannot run {}: {e}",
-                safe(&argv[0].to_string_lossy())
+                "stoop: cannot contain {}: {e}",
+                safe(&program.to_string_lossy())
             );
-            127
+            return 1;
         }
+    };
+    match child.wait() {
+        Ok(status) => {
+            let _ = tree.release();
+            status.code().unwrap_or(1)
+        }
+        Err(e) => {
+            let _ = tree.kill();
+            eprintln!(
+                "stoop: cannot wait for {}: {e}",
+                safe(&program.to_string_lossy())
+            );
+            1
+        }
+    }
+}
+
+/// The message and status for a command that could not start.
+fn cannot_run(program: &std::ffi::OsStr, error: &std::io::Error) -> i32 {
+    eprintln!(
+        "stoop: cannot run {}: {error}",
+        safe(&program.to_string_lossy())
+    );
+    127
+}
+
+/// The name a byte string spells: any bytes on Unix, and UTF-8 on Windows, where a name that is
+/// not UTF-8 is not rebuilt (the caller keeps the key text instead).
+fn os_string_from_bytes(bytes: Vec<u8>) -> Option<std::ffi::OsString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        Some(std::ffi::OsString::from_vec(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        String::from_utf8(bytes).ok().map(std::ffi::OsString::from)
     }
 }
 
@@ -556,11 +615,13 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
 }
 
 /// `stoop run` as the MCP server starts it: the same decision as `run`, with the outcome returned.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn run_observed(o: Opts) -> Outcome {
     run_internal(o, false, true)
 }
 
 /// The error that stops a placeholder argv before anything runs, if there is one.
+#[cfg_attr(not(unix), allow(dead_code))]
 pub fn hook_refusal(argv: &[OsString]) -> Option<String> {
     units::hook::prepare(argv).err()
 }
@@ -1633,9 +1694,12 @@ mod flag_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
+    #[cfg(unix)]
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
+    #[cfg(unix)]
     #[test]
     fn pass_env_requires_exact_names_and_explicit_flag() {
         assert!(parse_pass_env(None, false).unwrap().is_empty());
@@ -1700,6 +1764,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn captured_credentials_survive_a_later_thread_without_entering_its_environment() {
         const CHILD: &str = "STOOP_TOKEN_CAPTURE_TEST_CHILD";
@@ -1919,6 +1984,7 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_utf8_traced_paths_are_not_recorded_lossily() {
         let root = Path::new("/repo");
@@ -1966,7 +2032,7 @@ mod canonical_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod non_utf8_tests {
     use super::*;
     use std::ffi::OsString;
@@ -1993,7 +2059,7 @@ mod non_utf8_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod exact_key_tests {
     use super::*;
     use std::ffi::{OsStr, OsString};
@@ -2065,7 +2131,7 @@ mod exact_key_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod argv_bytes_tests {
     use super::*;
     use std::ffi::OsString;
@@ -2106,7 +2172,7 @@ mod argv_bytes_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod env_hash_name_tests {
     use super::*;
     use std::ffi::OsString;
@@ -2123,7 +2189,7 @@ mod env_hash_name_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod hook_key_tests {
     use super::*;
     use std::ffi::OsString;

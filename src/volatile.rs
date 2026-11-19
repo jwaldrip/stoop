@@ -18,12 +18,11 @@
 //! Every invocation that reaches the decision is an observation, skips included. A skipped run's
 //! value equals an earlier proof's value, so counting only recorded runs would miss a repeat.
 
+use crate::platform::{self, OwnerOnly};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1138,7 +1137,7 @@ fn lock(store: &Path) -> io::Result<File> {
     match OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .owner_only()
         .open(store.join(".gitignore"))
     {
         Ok(mut file) => file.write_all(b"*\n")?,
@@ -1150,11 +1149,9 @@ fn lock(store: &Path) -> io::Result<File> {
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
+        .owner_only()
         .open(store.join(LOCK))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    platform::lock_exclusive(&file)?;
     Ok(file)
 }
 
@@ -1168,7 +1165,7 @@ fn write_bytes(store: &Path, bytes: &[u8]) -> io::Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .owner_only()
             .open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -2160,6 +2157,7 @@ mod tests {
         assert!(catalog.keys["k"].names.len() <= MAX_NAMES);
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_name_that_is_not_utf8_can_be_learned_by_its_exact_bytes() {
         use std::ffi::OsString;

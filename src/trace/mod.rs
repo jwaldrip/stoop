@@ -29,7 +29,11 @@ pub struct Touch {
 }
 use serde::{Deserialize, Serialize};
 
-pub const UNAVAILABLE: &str = "tracing needs Linux x86-64 or arm64 (ptrace and seccomp)";
+pub const UNAVAILABLE: &str = if cfg!(windows) {
+    "tracing is not available on Windows yet; the tracer runs on Linux x86-64 and arm64 only"
+} else {
+    "tracing needs Linux x86-64 or arm64 (ptrace and seccomp)"
+};
 const TRACER: &str = "ptrace-seccomp";
 pub(crate) mod version;
 use version::TRACER_VERSION;

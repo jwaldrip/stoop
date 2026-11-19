@@ -199,6 +199,7 @@ pub fn wait_for_file(path: &Path, within: Duration) -> Option<String> {
 }
 
 /// Send a signal to a process.
+#[cfg(unix)]
 pub fn signal(pid: u32, sig: i32) {
     // SAFETY: kill only sends a signal to a process the test started.
     unsafe {

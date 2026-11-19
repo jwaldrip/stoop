@@ -3,8 +3,10 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -51,6 +53,7 @@ impl fmt::Display for Operation {
 pub enum Failure {
     Run(Operation),
     Exit(Operation, i32),
+    #[cfg_attr(not(unix), allow(dead_code))]
     Signal(Operation, i32),
     Wait(Operation),
     Output(Operation),
@@ -310,19 +313,27 @@ enum Outcome {
     Lost,
 }
 
-// Owns the unreaped leader. In particular, a failed watcher-thread spawn must
-// not strand the child, and an unreaped leader keeps its process-group id ours.
-struct ManagedChild(Option<Child>);
+/// What killing a child reaches: its process group on Unix, which the child leads from spawn, and
+/// its job object on Windows, which the child joins before it runs.
+#[cfg(unix)]
+type Group = ();
+#[cfg(windows)]
+type Group = crate::platform::tree::Tree;
+
+// Owns the unreaped leader and its group. In particular, a failed watcher-thread spawn must not
+// strand the child, and an unreaped leader keeps its process-group id ours.
+struct ManagedChild(Option<Child>, Group);
 
 impl Drop for ManagedChild {
     fn drop(&mut self) {
         if let Some(mut child) = self.0.take() {
-            stop(&mut child);
+            stop(&mut child, &self.1);
         }
     }
 }
 
-fn stop(child: &mut Child) {
+#[cfg(unix)]
+fn stop(child: &mut Child, _group: &Group) {
     let pgid = child.id() as libc::pid_t;
     // The leader has not been reaped, so this process-group id cannot be reused.
     unsafe { libc::kill(-pgid, libc::SIGTERM) };
@@ -332,15 +343,23 @@ fn stop(child: &mut Child) {
     let _ = child.wait();
 }
 
-fn watch(child: &mut Child, control: &Control, deadline: Instant) -> Outcome {
+#[cfg(windows)]
+fn stop(child: &mut Child, group: &Group) {
+    // Ending the job ends every process in the tree. The leader is then reaped.
+    let _ = group.kill();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn watch(child: &mut Child, group: &Group, control: &Control, deadline: Instant) -> Outcome {
     loop {
         let now = Instant::now();
         if now >= deadline {
-            stop(child);
+            stop(child, group);
             return Outcome::TimedOut;
         }
         if control.abort.load(Ordering::SeqCst) {
-            stop(child);
+            stop(child, group);
             return Outcome::Aborted;
         }
         // Do not reap before I/O completes. A leader can exit while a helper
@@ -350,7 +369,7 @@ fn watch(child: &mut Child, control: &Control, deadline: Instant) -> Outcome {
                 Ok(Some(status)) => return Outcome::Exited(status),
                 Ok(None) => {}
                 Err(_) => {
-                    stop(child);
+                    stop(child, group);
                     return Outcome::Lost;
                 }
             }
@@ -363,6 +382,7 @@ fn timeout_error() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "git deadline expired")
 }
 
+#[cfg(unix)]
 fn nonblocking(fd: RawFd) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
@@ -371,6 +391,7 @@ fn nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn wait_ready(fd: RawFd, events: libc::c_short, deadline: Instant) -> io::Result<()> {
     loop {
         let remaining = deadline
@@ -408,6 +429,7 @@ struct TimedPipe<T> {
     deadline: Instant,
 }
 
+#[cfg(unix)]
 impl<T: Read + AsRawFd> Read for TimedPipe<T> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
@@ -428,6 +450,7 @@ impl<T: Read + AsRawFd> Read for TimedPipe<T> {
     }
 }
 
+#[cfg(unix)]
 impl<T: Write + AsRawFd> Write for TimedPipe<T> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         if buffer.is_empty() {
@@ -445,6 +468,36 @@ impl<T: Write + AsRawFd> Write for TimedPipe<T> {
                 result => return result,
             }
         }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[cfg(windows)]
+impl<T: Read> Read for TimedPipe<T> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(timeout_error());
+        }
+        self.inner.read(buffer)
+    }
+}
+
+#[cfg(windows)]
+impl<T: Write> Write for TimedPipe<T> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(timeout_error());
+        }
+        self.inner.write(buffer)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -491,14 +544,17 @@ fn run_git<T>(
         } else {
             Stdio::null()
         })
-        .stderr(Stdio::null())
-        .process_group(0);
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
     #[cfg(test)]
     command
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_ALLOW_PROTOCOL", "file");
-    let mut child = command.spawn().map_err(|_| Failure::Run(op).to_string())?;
+    let mut child = spawn_child(&mut command).map_err(|_| Failure::Run(op).to_string())?;
+    #[allow(clippy::let_unit_value)]
+    let group = join_group(&mut child).map_err(|_| Failure::Run(op).to_string())?;
     let stdin = child.stdin.take();
     let stdout = child.stdout.take();
     let control = Arc::new(Control {
@@ -506,10 +562,15 @@ fn run_git<T>(
         abort: AtomicBool::new(false),
     });
     let watched = Arc::clone(&control);
-    let mut child = ManagedChild(Some(child));
+    let mut child = ManagedChild(Some(child), group);
     let watcher = thread::Builder::new()
         .spawn(move || {
-            let outcome = watch(child.0.as_mut().expect("owned child"), &watched, deadline);
+            let outcome = watch(
+                child.0.as_mut().expect("owned child"),
+                &child.1,
+                &watched,
+                deadline,
+            );
             // watch reaps the leader on every return path.
             child.0.take();
             outcome
@@ -518,7 +579,7 @@ fn run_git<T>(
     let result = (|| {
         let input = stdin
             .map(|pipe| {
-                nonblocking(pipe.as_raw_fd()).map_err(|_| Failure::Output(op).to_string())?;
+                ready(&pipe).map_err(|_| Failure::Output(op).to_string())?;
                 Ok::<_, String>(TimedPipe {
                     inner: pipe,
                     deadline,
@@ -527,7 +588,7 @@ fn run_git<T>(
             .transpose()?;
         let output = stdout
             .map(|pipe| {
-                nonblocking(pipe.as_raw_fd()).map_err(|_| Failure::Output(op).to_string())?;
+                ready(&pipe).map_err(|_| Failure::Output(op).to_string())?;
                 Ok::<_, String>(TimedPipe {
                     inner: pipe,
                     deadline,
@@ -545,20 +606,68 @@ fn run_git<T>(
         Outcome::TimedOut => Err(Failure::Deadline(duration).to_string()),
         _ if result.is_err() => result,
         Outcome::Exited(status) if status.success() => result,
-        Outcome::Exited(status) => {
-            if let Some(code) = status.code() {
-                Err(Failure::Exit(op, code).to_string())
-            } else if let Some(signal) = status.signal() {
-                Err(Failure::Signal(op, signal).to_string())
-            } else {
-                Err(Failure::Output(op).to_string())
-            }
-        }
+        Outcome::Exited(status) => Err(failure_of(op, status)),
         Outcome::Aborted => Err(Failure::Output(op).to_string()),
         Outcome::Lost => Err(Failure::Wait(op).to_string()),
     }
 }
 
-#[cfg(test)]
+// Starts the leader. On Windows it starts suspended, so `join_group` can place it in its job first.
+#[cfg(unix)]
+fn spawn_child(command: &mut Command) -> io::Result<Child> {
+    command.spawn()
+}
+
+#[cfg(windows)]
+fn spawn_child(command: &mut Command) -> io::Result<Child> {
+    crate::platform::tree::spawn_suspended(command)
+}
+
+// The group a new leader belongs to. Unix already placed it in its own process group at spawn.
+// Windows joins the job now, before the leader runs.
+#[cfg(unix)]
+fn join_group(_child: &mut Child) -> io::Result<Group> {
+    Ok(())
+}
+
+#[cfg(windows)]
+fn join_group(child: &mut Child) -> io::Result<Group> {
+    crate::platform::tree::Tree::contain(child)
+}
+
+// Unix pipes become non-blocking, so TimedPipe can time out a read or write. Windows pipes block:
+// the watcher ends a stalled pipe by killing the tree, which closes its handles.
+#[cfg(unix)]
+fn ready<T: AsRawFd>(pipe: &T) -> io::Result<()> {
+    nonblocking(pipe.as_raw_fd())
+}
+
+#[cfg(windows)]
+fn ready<T>(_pipe: &T) -> io::Result<()> {
+    Ok(())
+}
+
+// The failure a leader's exit status reports. Windows has no signals, so only a code applies there.
+#[cfg(unix)]
+fn failure_of(op: Operation, status: ExitStatus) -> String {
+    use std::os::unix::process::ExitStatusExt;
+    if let Some(code) = status.code() {
+        Failure::Exit(op, code).to_string()
+    } else if let Some(signal) = status.signal() {
+        Failure::Signal(op, signal).to_string()
+    } else {
+        Failure::Output(op).to_string()
+    }
+}
+
+#[cfg(windows)]
+fn failure_of(op: Operation, status: ExitStatus) -> String {
+    match status.code() {
+        Some(code) => Failure::Exit(op, code).to_string(),
+        None => Failure::Output(op).to_string(),
+    }
+}
+
+#[cfg(all(test, unix))]
 #[path = "bounded_tests.rs"]
 mod tests;

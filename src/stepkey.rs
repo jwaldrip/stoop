@@ -91,7 +91,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod non_utf8_args {
     use super::sh_key;
     use std::ffi::OsString;

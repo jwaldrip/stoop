@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Planner regressions using proof files captured by the real Linux recorder.
 //! Regenerate with `STOOP_REGENERATE_RECORDER_FIXTURES=1 cargo test --test record_e2e
 //! regenerate_planner_recorder_fixtures -- --ignored` on Linux.
