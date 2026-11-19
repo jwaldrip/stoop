@@ -27,7 +27,7 @@ struct Options {
     prefilter: eval::Prefilter,
     allowed: Vec<String>,
 }
-fn parse(args: &[String]) -> Result<Option<Options>, String> {
+fn parse(args: &[std::ffi::OsString]) -> Result<Option<Options>, String> {
     let mut o = Options {
         workflow: None,
         rev: "HEAD".into(),
@@ -49,16 +49,24 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
         allowed: Vec::new(),
     };
     let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
+    while let Some(raw) = iter.next() {
+        // A word that is not UTF-8 names no option, so it is an unknown option.
+        let Some(arg) = raw.to_str() else {
+            return Err(format!(
+                "unknown option {}",
+                run::safe(&raw.to_string_lossy())
+            ));
+        };
         if arg == "--help" || arg == "-h" {
             return Ok(None);
         }
         let mut value = || {
-            iter.next()
-                .cloned()
-                .ok_or_else(|| format!("{arg} needs a value"))
+            let raw = iter.next().ok_or_else(|| format!("{arg} needs a value"))?;
+            raw.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{arg} needs a UTF-8 value"))
         };
-        match arg.as_str() {
+        match arg {
             "--workflow" => o.workflow = Some(value()?),
             "--rev" => o.rev = value()?,
             "--plan-job" => o.plan_job = value()?,
@@ -217,7 +225,7 @@ fn plan_override(w: &gha::workflow::Workflow, id: &str) -> Result<(), String> {
     }
     Ok(())
 }
-pub fn cmd(args: &[String]) -> i32 {
+pub fn cmd(args: &[std::ffi::OsString]) -> i32 {
     let o = match parse(args) {
         Ok(Some(o)) => o,
         Ok(None) => {
@@ -588,7 +596,7 @@ mod tests {
     fn injected_planner_proves_an_attested_record() {
         if let Some(root) = std::env::var_os("STOOP_TEST_PLAN_CHILD") {
             let root = PathBuf::from(root);
-            let mut args = vec![
+            let mut args: Vec<std::ffi::OsString> = vec![
                 "--workflow".into(),
                 ".github/workflows/ci.yml".into(),
                 "--format".into(),
@@ -596,7 +604,7 @@ mod tests {
             ];
             if let Some(mode) = std::env::var_os("STOOP_TEST_PREFILTER") {
                 args.push("--prefilter".into());
-                args.push(mode.to_string_lossy().into_owned());
+                args.push(mode);
             }
             let opts = parse(&args).unwrap().unwrap();
             let mut plan = json!({"skip": [], "jobs": []});
@@ -846,11 +854,11 @@ mod tests {
             ("off", eval::Prefilter::Off),
             ("check", eval::Prefilter::Check),
         ] {
-            let args = vec!["--prefilter".to_string(), value.to_string()];
+            let args: Vec<std::ffi::OsString> = vec!["--prefilter".into(), value.into()];
             assert_eq!(parse(&args).unwrap().unwrap().prefilter, mode);
         }
         assert_eq!(parse(&[]).unwrap().unwrap().prefilter, eval::Prefilter::On);
-        let bogus = vec!["--prefilter".to_string(), "bogus".to_string()];
+        let bogus: Vec<std::ffi::OsString> = vec!["--prefilter".into(), "bogus".into()];
         assert!(parse(&bogus).is_err());
         assert_eq!(cmd(&bogus), 2);
     }

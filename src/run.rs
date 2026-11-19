@@ -2,6 +2,7 @@
 
 #[path = "units/mod.rs"]
 mod units;
+pub(crate) use units::hook::safe;
 
 use crate::ignore::Ignore;
 use crate::input::{identify, identify_recorded, par_map, verify, Input};
@@ -48,7 +49,7 @@ pub struct Opts {
     /// Seconds a proof stays valid; 0 means forever. Default: 7 days.
     pub max_age: Option<u64>,
     pub defer_push: bool,
-    pub argv: Vec<String>,
+    pub argv: Vec<std::ffi::OsString>,
     /// Explicitly passed OIDC request variables; such a run is never recorded.
     pub pass_env: Vec<&'static str>,
     pub allow_id_token: bool,
@@ -215,10 +216,19 @@ pub(crate) fn shared_scope(root: &Path, store: &Path) -> Option<String> {
     Some(h.finalize().to_hex().to_string())
 }
 
-fn default_key(argv: &[String], rel_cwd: &str, scope: Option<&str>) -> String {
+/// The words a hook record can hold: a record stores text, so only an argv of UTF-8 words is
+/// recordable. The hook template is never recorded, so a shell-erased form of it is not recognised.
+fn recordable_argv(words: &[std::ffi::OsString]) -> Option<Vec<String>> {
+    words
+        .iter()
+        .map(|word| word.to_str().map(str::to_owned))
+        .collect()
+}
+
+fn default_key(argv: &[std::ffi::OsString], rel_cwd: &str, scope: Option<&str>) -> String {
     let mut h = blake3::Hasher::new();
     for a in argv {
-        h.update(a.as_bytes());
+        h.update(a.as_encoded_bytes());
         h.update(&[0]);
     }
     h.update(rel_cwd.as_bytes());
@@ -244,8 +254,9 @@ fn hook_key(
     for words in [&hook.original, &hook.argv] {
         hash.update(&(words.len() as u64).to_le_bytes());
         for word in words {
-            hash.update(&(word.len() as u64).to_le_bytes());
-            hash.update(word.as_bytes());
+            let bytes = word.as_encoded_bytes();
+            hash.update(&(bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
         }
     }
     for value in [cwd, scope.unwrap_or(""), label.unwrap_or("")] {
@@ -478,7 +489,7 @@ fn ago(created: u64) -> String {
     }
 }
 
-fn plain(argv: &[String], pass_env: &[&str]) -> i32 {
+fn plain(argv: &[std::ffi::OsString], pass_env: &[&str]) -> i32 {
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]);
     for name in pass_env {
@@ -492,7 +503,10 @@ fn plain(argv: &[String], pass_env: &[&str]) -> i32 {
             s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
         }
         Err(e) => {
-            eprintln!("stoop: cannot run {}: {e}", argv[0]);
+            eprintln!(
+                "stoop: cannot run {}: {e}",
+                safe(&argv[0].to_string_lossy())
+            );
             127
         }
     }
@@ -634,7 +648,13 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             .into_iter()
             .filter(|r| r.cwd == rel_cwd && r.scope == scope && r.label == o.key)
         {
-            if let Ok(Some(candidate)) = units::hook::prepare(&record.argv) {
+            let words: Vec<std::ffi::OsString> = record
+                .argv
+                .iter()
+                .cloned()
+                .map(std::ffi::OsString::from)
+                .collect();
+            if let Ok(Some(candidate)) = units::hook::prepare(&words) {
                 if units::hook::expanded_matches(&candidate, &o.argv)
                     && !found.iter().any(|known| known.argv == candidate.argv)
                 {
@@ -700,18 +720,32 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     }
     if let Some(h) = &hook {
         if !expanded && !explain && !o.no_record {
-            let record = units::hook_store::Record {
-                key: key.clone(),
-                argv: h.original.clone(),
-                cwd: rel_cwd.clone(),
-                scope: scope.clone(),
-                label: o.key.clone(),
-                created: now(),
-            };
-            if let Err(warning) = units::hook_store::record(&store_path, record) {
-                if !o.quiet {
-                    eprintln!("{warning}");
+            // A record holds text. A hook template with an argument that is not UTF-8 is not
+            // recorded, so a shell-erased form of this hook is not recognised. The whole-command
+            // proof is keyed by the exact bytes and is still recorded.
+            let words = recordable_argv(&h.original);
+            match words {
+                Some(argv) => {
+                    let record = units::hook_store::Record {
+                        key: key.clone(),
+                        argv,
+                        cwd: rel_cwd.clone(),
+                        scope: scope.clone(),
+                        label: o.key.clone(),
+                        created: now(),
+                    };
+                    if let Err(warning) = units::hook_store::record(&store_path, record) {
+                        if !o.quiet {
+                            eprintln!("{warning}");
+                        }
+                    }
                 }
+                None if !o.quiet => {
+                    eprintln!(
+                        "stoop: the hook template is not recorded, so a shell-erased form of this hook will not be recognised"
+                    );
+                }
+                None => {}
             }
         }
     }
@@ -777,7 +811,17 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         })
         .unwrap_or(DEFAULT_MAX_AGE);
     let mut env_names = ambient_env(
-        &format!("{} {}", o.argv.join(" "), o.mention),
+        &format!(
+            "{} {}",
+            // Only the names of variables the command mentions are read from this text, and
+            // those are ASCII, so lossy text finds the same names as the exact bytes.
+            o.argv
+                .iter()
+                .map(|word| word.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+            o.mention
+        ),
         &o.ignore_env,
     );
     env_names.extend(o.env.iter().cloned());
@@ -1035,7 +1079,11 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             let (outputs, removed, write_reasons) = build_outputs(&real_root, &written);
             let proof = Proof {
                 created: now(),
-                argv: o.argv.clone(),
+                argv: o
+                    .argv
+                    .iter()
+                    .map(|word| word.to_string_lossy().into_owned())
+                    .collect(),
                 cwd: Some(rel_cwd.clone()),
                 scope: scope.clone(),
                 provenance: Some(trace::Provenance::current()),
@@ -1521,7 +1569,7 @@ mod tests {
         for (program, status) in [("/usr/bin/true", 0), ("/usr/bin/false", 1)] {
             let outcome = run_outcome(
                 Opts {
-                    argv: vec![program.to_owned()],
+                    argv: vec![std::ffi::OsString::from(program)],
                     pass_env: vec![ID_TOKEN_VARS[0]],
                     ..Default::default()
                 },
@@ -1892,6 +1940,47 @@ mod exact_key_tests {
 }
 
 #[cfg(test)]
+mod argv_bytes_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    fn raw(bytes: &[u8]) -> OsString {
+        OsString::from_vec(bytes.to_vec())
+    }
+
+    #[test]
+    fn utf8_argv_keys_keep_their_existing_bytes() {
+        // The key hashes each word's bytes then a NUL, as it always has.
+        let mut h = blake3::Hasher::new();
+        h.update(b"echo");
+        h.update(&[0]);
+        h.update(b"hi");
+        h.update(&[0]);
+        let expected = format!("echo-{}", &h.finalize().to_hex()[..16]);
+        let argv = [OsString::from("echo"), OsString::from("hi")];
+        assert_eq!(default_key(&argv, "", None), expected);
+    }
+
+    #[test]
+    fn non_utf8_argv_words_are_hashed_by_their_exact_bytes() {
+        let fe = default_key(&[raw(b"x\xfe")], "", None);
+        assert_ne!(fe, default_key(&[raw(b"x\xff")], "", None));
+        // A lossy form of the word would collide with the replacement character.
+        assert_ne!(fe, default_key(&[OsString::from("x\u{fffd}")], "", None));
+    }
+
+    #[test]
+    fn only_a_utf8_argv_is_recordable() {
+        assert_eq!(recordable_argv(&[raw(b"x\xfe")]), None);
+        assert_eq!(
+            recordable_argv(&[OsString::from("x")]),
+            Some(vec!["x".to_string()])
+        );
+    }
+}
+
+#[cfg(test)]
 mod env_hash_name_tests {
     use super::*;
     use std::ffi::OsString;
@@ -1905,5 +1994,27 @@ mod env_hash_name_tests {
         let got = env_hashes(std::slice::from_ref(&key), None);
         assert_eq!(got[&key], env_hash_bytes(&key, b"v", None));
         std::env::remove_var(&name);
+    }
+}
+
+#[cfg(test)]
+mod hook_key_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    fn key(word: &[u8]) -> String {
+        let words = [
+            OsString::from("./t"),
+            OsString::from("{changed}"),
+            OsString::from_vec(word.to_vec()),
+        ];
+        let hook = units::hook::prepare(&words).unwrap().unwrap();
+        hook_key(&hook, None, "", None)
+    }
+
+    #[test]
+    fn a_hook_key_separates_non_utf8_words_by_their_exact_bytes() {
+        assert_ne!(key(b"x\xfe"), key(b"x\xff"));
     }
 }

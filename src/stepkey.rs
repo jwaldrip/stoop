@@ -3,7 +3,7 @@ pub fn sh_key(
     workflow: &str,
     job: &str,
     cwd_key: &str,
-    args: &[String],
+    args: &[std::ffi::OsString],
     matrix: Option<&str>,
 ) -> String {
     let mut h = blake3::Hasher::new();
@@ -14,7 +14,7 @@ pub fn sh_key(
         cwd_key.as_bytes(),
     ]
     .into_iter()
-    .chain(args.iter().map(|arg| arg.as_bytes()))
+    .chain(args.iter().map(|arg| arg.as_encoded_bytes()))
     {
         h.update(&(field.len() as u64).to_le_bytes());
         h.update(field);
@@ -56,7 +56,7 @@ mod tests {
     #[test]
     fn matches_cwd_and_argument_derivation() {
         let body = b"echo hello\n";
-        let args = vec!["argument".to_string()];
+        let args = vec![std::ffi::OsString::from("argument")];
         let mut expected = blake3::Hasher::new();
         for field in [body.as_slice(), b"workflow", b"job", b"src", b"argument"] {
             expected.update(&(field.len() as u64).to_le_bytes());
@@ -88,5 +88,22 @@ mod tests {
             assert_eq!(canonical_matrix(v).unwrap(), None);
         }
         assert!(canonical_matrix("bad").is_err());
+    }
+}
+
+#[cfg(test)]
+mod non_utf8_args {
+    use super::sh_key;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn non_utf8_arguments_are_keyed_by_their_exact_bytes() {
+        let fe = [OsString::from_vec(b"\xfe".to_vec())];
+        let ff = [OsString::from_vec(b"\xff".to_vec())];
+        assert_ne!(
+            sh_key(b"echo", "workflow", "job", "src", &fe, None),
+            sh_key(b"echo", "workflow", "job", "src", &ff, None)
+        );
     }
 }

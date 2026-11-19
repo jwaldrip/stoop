@@ -1,12 +1,13 @@
 //! Explicit changed-unit hooks. Slice 2a executes only their full-command form.
 
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Hook {
-    pub original: Vec<String>,
-    pub argv: Vec<String>,
-    pub removed: Vec<String>,
+    pub original: Vec<OsString>,
+    pub argv: Vec<OsString>,
+    pub removed: Vec<OsString>,
     pub spans: Vec<Vec<(usize, usize)>>,
     pub placeholder: String,
 }
@@ -24,6 +25,45 @@ const CHANGED: &[(&str, Option<&str>)] = &[
 
 fn option(word: &str) -> bool {
     word.starts_with('-') && word.len() > 1 && word != "--"
+}
+
+/// The text the placeholder grammar reads for one argument. UTF-8 is itself, so UTF-8 keeps its
+/// behaviour. A word that is not UTF-8 holds no placeholder: its printable ASCII stays, so `-`
+/// options and `=` read as they do, while braces and other bytes become `\0` and two hex digits.
+/// argv cannot hold NUL, so no escaped word equals a UTF-8 word.
+fn shadow(word: &OsStr) -> String {
+    if let Some(text) = word.to_str() {
+        return text.to_string();
+    }
+    let mut shown = String::new();
+    for &byte in word.as_encoded_bytes() {
+        if (0x20..0x7f).contains(&byte) && byte != b'{' && byte != b'}' {
+            shown.push(char::from(byte));
+        } else {
+            shown.push_str(&format!("\u{0}{byte:02x}"));
+        }
+    }
+    shown
+}
+
+fn shadows(words: &[OsString]) -> Vec<String> {
+    words.iter().map(|word| shadow(word)).collect()
+}
+
+/// Shadow text made printable: each escaped byte shows as the replacement character.
+fn lossy_shadow(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{0}' {
+            chars.next();
+            chars.next();
+            shown.push('\u{fffd}');
+        } else {
+            shown.push(ch);
+        }
+    }
+    shown
 }
 
 fn segments(suffix: &str, inputs: bool) -> Result<(), String> {
@@ -290,18 +330,19 @@ fn same_option(word: &str, name: &str) -> bool {
 }
 
 fn ambiguous(name: &str) -> String {
-    let name = safe(name);
+    let name = safe(&lossy_shadow(name));
     format!("cannot tell where the values for {name} end; attach the placeholder with =, put it right after {name} or after --, or declare the option (declarations arrive with the configuration slice)")
 }
 
-pub(crate) fn prepare(argv: &[String]) -> Result<Option<Hook>, String> {
-    let shell = shell_code(argv);
+pub(crate) fn prepare(exact: &[OsString]) -> Result<Option<Hook>, String> {
+    let argv = shadows(exact);
+    let shell = shell_code(&argv);
     let mut all = Vec::with_capacity(argv.len());
     let mut found = false;
     let mut env_code = false;
     let mut placeholder = String::new();
     for (idx, word) in argv.iter().enumerate() {
-        if mangled(word) {
+        if exact[idx].to_str().is_some() && mangled(word) {
             return Err(MANGLED.to_string());
         }
         let parts = spans(word)?;
@@ -414,9 +455,9 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Option<Hook>, String> {
             remove[i] = true;
         }
     }
-    let mut exec = Vec::with_capacity(argv.len());
+    let mut exec = Vec::with_capacity(exact.len());
     let mut removed = Vec::new();
-    for (i, word) in argv.iter().enumerate() {
+    for (i, word) in exact.iter().enumerate() {
         if remove[i] {
             removed.push(word.clone());
         } else {
@@ -424,7 +465,7 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Option<Hook>, String> {
         }
     }
     Ok(Some(Hook {
-        original: argv.to_vec(),
+        original: exact.to_vec(),
         argv: exec,
         removed,
         spans: all,
@@ -433,8 +474,10 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Option<Hook>, String> {
 }
 
 /// Does this argv equal a shell-expanded form of the recorded hook?
-pub(crate) fn expanded_matches(hook: &Hook, incoming: &[String]) -> bool {
-    let n = hook.original.len();
+pub(crate) fn expanded_matches(hook: &Hook, exact: &[OsString]) -> bool {
+    let original = shadows(&hook.original);
+    let incoming = shadows(exact);
+    let n = original.len();
     let m = incoming.len();
     if !hook.spans.iter().any(|s| !s.is_empty()) || n > 128 || m > 2048 {
         return false;
@@ -443,7 +486,7 @@ pub(crate) fn expanded_matches(hook: &Hook, incoming: &[String]) -> bool {
     let stride = m + 1;
     reachable[0] = true;
     for i in 0..n {
-        let word = &hook.original[i];
+        let word = &original[i];
         let spans = &hook.spans[i];
         let mut erased = String::new();
         let mut cursor = 0;
@@ -485,7 +528,7 @@ pub(crate) fn expanded_matches(hook: &Hook, incoming: &[String]) -> bool {
                 if i + 1 < n && j < m && option(word) {
                     let next = &hook.spans[i + 1];
                     if next.len() == 1
-                        && next[0] == (0, hook.original[i + 1].len())
+                        && next[0] == (0, original[i + 1].len())
                         && incoming[j] == format!("{word}=")
                     {
                         reachable[(i + 2) * stride + j + 1] = true;
@@ -530,27 +573,28 @@ fn quote_word(text: &str) -> String {
 }
 
 /// Removed words as a list, `["--files", "{changed}"]`, for the run line.
-pub(crate) fn show(words: &[String]) -> String {
+pub(crate) fn show(words: &[OsString]) -> String {
     let items: Vec<String> = words
         .iter()
-        .map(|item| format!("\"{}\"", safe(item).replace('"', "\\\"")))
+        .map(|item| format!("\"{}\"", safe(&item.to_string_lossy()).replace('"', "\\\"")))
         .collect();
     format!("[{}]", items.join(", "))
 }
 
 /// Words as a shell would type them, for explain output.
-pub(crate) fn render(words: &[String]) -> String {
+pub(crate) fn render(words: &[OsString]) -> String {
     words
         .iter()
         .map(|item| {
+            let item = item.to_string_lossy();
             let bare = !item.is_empty()
                 && item
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"-_./=:,@+%".contains(&b));
             if bare {
-                safe(item)
+                safe(&item)
             } else {
-                quote_word(item)
+                quote_word(&item)
             }
         })
         .collect::<Vec<_>>()
@@ -563,19 +607,20 @@ fn option_name(word: &str) -> &str {
 }
 
 /// The option that carried a removed placeholder, if one did.
-fn dropped_option(hook: &Hook) -> Option<&str> {
+fn dropped_option(hook: &Hook) -> Option<String> {
     hook.removed
         .iter()
+        .map(|item| shadow(item))
         .find(|item| option(item))
-        .map(|item| option_name(item))
+        .map(|item| lossy_shadow(option_name(&item)))
 }
 
 /// The line a run prints when the shell removed a recorded placeholder.
 pub(crate) fn expanded_line(hook: &Hook) -> String {
-    let placeholder = render(std::slice::from_ref(&hook.placeholder));
+    let placeholder = render(&[OsString::from(hook.placeholder.clone())]);
     match dropped_option(hook) {
         Some(name) => {
-            let name = safe(name);
+            let name = safe(&name);
             format!(
                 "stoop: the shell expanded {placeholder} after {name}; running the full command, which drops {name}; quote it"
             )
@@ -596,7 +641,7 @@ pub(crate) fn expanded_explain(hook: &Hook) -> String {
 }
 
 /// The line for placeholder-free argv that matches more than one recorded full command.
-pub(crate) fn ambiguous_line(argv: &[String], matches: usize, explain: bool) -> String {
+pub(crate) fn ambiguous_line(argv: &[OsString], matches: usize, explain: bool) -> String {
     let typed = render(argv);
     if explain {
         format!(
@@ -610,24 +655,25 @@ pub(crate) fn ambiguous_line(argv: &[String], matches: usize, explain: bool) -> 
 }
 
 /// The option or argument that holds the first empty value, made safe to print.
-fn empty_label(argv: &[String]) -> Option<String> {
-    for (i, item) in argv.iter().enumerate().skip(1) {
+fn empty_label(argv: &[OsString]) -> Option<String> {
+    let words = shadows(argv);
+    for (i, item) in words.iter().enumerate().skip(1) {
         if item.is_empty() {
-            let label = argv
+            let label = words
                 .get(i - 1)
                 .filter(|s| option(s))
                 .map_or("argument", String::as_str);
-            return Some(safe(label));
+            return Some(safe(&lossy_shadow(label)));
         }
         if option(item) && item.ends_with('=') {
-            return Some(safe(item.trim_end_matches('=')));
+            return Some(safe(&lossy_shadow(item.trim_end_matches('='))));
         }
     }
     None
 }
 
 /// The line for an empty value that no recorded hook explains, on a run or in explain.
-pub(crate) fn empty_value_line(argv: &[String], explain: bool) -> Option<String> {
+pub(crate) fn empty_value_line(argv: &[OsString], explain: bool) -> Option<String> {
     let label = empty_label(argv)?;
     Some(if explain {
         format!("stoop: would run as typed: no hook recorded with a placeholder at {label}")
@@ -645,5 +691,71 @@ mod tests {
         assert_eq!(safe("a\nb\u{1b}c"), "a\\u{a}b\\u{1b}c");
         assert_eq!(safe("x\u{202E}y"), "x\\u{202e}y");
         assert_eq!(safe("##[error]z::w"), "#%23[error]z%3A%3Aw");
+    }
+}
+
+#[cfg(test)]
+mod non_utf8_words {
+    use super::*;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    fn raw(bytes: &[u8]) -> OsString {
+        OsString::from_vec(bytes.to_vec())
+    }
+
+    #[test]
+    fn a_non_utf8_word_is_an_ordinary_word_even_when_lossy_text_would_be_a_placeholder() {
+        // Converted lossily this is a placeholder; as bytes it is an ordinary word.
+        let argv = [OsString::from("./t"), raw(b"{changed:*.rs\xff}")];
+        assert!(matches!(prepare(&argv), Ok(None)));
+    }
+
+    #[test]
+    fn a_placeholder_next_to_a_non_utf8_word_still_expands() {
+        let argv = [
+            OsString::from("./t"),
+            raw(b"\xff"),
+            OsString::from("{changed}"),
+        ];
+        assert!(matches!(prepare(&argv), Ok(Some(_))));
+    }
+
+    #[test]
+    fn distinct_words_have_distinct_shadows() {
+        let fe = shadow(OsStr::from_bytes(b"\xfe"));
+        assert_ne!(fe, shadow(OsStr::from_bytes(b"\xff")));
+        assert_ne!(fe, shadow(OsStr::new("\u{fffd}")));
+        assert_eq!(shadow(OsStr::new("{changed}")), "{changed}");
+    }
+}
+
+#[cfg(test)]
+mod incoming_words_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn a_non_utf8_incoming_word_never_matches_a_recorded_replacement_character() {
+        let recorded = [
+            OsString::from("./t"),
+            OsString::from("\u{fffd}"),
+            OsString::from("--files"),
+            OsString::from("{changed}"),
+        ];
+        let hook = prepare(&recorded).unwrap().unwrap();
+        let typed = [
+            OsString::from("./t"),
+            OsString::from_vec(b"\xff".to_vec()),
+            OsString::from("--files"),
+        ];
+        assert!(!expanded_matches(&hook, &typed));
+        let utf8 = [
+            OsString::from("./t"),
+            OsString::from("\u{fffd}"),
+            OsString::from("--files"),
+        ];
+        assert!(expanded_matches(&hook, &utf8));
     }
 }
