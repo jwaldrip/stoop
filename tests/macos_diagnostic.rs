@@ -14,6 +14,14 @@ fn tracer_usable() -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
+/// Whether a DTrace process is still running. A run must leave none behind.
+fn dtrace_left() -> bool {
+    Command::new("pgrep")
+        .args(["-x", "dtrace"])
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
 /// True when the test should be skipped. It never skips on a runner that has the tracer.
 fn skip(test: &str) -> bool {
     if tracer_usable() {
@@ -110,9 +118,7 @@ fn a_fixture_with_a_tree_and_failed_lookups_is_observed_in_full_and_never_record
     assert!(stderr.contains("stoop: DTrace diagnostic: "), "{stderr}");
     assert!(stderr.contains("not recorded"), "{stderr}");
     // The verdict is UNSOUND. Its reasons are the descriptor-relative lookups the tracer cannot
-    // place, and DTrace's own report of a loss or an error when it made one. When DTrace reported
-    // nothing, the known results below hold exactly. When it did, the run says so, and the exact
-    // lists are not asserted, because an event the tracer lost may be one of them.
+    // place, and DTrace's own report of a loss or an error when it made one.
     assert!(
         stderr.contains("DTrace diagnostic verdict: UNSOUND ("),
         "{stderr}"
@@ -129,13 +135,27 @@ fn a_fixture_with_a_tree_and_failed_lookups_is_observed_in_full_and_never_record
         );
     }
     w.no_proof_written();
+    assert!(!dtrace_left(), "a DTrace process is left after the run");
     if !stderr.contains(" 0 tracer loss or error line(s)") {
+        // DTrace reported a loss or an error, so the exact lists may be short. The lower bounds
+        // still hold: the command read its input, and most of its lookups were seen. A run that
+        // always reports a loss fails here.
+        eprintln!("fixture: branch = named loss (DTrace reported a loss or error)");
         assert!(
             stderr.contains("error stream") || stderr.contains("loss or error"),
             "{stderr}"
         );
+        let read = listed(&stderr, "read");
+        let failed = listed(&stderr, "failed");
+        assert!(read.contains(&w.path("in.txt")), "{read:?}");
+        let missing = failed
+            .iter()
+            .filter(|path| path.starts_with(&w.path("missing/")))
+            .count();
+        assert!(missing >= 1900, "failed lookups seen: {missing}");
         return;
     }
+    eprintln!("fixture: branch = exact (DTrace reported no loss)");
 
     let read = listed(&stderr, "read");
     let failed = listed(&stderr, "failed");
@@ -205,6 +225,10 @@ fn a_tracer_killed_mid_run_returns_the_status_and_says_the_report_is_unsound() {
             "stoop: DTrace diagnostic UNSOUND: the command's exit was not seen by the tracer"
         ),
         "{stderr}"
+    );
+    assert!(
+        !dtrace_left(),
+        "a DTrace process is left after the killed run"
     );
     w.no_proof_written();
 }

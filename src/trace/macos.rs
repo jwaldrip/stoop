@@ -94,11 +94,19 @@ const SCRIPT: &str = r#"#pragma D option quiet
 
 int tree[pid_t];
 int done;
+int idle;
+int seen_root;
 
 BEGIN
 {
 	tree[$1] = 1;
 	printf("READY\n");
+}
+
+proc:::exec
+/pid == $1/
+{
+	seen_root = 1;
 }
 
 syscall::posix_spawn:entry
@@ -157,6 +165,19 @@ proc:::exit
 
 tick-50ms
 /done != 0 && timestamp > done + 500000000/
+{
+	printf("STOP\n");
+	exit(0);
+}
+
+tick-1s
+/done == 0 && seen_root == 0/
+{
+	idle = idle + 1;
+}
+
+tick-1s
+/idle > 30 && done == 0/
 {
 	printf("STOP\n");
 	exit(0);
@@ -917,9 +938,33 @@ fn dtrace_command() -> Command {
         "-n",
         "/bin/sh",
         "-c",
-        "exec /usr/sbin/dtrace -q -s /dev/stdin \"$0\"",
+        "echo \"TRACER $$\"; exec /usr/sbin/dtrace -q -s /dev/stdin \"$0\"",
     ]);
     command
+}
+
+/// Signals the DTrace process through sudo. sudo's no-pty relay drops signals that come from its
+/// parent's process group, so a signal sent by stoop itself never reaches DTrace; a root `kill`
+/// does. Best effort: whether DTrace stopped is checked separately.
+fn signal_tracer(pid: u32, signal: &str) {
+    let _ = Command::new("sudo")
+        .args(["-n", "/bin/kill", signal, &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+/// Whether the DTrace process still exists, checked as root through sudo for the same reason the
+/// signal is.
+fn tracer_alive(pid: u32) -> bool {
+    Command::new("sudo")
+        .args(["-n", "/bin/kill", "-0", &pid.to_string()])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
 }
 
 /// Runs `argv` once under DTrace and returns what was observed. `Err` means the command was
@@ -954,30 +999,102 @@ fn wait_up_to(child: &mut Child, timeout: Duration) -> bool {
     }
 }
 
-/// Waits up to `timeout` for the tracer to exit. If it has not, it is killed (sudo runs as this
-/// user's real id, so the signal is allowed) and the wait is bounded again. Returns whether the
-/// tracer exited.
-fn reap(tracing: &mut Child, pid: u32, timeout: Duration) -> bool {
-    if wait_up_to(tracing, timeout) {
-        return true;
-    }
-    unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-    wait_up_to(tracing, timeout)
+/// How the launcher signals DTrace and checks that it is gone. A real run uses sudo, because
+/// sudo's no-pty relay drops signals from stoop's own process group. The unit tests have no
+/// passwordless sudo, so they signal their own children directly.
+#[derive(Clone, Copy)]
+struct Control {
+    signal: fn(u32, &str),
+    alive: fn(u32) -> bool,
 }
 
-/// Stops a run that cannot continue: the command is killed if it has not run, and the tracer is
-/// interrupted and reaped within the stop timeout.
+const SUDO: Control = Control {
+    signal: signal_tracer,
+    alive: tracer_alive,
+};
+
+const DIRECT: Control = Control {
+    signal: signal_direct,
+    alive: alive_direct,
+};
+
+impl Control {
+    fn for_run() -> Self {
+        if cfg!(test) {
+            DIRECT
+        } else {
+            SUDO
+        }
+    }
+}
+
+fn signal_direct(pid: u32, signal: &str) {
+    let number = if signal == "-INT" {
+        libc::SIGINT
+    } else {
+        libc::SIGKILL
+    };
+    unsafe { libc::kill(pid as i32, number) };
+}
+
+fn alive_direct(pid: u32) -> bool {
+    unsafe { libc::kill(pid as i32, 0) == 0 }
+}
+
+/// Stops DTrace by its own pid, through `control`, and reports whether it is gone. INT is sent
+/// first and KILL follows if DTrace survives `timeout`. Returns `false` only when DTrace still
+/// exists after KILL, which is the one fact LEFT_RUNNING reports. sudo's own exit is not
+/// evidence: DTrace can outlive a killed sudo, so only the pid is checked.
+fn reap(tracing: &mut Child, dtrace: u32, timeout: Duration, control: Control) -> bool {
+    (control.signal)(dtrace, "-INT");
+    let mut gone = wait_gone(tracing, dtrace, timeout, control);
+    if !gone {
+        (control.signal)(dtrace, "-KILL");
+        gone = wait_gone(tracing, dtrace, timeout, control);
+    }
+    if gone {
+        let _ = wait_up_to(tracing, timeout);
+    }
+    gone
+}
+
+/// Whether DTrace is gone within `timeout`. The launcher's child is reaped while it is polled, so
+/// an exited child is not mistaken for a process still running.
+fn wait_gone(tracing: &mut Child, dtrace: u32, timeout: Duration, control: Control) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let _ = tracing.try_wait();
+        if !(control.alive)(dtrace) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Stops a run that cannot continue: the command is killed if it has not run. DTrace is stopped
+/// by its own pid when that pid was announced. Otherwise sudo is killed, and the tracer's own dead
+/// man clause bounds whatever is left.
 fn abort_run(
     command: &mut Child,
     tracing: &mut Child,
-    tracer_pid: u32,
+    dtrace: Option<u32>,
     timeout: Duration,
     reason: &str,
 ) -> io::Error {
     let _ = command.kill();
     let _ = command.wait();
-    unsafe { libc::kill(tracer_pid as i32, libc::SIGINT) };
-    reap(tracing, tracer_pid, timeout);
+    match dtrace {
+        Some(pid) => {
+            reap(tracing, pid, timeout, Control::for_run());
+        }
+        None => {
+            let _ = tracing.kill();
+            let _ = tracing.wait();
+        }
+    }
     io::Error::other(reason.to_owned())
 }
 
@@ -1018,6 +1135,7 @@ fn read_lines(
     mut reader: impl Read,
     observer: &mut Observer,
     ready: &mut Option<mpsc::Sender<()>>,
+    tracer_pid: &mut Option<mpsc::Sender<u32>>,
     keep_raw: bool,
 ) {
     let mut pending: Vec<u8> = Vec::new();
@@ -1038,6 +1156,16 @@ fn read_lines(
             let end = start + offset;
             let line = &pending[start..end];
             start = end + 1;
+            if let Some(pid) = line
+                .strip_prefix(b"TRACER ")
+                .and_then(|pid| std::str::from_utf8(pid).ok())
+                .and_then(|pid| pid.parse::<u32>().ok())
+            {
+                if let Some(tx) = tracer_pid.take() {
+                    let _ = tx.send(pid);
+                }
+                continue;
+            }
             let text = match std::str::from_utf8(line) {
                 Ok(text) => text.to_owned(),
                 Err(_) => {
@@ -1120,6 +1248,7 @@ pub(crate) fn run_with(
     stop_timeout: Duration,
     keep_raw: bool,
 ) -> io::Result<Diagnostic> {
+    let control = Control::for_run();
     let (mut command, mut release) = start_held(argv, cwd)?;
     let root = command.id();
 
@@ -1136,7 +1265,6 @@ pub(crate) fn run_with(
             return Err(error);
         }
     };
-    let tracer_pid = tracing.id();
     let (stdin, stdout, stderr) = (
         tracing.stdin.take(),
         tracing.stdout.take(),
@@ -1146,7 +1274,7 @@ pub(crate) fn run_with(
         return Err(abort_run(
             &mut command,
             &mut tracing,
-            tracer_pid,
+            None,
             stop_timeout,
             "the tracer has no pipes",
         ));
@@ -1155,7 +1283,7 @@ pub(crate) fn run_with(
         return Err(abort_run(
             &mut command,
             &mut tracing,
-            tracer_pid,
+            None,
             stop_timeout,
             "the tracer closed before it read its script",
         ));
@@ -1163,14 +1291,17 @@ pub(crate) fn run_with(
     drop(stdin);
 
     let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (pid_tx, pid_rx) = mpsc::channel::<u32>();
     let (done_tx, done_rx) = mpsc::channel::<Observer>();
     let (err_tx, err_rx) = mpsc::channel::<StderrSeen>();
     let start_cwd = cwd.to_owned();
     std::thread::spawn(move || {
         let mut observer = Observer::new(root, &start_cwd);
         let mut ready = Some(ready_tx);
-        read_lines(stdout, &mut observer, &mut ready, keep_raw);
+        let mut pid = Some(pid_tx);
+        read_lines(stdout, &mut observer, &mut ready, &mut pid, keep_raw);
         drop(ready);
+        drop(pid);
         let _ = done_tx.send(observer);
     });
     // The error stream is read on its own, so a message from DTrace cannot join a record.
@@ -1178,11 +1309,26 @@ pub(crate) fn run_with(
         let _ = err_tx.send(read_stderr(stderr));
     });
 
+    // DTrace announces its own pid before it arms. Every later signal goes to that pid, and the
+    // command is not released until the pid is known: a tracer that cannot be stopped must not
+    // run the command.
+    let dtrace_pid = match pid_rx.recv_timeout(ready_timeout) {
+        Ok(pid) => pid,
+        Err(_) => {
+            return Err(abort_run(
+                &mut command,
+                &mut tracing,
+                None,
+                stop_timeout,
+                "the tracer did not announce its pid, so the command was not run",
+            ));
+        }
+    };
     if ready_rx.recv_timeout(ready_timeout).is_err() {
         return Err(abort_run(
             &mut command,
             &mut tracing,
-            tracer_pid,
+            Some(dtrace_pid),
             stop_timeout,
             "the tracer did not report READY, so the command was not run",
         ));
@@ -1192,8 +1338,7 @@ pub(crate) fn run_with(
     drop(release);
     if !released {
         let _ = command.wait();
-        unsafe { libc::kill(tracer_pid as i32, libc::SIGINT) };
-        reap(&mut tracing, tracer_pid, stop_timeout);
+        reap(&mut tracing, dtrace_pid, stop_timeout, control);
         return Err(io::Error::other(
             "the command could not be released, so it was not run",
         ));
@@ -1212,7 +1357,7 @@ pub(crate) fn run_with(
     let mut observer = match done_rx.recv_timeout(stop_timeout) {
         Ok(observer) => observer,
         Err(_) => {
-            unsafe { libc::kill(tracer_pid as i32, libc::SIGINT) };
+            (control.signal)(dtrace_pid, "-INT");
             match done_rx.recv_timeout(stop_timeout) {
                 Ok(mut observer) => {
                     observer.push_reason(INTERRUPTED);
@@ -1230,7 +1375,7 @@ pub(crate) fn run_with(
         Ok(seen) => note_stderr(&mut observer, &seen),
         Err(_) => observer.push_reason(STDERR_STALLED),
     }
-    if !reap(&mut tracing, tracer_pid, stop_timeout) {
+    if !reap(&mut tracing, dtrace_pid, stop_timeout, control) {
         observer.push_reason(LEFT_RUNNING);
     }
     if code.is_none() {
@@ -1927,10 +2072,11 @@ mod tests {
         );
     }
 
-    /// The fake tracer: a shell script that stands in for DTrace. The root pid is `$0`.
+    /// The fake tracer: a shell script that stands in for DTrace. It announces its own pid first,
+    /// as the real tracer does. The root pid is `$0`.
     fn fake(script: &str) -> Command {
         let mut command = Command::new("/bin/sh");
-        command.args(["-c", script]);
+        command.args(["-c", &format!("echo \"TRACER $$\"; {script}")]);
         command
     }
 
@@ -2183,7 +2329,13 @@ mod tests {
     fn a_line_that_never_ends_is_unsound() {
         let mut o = observer();
         let mut ready = None;
-        read_lines(&b"EXIT\t0.1\t100\nSTOP"[..], &mut o, &mut ready, false);
+        read_lines(
+            &b"EXIT\t0.1\t100\nSTOP"[..],
+            &mut o,
+            &mut ready,
+            &mut None,
+            false,
+        );
         let d = o.finish(0);
         assert!(
             reasons(&d)
@@ -2198,7 +2350,7 @@ mod tests {
     fn a_read_error_on_the_tracers_output_is_unsound() {
         let mut o = observer();
         let mut ready = None;
-        read_lines(Broken, &mut o, &mut ready, false);
+        read_lines(Broken, &mut o, &mut ready, &mut None, false);
         let d = o.finish(0);
         assert!(
             reasons(&d).iter().any(|r| r.contains("could not be read")),
@@ -2238,5 +2390,118 @@ mod tests {
         let d = o.finish(0);
         assert_eq!(d.execs, [(100, PathBuf::from("/usr/bin/true"))]);
         assert!(d.trace.touched[Path::new("/usr/bin/true")].read);
+    }
+
+    fn never_dies(_pid: u32) -> bool {
+        true
+    }
+
+    fn ignores_signals(_pid: u32, _signal: &str) {}
+
+    #[test]
+    fn a_tracer_that_survives_kill_is_reported_as_left_running() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let control = Control {
+            signal: ignores_signals,
+            alive: never_dies,
+        };
+        let started = Instant::now();
+        let gone = reap(&mut child, pid, Duration::from_millis(200), control);
+        assert!(!gone, "a tracer that survives KILL was reported gone");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn the_launcher_stops_the_pid_the_tracer_announced_not_the_process_it_started() {
+        let marker = marker("announced");
+        let _ = std::fs::remove_file(&marker);
+        // The announced process is a background sleep. A background job of a non-interactive
+        // shell ignores SIGINT, so only the launcher's escalation to KILL, sent to that pid, stops
+        // it. Signalling the shell instead would leave the sleep running.
+        let mut tracer = Command::new("/bin/sh");
+        tracer.args([
+            "-c",
+            &format!(
+                "sleep 30 & echo $! > '{}'; echo \"TRACER $!\"; echo READY; wait",
+                marker.display()
+            ),
+        ]);
+        let argv = [OsString::from("/usr/bin/true")];
+        let d = run_with(
+            tracer,
+            "",
+            &argv,
+            Path::new("/"),
+            Duration::from_secs(5),
+            Duration::from_millis(300),
+            false,
+        )
+        .unwrap();
+        assert!(
+            !reasons(&d).iter().any(|r| r.contains("left running")),
+            "{:?}",
+            reasons(&d)
+        );
+        let pid: i32 = std::fs::read_to_string(&marker)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let alive = unsafe { libc::kill(pid, 0) } == 0;
+        assert!(!alive, "the announced process {pid} is still running");
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    #[test]
+    fn a_command_is_not_released_when_the_tracer_announces_no_pid() {
+        let file = marker("nopid");
+        let _ = std::fs::remove_file(&file);
+        let argv = [
+            OsString::from("/usr/bin/touch"),
+            file.clone().into_os_string(),
+        ];
+        let mut tracer = Command::new("/bin/sh");
+        tracer.args(["-c", "echo READY; sleep 30"]);
+        let error = run_with(
+            tracer,
+            "",
+            &argv,
+            Path::new("/"),
+            Duration::from_millis(400),
+            Duration::from_secs(1),
+            false,
+        )
+        .err()
+        .expect("a tracer that announces no pid must not run the command");
+        assert!(
+            error.to_string().contains("did not announce its pid"),
+            "{error}"
+        );
+        assert!(!file.exists(), "the command ran without a known tracer pid");
+    }
+
+    #[test]
+    fn the_tracer_pid_line_is_consumed_and_is_not_a_record_or_raw_output() {
+        let mut o = observer();
+        let (tx, rx) = mpsc::channel::<u32>();
+        let mut ready = None;
+        let mut pid = Some(tx);
+        read_lines(
+            &b"TRACER 42\nEXIT\t0.1\t100\nSTOP\n"[..],
+            &mut o,
+            &mut ready,
+            &mut pid,
+            true,
+        );
+        assert_eq!(rx.try_recv().ok(), Some(42));
+        let d = o.finish(0);
+        assert_eq!(d.raw, ["EXIT\t0.1\t100", "STOP"]);
+        assert!(!reasons(&d).iter().any(|r| r.contains("could not be read")));
     }
 }
