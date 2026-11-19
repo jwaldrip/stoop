@@ -36,7 +36,7 @@ impl Workspace {
             "outputs": [],
             "probes": {}
         });
-        let version = if provenance.is_some() { 3 } else { 1 };
+        let version = if provenance.is_some() { 4 } else { 1 };
         if let Some(provenance) = provenance {
             proof["provenance"] = provenance;
         }

@@ -101,7 +101,7 @@ fn write_proof(store: &Path, key: &str, cwd: Option<&str>) {
     }
     fs::write(
         dir.join(format!("{key}.json")),
-        serde_json::to_vec(&serde_json::json!({"v": 3, "key": key, "proofs": [proof]})).unwrap(),
+        serde_json::to_vec(&serde_json::json!({"v": 4, "key": key, "proofs": [proof]})).unwrap(),
     )
     .unwrap();
 }

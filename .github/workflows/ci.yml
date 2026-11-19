@@ -34,8 +34,21 @@ jobs:
           echo "base=$base head=$head"
           git switch --detach "$base"
           cargo build --release --target-dir "$RUNNER_TEMP/stoop-base"
+          git fetch --no-tags --depth=1 origin e48c160af11e70d819431d692a489afe912a2eb4
+          git switch --detach FETCH_HEAD
+          cargo build --release --target-dir "$RUNNER_TEMP/stoop-before"
           git switch --detach "$head"
-          STOOP_BENCH_BASE_BIN="$RUNNER_TEMP/stoop-base/release/stoop" STOOP_DEBUG=1 cargo test --release --test record_e2e recorder_base_vs_head_timing_fixture -- --nocapture
+          STOOP_BENCH_BASE_BIN="$RUNNER_TEMP/stoop-base/release/stoop" STOOP_BENCH_PREVIOUS_BIN="$RUNNER_TEMP/stoop-before/release/stoop" STOOP_DEBUG=1 cargo test --release --test record_e2e recorder_base_vs_head_timing_fixture -- --nocapture
+      - name: Regenerate Linux recorder fixtures
+        run: |
+          env -i PATH="$PATH" HOME="$HOME" CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
+            RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}" STOOP_REGENERATE_RECORDER_FIXTURES=1 \
+            cargo test --test record_e2e regenerate_planner_recorder_fixtures -- --ignored
+      - uses: actions/upload-artifact@v4
+        with:
+          name: recorder-fixtures
+          path: tests/fixtures/recorder/*/proof.json
+          if-no-files-found: error
       - run: cargo test
       - name: Verify blob IDs above 2 GiB
         run: cargo test --release --test record_e2e sparse_input_over_two_gib_keeps_its_blob_oid -- --ignored --nocapture

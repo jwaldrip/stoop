@@ -1,20 +1,10 @@
 //! Evidence that hashing raw working-tree bytes is safe for Git object IDs.
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
+use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
-use std::process::{Command, Stdio};
-
-const ATTRS: [&str; 7] = [
-    "text",
-    "eol",
-    "filter",
-    "ident",
-    "working-tree-encoding",
-    "export-subst",
-    "crlf",
-];
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OidBasis {
@@ -28,84 +18,41 @@ pub struct OidBasis {
     pub autocrlf: String,
 }
 
-// Preserve standard Git configuration selectors, which change the effective
-// attributes, but remove repository redirection, alternate attribute sources,
-// tracing, and every other inherited Git execution override.
-pub(crate) fn git(root: &Path) -> Option<Command> {
-    let root = root.canonicalize().ok()?;
-    let mut command = Command::new("git");
-    for (key, _) in std::env::vars_os() {
-        let name = key.as_os_str().as_bytes();
-        if !name.starts_with(b"GIT_") {
-            continue;
-        }
-        let config = matches!(
-            name,
-            b"GIT_CONFIG_COUNT"
-                | b"GIT_CONFIG_PARAMETERS"
-                | b"GIT_CONFIG_GLOBAL"
-                | b"GIT_CONFIG_SYSTEM"
-                | b"GIT_CONFIG_NOSYSTEM"
-        ) || name.starts_with(b"GIT_CONFIG_KEY_")
-            || name.starts_with(b"GIT_CONFIG_VALUE_");
-        if !config || cfg!(test) {
-            command.env_remove(key);
-        }
+impl OidBasis {
+    /// Raw bytes are Git blob bytes only when no conversion is configured.
+    pub fn allows_oid(&self) -> bool {
+        [
+            &self.text,
+            &self.eol,
+            &self.filter,
+            &self.ident,
+            &self.working_tree_encoding,
+            &self.export_subst,
+            &self.crlf,
+        ]
+        .iter()
+        .all(|value| value.as_str() == "unspecified")
+            && (self.autocrlf == "unset"
+                || self.autocrlf.eq_ignore_ascii_case("false")
+                || self.autocrlf.eq_ignore_ascii_case("no")
+                || self.autocrlf.eq_ignore_ascii_case("off")
+                || self.autocrlf == "0")
     }
-    if let Some(parent) = root.parent() {
-        // Do not discover a repository above the supplied root.
-        command.env(
-            "GIT_CEILING_DIRECTORIES",
-            std::env::join_paths([parent]).ok()?,
-        );
-    }
-    command
-        .current_dir(&root)
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_NO_LAZY_FETCH", "1")
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.hooksPath=/dev/null",
-        ]);
-    #[cfg(test)]
-    command
-        .env("HOME", &root)
-        .env("XDG_CONFIG_HOME", root.join(".git/stoop-test-home"))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1");
-    Some(command)
 }
 
-fn autocrlf(root: &Path) -> Option<String> {
-    let out = git(root)?
-        .args(["config", "--null", "--get", "core.autocrlf"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return (out.status.code() == Some(1) && out.stdout.is_empty()).then(|| "unset".to_owned());
-    }
-    let value = out.stdout.strip_suffix(&[0])?;
-    if value.contains(&0) {
-        return None;
-    }
-    let value = std::str::from_utf8(value).ok()?;
-    // These are Git's documented false spellings. Reject all other values,
-    // including its special `input` mode and valueless boolean settings.
-    if value.eq_ignore_ascii_case("false")
-        || value.eq_ignore_ascii_case("no")
-        || value.eq_ignore_ascii_case("off")
-        || value == "0"
-    {
-        Some(value.to_owned())
-    } else {
-        None
-    }
+/// The Git and attribute state observed before tracing begins.
+#[derive(Clone, Debug)]
+pub struct Epoch {
+    pub basis: HashMap<String, OidBasis>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub git_dir: PathBuf,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub common_dir: PathBuf,
 }
+
+// Limit every response, including large index and attribute reports. An
+// oversized repository is unknown rather than evidence for an OID.
+const MAX_OUTPUT: usize = 64 * 1024 * 1024;
 
 fn valid_path(path: &str) -> bool {
     !path.is_empty()
@@ -115,39 +62,39 @@ fn valid_path(path: &str) -> bool {
             .all(|part| !part.is_empty() && part != "." && part != "..")
 }
 
-fn query(root: &Path, paths: &[&str], all: bool) -> Option<Vec<u8>> {
-    let mut command = git(root)?;
-    command.args(["check-attr", "-z", "--stdin"]);
-    if all {
-        command.arg("--all");
-    } else {
-        command.args(ATTRS);
+fn safe_file_or_absent(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => m.file_type().is_file() && m.nlink() == 1,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
     }
-    let mut child = command
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut stdin = child.stdin.take()?;
-    // Git can write while it is still reading paths. Write concurrently with
-    // draining stdout so a large batch cannot deadlock on full pipes.
-    std::thread::scope(|scope| {
-        let writer = scope.spawn(move || -> std::io::Result<()> {
-            for path in paths {
-                stdin.write_all(path.as_bytes())?;
-                stdin.write_all(&[0])?;
-            }
-            Ok(())
-        });
-        let out = child.wait_with_output().ok()?;
-        writer.join().ok()?.ok()?;
-        out.status.success().then_some(out.stdout)
-    })
 }
 
-fn fields(bytes: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
-    // An empty --all response is valid: no attributes apply to any path.
+fn safe_default_attributes() -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    if !home.is_absolute() {
+        return false;
+    }
+    let config_home = match std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        Some(path) if path.is_absolute() => path,
+        Some(_) => return false,
+        None => home.join(".config"),
+    };
+    safe_file_or_absent(&config_home.join("git/attributes"))
+}
+
+fn safe_dir_or_absent(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => m.file_type().is_dir(),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+fn nul_fields(bytes: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
     let (bytes, count) = if bytes.is_empty() {
         (bytes, 0)
     } else {
@@ -156,122 +103,369 @@ fn fields(bytes: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
     Some(bytes.split(|b| *b == 0).take(count))
 }
 
-// The explicit query must return exactly one record per requested path and
-// attribute, even when a path has no attributes in the --all query.
-fn named<'a>(paths: &[&'a str], bytes: &[u8]) -> Option<HashMap<&'a str, bool>> {
-    let mut states: HashMap<&str, (u8, bool)> = paths
-        .iter()
-        .copied()
-        .map(|path| (path, (0, true)))
-        .collect();
-    let mut fields = fields(bytes)?;
-    while let Some(path) = fields.next() {
-        let path = std::str::from_utf8(path).ok()?;
-        let attr = fields.next()?;
-        let value = fields.next()?;
-        let index = ATTRS.iter().position(|name| name.as_bytes() == attr)?;
-        let (seen, safe) = states.get_mut(path)?;
-        let bit = 1u8 << index;
-        if *seen & bit != 0 {
-            return None;
-        }
-        *seen |= bit;
-        *safe &= value == b"unspecified";
-    }
-    if states
-        .values()
-        .any(|(seen, _)| *seen != (1 << ATTRS.len()) - 1)
+fn repo_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let root = root.canonicalize().ok()?;
+    let dot_git = root.join(".git");
+    // Gitfiles, symlinks, separate gitdirs and linked worktrees need topology
+    // tracking beyond a simple worktree. Decline them instead of guessing.
+    if !std::fs::symlink_metadata(&dot_git)
+        .ok()?
+        .file_type()
+        .is_dir()
+        || !safe_file_or_absent(&dot_git.join("config"))
+        || !safe_file_or_absent(&dot_git.join("config.worktree"))
+        || !safe_file_or_absent(&dot_git.join("index"))
+        || !safe_dir_or_absent(&dot_git.join("info"))
+        || !safe_file_or_absent(&dot_git.join("info/attributes"))
     {
         return None;
     }
-    Some(
-        states
-            .into_iter()
-            .map(|(path, (_, safe))| (path, safe))
-            .collect(),
-    )
+    let report = crate::gitprobe::output(
+        &root,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+            "--show-object-format",
+        ],
+        b"",
+        MAX_OUTPUT,
+    )?;
+    let report = report.strip_suffix(b"\n")?;
+    let mut lines = report.split(|byte| *byte == b'\n');
+    let top = Path::new(OsStr::from_bytes(lines.next()?))
+        .canonicalize()
+        .ok()?;
+    let git_dir = Path::new(OsStr::from_bytes(lines.next()?))
+        .canonicalize()
+        .ok()?;
+    let common_dir = Path::new(OsStr::from_bytes(lines.next()?))
+        .canonicalize()
+        .ok()?;
+    let format = lines.next()?;
+    if lines.next().is_some()
+        || format != b"sha1"
+        || top != root
+        || git_dir != dot_git.canonicalize().ok()?
+        || common_dir != git_dir
+    {
+        return None;
+    }
+    Some((git_dir, common_dir))
 }
 
-fn reject_present(states: &mut HashMap<&str, bool>, bytes: &[u8]) -> Option<()> {
+// Git's human-readable states collide with literal attribute values. --all
+// reports only present attributes, so escape these spellings and the escape
+// prefix. No caller can confuse a present value with an absent attribute.
+fn present_value(value: &str) -> String {
+    if matches!(value, "set" | "unset" | "unspecified") || value.starts_with("present:") {
+        format!("present:{value}")
+    } else {
+        value.to_owned()
+    }
+}
+
+fn config(root: &Path) -> Option<String> {
+    let report = crate::gitprobe::output(
+        root,
+        &[
+            "config",
+            "--null",
+            "--list",
+            "--no-includes",
+            "--show-origin",
+        ],
+        b"",
+        MAX_OUTPUT,
+    )?;
+    let mut fields = nul_fields(&report)?;
+    let mut autocrlf = "unset".to_owned();
+    while let Some(origin) = fields.next() {
+        let entry = fields.next()?;
+        let (key, value) = match entry.iter().position(|byte| *byte == b'\n') {
+            Some(i) => (&entry[..i], &entry[i + 1..]),
+            None => (entry, b"true".as_slice()),
+        };
+        let key = std::str::from_utf8(key).ok()?.to_ascii_lowercase();
+        if key.is_empty()
+            || key == "core.attributesfile"
+            || key == "attr.tree"
+            || key == "core.worktree"
+            || key.starts_with("include.")
+            || key.starts_with("includeif.")
+        {
+            return None;
+        }
+        if let Some(path) = origin.strip_prefix(b"file:") {
+            let path = Path::new(OsStr::from_bytes(path));
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                root.join(path)
+            };
+            // A config emitted by Git must still exist and must not redirect
+            // to another file or be a FIFO.
+            let metadata = std::fs::symlink_metadata(&path).ok()?;
+            if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+                return None;
+            }
+        } else if origin != b"command line:" {
+            return None;
+        }
+        if key == "core.autocrlf" {
+            let value = std::str::from_utf8(value).ok()?;
+            autocrlf = present_value(value);
+        }
+    }
+    Some(autocrlf)
+}
+
+fn attributes_file(path: &str) -> bool {
+    path == ".gitattributes" || path.ends_with("/.gitattributes")
+}
+
+#[derive(Default)]
+struct Index {
+    paths: HashSet<String>,
+    gitlinks: HashSet<String>,
+    // Tracked attribute files. Git can read one from the index when its worktree
+    // copy is missing, as in a sparse checkout, so each is checked below.
+    attribute_files: HashSet<String>,
+}
+
+fn index_paths(root: &Path) -> Option<Index> {
+    let report = crate::gitprobe::output(root, &["ls-files", "--stage", "-z"], b"", MAX_OUTPUT)?;
+    let mut index = Index::default();
+    for entry in nul_fields(&report)? {
+        let tab = entry.iter().position(|byte| *byte == b'\t')?;
+        let mut header = entry[..tab].split(|byte| *byte == b' ');
+        let mode = header.next()?;
+        let oid = header.next()?;
+        let stage = header.next()?;
+        if header.next().is_some()
+            || oid.len() != 40
+            || !oid.iter().all(u8::is_ascii_hexdigit)
+            || stage != b"0"
+        {
+            return None;
+        }
+        let path = std::str::from_utf8(&entry[tab + 1..])
+            .ok()
+            .filter(|path| valid_path(path));
+        match mode {
+            b"160000" => {
+                // Everything beneath a gitlink is excluded. A gitlink whose name cannot be
+                // represented would leave its scope unknown, so the whole snapshot fails.
+                let path = path?;
+                if attributes_file(path)
+                    || index.paths.contains(path)
+                    || !index.gitlinks.insert(path.to_owned())
+                {
+                    return None;
+                }
+            }
+            b"100644" | b"100755" | b"120000" => {
+                // A path that cannot be represented has no evidence and so no OID.
+                let Some(path) = path else { continue };
+                if attributes_file(path) {
+                    if mode == b"120000" {
+                        return None;
+                    }
+                    index.attribute_files.insert(path.to_owned());
+                }
+                if !index.paths.insert(path.to_owned()) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(index)
+}
+
+fn beneath_gitlink(path: &str, gitlinks: &HashSet<String>) -> bool {
+    gitlinks.contains(path)
+        || path
+            .match_indices('/')
+            .any(|(i, _)| gitlinks.contains(&path[..i]))
+}
+
+// An attribute file applies to its own directory and everything beneath it. The
+// empty name stands for the root.
+fn beneath_directory(path: &str, dirs: &HashSet<String>) -> bool {
+    dirs.contains("")
+        || path
+            .match_indices('/')
+            .any(|(i, _)| dirs.contains(&path[..i]))
+}
+
+fn regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
+fn known_paths(root: &Path) -> Option<HashSet<String>> {
+    let mut index = index_paths(root)?;
+    let report = crate::gitprobe::output(
+        root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        b"",
+        MAX_OUTPUT,
+    )?;
+    for entry in nul_fields(&report)? {
+        if let Some(path) = std::str::from_utf8(entry)
+            .ok()
+            .filter(|path| valid_path(path))
+        {
+            index.paths.insert(path.to_owned());
+        }
+    }
+    // A tracked attribute file missing from the worktree, as in a sparse checkout,
+    // may still apply to its directory. Paths beneath it have unknown attributes.
+    let unmaterialized: HashSet<String> = index
+        .attribute_files
+        .iter()
+        .filter(|file| !regular_file(&root.join(file)))
+        .map(|file| {
+            file.strip_suffix(".gitattributes")
+                .unwrap_or("")
+                .trim_end_matches('/')
+                .to_owned()
+        })
+        .collect();
+    let mut paths = index.paths;
+    paths.retain(|path| {
+        !beneath_gitlink(path, &index.gitlinks) && !beneath_directory(path, &unmaterialized)
+    });
+    Some(paths)
+}
+
+// Do not let a symlink, hard link or special file redirect a worktree attribute
+// source. A missing file is fine; a tracked one that is missing is handled in known_paths.
+fn safe_worktree_sources(root: &Path, paths: &HashSet<String>) -> bool {
+    if !safe_file_or_absent(&root.join(".gitattributes")) {
+        return false;
+    }
+    let mut checked = HashSet::new();
+    for path in paths {
+        for (i, _) in path.match_indices('/') {
+            let dir = &path[..i];
+            if checked.insert(dir)
+                && (!safe_dir_or_absent(&root.join(dir))
+                    || !safe_file_or_absent(&root.join(dir).join(".gitattributes")))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn empty_basis(autocrlf: &str) -> OidBasis {
+    OidBasis {
+        text: "unspecified".into(),
+        eol: "unspecified".into(),
+        filter: "unspecified".into(),
+        ident: "unspecified".into(),
+        working_tree_encoding: "unspecified".into(),
+        export_subst: "unspecified".into(),
+        crlf: "unspecified".into(),
+        autocrlf: autocrlf.to_owned(),
+    }
+}
+
+fn attributes(
+    mut basis: HashMap<String, OidBasis>,
+    report: &[u8],
+) -> Option<HashMap<String, OidBasis>> {
     let mut seen = HashSet::new();
-    let mut fields = fields(bytes)?;
+    let mut fields = nul_fields(report)?;
     while let Some(path) = fields.next() {
-        let path = std::str::from_utf8(path).ok()?;
         let attr = fields.next()?;
-        let _value = fields.next()?;
+        let value = fields.next()?;
         if attr.is_empty() || !seen.insert((path, attr)) {
             return None;
         }
-        let safe = states.get_mut(path)?;
-        if ATTRS.iter().any(|name| name.as_bytes() == attr) {
-            *safe = false;
-        }
+        let path = std::str::from_utf8(path).ok()?;
+        let item = basis.get_mut(path)?;
+        let value = std::str::from_utf8(value).ok()?;
+        let field = match attr {
+            b"text" => &mut item.text,
+            b"eol" => &mut item.eol,
+            b"filter" => &mut item.filter,
+            b"ident" => &mut item.ident,
+            b"working-tree-encoding" => &mut item.working_tree_encoding,
+            b"export-subst" => &mut item.export_subst,
+            b"crlf" => &mut item.crlf,
+            _ => continue,
+        };
+        *field = present_value(value);
     }
-    Some(())
+    Some(basis)
 }
 
-fn check_paths<'a>(
-    root: &Path,
-    paths: impl IntoIterator<Item = &'a str>,
-) -> HashMap<String, OidBasis> {
-    let mut unique = HashSet::new();
-    let paths: Vec<_> = paths
-        .into_iter()
-        .filter(|path| valid_path(path) && unique.insert(*path))
-        .collect();
-    if paths.is_empty() {
-        return HashMap::new();
+/// Capture one configuration and attribute batch for the known worktree paths.
+/// Unsafe environment, ambiguous state, unsupported topology or failed Git
+/// probes return no epoch, not a guessed basis.
+pub fn snapshot(root: &Path) -> Option<Epoch> {
+    if !safe_default_attributes()
+        || std::env::vars_os().any(|(key, _)| key.as_os_str().as_bytes().starts_with(b"GIT_"))
+    {
+        return None;
     }
-    let Some(autocrlf) = autocrlf(root) else {
-        return HashMap::new();
-    };
-    let Some(report) = query(root, &paths, false) else {
-        return HashMap::new();
-    };
-    let Some(mut states) = named(&paths, &report) else {
-        return HashMap::new();
-    };
-    let Some(report) = query(root, &paths, true) else {
-        return HashMap::new();
-    };
-    if reject_present(&mut states, &report).is_none() {
-        return HashMap::new();
+    let root = root.canonicalize().ok()?;
+    let (git_dir, common_dir) = repo_dirs(&root)?;
+    let autocrlf = config(&root)?;
+    let paths = known_paths(&root)?;
+    if !safe_worktree_sources(&root, &paths) {
+        return None;
     }
-    states
-        .into_iter()
-        .filter(|(_, safe)| *safe)
-        .map(|(path, _)| {
-            // `check-attr` prints an actual value named "unspecified" or
-            // "unset" identically to an attribute state. The --all query is
-            // needed to distinguish absence from such values. We also reject
-            // explicitly unset attributes because that output is ambiguous.
-            let unspecified = || "unspecified".to_owned();
-            (
-                path.to_owned(),
-                OidBasis {
-                    text: unspecified(),
-                    eol: unspecified(),
-                    filter: unspecified(),
-                    ident: unspecified(),
-                    working_tree_encoding: unspecified(),
-                    export_subst: unspecified(),
-                    crlf: unspecified(),
-                    autocrlf: autocrlf.clone(),
-                },
-            )
-        })
-        .collect()
+    let mut input = Vec::new();
+    let mut basis = HashMap::with_capacity(paths.len());
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+        basis.insert(path, empty_basis(&autocrlf));
+    }
+    let report = crate::gitprobe::output(
+        &root,
+        &["check-attr", "--all", "-z", "--stdin"],
+        &input,
+        MAX_OUTPUT,
+    )?;
+    Some(Epoch {
+        basis: attributes(basis, &report)?,
+        git_dir,
+        common_dir,
+    })
 }
 
-/// Evidence for a single repository-relative UTF-8 path, if conversion is absent.
+/// Observe conversion evidence even when it makes the path ineligible.
+#[cfg(any(target_os = "linux", test))]
+pub fn observe(root: &Path, path: &str) -> Option<OidBasis> {
+    snapshot(root)?.basis.remove(path)
+}
+
+/// Evidence for a known path only when Git hashes its raw bytes.
 #[cfg(any(target_os = "linux", test))]
 pub fn check(root: &Path, path: &str) -> Option<OidBasis> {
-    check_paths(root, [path]).remove(path)
+    observe(root, path).filter(OidBasis::allows_oid)
 }
 
-/// Check a batch with one config read and batched Git attribute queries.
+#[cfg(test)]
+/// Restrict evidence to known, conversion-free paths.
 pub fn check_many(root: &Path, paths: &[String]) -> HashMap<String, OidBasis> {
-    check_paths(root, paths.iter().map(String::as_str))
+    let Some(mut epoch) = snapshot(root) else {
+        return HashMap::new();
+    };
+    paths
+        .iter()
+        .filter_map(|path| {
+            let basis = epoch.basis.remove(path)?;
+            basis.allows_oid().then(|| (path.clone(), basis))
+        })
+        .collect()
 }
 
 /// An unknown or nonempty directory may hide an attribute source.
@@ -285,6 +479,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+    use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -301,12 +496,23 @@ mod tests {
             fs::create_dir(&path).unwrap();
             let repo = Self(path);
             repo.git(&["init", "-q"]);
+            repo.write("plain.txt", "plain\n");
+            repo.write("file.txt", "file\n");
             repo
         }
 
         fn git(&self, args: &[&str]) {
-            let out = git(&self.0)
-                .unwrap()
+            let mut cmd = Command::new("git");
+            for (key, _) in std::env::vars_os() {
+                if key.as_os_str().as_bytes().starts_with(b"GIT_") {
+                    cmd.env_remove(key);
+                }
+            }
+            let out = cmd
+                .current_dir(&self.0)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
                 .args(args)
                 .stdin(Stdio::null())
                 .stderr(Stdio::null())
@@ -406,9 +612,156 @@ mod tests {
             let driver = format!("touch {}", marker.display());
             repo.git(&["config", "--local", &key, &driver]);
             repo.write(".gitattributes", &format!("* filter={name}\n"));
+            assert_eq!(
+                observe(&repo.0, "file.txt").unwrap().filter,
+                format!("present:{name}")
+            );
             assert!(check(&repo.0, "file.txt").is_none());
             assert!(!marker.exists());
         }
+    }
+
+    #[test]
+    fn snapshot_preserves_conversion_evidence_and_known_path_scope() {
+        let repo = Repo::new();
+        repo.write(
+            ".gitattributes",
+            "file.txt eol=crlf\nplain.txt custom=unspecified\n",
+        );
+        repo.write(".gitignore", "ignored.txt\n");
+        repo.write("ignored.txt", "ignored\n");
+        repo.git(&["add", "--", "plain.txt"]);
+        let epoch = snapshot(&repo.0).unwrap();
+        let plain = &epoch.basis["plain.txt"];
+        assert_eq!(plain.eol, "unspecified");
+        assert!(plain.allows_oid());
+        let converted = &epoch.basis["file.txt"];
+        assert_eq!(converted.eol, "crlf");
+        assert!(!converted.allows_oid());
+        assert!(!epoch.basis.contains_key("ignored.txt"));
+        assert!(!epoch.basis.contains_key("never-seen.txt"));
+        assert_eq!(epoch.git_dir, repo.0.join(".git").canonicalize().unwrap());
+        assert_eq!(epoch.common_dir, epoch.git_dir);
+    }
+
+    #[test]
+    fn present_attribute_state_names_are_not_absence() {
+        let repo = Repo::new();
+        for (attr, expected) in [
+            ("text", "present:set"),
+            ("-text", "present:unset"),
+            ("text=unset", "present:unset"),
+            ("text=unspecified", "present:unspecified"),
+            ("text=present:unset", "present:present:unset"),
+        ] {
+            repo.write(".gitattributes", &format!("file.txt {attr}\n"));
+            let basis = observe(&repo.0, "file.txt").unwrap();
+            assert_eq!(basis.text, expected, "{attr}");
+            assert!(!basis.allows_oid(), "{attr}");
+        }
+        repo.write(".gitattributes", "file.txt !text\n");
+        let basis = observe(&repo.0, "file.txt").unwrap();
+        assert_eq!(basis.text, "unspecified");
+        assert!(basis.allows_oid());
+    }
+
+    #[test]
+    fn known_gitlink_and_descendants_are_not_parent_blob_candidates() {
+        let parent = Repo::new();
+        let child = Repo::new();
+        child.git(&["add", "--", "plain.txt", "file.txt"]);
+        child.git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.org",
+            "commit",
+            "-qm",
+            "initial",
+        ]);
+        parent.git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            child.0.to_str().unwrap(),
+            "module",
+        ]);
+        let epoch = snapshot(&parent.0).unwrap();
+        assert!(parent.0.join("module/plain.txt").is_file());
+        assert!(!epoch.basis.contains_key("module"));
+        assert!(!epoch.basis.contains_key("module/plain.txt"));
+        assert!(epoch.basis["plain.txt"].allows_oid());
+    }
+
+    #[test]
+    fn tracked_attributes_missing_from_the_worktree_leave_their_directory_unknown() {
+        let repo = Repo::new();
+        repo.write("sub/.gitattributes", "* text\n");
+        repo.write("sub/file.txt", "file\n");
+        repo.git(&["add", "--", "sub/.gitattributes"]);
+        fs::remove_file(repo.0.join("sub/.gitattributes")).unwrap();
+        let epoch = snapshot(&repo.0).unwrap();
+        assert!(!epoch.basis.contains_key("sub/file.txt"));
+        assert!(!epoch.basis.contains_key("sub/.gitattributes"));
+        assert!(epoch.basis["plain.txt"].allows_oid());
+    }
+
+    #[test]
+    fn sha256_repository_has_no_epoch() {
+        let path = std::env::temp_dir().join(format!(
+            "stoop-oid-sha256-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        let repo = Repo(path);
+        repo.git(&["init", "-q", "--object-format=sha256"]);
+        repo.write("file.txt", "file\n");
+        assert!(snapshot(&repo.0).is_none());
+    }
+
+    #[test]
+    fn clean_git_env_probe_child() {
+        if let Some(root) = std::env::var_os("STOOP_CLEAN_GIT_ENV_PROBE") {
+            let epoch = snapshot(Path::new(&root)).unwrap();
+            assert!(epoch.basis["plain.txt"].allows_oid());
+        }
+    }
+
+    #[test]
+    fn git_env_absent_allows_safe_worktree() {
+        let repo = Repo::new();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "oid_attrs::tests::clean_git_env_probe_child"])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &repo.0)
+            .env("STOOP_CLEAN_GIT_ENV_PROBE", &repo.0)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    #[test]
+    fn redirected_attribute_files_in_the_worktree_are_rejected() {
+        use std::os::unix::fs::symlink;
+        let repo = Repo::new();
+        repo.write("attributes-target", "file.txt text\n");
+        symlink("attributes-target", repo.0.join(".gitattributes")).unwrap();
+        assert!(snapshot(&repo.0).is_none());
+        fs::remove_file(repo.0.join(".gitattributes")).unwrap();
+        symlink(
+            "../../attributes-target",
+            repo.0.join(".git/info/attributes"),
+        )
+        .unwrap();
+        assert!(snapshot(&repo.0).is_none());
     }
 
     #[test]
@@ -436,7 +789,34 @@ mod tests {
         ] {
             assert!(check(&repo.0, path).is_none(), "accepted {path}");
         }
-        assert!(check(&repo.0, "other.txt").is_some());
+        assert!(check(&repo.0, "other.txt").is_none());
+    }
+
+    #[test]
+    fn included_git_config_is_not_assumed_safe() {
+        let repo = Repo::new();
+        repo.write("config-extra", "[core]\n\tautocrlf = false\n");
+        repo.git(&["config", "--local", "include.path", "../config-extra"]);
+        assert!(check(&repo.0, "plain.txt").is_none());
+    }
+
+    #[test]
+    fn configured_attribute_tree_is_not_assumed_safe() {
+        let repo = Repo::new();
+        repo.git(&["config", "--local", "attr.tree", "HEAD"]);
+        assert!(check(&repo.0, "plain.txt").is_none());
+    }
+
+    #[test]
+    fn conditional_git_config_include_is_not_assumed_safe() {
+        let repo = Repo::new();
+        repo.git(&[
+            "config",
+            "--local",
+            "includeIf.gitdir:/nonexistent/.path",
+            "config-extra",
+        ]);
+        assert!(check(&repo.0, "plain.txt").is_none());
     }
 
     #[test]
@@ -453,6 +833,9 @@ mod tests {
             "bad\0name",
             "--leading option",
         ];
+        for path in &names[..4] {
+            repo.write(path, "contents\n");
+        }
         let paths: Vec<_> = names.iter().map(|s| (*s).to_owned()).collect();
         let result = check_many(&repo.0, &paths);
         assert_eq!(result.len(), 3);
@@ -474,43 +857,110 @@ mod tests {
         assert!(check(&repo.0, "file").is_none());
     }
 
-    fn named_report(path: &str) -> Vec<u8> {
-        let mut report = Vec::new();
-        for attr in ATTRS {
-            report.extend_from_slice(path.as_bytes());
-            report.push(0);
-            report.extend_from_slice(attr.as_bytes());
-            report.push(0);
-            report.extend_from_slice(b"unspecified\0");
-        }
-        report
-    }
-
     #[test]
-    fn malformed_missing_duplicate_and_unexpected_records_fail_closed() {
-        let paths = ["one"];
-        let report = named_report("one");
-        assert_eq!(named(&paths, &report).unwrap().get("one"), Some(&true));
-        assert!(named(&paths, &report[..report.len() - 1]).is_none());
-        assert!(named(&paths, &report[0..report.len() - 5]).is_none());
-        assert!(named(&paths, &named_report("other")).is_none());
-        let mut duplicate = report.clone();
-        duplicate.extend_from_slice(b"one\0text\0unspecified\0");
-        assert!(named(&paths, &duplicate).is_none());
-        let mut unknown = report.clone();
-        unknown.extend_from_slice(b"one\0unknown\0unspecified\0");
-        assert!(named(&paths, &unknown).is_none());
-
+    fn malformed_duplicate_and_unexpected_attribute_records_fail_closed() {
+        let basis = HashMap::from([("one".to_owned(), empty_basis("unset"))]);
+        let empty = attributes(basis.clone(), b"").unwrap();
+        assert!(empty["one"].allows_oid());
         for invalid in [
             b"other\0custom\0value\0".as_slice(),
             b"one\0custom\0value".as_slice(),
             b"one\0custom\0value\0one\0custom\0value\0".as_slice(),
+            b"one\0text\0".as_slice(),
         ] {
-            let mut states = named(&paths, &report).unwrap();
-            assert!(reject_present(&mut states, invalid).is_none());
+            assert!(attributes(basis.clone(), invalid).is_none());
         }
-        let mut states = named(&paths, &report).unwrap();
-        reject_present(&mut states, b"one\0filter\0unspecified\0").unwrap();
-        assert_eq!(states.get("one"), Some(&false));
+        let present = attributes(basis, b"one\0filter\0unspecified\0").unwrap();
+        assert_eq!(present["one"].filter, "present:unspecified");
+        assert!(!present["one"].allows_oid());
+    }
+
+    #[test]
+    fn fifo_probe_child() {
+        if let Some(root) = std::env::var_os("STOOP_FIFO_PROBE") {
+            assert!(check(Path::new(&root), "plain.txt").is_none());
+        }
+    }
+
+    #[test]
+    fn fifo_attribute_source_does_not_hang() {
+        use std::os::unix::process::CommandExt;
+        use std::time::{Duration, Instant};
+        let repo = Repo::new();
+        let fifo = repo.0.join("attrs-fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        repo.git(&[
+            "config",
+            "--local",
+            "core.attributesFile",
+            fifo.to_str().unwrap(),
+        ]);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "oid_attrs::tests::fifo_probe_child",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &repo.0)
+            .env("STOOP_FIFO_PROBE", &repo.0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                let _ = child.wait();
+                panic!("attribute source FIFO blocked recording");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn git_env_probe_child() {
+        if let Some(root) = std::env::var_os("STOOP_GIT_ENV_PROBE") {
+            assert!(check(Path::new(&root), "plain.txt").is_none());
+        }
+    }
+
+    #[test]
+    fn redirected_attribute_source_is_never_treated_as_safe() {
+        let repo = Repo::new();
+        for (name, value) in [
+            ("GIT_ATTR_SOURCE", "HEAD"),
+            ("GIT_DIR", "/nonexistent"),
+            ("GIT_COMMON_DIR", "/nonexistent"),
+            ("GIT_WORK_TREE", "/nonexistent"),
+            ("GIT_INDEX_FILE", "/nonexistent"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_COUNT", "0"),
+            ("GIT_TERMINAL_PROMPT", "0"),
+            ("GIT_UNRECOGNIZED_OVERRIDE", "1"),
+        ] {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "oid_attrs::tests::git_env_probe_child"])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .env("HOME", &repo.0)
+                .env("STOOP_GIT_ENV_PROBE", &repo.0)
+                .env(name, value)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
     }
 }

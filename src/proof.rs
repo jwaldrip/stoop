@@ -12,8 +12,8 @@ use std::path::PathBuf;
 /// between branches does not evict the proof the other branch still matches.
 const MAX_PROOFS: usize = 8;
 
-/// Older proof formats may contain Git object IDs without conversion evidence.
-const PROOF_VERSION: u32 = 3;
+/// Older proof formats may contain Git object IDs without complete safety evidence.
+const PROOF_VERSION: u32 = 4;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Proof {
@@ -623,7 +623,7 @@ mod tests {
         assert_eq!(a.load("k").len(), 3);
         let bytes = a.export("k").unwrap();
         let wire: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(wire["v"], 3);
+        assert_eq!(wire["v"], 4);
         assert_eq!(b.import("k", &bytes).unwrap(), 3);
         assert_eq!(b.import("k", &bytes).unwrap(), 0);
         let platforms = &b.list()[0].platforms;
@@ -668,7 +668,7 @@ mod tests {
             assert_eq!(saved[0].inputs[0].id, "f:new");
             let wire: serde_json::Value =
                 serde_json::from_slice(&old_store.export("k").unwrap()).unwrap();
-            assert_eq!(wire["v"], 3);
+            assert_eq!(wire["v"], 4);
         }
     }
 

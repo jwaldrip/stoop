@@ -4,7 +4,7 @@
 mod units;
 
 use crate::ignore::Ignore;
-use crate::input::{identify, identify_recorded, par_map, records_oids, verify, Input};
+use crate::input::{identify, identify_recorded, par_map, verify, Input};
 use crate::pathutil::{absolutize, cwd_key, to_key, Physical};
 use crate::proof::{now, sanitize, Proof, Store};
 use crate::sync::Remote;
@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Instant;
 
 #[derive(Default)]
@@ -96,19 +97,15 @@ pub(crate) fn shared_scope(root: &Path, store: &Path) -> Option<String> {
         .join(".git")
         .exists()
         .then(|| {
-            Command::new("git")
-                .arg("-C")
-                .arg(root)
-                .args(["config", "--local", "--get", "remote.origin.url"])
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .env_remove("GIT_COMMON_DIR")
-                .output()
-                .ok()
-                .filter(|out| out.status.success())
-                .and_then(|out| String::from_utf8(out.stdout).ok())
-                .map(|url| url.trim().to_string())
-                .filter(|url| !url.is_empty())
+            crate::gitprobe::output(
+                root,
+                &["config", "--local", "--get", "remote.origin.url"],
+                &[],
+                64 * 1024,
+            )
+            .and_then(|out| String::from_utf8(out).ok())
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty())
         })
         .flatten();
     let mut h = blake3::Hasher::new();
@@ -571,7 +568,11 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         root: &root,
         real_root: real_root.clone(),
         ignore: &ignore,
-        oids: records_oids(&root),
+        // One attribute snapshot per run, taken before the command can change anything.
+        oid_epoch: trace::supported()
+            .then(|| crate::oid_attrs::snapshot(&real_root))
+            .flatten()
+            .map(Arc::new),
     });
     let trace = match trace::run(
         &o.argv,
@@ -763,18 +764,13 @@ pub fn build_priors(trace: &Trace) -> Vec<Input> {
         .priors
         .iter()
         .map(|(path, id)| {
-            let pair = (!trace.oid_attrs_changed)
-                .then(|| {
-                    Some((
-                        trace.prior_oids.get(path)?.clone(),
-                        trace.prior_oid_bases.get(path)?.clone(),
-                    ))
-                })
+            let basis = (!trace.oid_attrs_changed)
+                .then(|| trace.prior_oid_bases.get(path))
                 .flatten();
-            let (oid, oid_basis) = match pair {
-                Some((oid, basis)) => (Some(oid), Some(basis)),
-                None => (None, None),
-            };
+            let oid = basis
+                .filter(|basis| basis.allows_oid())
+                .and_then(|_| trace.prior_oids.get(path).cloned());
+            let oid_basis = basis.cloned();
             Input {
                 path: path.clone(),
                 id: id.clone(),
@@ -987,30 +983,36 @@ pub fn build_inputs(
     if reads_git {
         return Err("it reads .git, so a skip could hide a history change (add `.git` to .stoopignore if that read cannot change the result)".into());
     }
-    // Check all physical keys together, before hashing. A run that touched attributes
-    // or Git metadata cannot establish the attribute state at the time of every read.
-    let attr_keys: Vec<String> = if records_oids(root) && !trace.oid_attrs_changed {
-        cands
-            .iter()
-            .filter(|(path, _, _, _, _)| {
-                std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
-            })
-            .filter_map(|(_, _, _, _, key)| key.clone())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let bases = if attr_keys.is_empty() {
-        Default::default()
-    } else {
-        crate::oid_attrs::check_many(root, &attr_keys)
-    };
-    let ids = par_map(&cands, |(path, _, inside, listed, physical_key)| {
-        let basis = physical_key.as_ref().and_then(|key| bases.get(key));
-        identify_recorded(path, *inside, *listed, basis.is_some()).map(|(id, oid)| {
-            let oid_basis = oid.as_ref().and_then(|_| basis.cloned());
+    // All known paths share the snapshot taken before the command started. A
+    // changed attribute source makes both its OIDs and its evidence stale.
+    let epoch = trace
+        .oid_epoch
+        .as_deref()
+        .filter(|_| !trace.oid_attrs_changed);
+    // Tests also build synthetic traces without starting a traced command.
+    #[cfg(test)]
+    let synthetic_epoch =
+        if epoch.is_none() && !trace.oid_epoch_captured && !trace.oid_attrs_changed {
+            crate::oid_attrs::snapshot(&real_root)
+        } else {
+            None
+        };
+    #[cfg(test)]
+    let epoch = epoch.or(synthetic_epoch.as_ref());
+    let ids = par_map(&cands, |(path, key, inside, listed, physical_key)| {
+        let basis = physical_key
+            .as_ref()
+            .and_then(|physical| epoch.and_then(|epoch| epoch.basis.get(physical)));
+        // A Git OID names the blob at the input's own tree path. A read reached through
+        // another spelling (a directory alias) keeps its evidence but claims no OID.
+        let names_tree_path = physical_key.as_deref() == Some(key.as_str());
+        let with_oid = names_tree_path && basis.is_some_and(|basis| basis.allows_oid());
+        identify_recorded(path, *inside, *listed, with_oid).map(|(id, oid)| {
+            // Evidence describes a file's attributes even when conversion or a
+            // length-changing read prevents a raw Git OID from being emitted.
+            let oid_basis = (id.starts_with("f:") || id.starts_with("x:"))
+                .then(|| basis.cloned())
+                .flatten();
             (id, oid, oid_basis)
         })
     });
@@ -1107,10 +1109,162 @@ mod tests {
         assert_eq!(prior.oid.as_deref(), Some("sha1:blob"));
         assert_eq!(prior.oid_basis, Some(basis));
 
+        let mut converted = trace.prior_oid_bases["file"].clone();
+        converted.eol = "crlf".into();
+        trace
+            .prior_oid_bases
+            .insert("file".into(), converted.clone());
+        let prior = build_priors(&trace).pop().unwrap();
+        assert_eq!(prior.oid, None);
+        assert_eq!(prior.oid_basis, Some(converted.clone()));
+        trace.prior_oids.remove("file");
+        let prior = build_priors(&trace).pop().unwrap();
+        assert_eq!(prior.oid, None);
+        assert_eq!(prior.oid_basis, Some(converted));
+
         trace.oid_attrs_changed = true;
         let prior = build_priors(&trace).pop().unwrap();
         assert_eq!(prior.oid, None);
         assert_eq!(prior.oid_basis, None);
+    }
+
+    #[test]
+    fn converted_input_keeps_observed_attribute_evidence() {
+        let root = std::env::temp_dir().join(format!("stoop-oid-converted-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
+        std::fs::write(root.join(".gitattributes"), "*.txt eol=crlf\n").unwrap();
+        std::fs::write(root.join("file.txt"), b"line\r\n").unwrap();
+        let mut trace = Trace::default();
+        trace.touched.insert(
+            root.join("file.txt"),
+            trace::Touch {
+                read: true,
+                listed: false,
+            },
+        );
+        let mut phys = Physical::new(&root, &root);
+        let (inputs, _) = build_inputs(
+            &root,
+            &mut phys,
+            &trace,
+            &Ignore::new(&[], None, &[]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let input = inputs
+            .iter()
+            .find(|input| input.path == "file.txt")
+            .unwrap();
+        assert!(input.oid.is_none());
+        assert_eq!(
+            input.oid_basis.as_ref().map(|basis| basis.eol.as_str()),
+            Some("crlf")
+        );
+        let converted = input.oid_basis.clone().unwrap();
+
+        // A real trace whose pre-run snapshot was refused must not re-query Git.
+        trace.oid_epoch_captured = true;
+        let (inputs, _) = build_inputs(
+            &root,
+            &mut phys,
+            &trace,
+            &Ignore::new(&[], None, &[]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let input = inputs
+            .iter()
+            .find(|input| input.path == "file.txt")
+            .unwrap();
+        assert!(input.oid.is_none());
+        assert!(input.oid_basis.is_none());
+
+        trace.oid_epoch = Some(Arc::new(crate::oid_attrs::Epoch {
+            basis: std::collections::HashMap::from([("file.txt".into(), converted)]),
+            git_dir: root.join(".git"),
+            common_dir: root.join(".git"),
+        }));
+        trace.oid_attrs_changed = true;
+        let (inputs, _) = build_inputs(
+            &root,
+            &mut phys,
+            &trace,
+            &Ignore::new(&[], None, &[]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let input = inputs
+            .iter()
+            .find(|input| input.path == "file.txt")
+            .unwrap();
+        assert!(input.oid.is_none());
+        assert!(input.oid_basis.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn submodule_descendant_has_no_parent_oid() {
+        let base = std::env::temp_dir().join(format!("stoop-oid-submodule-{}", std::process::id()));
+        let root = base.join("root");
+        let child = base.join("child");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&child).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let status = std::process::Command::new("git")
+                .current_dir(dir)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.org",
+                    "-c",
+                    "protocol.file.allow=always",
+                ])
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        git(&child, &["init", "-q"]);
+        std::fs::write(child.join("file.txt"), b"data\n").unwrap();
+        git(&child, &["add", "."]);
+        git(&child, &["commit", "-qm", "child"]);
+        git(&root, &["init", "-q"]);
+        git(
+            &root,
+            &["submodule", "add", "-q", child.to_str().unwrap(), "sub"],
+        );
+        let root = std::fs::canonicalize(&root).unwrap();
+        let mut trace = Trace::default();
+        trace.touched.insert(
+            root.join("sub/file.txt"),
+            trace::Touch {
+                read: true,
+                listed: false,
+            },
+        );
+        let mut phys = Physical::new(&root, &root);
+        let (inputs, _) = build_inputs(
+            &root,
+            &mut phys,
+            &trace,
+            &Ignore::new(&[], None, &[]),
+            &BTreeSet::new(),
+        )
+        .unwrap();
+        let input = inputs
+            .iter()
+            .find(|input| input.path == "sub/file.txt")
+            .unwrap();
+        assert!(input.oid.is_none(), "{input:?}");
+        std::fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

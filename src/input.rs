@@ -12,7 +12,7 @@ use crate::pathutil::from_key;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read};
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -89,8 +89,9 @@ pub fn identify_recorded(
     }
 }
 
+#[cfg(test)]
 pub fn records_oids(root: &Path) -> bool {
-    fs::symlink_metadata(root.join(".git")).is_ok_and(|m| m.is_file() || m.is_dir())
+    crate::oid_attrs::snapshot(root).is_some()
 }
 
 fn list_hash(dir: &Path) -> Option<String> {
@@ -110,10 +111,27 @@ fn list_hash(dir: &Path) -> Option<String> {
 
 /// Every byte counts, whatever the file is: source, binary, archive, model weights.
 pub fn hash_file(path: &Path) -> io::Result<String> {
-    let mut f = fs::File::open(path)?;
+    let (mut f, _) = open_regular_file(path)?;
     let mut h = blake3::Hasher::new();
     h.update_reader(&mut f)?;
     Ok(h.finalize().to_hex().to_string())
+}
+
+// Do not block if a regular file is replaced with a FIFO between lstat and
+// open, or follow a newly substituted symlink. Hash the opened regular file.
+fn open_regular_file(path: &Path) -> io::Result<(fs::File, fs::Metadata)> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok((file, metadata))
 }
 
 fn digest_hex(prefix: &str, digest: ring::digest::Digest) -> String {
@@ -177,8 +195,8 @@ fn hash_reader_with_oid(mut reader: impl Read, len: u64) -> io::Result<(String, 
 }
 
 pub fn hash_file_with_oid(path: &Path) -> io::Result<(String, Option<String>)> {
-    let file = fs::File::open(path)?;
-    let len = file.metadata()?.len();
+    let (file, metadata) = open_regular_file(path)?;
+    let len = metadata.len();
     hash_reader_with_oid(file, len)
 }
 
@@ -365,14 +383,38 @@ mod tests {
     }
 
     #[test]
-    fn records_oids_requires_git_file_or_directory() {
+    fn sha256_worktree_never_advertises_sha1_oids() {
+        let d = tmp("sha256-ineligible");
+        git(&d, &["init", "--object-format=sha256", "-q"]);
+        assert!(!records_oids(&d));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn records_oids_requires_a_safe_sha1_worktree() {
         let d = tmp("git-entry");
         assert!(!records_oids(&d));
         fs::write(d.join(".git"), "gitdir: elsewhere\n").unwrap();
-        assert!(records_oids(&d));
+        assert!(!records_oids(&d));
         fs::remove_file(d.join(".git")).unwrap();
         fs::create_dir(d.join(".git")).unwrap();
+        assert!(!records_oids(&d));
+        fs::remove_dir(d.join(".git")).unwrap();
+        git(&d, &["init", "--object-format=sha1", "-q"]);
         assert!(records_oids(&d));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn records_oids_rejects_a_real_separate_gitdir() {
+        let d = tmp("separate-gitdir");
+        let admin = d.join("admin");
+        git(
+            &d,
+            &["init", "--separate-git-dir", admin.to_str().unwrap(), "-q"],
+        );
+        assert!(d.join(".git").is_file());
+        assert!(!records_oids(&d));
         fs::remove_dir_all(d).unwrap();
     }
 
@@ -564,6 +606,7 @@ mod tests {
         let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         assert_eq!(identify_recorded(&path, true, false, true), None);
+        assert!(hash_file_with_oid(&path).is_err());
         fs::remove_dir_all(d).unwrap();
     }
 

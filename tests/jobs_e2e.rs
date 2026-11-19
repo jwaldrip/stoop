@@ -210,6 +210,11 @@ impl Ws {
         let path = self.temp.join("script.sh");
         fs::write(&path, script).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_stoop"));
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(key);
+            }
+        }
         command
             .arg("sh")
             .arg(path)

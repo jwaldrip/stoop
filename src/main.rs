@@ -2,6 +2,8 @@ mod attest;
 #[allow(dead_code)]
 mod gha;
 #[allow(dead_code)]
+mod gitprobe;
+#[allow(dead_code)]
 mod gittree;
 mod ignore;
 mod input;

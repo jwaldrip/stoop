@@ -248,7 +248,7 @@ fn known_github(name: &str) -> bool {
 /// Recorder semantics older than this floor may produce unsound plan proofs.
 /// When recorder changes make earlier proofs unsound, bump this floor and
 /// `TRACER_VERSION` together. This is not the planner runner's runtime version.
-const MIN_PLANNABLE_RECORDER_VERSION: u32 = 5;
+const MIN_PLANNABLE_RECORDER_VERSION: u32 = 6;
 
 /// Resolve only runner labels whose platform is known without executing the job.
 fn declared_platform(runs_on: &serde_json::Value) -> Option<(&'static str, &'static str)> {
@@ -1129,6 +1129,7 @@ mod tests {
         for (version, expected) in [
             (3, Code::ProofPlatform),
             (4, Code::ProofPlatform),
+            (5, Code::ProofPlatform),
             (MIN_PLANNABLE_RECORDER_VERSION, Code::Proved),
         ] {
             let mut f = Fixture::new();
@@ -1152,6 +1153,7 @@ mod tests {
         for (version, expected) in [
             (3, Code::ProofPlatform),
             (4, Code::ProofPlatform),
+            (5, Code::ProofPlatform),
             (MIN_PLANNABLE_RECORDER_VERSION, Code::Proved),
         ] {
             let mut f = Fixture::new();
@@ -1188,7 +1190,7 @@ mod tests {
         let mut f = Fixture::new();
         let p = proof(vec![]);
         f.install(vec![p.clone()]);
-        for version in [1, 2] {
+        for version in [0, 1, 2, 3] {
             let file = serde_json::json!({"v": version, "key": "sh-0", "proofs": [p]});
             fs::write(
                 f.root.join("store/proofs/sh-0.json"),
