@@ -22,9 +22,21 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install the shells the hook tests run under
+        run: sudo apt-get update && sudo apt-get install -y zsh fish dash
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - name: Quoting fixture under the Actions bash shell
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --quiet
+          work="$(mktemp -d)"
+          cd "$work"
+          printf 'changed\n' > a.t
+          "$GITHUB_WORKSPACE/target/debug/stoop" run --root . -- /bin/sh -c 'printf "%s\n" "$@"' sh '{changed:*.t}' > out.txt
+          test "$(cat out.txt)" = "{changed:*.t}" || { echo 'quoted placeholder did not arrive intact'; cat out.txt; exit 1; }
 
   linux-arm:
     name: tests (Linux arm64)
@@ -33,6 +45,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install the shells the hook tests run under
+        run: sudo apt-get update && sudo apt-get install -y zsh fish dash
       - run: cargo test
 
   macos:

@@ -1,0 +1,113 @@
+name: Hook mutation probe
+on:
+  push:
+    branches: [probe/hook-2a]
+permissions:
+  contents: read
+jobs:
+  mutant:
+    name: mutant ${{ matrix.mutant }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mutant: executable
+            file: src/units/hook.rs
+            before: "    if idx == 0 {"
+            after: "    if false && idx == 0 {"
+            suite: units_hook
+            test: a_placeholder_cannot_be_the_executable
+          - mutant: one-filter
+            file: src/units/hook.rs
+            before: "        if filter {"
+            after: "        if false && filter {"
+            suite: units_hook
+            test: a_placeholder_takes_only_one_filter
+          - mutant: arity
+            file: src/units/hook.rs
+            before: "return Err(ambiguous(&argv[j]));"
+            after: "return Ok(None);"
+            suite: units_hook
+            test: ambiguous_option_arity_fails_before_the_runner
+          - mutant: mangled
+            file: src/units/hook.rs
+            before: "        if mangled(word) {"
+            after: "        if false && mangled(word) {"
+            suite: units_hook
+            test: malformed_and_shell_mangled_placeholders_fail_before_launch
+          - mutant: record-first
+            file: src/run.rs
+            before: "if !erased && !explain && !o.no_record {"
+            after: "if false && !erased && !explain && !o.no_record {"
+            suite: units_hook
+            test: a_first_sighting_records_the_template_before_the_run_outcome
+          - mutant: env-export
+            file: src/run.rs
+            before: "        std::env::set_var(name, \"\");"
+            after: "        let _ = name;"
+            suite: units_hook
+            test: inherited_changed_value_is_cleared_only_for_a_hook
+          - mutant: literal
+            file: src/run.rs
+            before: "let literal = o.literal || !observe_runners;"
+            after: "let literal = !observe_runners;"
+            suite: units_hook
+            test: literal_mode_and_ordinary_empty_values_do_not_rewrite_argv
+          - mutant: expanded-match
+            file: src/run.rs
+            before: "units::hook::expanded_matches(&candidate, &o.argv) =>"
+            after: "false =>"
+            suite: units_hook
+            test: failed_hook_still_detects_erased_forms_without_skipping
+          - mutant: quoted-shell
+            file: src/units/hook.rs
+            before: "    let name = Path::new(argv.get(command)?)"
+            after: "    let name = Path::new(\"none\")"
+            suite: units_shells
+            test: single_quoted_placeholders_arrive_intact_in_every_shell
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_TARGET_DIR: /tmp/target-hook-mutant
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the shells the hook tests run under
+        run: sudo apt-get update && sudo apt-get install -y zsh fish dash
+      - name: Apply exactly one mutant and require its anchor to be unique
+        shell: bash
+        env:
+          MUTANT_FILE: ${{ matrix.file }}
+          MUTANT_BEFORE: ${{ matrix.before }}
+          MUTANT_AFTER: ${{ matrix.after }}
+        run: |
+          node <<'NODE'
+          const fs = require('fs');
+          const path = process.env.MUTANT_FILE;
+          const before = process.env.MUTANT_BEFORE;
+          const after = process.env.MUTANT_AFTER;
+          const source = fs.readFileSync(path, 'utf8');
+          const first = source.indexOf(before);
+          if (first < 0 || source.indexOf(before, first + before.length) >= 0) {
+            throw new Error(`mutation anchor missing or ambiguous in ${path}`);
+          }
+          fs.writeFileSync(path, source.slice(0, first) + after + source.slice(first + before.length));
+          console.log(`applied one mutant to ${path}`);
+          NODE
+      - name: The bound test must fail on the mutant
+        shell: bash
+        env:
+          SUITE: ${{ matrix.suite }}
+          TEST: ${{ matrix.test }}
+        run: |
+          set +e
+          cargo test --test "$SUITE" "$TEST" -- --exact --nocapture >"$RUNNER_TEMP/result" 2>&1
+          status=$?
+          set -e
+          cat "$RUNNER_TEMP/result"
+          if [[ $status -eq 0 ]]; then
+            echo "mutant survived: $TEST still passed" >&2
+            exit 1
+          fi
+          grep -F 'test result: FAILED' "$RUNNER_TEMP/result"
+          echo "mutant live: $TEST rejected it"

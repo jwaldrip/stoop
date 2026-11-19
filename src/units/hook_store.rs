@@ -33,7 +33,15 @@ fn path(store: &Path) -> PathBuf {
     store.join("hooks-v1.json")
 }
 
-fn read_catalog(store: &Path) -> io::Result<Catalog> {
+/// What a damaged catalog means for this run.
+pub(crate) enum Damage {
+    /// Missing, corrupt or oversized: safe to replace with a fresh catalog.
+    Replace(String),
+    /// A catalog written by another stoop version, or one we cannot read: never overwritten.
+    Keep(String),
+}
+
+fn read_catalog(store: &Path) -> Result<Catalog, Damage> {
     let file = match File::open(path(store)) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -42,22 +50,24 @@ fn read_catalog(store: &Path) -> io::Result<Catalog> {
                 records: Vec::new(),
             });
         }
-        Err(error) => return Err(error),
+        Err(error) => return Err(Damage::Keep(format!("cannot read it ({error})"))),
     };
     let mut bytes = Vec::new();
-    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_FILE_BYTES {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "hook records exceed size limit",
-        ));
+    if let Err(error) = file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes) {
+        return Err(Damage::Keep(format!("cannot read it ({error})")));
     }
-    let catalog: Catalog = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    if catalog.version != 1 || catalog.records.len() > MAX_RECORDS {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid hook record catalog",
-        ));
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(Damage::Replace("it is larger than the size limit".into()));
+    }
+    let catalog: Catalog = match serde_json::from_slice(&bytes) {
+        Ok(catalog) => catalog,
+        Err(error) => return Err(Damage::Replace(format!("it is not valid ({error})"))),
+    };
+    if catalog.version != 1 {
+        return Err(Damage::Keep(format!(
+            "it was written by another stoop version (catalog version {})",
+            catalog.version
+        )));
     }
     Ok(catalog)
 }
@@ -134,26 +144,45 @@ pub(crate) fn records(store: &Path, now: u64, max_age: u64) -> io::Result<Vec<Re
 
 pub(crate) fn record(store: &Path, record: Record, now: u64, max_age: u64) -> io::Result<()> {
     if record.argv.len() > 128
-        || serde_json::to_vec(&record).map_err(io::Error::other)?.len() > MAX_RECORD_BYTES
+        || serde_json::to_vec(&record)
+            .map(|bytes| bytes.len() > MAX_RECORD_BYTES)
+            .unwrap_or(true)
     {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "hook template exceeds size limit",
         ));
     }
-    let _lock = lock(store)?;
-    let mut catalog = read_catalog(store)?;
+    let _lock = lock(store).map_err(|error| {
+        format!("stoop: cannot lock hook records ({error}); running the command as typed")
+    })?;
+    let mut catalog = match read_catalog(store) {
+        Ok(catalog) => catalog,
+        Err(Damage::Replace(_)) => Catalog {
+            version: 1,
+            records: Vec::new(),
+        },
+        Err(Damage::Keep(why)) => {
+            return Err(format!(
+                "stoop: hook records are kept as they are ({why}); running the command as typed"
+            ));
+        }
+    };
     catalog
         .records
         .retain(|old| current(old, now, max_age) && old.key != record.key);
     catalog.records.push(record);
-    if catalog.records.len() > MAX_RECORDS {
-        catalog.records.drain(..catalog.records.len() - MAX_RECORDS);
+    while catalog.records.len() > MAX_RECORDS {
+        catalog.records.remove(0);
     }
     loop {
-        let bytes = serde_json::to_vec(&catalog).map_err(io::Error::other)?;
+        let bytes = serde_json::to_vec(&catalog).map_err(|error| {
+            format!("stoop: cannot save hook records ({error}); running the command as typed")
+        })?;
         if bytes.len() as u64 <= MAX_FILE_BYTES {
-            return write_bytes(store, &bytes);
+            return write_bytes(store, &bytes).map_err(|error| {
+                format!("stoop: cannot save hook records ({error}); running the command as typed")
+            });
         }
         if catalog.records.len() <= 1 {
             return Err(io::Error::new(
@@ -165,7 +194,8 @@ pub(crate) fn record(store: &Path, record: Record, now: u64, max_age: u64) -> io
     }
 }
 
-pub(crate) fn forget(store: &Path, key: &str) -> io::Result<bool> {
+/// Remove every template stored under `key`. Returns whether one was removed.
+pub(crate) fn forget(store: &Path, key: &str) -> Result<bool, String> {
     if !path(store).exists() {
         return Ok(false);
     }

@@ -388,8 +388,8 @@ fn apply_hook(o: &mut Opts, hook: &units::hook::Hook) {
     o.argv.clone_from(&hook.argv);
 }
 
-/// Remove the hook records and proofs stored under one key.
-pub fn forget_hook_records(o: &Opts, key: &str) -> std::io::Result<bool> {
+/// Remove the hook records stored under one key. A damaged catalog is a warning.
+pub fn forget_hook_records(o: &Opts, key: &str) -> Result<bool, String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = root_for(o, &cwd);
     units::hook_store::forget(&store_for(o, &cwd, &root), key)
@@ -448,13 +448,11 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     if !literal && hook.is_none() {
         let records = match units::hook_store::records(&store_path, now(), max_age) {
             Ok(records) => records,
-            Err(error) => {
-                eprintln!("stoop: cannot read hook records: {error}");
-                return Outcome {
-                    status: 125,
-                    key: initial_key,
-                    how: How::Untraced,
-                };
+            Err(warning) => {
+                if !o.quiet {
+                    eprintln!("{warning}");
+                }
+                Vec::new()
             }
         };
         for record in records
@@ -535,13 +533,10 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 label: o.key.clone(),
                 created: now(),
             };
-            if let Err(error) = units::hook_store::record(&store_path, record, now(), max_age) {
-                eprintln!("stoop: cannot save hook record: {error}");
-                return Outcome {
-                    status: 125,
-                    key,
-                    how: How::Untraced,
-                };
+            if let Err(warning) = units::hook_store::record(&store_path, record, now(), max_age) {
+                if !o.quiet {
+                    eprintln!("{warning}");
+                }
             }
         }
     }

@@ -146,6 +146,9 @@ fn real_main(mut args: Vec<String>) -> i32 {
                 return 2;
             };
             let hook = run::forget_hook_records(&o, &proof::sanitize(key));
+            if let Err(warning) = &hook {
+                eprintln!("{warning}");
+            }
             let result = if key.starts_with("job-") {
                 jobs_for(&o).forget(&proof::sanitize(key))
             } else {

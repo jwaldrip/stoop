@@ -233,3 +233,55 @@ fn explicit_keys_cannot_share_hook_and_ordinary_proofs() {
     assert!(!err(&hook).contains("stoop: skip"), "{}", err(&hook));
     assert_eq!(f.log(), "changed=<>\n");
 }
+
+#[test]
+fn a_placeholder_cannot_be_the_executable() {
+    let f = Fixture::new();
+    let out = f
+        .command(true)
+        .args(["run", "--", "{changed}"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(!f.root.join("log").exists());
+}
+
+#[test]
+fn a_placeholder_takes_only_one_filter() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["{changed:*.t:*.u}"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(!f.root.join("log").exists());
+}
+
+#[test]
+fn a_first_sighting_records_the_template_before_the_run_outcome() {
+    let f = Fixture::new();
+    let failed = f
+        .command(false)
+        .env("FAIL", "1")
+        .args(["run", "--", "./runner", "--files", "{changed}"])
+        .output()
+        .unwrap();
+    assert_eq!(failed.status.code(), Some(1), "{}", err(&failed));
+    let catalog = fs::read_to_string(f.root.join(".stoop/hooks-v1.json")).unwrap();
+    assert!(catalog.contains("{changed}"), "{catalog}");
+}
+
+#[test]
+fn several_values_before_the_placeholder_are_refused_with_the_documented_fix() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--files", "a", "b", "{changed}"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(
+        err(&out).contains("cannot tell where values"),
+        "{}",
+        err(&out)
+    );
+    assert!(
+        err(&out).contains("option arity configuration"),
+        "{}",
+        err(&out)
+    );
+    assert!(!f.root.join("log").exists());
+}
