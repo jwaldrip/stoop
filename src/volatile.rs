@@ -2040,3 +2040,104 @@ mod tests {
         assert_eq!(learned_names(&out), vec![key]);
     }
 }
+
+#[cfg(test)]
+mod red_tests {
+    //! Failing-first tests for the review of b6b33ad. They use the current API on purpose, so each
+    //! one fails on behaviour: a learned name whose value stops being an identifier, a learned name
+    //! that is unset, the CodeBuild batch identifier, the never-learn names, and provider gates.
+    use super::*;
+
+    fn dir(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("stoop-volatile-red-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    const V: [&str; 4] = ["3f9a2c1d", "7b20e4a8", "c5d61f09", "0a8e77b2"];
+
+    fn observe(store: &Path, name: &str, value: Option<&str>) -> Outcome {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+        let names = vec![name.to_string()];
+        decide(&Request {
+            store,
+            key: "k",
+            candidates: &names,
+            mention: "",
+            forced: &[],
+            salt: None,
+            learn: true,
+            persist: true,
+            now: 1,
+        })
+    }
+
+    #[test]
+    fn a_learned_name_whose_value_is_no_longer_an_identifier_counts() {
+        let s = dir("plain-after-learning");
+        let name = "VOLATILE_RED_PLAIN_AFTER";
+        for value in V {
+            observe(&s, name, Some(value));
+        }
+        let plain = observe(&s, name, Some("production"));
+        assert!(plain.plan.excluded.is_empty(), "{:?}", plain.plan);
+        assert!(
+            plain.plan.counted.contains(&name.to_string()),
+            "{:?}",
+            plain.plan
+        );
+        let staging = observe(&s, name, Some("staging"));
+        assert!(staging.plan.excluded.is_empty(), "{:?}", staging.plan);
+        std::env::remove_var(name);
+    }
+
+    #[test]
+    fn an_unset_learned_name_counts() {
+        let s = dir("unset-after-learning");
+        let name = "VOLATILE_RED_UNSET_AFTER";
+        for value in V {
+            observe(&s, name, Some(value));
+        }
+        let unset = observe(&s, name, None);
+        assert!(unset.plan.excluded.is_empty(), "{:?}", unset.plan);
+        assert!(
+            unset.plan.counted.contains(&name.to_string()),
+            "{:?}",
+            unset.plan
+        );
+    }
+
+    #[test]
+    fn codebuild_batch_build_identifier_is_not_curated() {
+        assert!(curated_reason("CODEBUILD_BATCH_BUILD_IDENTIFIER").is_none());
+    }
+
+    #[test]
+    fn the_reviewed_behavioural_names_are_never_learned() {
+        for name in [
+            "SOURCE_DATE_EPOCH",
+            "IMAGE_TAG",
+            "FEATURE_FLAGS_SHA",
+            "MY_APP_TAG",
+            "MY_APP_DIGEST",
+            "BUILD_EPOCH",
+        ] {
+            assert!(never_learn(name), "{name} must not be learned");
+        }
+    }
+
+    #[test]
+    fn jenkins_names_count_when_their_provider_marker_is_absent() {
+        let names = vec!["BUILD_NUMBER".to_string()];
+        let plan = plan(&names, "", &[], &BTreeMap::new());
+        assert!(
+            plan.counted.contains(&"BUILD_NUMBER".to_string()),
+            "{plan:?}"
+        );
+    }
+}
