@@ -702,6 +702,9 @@ mod tests {
             repo.git(&["init", "-q"]);
             repo.write("plain.txt", "plain\n");
             repo.write("file.txt", "file\n");
+            // Fixture inputs are tracked, as committed inputs are. A file that is only written is
+            // untracked and has no basis.
+            repo.git(&["add", "--", "plain.txt", "file.txt"]);
             repo
         }
 
@@ -834,7 +837,6 @@ mod tests {
         );
         repo.write(".gitignore", "ignored.txt\n");
         repo.write("ignored.txt", "ignored\n");
-        repo.git(&["add", "--", "plain.txt"]);
         let epoch = snapshot(&repo.0).unwrap();
         let plain = &epoch.basis["plain.txt"];
         assert_eq!(plain.eol, "unspecified");
@@ -873,7 +875,6 @@ mod tests {
     fn known_gitlink_and_descendants_are_not_parent_blob_candidates() {
         let parent = Repo::new();
         let child = Repo::new();
-        child.git(&["add", "--", "plain.txt", "file.txt"]);
         child.git(&[
             "-c",
             "user.name=Test",
@@ -1053,6 +1054,7 @@ mod tests {
         ];
         for path in &names[..4] {
             repo.write(path, "contents\n");
+            repo.git(&["add", "--", *path]);
         }
         let paths: Vec<_> = names.iter().map(|s| (*s).to_owned()).collect();
         let result = check_many(&repo.0, &paths);
@@ -1063,6 +1065,15 @@ mod tests {
         for path in &names[3..7] {
             assert!(!result.contains_key(*path));
         }
+    }
+
+    #[test]
+    fn untracked_files_get_no_basis() {
+        let repo = Repo::new();
+        repo.write("loose.txt", "loose\n");
+        assert!(check(&repo.0, "loose.txt").is_none());
+        assert!(observe(&repo.0, "loose.txt").is_none());
+        assert!(snapshot(&repo.0).unwrap().basis.contains_key("file.txt"));
     }
 
     #[test]

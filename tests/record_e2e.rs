@@ -1109,7 +1109,8 @@ fn outside_owner_mode_and_node_changes_keep_every_blob_id() {
 /// change, which must keep the blob id, so a decline cannot pass the test.
 #[test]
 fn changes_to_git_sources_drop_every_blob_id_in_the_run() {
-    let cases: &[(&str, &[(&str, Option<&str>)], &str)] = &[
+    type Case<'a> = (&'a str, &'a [(&'a str, Option<&'a str>)], &'a str);
+    let cases: &[Case] = &[
         ("home-config-create", &[("H:", None)], "printf '[core]\\n' >> \"$HOME/.gitconfig\""),
         ("home-config-append", &[("H:.gitconfig", Some("[user]\n"))], "printf 'x = 1\\n' >> \"$HOME/.gitconfig\""),
         ("home-config-truncate", &[("H:.gitconfig", Some("[user]\n"))], ": > \"$HOME/.gitconfig\""),

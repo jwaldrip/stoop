@@ -1793,6 +1793,12 @@ mod tests {
             .success());
         std::fs::write(root.join(".gitattributes"), "*.txt eol=crlf\n").unwrap();
         std::fs::write(root.join("file.txt"), b"line\r\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "--", "file.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
         let mut trace = Trace::default();
         trace.touched.insert(
             root.join("file.txt"),
