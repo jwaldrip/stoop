@@ -1593,7 +1593,7 @@ mod tests {
         let job = spec(&["actions/checkout@v4"], &[]);
         let recorded = record(&[("actions/checkout@v4", A)]);
         assert!(ActionCheck::new(&fake).check(&job, &recorded).is_ok());
-        let strict = run::env_flag("STOOP_STRICT_ACTIONS");
+        let strict = crate::journal::strict_actions();
         assert_eq!(
             ActionCheck::with_strict(&fake, strict)
                 .check(&job, &recorded)

@@ -84,7 +84,7 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
     }
     if !o.allowed.is_empty()
         && (std::env::var_os("GITHUB_OUTPUT").is_some()
-            || (o.format == "github" && run::env_flag("GITHUB_ACTIONS")))
+            || (o.format == "github" && run::env_switch("GITHUB_ACTIONS", true)))
     {
         return Err("--allow-uses is only available for local dry runs".into());
     }
@@ -224,7 +224,7 @@ pub fn cmd(args: &[String]) -> i32 {
         .clone()
         .unwrap_or_else(|| run::find_root(&std::env::current_dir().unwrap_or_default()));
     let path = workflow_path(&o).unwrap_or_default();
-    let mut plan = json!({"schema":"stoop.plan/1","workflow":"","path":path,"rev":"","plan_job":o.plan_job,"full":run::env_flag("STOOP_FULL"),"skip":[],"jobs":[]});
+    let mut plan = json!({"schema":"stoop.plan/1","workflow":"","path":path,"rev":"","plan_job":o.plan_job,"full":run::env_switch("STOOP_FULL", true),"skip":[],"jobs":[]});
     let result = build(
         &o,
         &root,
@@ -372,17 +372,17 @@ fn build<S: attest::KeySource>(
     let mut global_error = plan_override(&workflow, &o.plan_job)
         .and_then(|()| gha::workflow::validate_plan_environment(&workflow, &o.plan_job))
         .err();
-    if run::env_flag("GITHUB_ACTIONS")
+    if run::env_switch("GITHUB_ACTIONS", true)
         && std::env::var("GITHUB_JOB").ok().as_deref() != Some(o.plan_job.as_str())
     {
         global_error = Some("plan job differs from GITHUB_JOB".into());
     }
-    if run::env_flag("GITHUB_ACTIONS")
+    if run::env_switch("GITHUB_ACTIONS", true)
         && std::env::var("GITHUB_SHA").ok().as_deref() != Some(tree.commit())
     {
         global_error = Some("planned revision differs from GITHUB_SHA".into());
     }
-    if run::env_flag("GITHUB_ACTIONS") {
+    if run::env_switch("GITHUB_ACTIONS", true) {
         if run::env_str("STOOP_JOB_WORKFLOW_REF") != run::env_str("GITHUB_WORKFLOW_REF")
             || run::env_str("STOOP_JOB_WORKFLOW_REF").is_none()
         {
@@ -511,7 +511,7 @@ fn build<S: attest::KeySource>(
         now,
         max_age: ceiling,
         github_vars: cx.verified_vars(&o.plan_job),
-        salt: run::env_str("STOOP_ENV_SALT"),
+        salt: run::env_salt(),
         event_path,
         event,
         explain: o.explain,
@@ -523,22 +523,23 @@ fn build<S: attest::KeySource>(
         let gated = gate
             .as_ref()
             .is_none_or(|(code, _)| *code != Code::NotGated);
-        let decision =
-            if !graph_error && (run::env_flag("STOOP_FULL") || run::env_flag("STOOP_OFF")) {
-                run_decision(Code::Full, "STOOP_FULL or STOOP_OFF enabled")
-            } else if let Some(error) = &global_error {
-                run_decision(Code::Error, error.clone())
-            } else if (spec.blocked.is_some() || spec.key.is_none())
-                && gate
-                    .as_ref()
-                    .is_none_or(|(code, _)| *code != Code::NotGated)
-            {
-                eval::decide(spec, &mut ctx)
-            } else if let Some((code, detail)) = gate {
-                run_decision(code, detail)
-            } else {
-                eval::decide(spec, &mut ctx)
-            };
+        let decision = if !graph_error
+            && (run::env_switch("STOOP_FULL", true) || run::env_switch("STOOP_OFF", true))
+        {
+            run_decision(Code::Full, "STOOP_FULL or STOOP_OFF enabled")
+        } else if let Some(error) = &global_error {
+            run_decision(Code::Error, error.clone())
+        } else if (spec.blocked.is_some() || spec.key.is_none())
+            && gate
+                .as_ref()
+                .is_none_or(|(code, _)| *code != Code::NotGated)
+        {
+            eval::decide(spec, &mut ctx)
+        } else if let Some((code, detail)) = gate {
+            run_decision(code, detail)
+        } else {
+            eval::decide(spec, &mut ctx)
+        };
         if decision.skip {
             skip.push(spec.job.clone());
         }

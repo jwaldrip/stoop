@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::expr::{Contexts, Unknowable, Value};
 pub const VERIFIED_VARS: &[&str] = &[
@@ -35,11 +35,33 @@ pub const VERIFIED_VARS: &[&str] = &[
 pub struct GhCtx {
     pub env: BTreeMap<String, String>,
     pub event: serde_json::Value,
+    /// Names whose values are not UTF-8. Stoop cannot compare them, so they are unavailable.
+    pub unreadable: BTreeSet<String>,
 }
+
+/// What the planner compares for a verified variable whose value is not UTF-8. It never
+/// equals the recorded hash of a readable value, so the job runs.
+pub const UNREADABLE: &str = "\u{fffd}unreadable";
 
 impl GhCtx {
     pub fn from_env() -> Result<Self, String> {
-        let env: BTreeMap<String, String> = std::env::vars().collect();
+        let mut env = BTreeMap::new();
+        let mut unreadable = BTreeSet::new();
+        // A variable whose name or value is not UTF-8 must not stop stoop. A name that is not
+        // UTF-8 matches none of the names stoop reads, so it is skipped.
+        for (name, value) in std::env::vars_os() {
+            let Ok(name) = name.into_string() else {
+                continue;
+            };
+            match value.into_string() {
+                Ok(value) => {
+                    env.insert(name, value);
+                }
+                Err(_) => {
+                    unreadable.insert(name);
+                }
+            }
+        }
         let event = match env.get("GITHUB_EVENT_PATH") {
             Some(path) if !path.is_empty() => {
                 let bytes = std::fs::read(path).map_err(|e| format!("event payload: {e}"))?;
@@ -47,11 +69,19 @@ impl GhCtx {
             }
             _ => serde_json::Value::Null,
         };
-        Ok(Self::from_parts(env, event))
+        Ok(Self {
+            env,
+            event,
+            unreadable,
+        })
     }
 
     pub fn from_parts(env: BTreeMap<String, String>, event: serde_json::Value) -> Self {
-        Self { env, event }
+        Self {
+            env,
+            event,
+            unreadable: BTreeSet::new(),
+        }
     }
 
     pub fn verified_vars(&self, job: &str) -> BTreeMap<String, String> {
@@ -59,6 +89,8 @@ impl GhCtx {
         for name in VERIFIED_VARS {
             if let Some(value) = self.env.get(*name) {
                 vars.insert((*name).into(), value.clone());
+            } else if self.unreadable.contains(*name) {
+                vars.insert((*name).into(), UNREADABLE.into());
             }
         }
         vars.insert("GITHUB_JOB".into(), job.into());
@@ -105,5 +137,19 @@ impl Contexts for GhCtx {
             )),
             _ => Err(Unknowable(format!("unknown context {name}"))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_utf8_unreadable_verified_variable_never_matches_a_readable_hash() {
+        let mut ctx = GhCtx::from_parts(BTreeMap::new(), serde_json::Value::Null);
+        ctx.unreadable.insert("GITHUB_SHA".into());
+        let vars = ctx.verified_vars("job");
+        assert_eq!(vars["GITHUB_SHA"], UNREADABLE);
+        assert_eq!(vars["GITHUB_JOB"], "job");
     }
 }
