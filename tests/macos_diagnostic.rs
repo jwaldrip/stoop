@@ -109,11 +109,23 @@ fn a_fixture_with_a_tree_and_failed_lookups_is_observed_in_full_and_never_record
     assert_eq!(fs::read_to_string(w.dir.join("runs.log")).unwrap(), "run");
     assert!(stderr.contains("stoop: DTrace diagnostic: "), "{stderr}");
     assert!(stderr.contains("not recorded"), "{stderr}");
-    // The known result: DTrace saw the whole fixture and reported no loss or error.
+    // The known result: DTrace reported no loss or error at all. The run is unsound for one
+    // reason only: the system's loader looks files up through directory descriptors, which the
+    // tracer does not follow yet (the spike's gap two). Nothing else makes it unsound.
     assert!(
-        stderr.contains("DTrace diagnostic verdict: no loss seen"),
+        stderr.contains("DTrace diagnostic verdict: UNSOUND ("),
         "{stderr}"
     );
+    assert!(
+        stderr.contains(" 0 tracer loss or error line(s)"),
+        "{stderr}"
+    );
+    for line in stderr
+        .lines()
+        .filter(|line| line.starts_with("stoop: DTrace diagnostic UNSOUND: "))
+    {
+        assert!(line.contains("directory descriptor"), "{line}");
+    }
     w.no_proof_written();
 
     let read = listed(&stderr, "read");

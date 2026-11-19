@@ -35,6 +35,11 @@ use std::time::Duration;
 pub const DIAGNOSTIC_ONLY: &str =
     "diagnostic backend: macOS observations are not recorded as proofs";
 
+/// The reason every descriptor-relative lookup that cannot be placed shares. The tracer does not
+/// follow descriptors yet, so such a lookup makes the run unsound (the spike's gap two).
+const DESCRIPTOR_GAP: &str =
+    "a path relative to a directory descriptor cannot be placed: descriptors are not followed yet";
+
 /// `AT_FDCWD` on macOS.
 const AT_FDCWD: i32 = -2;
 const O_WRONLY: i32 = 0x1;
@@ -292,6 +297,8 @@ pub struct Diagnostic {
     pub spawns: Vec<(u32, u32)>,
     /// Pid and path of each exec attempt made inside the tree.
     pub execs: Vec<(u32, PathBuf)>,
+    /// Descriptor-relative lookups that could not be placed: the descriptor and the path as passed.
+    pub unplaced: BTreeSet<(i32, String)>,
 }
 
 enum Event {
@@ -334,6 +341,7 @@ pub struct Observer {
     raw: Vec<String>,
     spawns: Vec<(u32, u32)>,
     execs: Vec<(u32, PathBuf)>,
+    unplaced: BTreeSet<(i32, String)>,
 }
 
 impl Observer {
@@ -359,6 +367,7 @@ impl Observer {
             raw: Vec::new(),
             spawns: Vec::new(),
             execs: Vec::new(),
+            unplaced: BTreeSet::new(),
         };
         observer.flag(DIAGNOSTIC_ONLY);
         observer
@@ -560,10 +569,8 @@ impl Observer {
             return Some(lexical(Path::new("/"), path));
         }
         if let Some(fd) = dirfd.filter(|fd| *fd != AT_FDCWD) {
-            let shown: String = path.chars().filter(|c| !c.is_control()).take(80).collect();
-            self.flag(format!(
-                "a path relative to directory descriptor {fd} cannot be placed (pid {pid}: {shown})"
-            ));
+            self.unplaced.insert((fd, path.to_owned()));
+            self.flag(DESCRIPTOR_GAP);
             return None;
         }
         match self.members.get(&pid).and_then(|m| m.cwd.clone()) {
@@ -602,6 +609,7 @@ impl Observer {
             raw: self.raw,
             spawns: self.spawns,
             execs: self.execs,
+            unplaced: self.unplaced,
         }
     }
 }
@@ -888,9 +896,10 @@ pub(crate) fn report(d: &Diagnostic, paths: bool, raw: bool) -> Vec<String> {
         );
     } else {
         out.push(format!(
-            "DTrace diagnostic verdict: UNSOUND ({} reason(s), {} tracer loss or error line(s)); not recorded",
+            "DTrace diagnostic verdict: UNSOUND ({} reason(s), {} tracer loss or error line(s), {} descriptor-relative path(s) not placed); not recorded",
             reasons.len(),
-            d.losses
+            d.losses,
+            d.unplaced.len()
         ));
         for reason in reasons {
             out.push(format!(
@@ -914,6 +923,9 @@ pub(crate) fn report(d: &Diagnostic, paths: bool, raw: bool) -> Vec<String> {
         }
         for (pid, path) in &d.execs {
             out.push(format!("dtrace exec {pid} {}", shown_path(path)));
+        }
+        for (fd, path) in &d.unplaced {
+            out.push(format!("dtrace unplaced {fd} {}", crate::run::safe(path)));
         }
     }
     if raw {
@@ -1216,6 +1228,34 @@ mod tests {
         let mut o = observer();
         feed(&mut o, &["EV\t100\tchdir\t-\t-1\tmissing"]);
         assert!(o.failed.contains(Path::new("/work/missing")));
+    }
+
+    #[test]
+    fn descriptor_relative_paths_are_listed_as_unplaced_and_share_one_reason() {
+        let mut o = observer();
+        feed(
+            &mut o,
+            &[
+                "SPAWN\t100\t200",
+                "EV\t100\topenat\t7\t0\trel.txt",
+                "EV\t200\topenat\t7\t0\trel.txt",
+            ],
+        );
+        clean_end(&mut o);
+        let d = o.finish(0);
+        assert!(
+            d.unplaced.contains(&(7, "rel.txt".to_string())),
+            "{:?}",
+            d.unplaced
+        );
+        let descriptor_reasons = reasons(&d)
+            .iter()
+            .filter(|r| r.contains("directory descriptor"))
+            .count();
+        assert_eq!(descriptor_reasons, 1, "{:?}", reasons(&d));
+        assert!(report(&d, true, false)
+            .iter()
+            .any(|l| l == "dtrace unplaced 7 rel.txt"));
     }
 
     #[test]
