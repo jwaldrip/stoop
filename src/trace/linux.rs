@@ -12,6 +12,7 @@
 use super::{ExecEvent, Scope, Trace};
 use crate::ignore::Ignore;
 use crate::input::{file_id, hash_file, hash_file_with_oid};
+use crate::oid_attrs::is_absent;
 use crate::pathutil::{absolutize, to_key, without_dots, Physical};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsString};
@@ -1251,11 +1252,6 @@ fn describe_dest(sa: &[u8]) -> String {
         },
         _ => "connect to a vsock peer".to_string(),
     }
-}
-
-/// Whether `e` says the path, or one of its parents, is not there.
-fn is_absent(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ENOTDIR)
 }
 
 fn is_dir(p: &Path) -> bool {

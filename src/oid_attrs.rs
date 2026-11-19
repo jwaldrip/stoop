@@ -66,11 +66,13 @@ pub struct Watch {
 impl Watch {
     /// Whether a namespace change at this physical name, or a write to a file there, can change
     /// what Git reads.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn names_contain(&self, physical: &Path) -> bool {
         self.names.contains(physical)
     }
 
     /// Whether this metadata is a watched file, whatever name it is reached by.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn is_watched_file(&self, metadata: &std::fs::Metadata) -> bool {
         metadata.is_file() && self.inodes.contains(&(metadata.dev(), metadata.ino()))
     }
@@ -517,11 +519,16 @@ pub fn directory_removal_invalidates(path: &Path) -> bool {
 }
 
 /// The configuration and attribute files Git reads from outside the repository. `git var -l` names
-/// them whether or not they exist, so a file the run creates is watched too. The system files are
-/// listed as well, since a runner's Git can read them from a prefix the output does not show.
-/// A relative name, or a snapshot without a global configuration and attribute file, declines.
+/// them whether or not they exist, so a file the run creates is watched too. Git's system files are
+/// also watched by their fixed names, whatever the report says. A relative name, or a report without
+/// a global configuration and attribute file, declines.
 fn external_sources(root: &Path) -> Option<Vec<PathBuf>> {
     let report = crate::gitprobe::output(root, &["var", "-l"], b"", MAX_OUTPUT)?;
+    external_sources_in(&report)
+}
+
+/// The external sources that a `git var -l` report names. See `external_sources`.
+fn external_sources_in(report: &[u8]) -> Option<Vec<PathBuf>> {
     let mut sources = vec![
         PathBuf::from("/etc/gitconfig"),
         PathBuf::from("/etc/gitattributes"),
@@ -549,7 +556,35 @@ fn external_sources(root: &Path) -> Option<Vec<PathBuf>> {
     (config && attributes).then_some(sources)
 }
 
-fn is_absent(error: &std::io::Error) -> bool {
+#[cfg(test)]
+mod external_source_tests {
+    use super::external_sources_in;
+    use std::path::PathBuf;
+
+    #[test]
+    fn every_reported_name_counts_and_a_missing_global_name_declines() {
+        let report = b"user.name=x\nGIT_CONFIG_SYSTEM=/opt/git/gitconfig\nGIT_ATTR_SYSTEM=/opt/git/gitattributes\nGIT_CONFIG_GLOBAL=/h/.config/git/config\nGIT_CONFIG_GLOBAL=/h/.gitconfig\nGIT_ATTR_GLOBAL=/h/.config/git/attributes\n";
+        let sources = external_sources_in(report).unwrap();
+        for path in [
+            "/etc/gitconfig",
+            "/etc/gitattributes",
+            "/opt/git/gitconfig",
+            "/opt/git/gitattributes",
+            "/h/.config/git/config",
+            "/h/.gitconfig",
+            "/h/.config/git/attributes",
+        ] {
+            assert!(sources.contains(&PathBuf::from(path)), "{path}");
+        }
+        assert!(external_sources_in(b"GIT_CONFIG_GLOBAL=/h/.gitconfig\n").is_none());
+        assert!(external_sources_in(b"GIT_ATTR_GLOBAL=/h/attributes\n").is_none());
+        assert!(
+            external_sources_in(b"GIT_CONFIG_GLOBAL=.gitconfig\nGIT_ATTR_GLOBAL=/h/a\n").is_none()
+        );
+    }
+}
+
+pub(crate) fn is_absent(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENOTDIR)
 }
 
@@ -626,7 +661,7 @@ fn names_below(
 /// The watched set for one repository: Git's external sources, and the files of its git directory
 /// that Git reads for attributes or configuration. The index counts too: Git reads an attribute
 /// file from it when the worktree copy is missing.
-fn build_watch(git_dir: &Path, sources: &[PathBuf]) -> Option<Watch> {
+pub(crate) fn build_watch(git_dir: &Path, sources: &[PathBuf]) -> Option<Watch> {
     let mut watch = Watch::default();
     for source in sources {
         watch_path(source, &mut watch)?;

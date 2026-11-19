@@ -1842,6 +1842,7 @@ mod tests {
             basis: std::collections::HashMap::from([("file.txt".into(), converted)]),
             git_dir: root.join(".git"),
             common_dir: root.join(".git"),
+            watch: Default::default(),
         }));
         trace.oid_attrs_changed = true;
         let (inputs, _) = build_inputs(
