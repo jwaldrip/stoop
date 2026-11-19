@@ -1476,6 +1476,13 @@ fn check_candidate(trace: &Trace, cand: &Candidate, post: &Post) -> Result<(), N
     } else {
         first
     };
+    // An inode the run changed itself (written, linked or renamed through any name) is not a change
+    // from outside, so the candidate is not refused for it.
+    if let Seen::File(file) = seen {
+        if trace.own_inodes.contains(&(file.stat.dev, file.stat.ino)) {
+            return Ok(());
+        }
+    }
     let empty = identity::Names::new();
     let listing = if cand.listed {
         let Some(listed) = trace.listings.get(&cand.source) else {
@@ -1687,6 +1694,11 @@ pub fn build_inputs(
                 continue;
             }
             Some(Some(Seen::Symlink { resolved, .. })) if *resolved == now => {}
+            Some(Some(Seen::Symlink { hops, .. }))
+                if hops.iter().any(|hop| trace.is_output(hop)) =>
+            {
+                // The run wrote a link on the way to this one, so the change of target is its own.
+            }
             Some(Some(_)) => {
                 refusals.push(NotRecorded::Changed {
                     key: to_key(root, lex),

@@ -662,7 +662,17 @@ fn observe(rec: Option<&mut Rec<'_>>, t: &mut Trace, lex: PathBuf, how: Use) {
             t.seen.as_ref().and_then(|seen| seen.get(&lex)),
             Some(before) if !matches!(before, Seen::Dir(_) | Seen::Absent)
         );
-    let output = rechecked && t.is_output(&lex);
+    let output = rechecked
+        && (t.is_output(&lex)
+            || matches!(
+                t.seen.as_ref().and_then(|seen| seen.get(&lex)),
+                Some(Seen::Symlink { resolved: Some(target), .. }) if t.is_output(target)
+            ));
+    // A file whose inode the run changed itself is not a change from outside.
+    let own_inode = matches!(
+        t.seen.as_ref().and_then(|seen| seen.get(&lex)),
+        Some(Seen::File(file)) if t.own_inodes.contains(&(file.stat.dev, file.stat.ino))
+    );
     let Some(seen) = t.seen.as_mut() else { return };
     let mut changed = false;
     match seen.get_mut(&lex) {
@@ -677,7 +687,9 @@ fn observe(rec: Option<&mut Rec<'_>>, t: &mut Trace, lex: PathBuf, how: Use) {
             // Something absent may appear later. A path the run created is its own output.
             changed = !created_here && !matches!(identity::observe(&lex, resolve), Seen::Absent);
         }
-        Some(before) if how == Use::Content && !output && !matches!(before, Seen::Dir(_)) => {
+        Some(before)
+            if how == Use::Content && !output && !own_inode && !matches!(before, Seen::Dir(_)) =>
+        {
             if identity::same_identity(before, &identity::observe(&lex, resolve)) {
                 if hash {
                     rec.read_hash(before, &lex, now);
@@ -701,6 +713,21 @@ fn push_changed(t: &mut Trace, path: &Path) {
         .any(|changed| changed.as_path() == path)
     {
         t.changed_during.push(path.to_path_buf());
+    }
+}
+
+/// Record the inode a call is about to change, through the name it uses, so that the run's own
+/// change to it is not taken for a change from outside.
+fn note_inode(t: &mut Trace, path: &Path, follows: bool) {
+    let metadata = if follows {
+        fs::metadata(path)
+    } else {
+        fs::symlink_metadata(path)
+    };
+    if let Ok(metadata) = metadata {
+        if metadata.is_file() {
+            t.own_inodes.insert((metadata.dev(), metadata.ino()));
+        }
     }
 }
 
@@ -2272,9 +2299,17 @@ impl Tracer<'_> {
         // A write through a link changes what the link points to, not the link itself.
         let through_link =
             follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink());
+        note_inode(&mut self.t, raw, follows);
         if !through_link {
             self.t.written.insert(raw.to_path_buf());
         } else {
+            // A write through a dangling link creates what the link names: that path is the run's own output.
+            if fs::canonicalize(raw).is_err() {
+                if let Ok(named) = fs::read_link(raw) {
+                    let parent = raw.parent().unwrap_or(Path::new("/"));
+                    self.t.written.insert(absolutize(parent, &named));
+                }
+            }
             self.touch(raw.to_path_buf(), Use::Look);
         }
         let rec = self.rec.as_mut()?;
@@ -2765,6 +2800,7 @@ impl Tracer<'_> {
                 Op::LinkSource { dirfd, path, flags } => {
                     let by_fd = flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0);
                     if let Some(p) = self.resolve(pid, &args, dirfd, path) {
+                        note_inode(&mut self.t, &p, false);
                         self.touch(p.clone(), Use::Look);
                         if self.oid_sensitive(&p, true) {
                             self.t.oid_attrs_changed = true;

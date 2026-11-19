@@ -8,6 +8,7 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use crate::oid_attrs::is_absent;
+use crate::pathutil::absolutize;
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -41,6 +42,8 @@ pub enum Seen {
         target: OsString,
         followed: Box<Seen>,
         resolved: Option<PathBuf>,
+        /// The links the path passes through on its way to what it names (see `link_hops`).
+        hops: Vec<PathBuf>,
     },
     /// A device, FIFO or socket: never an input.
     Special,
@@ -222,10 +225,32 @@ pub fn observe(path: &Path, follow: bool) -> Seen {
                 target: target.into_os_string(),
                 followed: Box::new(followed),
                 resolved,
+                hops: if follow { link_hops(path) } else { Vec::new() },
             }
         }
         Ok(metadata) => from_metadata(&metadata),
     }
+}
+
+/// The symbolic links a path passes through on its way to what it names, in order. The path itself
+/// and the final target are not included. A run that writes one of them has changed what the path
+/// resolves to, so that change is the run's own.
+fn link_hops(path: &Path) -> Vec<PathBuf> {
+    let mut hops = Vec::new();
+    let mut current = path.to_path_buf();
+    while hops.len() < 40 {
+        let Ok(target) = fs::read_link(&current) else {
+            break;
+        };
+        let parent = current.parent().unwrap_or(Path::new("/"));
+        let next = absolutize(parent, &target);
+        if !fs::symlink_metadata(&next).is_ok_and(|m| m.file_type().is_symlink()) {
+            break;
+        }
+        hops.push(next.clone());
+        current = next;
+    }
+    hops
 }
 
 fn needs_hash(file: &FileSeen, now: i128) -> bool {
@@ -283,11 +308,13 @@ pub fn same_identity(before: &Seen, now: &Seen) -> bool {
                 target: a,
                 followed: followed_a,
                 resolved: resolved_a,
+                ..
             },
             Seen::Symlink {
                 target: b,
                 followed: followed_b,
                 resolved: resolved_b,
+                ..
             },
         ) => a == b && resolved_a == resolved_b && same_identity(followed_a, followed_b),
         _ => false,
@@ -573,6 +600,7 @@ mod tests {
             target: "a".into(),
             followed: Box::new(Seen::Absent),
             resolved: None,
+            hops: Vec::new(),
         };
         let same = Post::Symlink { target: "a".into() };
         let retargeted = Post::Symlink { target: "b".into() };
@@ -587,6 +615,7 @@ mod tests {
             target: "a".into(),
             followed: Box::new(Seen::Absent),
             resolved: resolved.map(PathBuf::from),
+            hops: Vec::new(),
         };
         assert!(same_identity(&link(Some("/r/a")), &link(Some("/r/a"))));
         assert!(!same_identity(&link(Some("/r/a")), &link(Some("/r/b"))));

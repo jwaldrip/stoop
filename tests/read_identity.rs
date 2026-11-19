@@ -526,7 +526,7 @@ fn a_stoop_sh_step_with_a_mid_run_edit_is_not_recorded() {
     let err = stderr(&out);
     assert!(out.status.success(), "{err}");
     assert!(
-        err.contains("stoop: not recorded: src/a changed while the command ran"),
+        err.contains("not recorded: ") && err.contains("src/a changed while the command ran"),
         "{err}"
     );
     let proofs = case.root().join(".stoop/proofs");

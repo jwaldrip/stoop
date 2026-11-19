@@ -130,11 +130,17 @@ pub struct Trace {
     /// Directory entries snapshotted so far, counted against `identity::MAX_LISTED_NAMES`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub listed_names: usize,
+    /// Inodes (device and number) the run changed itself, through any name: written, linked, renamed
+    /// or re-moded. A path that still holds one of them was changed by the run, not by anything else.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub own_inodes: HashSet<(u64, u64)>,
 }
 
 impl Trace {
     pub fn is_output(&self, p: &Path) -> bool {
-        self.written.contains(p) || self.created_dirs.iter().any(|d| p.starts_with(d))
+        self.written.contains(p)
+            || self.keys.contains_key(p)
+            || self.created_dirs.iter().any(|d| p.starts_with(d))
     }
 }
 
