@@ -35,12 +35,21 @@ fn skip(test: &str) -> bool {
     true
 }
 
+/// One end-to-end test at a time. Each test runs DTrace and then checks that no dtrace process is
+/// left, so a second test running DTrace at the same moment would make that check wrong. The
+/// lock does not depend on how many threads cargo uses.
+static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 struct Work {
     dir: PathBuf,
+    _serial: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Work {
     fn new(name: &str) -> Self {
+        let serial = SERIAL
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!("stoop-dtrace-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
@@ -49,7 +58,10 @@ impl Work {
         let dir = fs::canonicalize(dir).unwrap();
         fs::write(dir.join("in.txt"), "in").unwrap();
         fs::write(dir.join("nested.txt"), "nested").unwrap();
-        Self { dir }
+        Self {
+            dir,
+            _serial: serial,
+        }
     }
 
     fn stoop(&self, script: &str, mode: &str) -> Output {
