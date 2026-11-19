@@ -207,6 +207,9 @@ impl Ws {
         self.command(script, write).output().unwrap()
     }
     fn command(&self, script: &str, write: &str) -> Command {
+        self.command_with_options(script, write, &[])
+    }
+    fn command_with_options(&self, script: &str, write: &str, options: &[&str]) -> Command {
         let path = self.temp.join("script.sh");
         fs::write(&path, script).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_stoop"));
@@ -217,6 +220,7 @@ impl Ws {
         }
         command
             .arg("sh")
+            .args(options)
             .arg(path)
             .current_dir(&self.root)
             .env("GITHUB_ACTIONS", "true")
@@ -1109,4 +1113,369 @@ fn rejected_push_retries_three_times_without_failing_step() {
         1
     );
     assert!(w.records().is_empty());
+}
+
+struct TokenApi {
+    url: String,
+    requests: Arc<std::sync::atomic::AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl TokenApi {
+    fn new(sha: String) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}/token", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let seen = requests.clone();
+        let stopping = stop.clone();
+        let thread = thread::spawn(move || {
+            while !stopping.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut line = String::new();
+                        reader.read_line(&mut line).unwrap();
+                        let target = line.split_whitespace().nth(1).unwrap_or("").to_owned();
+                        let mut bearer = false;
+                        loop {
+                            line.clear();
+                            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                                break;
+                            }
+                            if let Some((name, value)) = line.trim_end().split_once(':') {
+                                if name.eq_ignore_ascii_case("authorization")
+                                    && value.trim() == "bearer fixture-bearer"
+                                {
+                                    bearer = true;
+                                }
+                            }
+                        }
+                        let audience = target.strip_prefix("/token?audience=").map(decode_query);
+                        let body = if let (true, Some(audience)) = (bearer, audience) {
+                            seen.fetch_add(1, Ordering::Relaxed);
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap()
+                                .as_secs();
+                            let claims = serde_json::json!({
+                                "iss": "https://token.actions.githubusercontent.com",
+                                "aud": audience,
+                                "repository": "owner/repo",
+                                "repository_id": "12345",
+                                "repository_owner_id": "6789",
+                                "runner_environment": "github-hosted",
+                                "ref_protected": "true",
+                                "ref": "refs/heads/main",
+                                "event_name": "push",
+                                "sha": sha,
+                                "run_id": "123",
+                                "run_attempt": "1",
+                                "workflow_ref": "owner/repo/.github/workflows/ci.yml@refs/heads/main",
+                                "job_workflow_ref": "owner/repo/.github/workflows/ci.yml@refs/heads/main",
+                                "iat": now,
+                                "nbf": now,
+                                "exp": now + 300,
+                            });
+                            let header = serde_json::json!({"alg": "RS256", "kid": "test-key-1", "typ": "JWT"});
+                            let signed = format!(
+                                "{}.{}",
+                                jwt_b64(&serde_json::to_vec(&header).unwrap()),
+                                jwt_b64(&serde_json::to_vec(&claims).unwrap())
+                            );
+                            let key = ring::signature::RsaKeyPair::from_pkcs8(include_bytes!(
+                                "fixtures/attest/test-rsa-1.pkcs8.der"
+                            ))
+                            .unwrap();
+                            let mut signature = vec![0; key.public().modulus_len()];
+                            key.sign(
+                                &ring::signature::RSA_PKCS1_SHA256,
+                                &ring::rand::SystemRandom::new(),
+                                signed.as_bytes(),
+                                &mut signature,
+                            )
+                            .unwrap();
+                            serde_json::json!({"value": format!("{signed}.{}", jwt_b64(&signature))}).to_string()
+                        } else {
+                            "{}".to_owned()
+                        };
+                        let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5))
+                    }
+                    Err(error) => panic!("token fixture: {error}"),
+                }
+            }
+        });
+        Self {
+            url,
+            requests,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for TokenApi {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        self.thread.take().unwrap().join().unwrap();
+    }
+}
+
+fn decode_query(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            out.push(u8::from_str_radix(&value[i + 1..i + 3], 16).unwrap());
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).unwrap()
+}
+
+fn jwt_b64(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut out = String::new();
+    for chunk in bytes.chunks(3) {
+        let n = chunk
+            .iter()
+            .enumerate()
+            .fold(0u32, |v, (i, b)| v | (u32::from(*b) << (16 - i * 8)));
+        for i in 0..=chunk.len() {
+            out.push(ALPHABET[((n >> (18 - i * 6)) & 63) as usize] as char);
+        }
+    }
+    out
+}
+
+#[test]
+fn clean_children_still_publish_an_attestation_the_planner_verifies() {
+    use std::os::unix::fs::PermissionsExt;
+    let script = "env > \"$RUNNER_TEMP/child.env\"\n";
+    let mut w = Ws::new("oidc-filter", &[script]);
+    let workflow = format!("name: fixture\non: push\ndefaults:\n  run:\n    shell: stoop sh {{0}}\njobs:\n  stoop-plan:\n    runs-on: ubuntu-latest\n    steps: []\n  test:\n    needs: [stoop-plan]\n    if: ${{{{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',test,') }}}}\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: |\n          {}\n", script.trim_end());
+    let runner = if cfg!(target_arch = "aarch64") {
+        "ubuntu-24.04-arm"
+    } else {
+        "ubuntu-latest"
+    };
+    let workflow = workflow.replace("runs-on: ubuntu-latest", &format!("runs-on: {runner}"));
+    fs::write(w.root.join(".github/workflows/ci.yml"), workflow).unwrap();
+    git(&w.root, &["add", ".github/workflows/ci.yml"]);
+    git(
+        &w.root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.org",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "gated fixture",
+        ],
+    );
+    w.sha = git(&w.root, &["rev-parse", "HEAD"]);
+    git(&w.root, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    fs::write(
+        w.temp.join("event.json"),
+        r#"{"repository":{"default_branch":"main"}}"#,
+    )
+    .unwrap();
+    let token = TokenApi::new(w.sha.clone());
+    let bin = w.temp.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let curl = bin.join("curl");
+    fs::write(&curl, "#!/bin/sh\n/usr/bin/env >> \"$STOOP_CURL_ENV\"\nif [ \"$1\" = -q ]; then\n  config=$(cat)\n  case \"$config\" in\n    *token.actions.githubusercontent.com/.well-known/jwks*) cat \"$STOOP_TEST_JWKS\" ;;\n    *\"$STOOP_TEST_TOKEN_URL\"*) printf '%s\\n' \"$config\" | /usr/bin/curl \"$@\" --noproxy '*' --proto '=http,https' ;;\n    *) exit 81 ;;\n  esac\nelse\n  case \"$*\" in\n    *\"$STOOP_TEST_ACTION_API/repos/actions/checkout/tarball/\"*) exec /usr/bin/curl \"$@\" --noproxy '*' ;;\n    *) exit 82 ;;\n  esac\nfi\n").unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+    let hook = w.root.join(".git/hooks/pre-push");
+    fs::write(&hook, "#!/bin/sh\n/usr/bin/env > \"$STOOP_HOOK_ENV\"\n").unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    let jwks = w.temp.join("jwks.json");
+    fs::write(&jwks, include_bytes!("fixtures/attest/test-jwks.json")).unwrap();
+    let curl_env = w.temp.join("curl.env");
+    let hook_env = w.temp.join("hook.env");
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let configure = |command: &mut Command| {
+        command
+            .env("PATH", &path)
+            .env("CI", "true")
+            .env("ACTIONS_ID_TOKEN_REQUEST_URL", &token.url)
+            .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "fixture-bearer")
+            .env("STOOP_TEST_TOKEN_URL", &token.url)
+            .env("STOOP_TEST_ACTION_API", &w.api.url)
+            .env("STOOP_TEST_JWKS", &jwks)
+            .env("STOOP_CURL_ENV", &curl_env)
+            .env("STOOP_HOOK_ENV", &hook_env)
+            .env("GITHUB_REPOSITORY_ID", "12345")
+            .env("GITHUB_REPOSITORY_OWNER_ID", "6789")
+            .env(
+                "STOOP_JOB_WORKFLOW_REF",
+                "owner/repo/.github/workflows/ci.yml@refs/heads/main",
+            )
+            .env("RUNNER_OS", "Linux")
+            .env_remove("STOOP_PASS_ENV");
+    };
+    let mut command = w.command(script, "1");
+    configure(&mut command);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        token.requests.load(Ordering::Relaxed) > 0,
+        "journal never requested the token"
+    );
+    for path in [w.temp.join("child.env"), curl_env.clone(), hook_env.clone()] {
+        let env = fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        for value in [
+            b"ACTIONS_ID_TOKEN_REQUEST_URL".as_slice(),
+            b"ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+            b"fixture-bearer",
+        ] {
+            assert!(
+                !env.windows(value.len()).any(|window| window == value),
+                "{} inherited a request credential",
+                path.display()
+            );
+        }
+    }
+    let records = w.records();
+    assert!(
+        records[0]["records"][0]["attest"].as_str().is_some(),
+        "record was not attested: {records:?}"
+    );
+
+    let mut plan = Command::new(env!("CARGO_BIN_EXE_stoop"));
+    plan.args([
+        "plan",
+        "--workflow",
+        ".github/workflows/ci.yml",
+        "--format",
+        "json",
+    ])
+    .current_dir(&w.root)
+    .env_clear()
+    .env("HOME", &w.temp)
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env("GITHUB_ACTIONS", "true")
+    .env("GITHUB_REPOSITORY", "owner/repo")
+    .env("GITHUB_WORKFLOW", "fixture")
+    .env(
+        "GITHUB_WORKFLOW_REF",
+        "owner/repo/.github/workflows/ci.yml@refs/heads/main",
+    )
+    .env("GITHUB_JOB", "stoop-plan")
+    .env("GITHUB_SHA", &w.sha)
+    .env("GITHUB_EVENT_PATH", w.temp.join("event.json"))
+    .env(
+        "GITHUB_SERVER_URL",
+        format!("file://{}", w.root.parent().unwrap().display()),
+    )
+    .env("GITHUB_API_URL", &w.api.url)
+    .env(
+        "RUNNER_WORKSPACE",
+        w.root.parent().unwrap().join("runner-work/repo"),
+    )
+    .env("STOOP_SYNC", "git");
+    configure(&mut plan);
+    let output = plan.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["jobs"][0]["code"], "proved", "{result}");
+    fs::write(&jwks, r#"{"keys":[]}"#).unwrap();
+    let output = plan.output().unwrap();
+    assert!(output.status.success());
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["jobs"][0]["code"], "unattested", "{result}");
+    assert_eq!(result["skip"], serde_json::json!([]));
+}
+
+#[test]
+fn allowed_step_blocks_later_publication_after_an_attested_running_record() {
+    use std::os::unix::fs::PermissionsExt;
+    let first = "true\n";
+    let allowed =
+        "test -f \"$RUNNER_TEMP/stoop/journal.blocked\" && env > \"$RUNNER_TEMP/allowed.env\"\n";
+    let last = "echo last\n";
+    let w = Ws::new("oidc-opt-in", &[first, allowed, last]);
+    let token = TokenApi::new(w.sha.clone());
+    let bin = w.temp.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let curl = bin.join("curl");
+    fs::write(&curl, "#!/bin/sh\nif [ \"$1\" = -q ]; then\n  config=$(cat)\n  case \"$config\" in\n    *\"$STOOP_TEST_TOKEN_URL\"*) printf '%s\\n' \"$config\" | /usr/bin/curl \"$@\" --noproxy '*' --proto '=http,https' ;;\n    *) exit 81 ;;\n  esac\nelse\n  case \"$*\" in\n    *\"$STOOP_TEST_ACTION_API/repos/actions/checkout/tarball/\"*) exec /usr/bin/curl \"$@\" --noproxy '*' ;;\n    *) exit 82 ;;\n  esac\nfi\n").unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+    let configure = |command: &mut Command| {
+        command
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("ACTIONS_ID_TOKEN_REQUEST_URL", &token.url)
+            .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "fixture-bearer")
+            .env("STOOP_TEST_TOKEN_URL", &token.url)
+            .env("STOOP_TEST_ACTION_API", &w.api.url)
+            .env_remove("STOOP_PASS_ENV");
+    };
+    let mut command = w.command(first, "1");
+    configure(&mut command);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let before = w.records();
+    assert_eq!(before[0]["records"][0]["status"], "running");
+    assert!(before[0]["records"][0]["attest"].as_str().is_some());
+    let requests = token.requests.load(Ordering::Relaxed);
+    assert!(requests > 0);
+
+    let mut command = w.command_with_options(allowed, "1", &["--allow-id-token"]);
+    configure(&mut command);
+    command.env(
+        "STOOP_PASS_ENV",
+        "ACTIONS_ID_TOKEN_REQUEST_URL,ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+    );
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let env = fs::read(w.temp.join("allowed.env")).unwrap();
+    assert!(env
+        .windows(b"ACTIONS_ID_TOKEN_REQUEST_TOKEN=fixture-bearer".len())
+        .any(|v| v == b"ACTIONS_ID_TOKEN_REQUEST_TOKEN=fixture-bearer"));
+    assert!(w.temp.join("stoop/journal.blocked").is_file());
+    assert_eq!(w.records(), before);
+    assert_eq!(token.requests.load(Ordering::Relaxed), requests);
+
+    let mut command = w.command(last, "1");
+    configure(&mut command);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(w.records(), before);
+    assert_eq!(token.requests.load(Ordering::Relaxed), requests);
 }

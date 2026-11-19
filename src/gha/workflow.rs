@@ -416,7 +416,9 @@ fn shell(s: &str) -> Result<Option<u64>, String> {
     while i + 1 < words.len() {
         let opt = words[i];
         match opt {
-            "--probe" | "--root" => return Err(format!("{opt} is not plannable")),
+            "--probe" | "--root" | "--allow-id-token" => {
+                return Err(format!("{opt} is not plannable"))
+            }
             "--sync-write" | "--no-record" | "--quiet" | "--allow-network" => i += 1,
             "--ignore" | "--ignore-env" | "--env" | "--max-age" | "--sync" | "--store"
             | "--key" => {
@@ -1353,6 +1355,7 @@ mod tests {
             ("", "      - uses: actions/checkout@v4\n        with: {submodules: true}\n      - run: x\n", "submodules"),
             ("", "      - uses: actions/checkout@v4\n        with: {lfs: true}\n      - run: x\n", "lfs"),
             ("", "      - shell: stoop sh --root x {0}\n        run: x\n", "--root"),
+            ("", "      - shell: stoop sh --allow-id-token {0}\n        run: x\n", "--allow-id-token is not plannable"),
             ("", "      - run: x\n        timeout-minutes: 5\n", "timeout-minutes"),
             ("", "      - run: x\n        if: success()\n", "step if"),
             ("", "      - uses: docker://image\n      - run: x\n", "docker"),
