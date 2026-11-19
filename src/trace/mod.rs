@@ -26,11 +26,16 @@ pub struct Touch {
     /// stat, access or readlink on it. Decides whether a write must record content.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub read: bool,
+    /// The run read the file's bytes: it opened the file for reading without `O_PATH`, or executed
+    /// it (the executable and each interpreter). `read` alone also covers stat, access and readlink.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub content: bool,
 }
 use serde::{Deserialize, Serialize};
 
 pub const UNAVAILABLE: &str = "tracing needs Linux x86-64 or arm64 (ptrace and seccomp)";
 const TRACER: &str = "ptrace-seccomp";
+pub(crate) mod identity;
 pub(crate) mod version;
 use version::TRACER_VERSION;
 
@@ -113,6 +118,18 @@ pub struct Trace {
     pub unplannable: Vec<String>,
     /// Successful execs, present only for an ordinary, traced `stoop run`.
     pub execs: Option<Vec<ExecEvent>>,
+    /// Read-time identity of each path the run looked at, keyed as `touched` is. Present only when
+    /// the run records (Linux, with a recording scope).
+    pub seen: Option<HashMap<PathBuf, identity::Seen>>,
+    /// Directory listings the run made, keyed by physical directory path.
+    pub listings: HashMap<PathBuf, identity::ListSeen>,
+    /// Paths that changed while the run was still going, found at a later look, in the order found.
+    pub changed_during: Vec<PathBuf>,
+    /// Names the run created, removed or renamed directly in each physical directory.
+    pub own_names: HashMap<PathBuf, identity::Names>,
+    /// Directory entries snapshotted so far, counted against `identity::MAX_LISTED_NAMES`.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub listed_names: usize,
 }
 
 impl Trace {

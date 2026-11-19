@@ -9,6 +9,7 @@
 //! except for priors: what a path held before the run first wrote it is read at the
 //! same stop, because the write is about to change it.
 
+use super::identity::{self, ListSeen, Seen};
 use super::{ExecEvent, Scope, Trace};
 use crate::ignore::Ignore;
 use crate::input::{file_id, hash_file, hash_file_with_oid};
@@ -595,6 +596,8 @@ struct Rec<'a> {
     oid_epoch: Option<Arc<crate::oid_attrs::Epoch>>,
     link_walks: BTreeMap<PathBuf, Vec<PathBuf>>,
     redirected_reads: HashSet<String>,
+    /// Bytes hashed at read stops and the debug lines printed about them.
+    reads: identity::ReadBudget,
 }
 
 struct Tracer<'a> {
@@ -609,6 +612,115 @@ struct Tracer<'a> {
     rec: Option<Rec<'a>>,
     execs: Option<ExecObserver>,
     t: Trace,
+}
+
+/// What a traced call did with a path. The funnel sets the matching `Touch` bits and, when the run
+/// is recorded, captures the path's read-time identity on its first look.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Use {
+    /// A name the call creates, removes or renames, or a directory it only checks for. Not a look
+    /// at what the path holds.
+    Name,
+    /// The call stats, accesses or reads the link of the path, or links from it.
+    Look,
+    /// The call opens the path for reading without `O_PATH`, or executes it: its bytes are read.
+    Content,
+    /// The call lists the directory's entries.
+    List,
+}
+
+/// Every traced use of a path goes through here, and nothing else inserts into `Trace::touched`.
+/// On a path's first look its read-time identity is captured. A later look checks that the path
+/// still holds what it held: an absence stays absent, and a file read again is still that file.
+fn observe(rec: Option<&mut Rec<'_>>, t: &mut Trace, lex: PathBuf, how: Use) {
+    {
+        let touch = t.touched.entry(lex.clone()).or_default();
+        match how {
+            Use::Name => {}
+            Use::Look => touch.read = true,
+            Use::Content => {
+                touch.read = true;
+                touch.content = true;
+            }
+            Use::List => touch.listed = true,
+        }
+    }
+    let Some(rec) = rec else { return };
+    // A proc magic link resolves in the tracer's namespace, so it is never followed here. Dynamic
+    // files (proc, sys, dev) describe the process reading them, so their bytes are never hashed.
+    let resolve = !lex.starts_with("/proc");
+    let hash = !is_dynamic(&lex);
+    let now = identity::now_ns();
+    let absent_before = matches!(
+        t.seen.as_ref().and_then(|seen| seen.get(&lex)),
+        Some(Seen::Absent)
+    );
+    let created_here = absent_before && t.is_output(&lex);
+    // A file the run wrote is its own output: a later read of it says nothing about the world.
+    let rechecked = how == Use::Content
+        && matches!(
+            t.seen.as_ref().and_then(|seen| seen.get(&lex)),
+            Some(before) if !matches!(before, Seen::Dir(_) | Seen::Absent)
+        );
+    let output = rechecked && t.is_output(&lex);
+    let Some(seen) = t.seen.as_mut() else { return };
+    let mut changed = false;
+    match seen.get_mut(&lex) {
+        None => {
+            let mut fresh = identity::observe(&lex, resolve);
+            if how == Use::Content && hash {
+                rec.read_hash(&mut fresh, &lex, now);
+            }
+            seen.insert(lex.clone(), fresh);
+        }
+        Some(Seen::Absent) => {
+            // Something absent may appear later. A path the run created is its own output.
+            changed = !created_here && !matches!(identity::observe(&lex, resolve), Seen::Absent);
+        }
+        Some(before) if how == Use::Content && !output && !matches!(before, Seen::Dir(_)) => {
+            if identity::same_identity(before, &identity::observe(&lex, resolve)) {
+                if hash {
+                    rec.read_hash(before, &lex, now);
+                }
+            } else {
+                changed = true;
+            }
+        }
+        Some(_) => {}
+    }
+    if changed {
+        push_changed(t, &lex);
+    }
+}
+
+/// Record that `path` changed while the command was running, once.
+fn push_changed(t: &mut Trace, path: &Path) {
+    if !t
+        .changed_during
+        .iter()
+        .any(|changed| changed.as_path() == path)
+    {
+        t.changed_during.push(path.to_path_buf());
+    }
+}
+
+/// Names that describe the process reading them (proc, sys and dev). They are never resolved here
+/// and their contents are never hashed.
+fn is_dynamic(path: &Path) -> bool {
+    ["/proc", "/sys", "/dev"]
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+}
+
+impl Rec<'_> {
+    /// A content read of `lex`: a racy file is hashed now, with a debug line under `STOOP_DEBUG`.
+    fn read_hash(&mut self, seen: &mut Seen, lex: &Path, now: i128) {
+        let hashed = identity::hash_racy_at_read(seen, lex, now, &mut self.reads);
+        if hashed && self.reads.logged < 32 && std::env::var_os("STOOP_DEBUG").is_some() {
+            self.reads.logged += 1;
+            eprintln!("stoop: debug: hashed {} at the read", self.key_text(lex));
+        }
+    }
 }
 
 pub fn run<'a>(
@@ -682,10 +794,12 @@ pub fn run<'a>(
             hashed: 0,
             link_walks: BTreeMap::new(),
             redirected_reads: HashSet::new(),
+            reads: identity::ReadBudget::default(),
         }),
         t: Trace {
             status: 1,
             oid_epoch: scope.and_then(|s| s.oid_epoch.clone()),
+            seen: scope.map(|_| HashMap::new()),
             #[cfg(test)]
             oid_epoch_captured: scope.is_some(),
             ..Trace::default()
@@ -1583,7 +1697,7 @@ impl Rec<'_> {
         let key = self.key_of(&loc.path, t)?;
         for link in self.links_below_root(raw).unwrap_or_default() {
             let name = to_key(self.phys.real(), &link);
-            t.touched.entry(link).or_default().read = true;
+            observe(Some(&mut *self), t, link, Use::Look);
             push_reason(t, format!("it wrote through the symlink {name}"));
         }
         if !t.priors.contains_key(&key) {
@@ -1825,7 +1939,6 @@ impl Tracer<'_> {
                 magic = true;
             } else if let Some(rec) = &self.rec {
                 if current.starts_with(rec.phys.real()) {
-                    self.t.touched.entry(current.clone()).or_default().read = true;
                     repository_links.push(current.clone());
                 }
             }
@@ -1867,6 +1980,9 @@ impl Tracer<'_> {
                 parts.push_front(part);
             }
         }
+        for link in repository_links.clone() {
+            self.observe(link, Use::Look);
+        }
         // A final-component symlink can be retargeted or removed later in this run.
         // Preserve its call-time in-repository target instead of relying on the
         // post-run link lookup to recover what was actually read.
@@ -1876,7 +1992,7 @@ impl Tracer<'_> {
                 .as_ref()
                 .is_some_and(|r| r.phys.repo_rel(&current).is_some())
         {
-            self.t.touched.entry(current.clone()).or_default().read = true;
+            self.observe(current.clone(), Use::Look);
         }
         self.magic_cache.insert(parent, (self.magic_epoch, magic));
         if magic {
@@ -1935,16 +2051,16 @@ impl Tracer<'_> {
         }
     }
 
-    fn touch(&mut self, lex: PathBuf, read: bool) {
+    fn touch(&mut self, lex: PathBuf, how: Use) {
         let mut path = lex;
         if let Some(rec) = &mut self.rec {
             for link in rec.links_below_root(&path).unwrap_or_default() {
-                self.t.touched.entry(link).or_default().read = true;
+                observe(Some(&mut *rec), &mut self.t, link, Use::Look);
             }
             // Record observations where the call resolved them, not after the run.
             if let Some(loc) = rec.phys.locate(&path) {
                 if loc.path != path && rec.phys.repo_rel(&loc.path).is_some() {
-                    if read && loc.redirected {
+                    if how != Use::Name && loc.redirected {
                         if let Some(key) = rec.key_of(&loc.path, &mut self.t) {
                             if self.t.keys.contains_key(&loc.path) {
                                 push_reason(
@@ -1961,7 +2077,122 @@ impl Tracer<'_> {
                 }
             }
         }
-        self.t.touched.entry(path).or_default().read |= read;
+        observe(self.rec.as_mut(), &mut self.t, path, how);
+    }
+
+    /// Record a use of `lex` through the funnel.
+    fn observe(&mut self, lex: PathBuf, how: Use) {
+        observe(self.rec.as_mut(), &mut self.t, lex, how);
+    }
+
+    /// `getdents` on a directory: the run lists it, so its entries are pinned as they are now.
+    fn observe_list(&mut self, dir: PathBuf) {
+        observe(self.rec.as_mut(), &mut self.t, dir.clone(), Use::List);
+        if self.rec.is_none() || self.t.listings.contains_key(&dir) {
+            return;
+        }
+        let Ok(metadata) = fs::symlink_metadata(&dir) else {
+            return;
+        };
+        if !metadata.is_dir() {
+            return;
+        }
+        let stat = identity::dir_stat(&metadata);
+        let names = if identity::racy(stat.mtime_ns, stat.ctime_ns, identity::now_ns()) {
+            self.read_listing(&dir)
+        } else {
+            None
+        };
+        self.t.listings.insert(dir, ListSeen { stat, names });
+    }
+
+    /// The names of a listed directory, counted against the run's cap. A directory that cannot be
+    /// read, or a run past the cap, refuses the record.
+    fn read_listing(&mut self, dir: &Path) -> Option<identity::Names> {
+        let Some(names) = identity::read_names(dir) else {
+            let key = self
+                .rec
+                .as_ref()
+                .map(|rec| rec.key_text(dir))
+                .unwrap_or_default();
+            self.flag(&format!("could not read the entries of {key}"));
+            return None;
+        };
+        if self.t.listed_names + names.len() > identity::MAX_LISTED_NAMES {
+            self.flag(&format!(
+                "it listed more than {} directory entries",
+                identity::MAX_LISTED_NAMES
+            ));
+            return None;
+        }
+        self.t.listed_names += names.len();
+        Some(names)
+    }
+
+    /// Before the run's first change to a listed directory, pin what the listing showed. A directory
+    /// whose stat moved since the listing changed while the command ran. Otherwise its names are read
+    /// now, before the change, so the run's own change can be told apart from anything else.
+    fn pin_listing(&mut self, dir: &Path) {
+        let Some(listing) = self.t.listings.get(dir) else {
+            return;
+        };
+        if listing.names.is_some() {
+            return;
+        }
+        let listed = listing.stat;
+        let moved = match fs::symlink_metadata(dir) {
+            Ok(metadata) => identity::dir_stat(&metadata) != listed,
+            Err(_) => true,
+        };
+        if moved {
+            push_changed(&mut self.t, dir);
+            return;
+        }
+        if let Some(names) = self.read_listing(dir) {
+            if let Some(listing) = self.t.listings.get_mut(dir) {
+                listing.names = Some(names);
+            }
+        }
+    }
+
+    /// A change the run makes to a directory itself (chmod, chown): pin its listing first.
+    fn note_listed_change(&mut self, path: &Path) {
+        let Some(rec) = self.rec.as_mut() else {
+            return;
+        };
+        let Some(loc) = rec.phys.locate(path) else {
+            return;
+        };
+        self.pin_listing(&loc.path);
+    }
+
+    /// A change the run makes to an entry: its name is the run's own in the entry's directory, and
+    /// any listing of that directory is pinned before the change.
+    fn note_entry_change(&mut self, raw: &Path, follows: bool) {
+        let through_link =
+            follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink());
+        let Some(rec) = self.rec.as_mut() else {
+            return;
+        };
+        // A write through a link lands on what the link names.
+        let entry = if through_link {
+            fs::canonicalize(raw).unwrap_or_else(|_| raw.to_path_buf())
+        } else {
+            raw.to_path_buf()
+        };
+        let Some(loc) = rec.phys.locate(&entry) else {
+            return;
+        };
+        let (Some(dir), Some(name)) = (loc.path.parent(), loc.path.file_name()) else {
+            return;
+        };
+        let dir = dir.to_path_buf();
+        self.t
+            .own_names
+            .entry(dir.clone())
+            .or_default()
+            .insert(name.as_encoded_bytes().into());
+        self.pin_listing(&dir);
     }
 
     /// The kernel loads shebang and ELF interpreters without a traceable open syscall.
@@ -1972,7 +2203,7 @@ impl Tracer<'_> {
         }
         // Linux permits at most four recursive script interpreters.
         for _ in 0..=4 {
-            self.touch(path.clone(), true);
+            self.touch(path.clone(), Use::Content);
             let mut bytes = [0u8; 256];
             let Ok(mut file) = fs::File::open(&path) else {
                 return;
@@ -2016,7 +2247,7 @@ impl Tracer<'_> {
                         return;
                     };
                     if let Some(interpreter) = self.map_magic_path(pid, absolute) {
-                        self.touch(interpreter, true);
+                        self.touch(interpreter, Use::Content);
                     }
                 }
                 Ok(None) => {}
@@ -2029,6 +2260,7 @@ impl Tracer<'_> {
     /// Record a write, and what the path held before the first one. Returns the key when in scope.
     fn write(&mut self, raw: &Path, follows: bool) -> Option<String> {
         self.rec.as_ref()?;
+        self.note_entry_change(raw, follows);
         if !self.t.oid_attrs_changed
             && self
                 .rec
@@ -2043,7 +2275,7 @@ impl Tracer<'_> {
         if !through_link {
             self.t.written.insert(raw.to_path_buf());
         } else {
-            self.touch(raw.to_path_buf(), true);
+            self.touch(raw.to_path_buf(), Use::Look);
         }
         let rec = self.rec.as_mut()?;
         let key = rec.write(&mut self.t, raw, follows)?;
@@ -2134,7 +2366,7 @@ impl Tracer<'_> {
         match flags.map(|i| args[i] as i32) {
             // An O_TMPFILE open writes nothing; the later linkat names the file.
             Some(f) if f & libc::O_TMPFILE == libc::O_TMPFILE => {
-                self.touch(p, false);
+                self.touch(p, Use::Name);
             }
             // creat truncates the named file.
             None => {
@@ -2153,7 +2385,14 @@ impl Tracer<'_> {
                     let follows = f & libc::O_NOFOLLOW == 0 && !creates_exclusively;
                     self.write(&p, follows);
                 } else {
-                    self.touch(p, true);
+                    self.touch(
+                        p,
+                        if f & libc::O_PATH != 0 {
+                            Use::Look
+                        } else {
+                            Use::Content
+                        },
+                    );
                 }
             }
         }
@@ -2172,7 +2411,7 @@ impl Tracer<'_> {
             // mkdir on a path that exists fails with EEXIST and creates nothing: `mkdir -p`
             // and `create_dir_all` do this for every ancestor. The existence is an input.
             if fs::symlink_metadata(&p).is_ok() {
-                self.touch(p, false);
+                self.touch(p, Use::Name);
                 return;
             }
         }
@@ -2299,7 +2538,8 @@ impl Tracer<'_> {
                 if inside || self.oid_sensitive(raw, follows) {
                     self.t.oid_attrs_changed = true;
                 }
-                self.touch(raw.to_path_buf(), false);
+                self.note_listed_change(raw);
+                self.touch(raw.to_path_buf(), Use::Name);
             }
             Ok(_) => {
                 self.write(raw, follows);
@@ -2384,6 +2624,7 @@ impl Tracer<'_> {
         if inside || self.oid_sensitive(&p, !nofollow) {
             self.t.oid_attrs_changed = true;
         }
+        self.note_listed_change(&p);
     }
 
     /// fchown. The descriptor's name decides when it has one. A descriptor whose file is deleted
@@ -2438,7 +2679,7 @@ impl Tracer<'_> {
                 Op::Open { dirfd, path, flags } => self.open(pid, &args, dirfd, path, flags),
                 Op::Look { dirfd, path } => {
                     if let Some(p) = self.resolve(pid, &args, dirfd, path) {
-                        self.touch(p, true);
+                        self.touch(p, Use::Look);
                     }
                 }
                 Op::Exec { dirfd, path } => {
@@ -2467,12 +2708,12 @@ impl Tracer<'_> {
                 Op::List => {
                     let fd = args[0] as i32;
                     if let Ok(p) = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
-                        self.t.touched.entry(p).or_default().listed = true;
+                        self.observe_list(p);
                     }
                 }
                 Op::Chdir { path } => {
                     if let Some(p) = self.resolve(pid, &args, None, path) {
-                        self.touch(p, false);
+                        self.touch(p, Use::Name);
                     }
                     // Threads can share a cwd, so any chdir drops every cached value.
                     self.cwds.clear();
@@ -2524,7 +2765,7 @@ impl Tracer<'_> {
                 Op::LinkSource { dirfd, path, flags } => {
                     let by_fd = flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0);
                     if let Some(p) = self.resolve(pid, &args, dirfd, path) {
-                        self.touch(p.clone(), true);
+                        self.touch(p.clone(), Use::Look);
                         if self.oid_sensitive(&p, true) {
                             self.t.oid_attrs_changed = true;
                         }
@@ -2605,9 +2846,11 @@ mod tests {
                 git_dir: git_dir.clone(),
                 common_dir: git_dir.clone(),
                 watch,
+                watched: Vec::new(),
             })),
             link_walks: BTreeMap::new(),
             redirected_reads: HashSet::new(),
+            reads: identity::ReadBudget::default(),
         };
 
         let outside_file = base.join("outside/file");

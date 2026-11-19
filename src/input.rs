@@ -9,6 +9,7 @@
 //! - `l:<text>`  symbolic link (its target is recorded as a separate input)
 
 use crate::pathutil::from_key;
+use crate::trace::identity::{self, Post};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read};
@@ -54,40 +55,73 @@ pub fn identify_recorded(
     listed: bool,
     oids: bool,
 ) -> Option<(String, Option<String>)> {
-    match fs::symlink_metadata(path) {
+    identify_post(path, inside, listed, oids).0
+}
+
+/// What `path` holds now: the id a proof records (`None` when it is not recorded), and the state
+/// the read-time comparison checks it against.
+pub fn identify_post(
+    path: &Path,
+    inside: bool,
+    listed: bool,
+    oids: bool,
+) -> (Option<(String, Option<String>)>, Post) {
+    let m = match fs::symlink_metadata(path) {
         Err(e) => {
-            let id = match e.kind() {
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => "a",
-                _ => "u",
+            let (id, post) = match e.kind() {
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => ("a", Post::Absent),
+                _ => ("u", Post::Unreadable),
             };
-            inside.then(|| (id.to_owned(), None))
+            return (inside.then(|| (id.to_owned(), None)), post);
         }
-        Ok(m) => {
-            let ft = m.file_type();
-            if ft.is_symlink() {
-                let t = fs::read_link(path).ok()?;
-                Some((format!("l:{}", t.to_string_lossy()), None))
-            } else if ft.is_dir() {
-                let id = if listed {
-                    format!("dl:{}", list_hash(path)?)
-                } else {
-                    "d".to_owned()
-                };
-                Some((id, None))
-            } else if ft.is_file() {
-                let hash = if inside && oids {
-                    hash_file_with_oid(path)
-                } else {
-                    hash_file(path).map(|hash| (hash, None))
-                };
-                match hash {
-                    Ok((hash, oid)) => Some((file_id(executable(&m), &hash), oid)),
-                    Err(_) => inside.then(|| ("u".to_owned(), None)),
-                }
-            } else {
-                None
-            }
+        Ok(m) => m,
+    };
+    let ft = m.file_type();
+    if ft.is_symlink() {
+        return match fs::read_link(path) {
+            Ok(target) => (
+                Some((format!("l:{}", target.to_string_lossy()), None)),
+                Post::Symlink {
+                    target: target.into_os_string(),
+                },
+            ),
+            Err(_) => (None, Post::Unreadable),
+        };
+    }
+    if ft.is_dir() {
+        let stat = identity::dir_stat(&m);
+        if !listed {
+            return (
+                Some(("d".to_owned(), None)),
+                Post::Dir { stat, names: None },
+            );
         }
+        return match identity::read_names(path) {
+            Some(names) => (
+                Some((format!("dl:{}", names_hash(&names)), None)),
+                Post::Dir {
+                    stat,
+                    names: Some(names),
+                },
+            ),
+            None => (None, Post::Unreadable),
+        };
+    }
+    if !ft.is_file() {
+        return (None, Post::Special);
+    }
+    // Evidence describes a file's attributes even when conversion or a length-changing read
+    // prevents a raw Git OID from being emitted.
+    match hash_observed(path, inside && oids) {
+        Ok((hash, oid, after)) => {
+            let id = file_id(executable(&m), &hash);
+            let post = Post::File {
+                stat: identity::file_stat(&after),
+                hash,
+            };
+            (Some((id, oid)), post)
+        }
+        Err(_) => (inside.then(|| ("u".to_owned(), None)), Post::Unreadable),
     }
 }
 
@@ -109,18 +143,14 @@ pub fn records_oids(root: &Path) -> bool {
     crate::oid_attrs::snapshot(root).is_some()
 }
 
-fn list_hash(dir: &Path) -> Option<String> {
-    let mut names: Vec<Vec<u8>> = Vec::new();
-    for e in fs::read_dir(dir).ok()? {
-        names.push(e.ok()?.file_name().as_encoded_bytes().to_vec());
-    }
-    names.sort();
+/// The listing id of a directory: each entry name, sorted, with its length.
+fn names_hash(names: &identity::Names) -> String {
     let mut h = blake3::Hasher::new();
     for n in names {
         h.update(&(n.len() as u64).to_le_bytes());
-        h.update(&n);
+        h.update(n);
     }
-    Some(h.finalize().to_hex().to_string())
+    h.finalize().to_hex().to_string()
 }
 
 /// Every byte counts, whatever the file is: source, binary, archive, model weights.
@@ -212,11 +242,45 @@ fn hash_reader_with_oid(mut reader: impl Read, len: u64) -> io::Result<(String, 
     Ok((blake.finalize().to_hex().to_string(), oid))
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn hash_file_with_oid(path: &Path) -> io::Result<(String, Option<String>)> {
     let (file, metadata) = open_regular_file(path)?;
     let len = metadata.len();
     hash_reader_with_oid(file, len)
 }
+
+/// Hash a regular file and take its stat from the same descriptor after the bytes are read, so a
+/// change made while the file was being read is visible to the comparison.
+fn hash_observed(path: &Path, oids: bool) -> io::Result<(String, Option<String>, fs::Metadata)> {
+    let (mut file, before) = open_regular_file(path)?;
+    let (hash, oid) = if oids {
+        hash_reader_with_oid(&mut file, before.len())?
+    } else {
+        let mut blake = blake3::Hasher::new();
+        blake.update_reader(&mut file)?;
+        (blake.finalize().to_hex().to_string(), None)
+    };
+    after_hash();
+    let after = file.metadata()?;
+    Ok((hash, oid, after))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Runs once, after a regular file has been hashed and before its post-hash stat is taken.
+    pub(crate) static AFTER_HASH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_hash() {
+    if let Some(hook) = AFTER_HASH.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn after_hash() {}
 
 /// Run `f` over `items` on all cores, preserving order.
 pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
@@ -656,5 +720,36 @@ mod tests {
     fn proc_file_never_gets_an_oid() {
         let result = identify_recorded(Path::new("/proc/self/status"), false, false, true);
         assert!(matches!(result, Some((_, None))));
+    }
+}
+
+#[cfg(test)]
+mod post_hash_tests {
+    use super::*;
+    use crate::trace::identity::{compare, FileSeen, ReadHash, Refusal, Seen};
+
+    /// A write between the hash and the post-hash stat must be seen. Taking the stat from before the
+    /// hash would describe bytes the file no longer holds.
+    #[test]
+    fn a_write_between_the_hash_and_the_post_hash_stat_is_seen() {
+        let dir = std::env::temp_dir().join(format!("stoop-post-hash-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bytes");
+        fs::write(&path, b"abc").unwrap();
+        let before = identity::file_stat(&fs::symlink_metadata(&path).unwrap());
+        let writer = path.clone();
+        AFTER_HASH.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(&writer, b"abcdef").unwrap();
+            }));
+        });
+        let (_, post) = identify_post(&path, true, false, false);
+        let seen = Seen::File(FileSeen {
+            stat: before,
+            read_hash: ReadHash::NotNeeded,
+        });
+        assert_eq!(compare(&seen, &post, None), Err(Refusal::Changed));
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

@@ -1,4 +1,5 @@
 //! Evidence that hashing raw working-tree bytes is safe for Git object IDs.
+use crate::trace::identity;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
@@ -91,6 +92,17 @@ pub struct Epoch {
     /// The names whose change can alter what Git reads for attributes or configuration.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub watch: Watch,
+    /// Read-time state of each watched name and examined attribute file, before the command ran.
+    pub watched: Vec<(PathBuf, identity::Seen)>,
+}
+
+impl Epoch {
+    /// Whether a watched name changed while the command ran. Its blob ids are then not trustworthy.
+    pub fn watched_changed(&self) -> bool {
+        self.watched
+            .iter()
+            .any(|(path, seen)| !identity::watched_matches(seen, path))
+    }
 }
 
 /// Git's attribute and configuration sources, resolved once before the run. Each name on the way
@@ -398,25 +410,49 @@ fn known_paths(root: &Path) -> Option<HashSet<String>> {
     Some(paths)
 }
 
-// Do not let a symlink, hard link or special file redirect a worktree attribute
-// source. A missing file is fine; a tracked one that is missing is handled in known_paths.
-fn safe_worktree_sources(root: &Path, paths: &HashSet<String>) -> bool {
-    if !safe_file_or_absent(&root.join(".gitattributes")) {
-        return false;
+/// The in-repository attribute files the snapshot examined: the root's and each directory's that
+/// holds a tracked path. None when one of them is neither a plain file nor absent.
+fn worktree_attribute_files(root: &Path, paths: &HashSet<String>) -> Option<Vec<PathBuf>> {
+    // Do not let a symlink, hard link or special file redirect a worktree attribute source. A
+    // missing file is fine; a tracked one that is missing is handled in known_paths.
+    let root_file = root.join(".gitattributes");
+    if !safe_file_or_absent(&root_file) {
+        return None;
     }
+    let mut files = vec![root_file];
     let mut checked = HashSet::new();
     for path in paths {
         for (i, _) in path.match_indices('/') {
             let dir = &path[..i];
-            if checked.insert(dir)
-                && (!safe_dir_or_absent(&root.join(dir))
-                    || !safe_file_or_absent(&root.join(dir).join(".gitattributes")))
-            {
-                return false;
+            if checked.insert(dir) {
+                if !safe_dir_or_absent(&root.join(dir)) {
+                    return None;
+                }
+                let file = root.join(dir).join(".gitattributes");
+                if !safe_file_or_absent(&file) {
+                    return None;
+                }
+                files.push(file);
             }
         }
     }
-    true
+    Some(files)
+}
+
+/// The read-time state of every watched name and of every examined attribute file, taken before
+/// the command starts. A racy one is hashed now, so the comparison after the run can use its bytes.
+fn watched_seen(watch: &Watch, attribute_files: &[PathBuf]) -> Vec<(PathBuf, identity::Seen)> {
+    let now = identity::now_ns();
+    let mut budget = identity::ReadBudget::default();
+    let names: BTreeSet<&PathBuf> = watch.names.iter().chain(attribute_files).collect();
+    names
+        .into_iter()
+        .map(|path| {
+            let mut seen = identity::observe(path, true);
+            identity::hash_racy_at_read(&mut seen, path, now, &mut budget);
+            (path.clone(), seen)
+        })
+        .collect()
 }
 
 fn empty_basis(autocrlf: &str) -> OidBasis {
@@ -506,9 +542,7 @@ pub(crate) fn snapshot(root: &Path) -> Option<Epoch> {
     let autocrlf = config(&root)?;
     let watch = build_watch(&git_dir, &external_sources(&root)?)?;
     let paths = known_paths(&root)?;
-    if !safe_worktree_sources(&root, &paths) {
-        return None;
-    }
+    let attribute_files = worktree_attribute_files(&root, &paths)?;
     let mut input = Vec::new();
     let mut basis = HashMap::with_capacity(paths.len());
     for path in paths {
@@ -522,11 +556,13 @@ pub(crate) fn snapshot(root: &Path) -> Option<Epoch> {
         &input,
         MAX_OUTPUT,
     )?;
+    let watched = watched_seen(&watch, &attribute_files);
     Some(Epoch {
         basis: attributes(basis, &report)?,
         git_dir,
         common_dir,
         watch,
+        watched,
     })
 }
 

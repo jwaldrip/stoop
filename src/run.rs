@@ -5,10 +5,11 @@ mod units;
 pub(crate) use units::hook::safe;
 
 use crate::ignore::Ignore;
-use crate::input::{identify, identify_recorded, par_map, verify, Input};
+use crate::input::{identify, identify_post, par_map, verify, Input};
 use crate::pathutil::{absolutize, cwd_key, is_git_name, to_key, Physical};
 use crate::proof::{now, sanitize, Proof, Store};
 use crate::sync::Remote;
+use crate::trace::identity::{self, Post, Seen};
 use crate::trace::{self, Trace};
 use crate::volatile;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
@@ -1170,7 +1171,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             .flatten()
             .map(Arc::new),
     });
-    let trace = match trace::run(
+    let mut trace = match trace::run(
         &o.argv,
         &cwd,
         o.allow_network || !o.probes.is_empty(),
@@ -1237,6 +1238,15 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     };
 
     // 3. It passed: write down what it read, what it wrote, and what each written path held before.
+    // Attribute and configuration sources that Git reads must still be what they were before the
+    // command ran. A change makes the blob ids of this run's inputs untrustworthy, not the run.
+    if trace
+        .oid_epoch
+        .as_deref()
+        .is_some_and(|epoch| epoch.watched_changed())
+    {
+        trace.oid_attrs_changed = true;
+    }
     let mut phys = Physical::new(&root, &real_root);
     let written: BTreeSet<String> = trace.keys.values().cloned().collect();
     match build_inputs(&root, &mut phys, &trace, &ignore, &written) {
@@ -1393,19 +1403,121 @@ fn merge_reasons(first: &[String], more: Vec<String>) -> Vec<String> {
     out
 }
 
-/// What the run read, as comparable inputs, or why it cannot be trusted. A read of a path the
-/// run wrote is not an input: it reads the run's own output. A read through a link or a
-/// symlinked directory is also recorded under the key of the file it reached, so a change to
-/// that file is seen. The second value holds reasons the planner cannot replay the run.
+/// Why a run cannot be recorded. `Changed` names an input that changed while the command ran, so
+/// the command may have read other bytes than the record would describe.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotRecorded {
+    Changed { key: String },
+    Other(String),
+}
+
+impl NotRecorded {
+    fn sort_key(&self) -> &str {
+        match self {
+            NotRecorded::Changed { key } => key,
+            NotRecorded::Other(text) => text,
+        }
+    }
+}
+
+impl std::fmt::Display for NotRecorded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotRecorded::Changed { key } => write!(f, "{key} changed while the command ran"),
+            NotRecorded::Other(text) => f.write_str(text),
+        }
+    }
+}
+
+impl From<String> for NotRecorded {
+    fn from(text: String) -> Self {
+        NotRecorded::Other(text)
+    }
+}
+
+impl From<&str> for NotRecorded {
+    fn from(text: &str) -> Self {
+        NotRecorded::Other(text.to_owned())
+    }
+}
+
+/// A path to compare with its read-time identity once the command has exited.
+struct Candidate {
+    path: PathBuf,
+    key: String,
+    inside: bool,
+    listed: bool,
+    physical_key: Option<String>,
+    /// The touched path whose read-time identity covers this candidate.
+    source: PathBuf,
+    /// The candidate is what a symbolic link at `source` resolved to, so the link's followed
+    /// identity covers it rather than a touch of its own.
+    followed: bool,
+}
+
+/// Compare one candidate with what its source held at the run's first look.
+fn check_candidate(trace: &Trace, cand: &Candidate, post: &Post) -> Result<(), NotRecorded> {
+    let Some(recorded) = trace.seen.as_ref() else {
+        return Ok(());
+    };
+    let no_identity = || NotRecorded::Other(format!("{} has no read-time identity", cand.key));
+    let Some(first) = recorded.get(&cand.source) else {
+        return Err(no_identity());
+    };
+    let seen = if cand.followed {
+        match first {
+            Seen::Symlink { followed, .. } => followed.as_ref(),
+            _ => {
+                return Err(NotRecorded::Changed {
+                    key: cand.key.clone(),
+                })
+            }
+        }
+    } else {
+        first
+    };
+    let empty = identity::Names::new();
+    let listing = if cand.listed {
+        let Some(listed) = trace.listings.get(&cand.source) else {
+            return Err(no_identity());
+        };
+        Some((listed, trace.own_names.get(&cand.source).unwrap_or(&empty)))
+    } else {
+        None
+    };
+    identity::compare(seen, post, listing).map_err(|why| match why {
+        identity::Refusal::Changed => NotRecorded::Changed {
+            key: cand.key.clone(),
+        },
+        identity::Refusal::OverBudget => NotRecorded::Other(format!(
+            "{} changed less than 2 s before it was read and is too large to check (read-time hashing is capped at 1 GiB per run)",
+            cand.key
+        )),
+        identity::Refusal::Unhashable => {
+            NotRecorded::Other(format!("{} could not be read to check it", cand.key))
+        }
+    })
+}
+
+/// What the run read, as comparable inputs, or why it cannot be trusted. A read of a path the run
+/// wrote is not an input: it reads the run's own output. A read through a link or a symlinked
+/// directory is also recorded under the key of the file it reached, so a change to that file is
+/// seen. Every candidate is also compared with its read-time identity, so a change made while the
+/// command ran refuses the record. The second value holds reasons the planner cannot replay the run.
 pub fn build_inputs(
     root: &Path,
     phys: &mut Physical,
     trace: &Trace,
     ignore: &Ignore,
     written: &BTreeSet<String>,
-) -> Result<(Vec<Input>, Vec<String>), String> {
+) -> Result<(Vec<Input>, Vec<String>), NotRecorded> {
     if let Some(u) = trace.unsound.first() {
-        return Err(u.clone());
+        return Err(u.clone().into());
+    }
+    if let Some(path) = trace.changed_during.first() {
+        return Err(NotRecorded::Changed {
+            key: to_key(root, path),
+        });
     }
     let paths = trace
         .touched
@@ -1436,8 +1548,10 @@ pub fn build_inputs(
     );
     let mut reasons: Vec<String> = Vec::new();
     let mut reads_git = false;
-    // (path, key, lexical inside, entries listed, repository-relative physical key)
-    let mut cands: Vec<(PathBuf, String, bool, bool, Option<String>)> = Vec::new();
+    // Refusals found while checking the record. The reported one is the first in key order, so
+    // the message does not depend on the order the tracer's hash map happens to hold paths in.
+    let mut refusals: Vec<NotRecorded> = Vec::new();
+    let mut cands: Vec<Candidate> = Vec::new();
     for (lex, touch) in &trace.touched {
         let inside = lex.starts_with(root);
         let key = to_key(root, lex);
@@ -1460,21 +1574,23 @@ pub fn build_inputs(
                         } else if written.contains(pkey) {
                             reasons.push(format!("it read {pkey} through {key} and also wrote it"));
                         } else {
-                            cands.push((
-                                pp.clone(),
-                                pkey.to_string(),
-                                true,
-                                touch.listed,
-                                Some(pkey.to_string()),
-                            ));
+                            cands.push(Candidate {
+                                path: pp.clone(),
+                                key: pkey.to_string(),
+                                inside: true,
+                                listed: touch.listed,
+                                physical_key: Some(pkey.to_string()),
+                                source: lex.clone(),
+                                followed: false,
+                            });
                         }
                     }
                     Some(_) => {}
                 }
             }
         }
-        // A lexical key containing `..` does not describe kernel resolution across a
-        // symlink. The physical candidate above is the only faithful repository key.
+        // A lexical key containing `..` does not describe kernel resolution across a symlink. The
+        // physical candidate above is the only faithful repository key.
         if lex
             .components()
             .any(|part| matches!(part, std::path::Component::ParentDir))
@@ -1511,25 +1627,63 @@ pub fn build_inputs(
             .and_then(Path::to_str)
             .filter(|_| inside)
             .map(str::to_owned);
-        cands.push((lex.clone(), key, inside, touch.listed, physical_key));
+        cands.push(Candidate {
+            path: lex.clone(),
+            key,
+            inside,
+            listed: touch.listed,
+            physical_key,
+            source: lex.clone(),
+            followed: false,
+        });
     }
-    // A symlink hides a second file: record where it points, whether or not the link is
-    // ignored (an alias under an ignored /tmp can point into the repository).
+    // A symlink hides a second file: record where it points, whether or not the link is ignored
+    // (an alias under an ignored /tmp can point into the repository). The link must still resolve
+    // to what it resolved to at the run's first look, or the file it read is no longer the one
+    // recorded.
     for lex in trace.touched.keys() {
         if trace.magic_links.contains(lex) {
             continue;
         }
+        let first = trace.seen.as_ref().map(|seen| seen.get(lex));
         if !std::fs::symlink_metadata(lex).is_ok_and(|m| m.file_type().is_symlink()) {
+            // The run followed a link at its first look; no candidate checks what it resolved to now.
+            if let Some(Some(Seen::Symlink {
+                resolved: Some(_), ..
+            })) = first
+            {
+                refusals.push(NotRecorded::Changed {
+                    key: to_key(root, lex),
+                });
+            }
             continue;
         }
-        // Proc magic links are resolved while the tracee is stopped. Resolving them
-        // here would instead use the recorder's own process and working directory.
+        // Proc magic links are resolved while the tracee is stopped. Resolving them here would
+        // instead use the recorder's own process and working directory.
         if std::fs::read_link(lex)
             .is_ok_and(|target| target.starts_with("/proc") || target.starts_with("/dev/fd"))
         {
             continue;
         }
-        let Ok(target) = std::fs::canonicalize(lex) else {
+        let now = std::fs::canonicalize(lex).ok();
+        match first {
+            None => {}
+            Some(None) => {
+                refusals.push(NotRecorded::Other(format!(
+                    "{} has no read-time identity",
+                    to_key(root, lex)
+                )));
+                continue;
+            }
+            Some(Some(Seen::Symlink { resolved, .. })) if *resolved == now => {}
+            Some(Some(_)) => {
+                refusals.push(NotRecorded::Changed {
+                    key: to_key(root, lex),
+                });
+                continue;
+            }
+        }
+        let Some(target) = now else {
             continue;
         };
         if target == real_root {
@@ -1556,13 +1710,15 @@ pub fn build_inputs(
                     ));
                     continue;
                 }
-                cands.push((
-                    target.clone(),
-                    tkey.to_string(),
-                    true,
-                    false,
-                    Some(tkey.to_string()),
-                ));
+                cands.push(Candidate {
+                    path: target.clone(),
+                    key: tkey.to_string(),
+                    inside: true,
+                    listed: false,
+                    physical_key: Some(tkey.to_string()),
+                    source: lex.clone(),
+                    followed: true,
+                });
             }
             _ => {
                 if target
@@ -1577,15 +1733,23 @@ pub fn build_inputs(
                 if ignore.is_ignored(&link_key) || ignore.is_ignored(&tk) {
                     continue;
                 }
-                cands.push((target.clone(), tk, false, false, None));
+                cands.push(Candidate {
+                    path: target.clone(),
+                    key: tk,
+                    inside: false,
+                    listed: false,
+                    physical_key: None,
+                    source: lex.clone(),
+                    followed: true,
+                });
             }
         }
     }
     if reads_git {
         return Err("it reads .git, so a skip could hide a history change (add `.git` to .stoopignore if that read cannot change the result)".into());
     }
-    // All known paths share the snapshot taken before the command started. A
-    // changed attribute source makes both its OIDs and its evidence stale.
+    // All known paths share the snapshot taken before the command started. A changed attribute
+    // source makes both its OIDs and its evidence stale.
     let epoch = trace
         .oid_epoch
         .as_deref()
@@ -1600,36 +1764,49 @@ pub fn build_inputs(
         };
     #[cfg(test)]
     let epoch = epoch.or(synthetic_epoch.as_ref());
-    let ids = par_map(&cands, |(path, key, inside, listed, physical_key)| {
-        let basis = physical_key
+    let ids = par_map(&cands, |cand| {
+        let basis = cand
+            .physical_key
             .as_ref()
             .and_then(|physical| epoch.and_then(|epoch| epoch.basis.get(physical)));
-        // A Git OID names the blob at the input's own tree path. A read reached through
-        // another spelling (a directory alias) keeps its evidence but claims no OID.
-        let names_tree_path = physical_key.as_deref() == Some(key.as_str());
+        // A Git OID names the blob at the input's own tree path. A read reached through another
+        // spelling (a directory alias) keeps its evidence but claims no OID.
+        let names_tree_path = cand.physical_key.as_deref() == Some(cand.key.as_str());
         let with_oid = names_tree_path && basis.is_some_and(|basis| basis.allows_oid());
-        identify_recorded(path, *inside, *listed, with_oid).map(|(id, oid)| {
-            // Evidence describes a file's attributes even when conversion or a
-            // length-changing read prevents a raw Git OID from being emitted.
+        let (id, post) = identify_post(&cand.path, cand.inside, cand.listed, with_oid);
+        let checked = check_candidate(trace, cand, &post);
+        let id = id.map(|(id, oid)| {
+            // Evidence describes a file's attributes even when conversion or a length-changing read
+            // prevents a raw Git OID from being emitted.
             let oid_basis = (id.starts_with("f:") || id.starts_with("x:"))
                 .then(|| basis.cloned())
                 .flatten();
             (id, oid, oid_basis)
-        })
+        });
+        (id, checked)
     });
     let mut out: Vec<Input> = Vec::with_capacity(cands.len());
-    let mut seen: HashSet<String> = HashSet::new();
-    for ((_, key, _, _, _), id) in cands.iter().zip(ids) {
+    let mut keys: HashSet<String> = HashSet::new();
+    for (cand, (id, checked)) in cands.iter().zip(ids) {
+        if let Err(refusal) = checked {
+            refusals.push(refusal);
+        }
         if let Some((id, oid, oid_basis)) = id {
-            if seen.insert(key.clone()) {
+            if keys.insert(cand.key.clone()) {
                 out.push(Input {
-                    path: key.clone(),
+                    path: cand.key.clone(),
                     id,
                     oid,
                     oid_basis,
                 });
             }
         }
+    }
+    if let Some(refusal) = refusals
+        .into_iter()
+        .min_by(|a, b| a.sort_key().cmp(b.sort_key()))
+    {
+        return Err(refusal);
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok((out, reasons))
@@ -1856,6 +2033,7 @@ mod tests {
             trace::Touch {
                 read: true,
                 listed: false,
+                content: false,
             },
         );
         let mut phys = Physical::new(&root, &root);
@@ -1900,6 +2078,7 @@ mod tests {
             git_dir: root.join(".git"),
             common_dir: root.join(".git"),
             watch: Default::default(),
+            watched: Vec::new(),
         }));
         trace.oid_attrs_changed = true;
         let (inputs, _) = build_inputs(
@@ -1958,6 +2137,7 @@ mod tests {
             trace::Touch {
                 read: true,
                 listed: false,
+                content: false,
             },
         );
         let mut phys = Physical::new(&root, &root);
@@ -2214,5 +2394,43 @@ mod diagnostic_how_tests {
         assert!(matches!(diagnostic_how(0), How::Unrecorded(_)));
         assert!(matches!(diagnostic_how(3), How::Failed));
         assert!(matches!(diagnostic_how(-1), How::Failed));
+    }
+}
+
+#[cfg(test)]
+mod read_identity_refusals {
+    use super::*;
+    use crate::ignore::Ignore;
+    use crate::pathutil::Physical;
+    use crate::trace::Touch;
+    use std::collections::{BTreeSet, HashMap};
+
+    #[test]
+    fn a_recorded_candidate_without_a_read_time_identity_refuses_the_record() {
+        let root = std::env::temp_dir().join(format!("stoop-no-identity-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("file.txt"), b"bytes").unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let ignore = Ignore::new(&[], None, &[]);
+        let mut phys = Physical::new(&root, &root);
+        let mut trace = Trace::default();
+        trace.touched.insert(
+            root.join("file.txt"),
+            Touch {
+                read: true,
+                content: true,
+                listed: false,
+            },
+        );
+        // Recording is on, but nothing was captured for the file: the record must be refused.
+        trace.seen = Some(HashMap::new());
+        let refused =
+            build_inputs(&root, &mut phys, &trace, &ignore, &BTreeSet::new()).unwrap_err();
+        assert_eq!(refused.to_string(), "file.txt has no read-time identity");
+        // Without recording there is nothing to compare, and the same trace is accepted.
+        trace.seen = None;
+        assert!(build_inputs(&root, &mut phys, &trace, &ignore, &BTreeSet::new()).is_ok());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 }

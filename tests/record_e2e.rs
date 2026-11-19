@@ -1438,6 +1438,18 @@ fn recorder_base_vs_head_timing_fixture() {
     for i in 0..128 {
         fs::write(w.root.join(format!("small/{i:04}.txt")), [b'x'; 1024]).unwrap();
     }
+    fs::create_dir(w.root.join("reads")).unwrap();
+    for i in 0..10_000 {
+        fs::write(w.root.join(format!("reads/{i:05}.txt")), [b'x'; 64]).unwrap();
+    }
+    for i in 0..1_000 {
+        let dir = w.root.join(format!("listed/{i:04}"));
+        fs::create_dir_all(&dir).unwrap();
+        for j in 0..10 {
+            fs::write(dir.join(format!("e{j}")), b"e").unwrap();
+        }
+    }
+    fs::create_dir(w.root.join("racy")).unwrap();
     w.commit_all();
     eprintln!(
         "stoop benchmark: same repository and runner, tracked files, fresh store per run, \
@@ -1459,6 +1471,14 @@ fn recorder_base_vs_head_timing_fixture() {
             128,
             "priors",
         ),
+        ("reads-10k", "cat reads/*.txt >/dev/null", 10_000, "inputs"),
+        (
+            "listdirs-1k",
+            "for d in listed/*; do ls \"$d\" >/dev/null; done",
+            1_000,
+            "inputs",
+        ),
+        ("racy-128", "cat racy/*.txt >/dev/null", 128, "inputs"),
     ] {
         let comparison = if workload == "overwrite-128" {
             let Some(previous) = &previous else {
@@ -1483,6 +1503,12 @@ fn recorder_base_vs_head_timing_fixture() {
                 if workload == "overwrite-128" {
                     for i in 0..128 {
                         fs::write(w.root.join(format!("small/{i:04}.txt")), [b'x'; 1024]).unwrap();
+                    }
+                }
+                if workload == "racy-128" {
+                    // Written just before the run, so each file is racy when the command reads it.
+                    for i in 0..128 {
+                        fs::write(w.root.join(format!("racy/{i:04}.txt")), [b'x'; 1024]).unwrap();
                     }
                 }
                 let store = w
@@ -1546,17 +1572,20 @@ fn recorder_base_vs_head_timing_fixture() {
                 )
                 .unwrap();
                 let inputs = file["proofs"][0][field].as_array().unwrap();
-                let count = inputs
-                    .iter()
-                    .filter(|item| {
-                        let path = item["path"].as_str().unwrap();
-                        if workload == "large-16MiB" {
-                            path == "payload.bin"
-                        } else {
-                            path.starts_with("small/")
+                let counted = |item: &Value| {
+                    let path = item["path"].as_str().unwrap();
+                    match workload {
+                        "large-16MiB" => path == "payload.bin",
+                        "reads-10k" => path.starts_with("reads/"),
+                        "listdirs-1k" => {
+                            path.starts_with("listed/")
+                                && item["id"].as_str().is_some_and(|id| id.starts_with("dl:"))
                         }
-                    })
-                    .count();
+                        "racy-128" => path.starts_with("racy/"),
+                        _ => path.starts_with("small/"),
+                    }
+                };
+                let count = inputs.iter().filter(|item| counted(item)).count();
                 assert_eq!(count, expected_count, "{workload}: {inputs:?}");
                 if label == "head" {
                     for item in inputs.iter().filter(|item| {

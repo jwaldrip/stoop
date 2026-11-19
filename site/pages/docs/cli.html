@@ -116,4 +116,10 @@
   <dd>The run passed and a proof was written.</dd>
   <dt>stoop: not recorded: REASON</dt>
   <dd>The run passed but couldn't be vouched for. See <a href="how-it-works.html#fails-wide">when it runs anyway</a>.</dd>
+  <dt>stoop: not recorded: KEY changed while the command ran</dt>
+  <dd>Something the command read, listed or looked for changed after the command first looked at it, so the proof could not describe what it read. Nothing is recorded. See <a href="blind-spots.html#edits-while-running">edits while a command runs</a>.</dd>
+  <dt>stoop: not recorded: KEY changed less than 2 s before it was read and is too large to check (read-time hashing is capped at 1 GiB per run)</dt>
+  <dd>The command read a file that changed in the last two seconds, and the run had no read budget left to hash it when it read it.</dd>
+  <dt>stoop: not recorded: it listed more than 1048576 directory entries</dt>
+  <dd>The command listed directories with more entries in total than stoop snapshots in one run.</dd>
 </dl>
