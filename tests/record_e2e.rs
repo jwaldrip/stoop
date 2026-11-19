@@ -427,7 +427,8 @@ fn prior_blob_attributes_are_queried_once_for_128_overwrites() {
          printf '%s\\n' invocation >> \"$STOOP_TEST_GIT_LOG\"\n\
          for arg in \"$@\"; do\n\
            case \"$arg\" in\n\
-             config|check-attr) printf '%s\\n' \"$arg\" >> \"$STOOP_TEST_GIT_LOG\" ;;\n\
+             check-attr) printf '%s\\n' check-attr >> \"$STOOP_TEST_GIT_LOG\" ;;\n\
+             --list) printf '%s\\n' config-list >> \"$STOOP_TEST_GIT_LOG\" ;;\n\
            esac\n\
          done\n\
          exec \"$STOOP_TEST_REAL_GIT\" \"$@\"\n",
@@ -479,7 +480,10 @@ fn prior_blob_attributes_are_queried_once_for_128_overwrites() {
         "{total} Git processes for 128 priors: {invocations}"
     );
     assert_eq!(
-        invocations.lines().filter(|line| *line == "config").count(),
+        invocations
+            .lines()
+            .filter(|line| *line == "config-list")
+            .count(),
         1,
         "{invocations}"
     );

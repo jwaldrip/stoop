@@ -97,15 +97,19 @@ pub(crate) fn shared_scope(root: &Path, store: &Path) -> Option<String> {
         .join(".git")
         .exists()
         .then(|| {
-            crate::gitprobe::output(
-                root,
-                &["config", "--local", "--get", "remote.origin.url"],
-                &[],
-                64 * 1024,
-            )
-            .and_then(|out| String::from_utf8(out).ok())
-            .map(|url| url.trim().to_string())
-            .filter(|url| !url.is_empty())
+            Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(["config", "--local", "--get", "remote.origin.url"])
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .env_remove("GIT_COMMON_DIR")
+                .output()
+                .ok()
+                .filter(|out| out.status.success())
+                .and_then(|out| String::from_utf8(out.stdout).ok())
+                .map(|url| url.trim().to_string())
+                .filter(|url| !url.is_empty())
         })
         .flatten();
     let mut h = blake3::Hasher::new();
@@ -570,7 +574,7 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         ignore: &ignore,
         // One attribute snapshot per run, taken before the command can change anything.
         oid_epoch: trace::supported()
-            .then(|| crate::oid_attrs::snapshot(&real_root))
+            .then(|| crate::oid_attrs::capture(&real_root))
             .flatten()
             .map(Arc::new),
     });

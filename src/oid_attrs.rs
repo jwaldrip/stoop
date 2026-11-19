@@ -405,13 +405,22 @@ fn attributes(
     Some(basis)
 }
 
-/// Capture one configuration and attribute batch for the known worktree paths.
-/// Unsafe environment, ambiguous state, unsupported topology or failed Git
-/// probes return no epoch, not a guessed basis.
-pub fn snapshot(root: &Path) -> Option<Epoch> {
-    if !safe_default_attributes()
-        || std::env::vars_os().any(|(key, _)| key.as_os_str().as_bytes().starts_with(b"GIT_"))
-    {
+/// Capture the repository's configuration and attribute batch for the known
+/// worktree paths, for this process. An inherited `GIT_*` variable declines the
+/// capture, because Git's environment can select attribute sources, object
+/// formats or directories that this capture does not model.
+pub fn capture(root: &Path) -> Option<Epoch> {
+    if std::env::vars_os().any(|(key, _)| key.as_os_str().as_bytes().starts_with(b"GIT_")) {
+        return None;
+    }
+    snapshot(root)
+}
+
+/// The repository's configuration and attribute batch, read without consulting
+/// this process's environment. Unsupported topology, ambiguous state or a failed
+/// Git probe returns no epoch, not a guessed basis.
+pub(crate) fn snapshot(root: &Path) -> Option<Epoch> {
+    if !safe_default_attributes() {
         return None;
     }
     let root = root.canonicalize().ok()?;
@@ -442,13 +451,13 @@ pub fn snapshot(root: &Path) -> Option<Epoch> {
 }
 
 /// Observe conversion evidence even when it makes the path ineligible.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 pub fn observe(root: &Path, path: &str) -> Option<OidBasis> {
     snapshot(root)?.basis.remove(path)
 }
 
 /// Evidence for a known path only when Git hashes its raw bytes.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 pub fn check(root: &Path, path: &str) -> Option<OidBasis> {
     observe(root, path).filter(OidBasis::allows_oid)
 }
@@ -725,7 +734,7 @@ mod tests {
     #[test]
     fn clean_git_env_probe_child() {
         if let Some(root) = std::env::var_os("STOOP_CLEAN_GIT_ENV_PROBE") {
-            let epoch = snapshot(Path::new(&root)).unwrap();
+            let epoch = capture(Path::new(&root)).unwrap();
             assert!(epoch.basis["plain.txt"].allows_oid());
         }
     }
@@ -878,7 +887,7 @@ mod tests {
     #[test]
     fn fifo_probe_child() {
         if let Some(root) = std::env::var_os("STOOP_FIFO_PROBE") {
-            assert!(check(Path::new(&root), "plain.txt").is_none());
+            assert!(capture(Path::new(&root)).is_none());
         }
     }
 
@@ -929,7 +938,7 @@ mod tests {
     #[test]
     fn git_env_probe_child() {
         if let Some(root) = std::env::var_os("STOOP_GIT_ENV_PROBE") {
-            assert!(check(Path::new(&root), "plain.txt").is_none());
+            assert!(capture(Path::new(&root)).is_none());
         }
     }
 

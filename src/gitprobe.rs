@@ -28,14 +28,20 @@ const ALLOWED: &[&[&str]] = &[
         "--git-common-dir",
         "--show-object-format",
     ],
-    &["config", "--null", "--list", "--no-includes", "--show-origin"],
+    &[
+        "config",
+        "--null",
+        "--list",
+        "--no-includes",
+        "--show-origin",
+    ],
     &["ls-files", "--stage", "-z"],
     &["ls-files", "--others", "--exclude-standard", "-z"],
     &["check-attr", "--all", "-z", "--stdin"],
 ];
 
 fn allowed(args: &[&str]) -> bool {
-    ALLOWED.iter().any(|candidate| *candidate == args)
+    ALLOWED.contains(&args)
 }
 
 /// Runs `git -C root <args>` with `input` on stdin. Returns stdout only when
@@ -58,7 +64,10 @@ pub fn output(root: &Path, args: &[&str], input: &[u8], max_bytes: usize) -> Opt
     }
     if let Some(parent) = root.parent() {
         // Discovery may end at root but never above its parent.
-        command.env("GIT_CEILING_DIRECTORIES", std::env::join_paths([parent]).ok()?);
+        command.env(
+            "GIT_CEILING_DIRECTORIES",
+            std::env::join_paths([parent]).ok()?,
+        );
     }
     command
         .arg("-C")
@@ -159,7 +168,10 @@ fn nonblocking(fd: RawFd) -> io::Result<()> {
 }
 
 fn retryable(err: &io::Error) -> bool {
-    matches!(err.kind(), io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock)
+    matches!(
+        err.kind(),
+        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+    )
 }
 
 // Grows `out` for `extra` bytes that were just read, never past `max_bytes`.
@@ -176,7 +188,10 @@ fn reserve(out: &mut Vec<u8>, extra: usize, max_bytes: usize) -> Option<()> {
 }
 
 fn collect(child: Child, input: &[u8], max_bytes: usize, deadline: Instant) -> Option<Vec<u8>> {
-    let mut leader = Leader { child, reaped: false };
+    let mut leader = Leader {
+        child,
+        reaped: false,
+    };
     let mut stdin = leader.child.stdin.take().filter(|_| !input.is_empty());
     let mut stdout = leader.child.stdout.take();
     if let Some(pipe) = &stdin {
@@ -246,19 +261,38 @@ fn collect(child: Child, input: &[u8], max_bytes: usize, deadline: Instant) -> O
             return None;
         }
         let mut fds = [
-            libc::pollfd { fd: -1, events: 0, revents: 0 },
-            libc::pollfd { fd: -1, events: 0, revents: 0 },
+            libc::pollfd {
+                fd: -1,
+                events: 0,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: -1,
+                events: 0,
+                revents: 0,
+            },
         ];
         let mut count: usize = 0;
         if let Some(pipe) = &stdout {
-            fds[count] = libc::pollfd { fd: pipe.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            fds[count] = libc::pollfd {
+                fd: pipe.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
             count += 1;
         }
         if let Some(pipe) = &stdin {
-            fds[count] = libc::pollfd { fd: pipe.as_raw_fd(), events: libc::POLLOUT, revents: 0 };
+            fds[count] = libc::pollfd {
+                fd: pipe.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
             count += 1;
         }
-        let mut millis = remaining.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32;
+        let mut millis = remaining
+            .as_nanos()
+            .div_ceil(1_000_000)
+            .min(i32::MAX as u128) as i32;
         if count == 0 {
             // Only the leader's exit remains, and poll cannot wait on it.
             millis = millis.min(10);
@@ -267,7 +301,10 @@ fn collect(child: Child, input: &[u8], max_bytes: usize, deadline: Instant) -> O
         if rc < 0 && io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
             return None;
         }
-        if fds[..count].iter().any(|fd| (fd.revents & libc::POLLNVAL) != 0) {
+        if fds[..count]
+            .iter()
+            .any(|fd| (fd.revents & libc::POLLNVAL) != 0)
+        {
             return None;
         }
     }
@@ -323,7 +360,10 @@ mod tests {
         let mut status = 0;
         let rc = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
         assert_eq!(rc, -1);
-        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ECHILD));
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
     }
 
     // Fixture setup runs outside the probe, so it also drops inherited GIT_* overrides.
@@ -408,11 +448,21 @@ mod tests {
         ];
         assert_eq!(output(&outside.0, rev_parse, &[], 4096), None);
         assert_eq!(
-            run(sh("printf secret >&2; printf ok; exit 3"), b"", 16, Duration::from_secs(2)),
+            run(
+                sh("printf secret >&2; printf ok; exit 3"),
+                b"",
+                16,
+                Duration::from_secs(2)
+            ),
             None
         );
         assert_eq!(
-            run(sh("printf secret >&2; printf ok"), b"", 16, Duration::from_secs(2)),
+            run(
+                sh("printf secret >&2; printf ok"),
+                b"",
+                16,
+                Duration::from_secs(2)
+            ),
             Some(b"ok".to_vec())
         );
     }
@@ -420,12 +470,24 @@ mod tests {
     #[test]
     fn output_is_capped_before_it_is_retained() {
         let timeout = Duration::from_secs(2);
-        assert_eq!(run(sh("head -c 100000 /dev/zero"), b"", 1000, timeout), None);
+        assert_eq!(
+            run(sh("head -c 100000 /dev/zero"), b"", 1000, timeout),
+            None
+        );
         assert_eq!(run(Command::new("/bin/cat"), b"x", 0, timeout), None);
-        assert_eq!(run(Command::new("/bin/cat"), b"abc", 3, timeout), Some(b"abc".to_vec()));
-        assert_eq!(run(Command::new("/bin/cat"), b"", 0, timeout), Some(Vec::new()));
+        assert_eq!(
+            run(Command::new("/bin/cat"), b"abc", 3, timeout),
+            Some(b"abc".to_vec())
+        );
+        assert_eq!(
+            run(Command::new("/bin/cat"), b"", 0, timeout),
+            Some(Vec::new())
+        );
         let big = vec![b'a'; CHUNK * 4];
-        assert_eq!(run(Command::new("/bin/cat"), &big, big.len() - 1, timeout), None);
+        assert_eq!(
+            run(Command::new("/bin/cat"), &big, big.len() - 1, timeout),
+            None
+        );
     }
 
     #[test]
@@ -435,7 +497,10 @@ mod tests {
         let child = spawn(&mut command).unwrap();
         let pid = child.id();
         let start = Instant::now();
-        assert_eq!(collect(child, &[], 16, start + Duration::from_millis(300)), None);
+        assert_eq!(
+            collect(child, &[], 16, start + Duration::from_millis(300)),
+            None
+        );
         assert!(start.elapsed() < Duration::from_secs(5));
         assert_reaped(pid);
     }
@@ -482,11 +547,17 @@ mod tests {
         let leader_pid = leader.id();
         let waited = Instant::now();
         while read_pid(&pid_path).is_none() {
-            assert!(waited.elapsed() < Duration::from_secs(30), "holder never started");
+            assert!(
+                waited.elapsed() < Duration::from_secs(30),
+                "holder never started"
+            );
             thread::sleep(Duration::from_millis(10));
         }
         let start = Instant::now();
-        assert_eq!(collect(leader, &[], 4096, start + Duration::from_secs(1)), None);
+        assert_eq!(
+            collect(leader, &[], 4096, start + Duration::from_secs(1)),
+            None
+        );
         assert!(start.elapsed() < Duration::from_secs(5));
         assert_reaped(leader_pid);
     }
@@ -494,7 +565,12 @@ mod tests {
     #[test]
     fn large_input_and_output_are_pipelined_without_deadlock() {
         let input: Vec<u8> = (0..1_048_576usize).map(|i| (i % 251) as u8).collect();
-        let echoed = run(Command::new("/bin/cat"), &input, input.len(), Duration::from_secs(10));
+        let echoed = run(
+            Command::new("/bin/cat"),
+            &input,
+            input.len(),
+            Duration::from_secs(10),
+        );
         assert_eq!(echoed.as_deref(), Some(input.as_slice()));
     }
 
@@ -502,13 +578,19 @@ mod tests {
     fn a_reader_that_never_drains_input_cannot_hold_the_caller() {
         let input = vec![0u8; 4 * 1024 * 1024];
         let start = Instant::now();
-        assert_eq!(run(sh("sleep 30"), &input, 16, Duration::from_millis(300)), None);
+        assert_eq!(
+            run(sh("sleep 30"), &input, 16, Duration::from_millis(300)),
+            None
+        );
         assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
     fn missing_root_fails_closed() {
         let missing = std::env::temp_dir().join("stoop-gitprobe-no-such-root");
-        assert_eq!(output(&missing, &["ls-files", "--stage", "-z"], &[], 16), None);
+        assert_eq!(
+            output(&missing, &["ls-files", "--stage", "-z"], &[], 16),
+            None
+        );
     }
 }
