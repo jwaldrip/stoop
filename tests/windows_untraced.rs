@@ -120,6 +120,7 @@ fn the_working_directory_environment_and_output_pass_through() {
         .env("STOOP_STORE", w.dir.join("store"))
         .env("STOOP_WIN_VAR", "hello-from-env")
         .env_remove("STOOP_OFF")
+        .env_remove("GITHUB_ACTIONS")
         .output()
         .unwrap();
     let stdout = text(&out.stdout);
@@ -158,6 +159,7 @@ fn stoop_sh_runs_the_script_under_bash_and_returns_its_status() {
         .env("STOOP_STORE", w.dir.join("store"))
         .env("PATH", path)
         .env_remove("STOOP_OFF")
+        .env_remove("GITHUB_ACTIONS")
         .output()
         .unwrap();
     let stderr = text(&out.stderr);
