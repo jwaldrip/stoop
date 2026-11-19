@@ -509,7 +509,7 @@ fn build<S: attest::KeySource>(
     let verifier = verifier_factory(policy, now, ceiling);
     let resolver = gha::resolve::Git::from_env(root).with_revision(tree.commit());
     let actions =
-        gha::resolve::ActionCheck::with_strict(&resolver, run::env_flag("STOOP_STRICT_ACTIONS"));
+        gha::resolve::ActionCheck::with_strict(&resolver, crate::journal::strict_actions());
     let check = Composite {
         verifier: &verifier,
         actions: &actions,
