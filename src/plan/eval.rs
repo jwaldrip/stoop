@@ -2149,6 +2149,18 @@ mod tests {
         );
     }
     #[test]
+    fn the_planner_refuses_a_proof_that_excluded_a_learned_name() {
+        let mut f = Fixture::new();
+        // A learned name is excluded only while its value looks like an identifier. The planner
+        // cannot see that value, so it refuses to replay such an exclusion.
+        let mut p = proof(vec![]);
+        p.env_excluded = vec!["VOLATILE_LEARNED_NAME".into()];
+        f.install(vec![p]);
+        let decision = f.decide(BTreeMap::new());
+        assert_eq!(decision.code, Code::Unplannable, "{}", decision.detail);
+        assert!(decision.detail.contains("learned"), "{}", decision.detail);
+    }
+    #[test]
     fn checkout_conversion_attributes_are_checked_at_commit() {
         for (attribute, blocked) in [
             ("text eol=crlf", true),

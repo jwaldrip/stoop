@@ -48,7 +48,13 @@ impl Ws {
             .env_remove("STOOP_ENV_SALT")
             .env_remove("CI_COMMIT_SHA")
             .env_remove("NODE_ENV")
-            .env_remove("SESSION_MARK_LEARN");
+            .env_remove("SESSION_MARK_LEARN")
+            .env_remove("JENKINS_URL")
+            .env_remove("TEAMCITY_VERSION")
+            .env_remove("TF_BUILD")
+            .env_remove("STY")
+            .env_remove("BUILD_NUMBER")
+            .env_remove("SOURCE_DATE_EPOCH");
         for (name, value) in env {
             command.env(name, value);
         }
@@ -318,4 +324,71 @@ fn a_damaged_learner_state_warns_and_counts_everything() {
     let stderr = w.run(&[("SESSION_MARK_LEARN", &opaque(0))]);
     assert!(stderr.contains("volatile env records"), "{stderr}");
     assert!(stderr.contains("recorded"), "{stderr}");
+}
+
+#[test]
+fn a_learned_name_whose_value_stops_looking_like_an_id_is_counted_again() {
+    let w = Ws::new("plain-after-learning");
+    for i in 0..4 {
+        w.run(&[("SESSION_MARK_LEARN", &opaque(i))]);
+    }
+    let plain = w.run(&[("SESSION_MARK_LEARN", "production")]);
+    assert!(!skipped(&plain), "{plain}");
+    assert!(
+        plain.contains("counting env SESSION_MARK_LEARN again"),
+        "{plain}"
+    );
+}
+
+#[test]
+fn an_unset_learned_name_counts() {
+    let w = Ws::new("unset-after-learning");
+    for i in 0..4 {
+        w.run(&[("SESSION_MARK_LEARN", &opaque(i))]);
+    }
+    let unset = w.run(&[]);
+    assert!(!skipped(&unset), "{unset}");
+}
+
+#[test]
+fn forgetting_the_learning_stops_an_old_exclusion_from_matching() {
+    let w = Ws::new("forget-exclusion");
+    for i in 0..4 {
+        w.run(&[("SESSION_MARK_LEARN", &opaque(i))]);
+    }
+    let (code, stderr) = w.stoop(&[], &["forget", "--volatile", "--root", ".", "v"]);
+    assert_eq!(code, 0, "{stderr}");
+    let after = w.run(&[]);
+    assert!(!skipped(&after), "{after}");
+}
+
+#[test]
+fn source_date_epoch_is_never_learned() {
+    let w = Ws::new("epoch");
+    for i in 0..6u64 {
+        let stderr = w.run(&[("SOURCE_DATE_EPOCH", &format!("{}", 1_700_000_000 + i))]);
+        assert!(!skipped(&stderr), "run {}: {stderr}", i + 1);
+    }
+}
+
+#[test]
+fn build_number_counts_outside_its_provider() {
+    let w = Ws::new("build-number");
+    w.run(&[("BUILD_NUMBER", "101")]);
+    let second = w.run(&[("BUILD_NUMBER", "102")]);
+    assert!(!skipped(&second), "{second}");
+}
+
+#[test]
+fn build_number_is_excluded_under_jenkins() {
+    let w = Ws::new("build-number-jenkins");
+    w.run(&[
+        ("BUILD_NUMBER", "101"),
+        ("JENKINS_URL", "https://ci.example/"),
+    ]);
+    let second = w.run(&[
+        ("BUILD_NUMBER", "102"),
+        ("JENKINS_URL", "https://ci.example/"),
+    ]);
+    assert!(skipped(&second), "{second}");
 }
