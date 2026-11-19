@@ -8,7 +8,7 @@ import { ensureBuilt, SITE_DIR } from "./support/build.mjs";
 import { loadScript } from "./support/vm-host.mjs";
 import { contractProblems, LIMITS } from "./support/contract.mjs";
 import {
-  readShipped, readIndex, staticProblems, signalProblems, executeAll, budgetProblems, contentProblems, paginationProblems,
+  readShipped, readIndex, staticProblems, signalProblems, executeAll, budgetProblems, contentProblems, paginationProblems, badInputProblems,
 } from "./support/guards.mjs";
 
 before(() => ensureBuilt());
@@ -35,10 +35,14 @@ test("the shipped script registers the five read-only tools, and they meet the c
   }
 });
 
-test("each tool returns the content it promises, within the output budget", async () => {
+test("each tool resolves with an object of at most 1500 serialised characters, with the content it promises", async () => {
   const { outputs } = await executeAll(readShipped(), SITE_DIR);
-  for (const [name, output] of Object.entries(outputs)) assert.ok(output.length <= LIMITS.output, `${name} is ${output.length} characters`);
-  assert.deepEqual(contentProblems(outputs, readIndex(SITE_DIR), SITE_DIR), []);
+  for (const [name, output] of Object.entries(outputs)) {
+    assert.equal(typeof output, "object", `${name} resolves with an object`);
+    const size = JSON.stringify(output).length;
+    assert.ok(size <= LIMITS.output, `${name} serialises to ${size} characters`);
+  }
+  assert.deepEqual(contentProblems(outputs, readIndex(SITE_DIR)), []);
 });
 
 test("following next_offset rebuilds a long page exactly", async () => {
@@ -51,14 +55,9 @@ test("every fetch passes the tool's AbortSignal, and an aborted call rejects wit
   assert.deepEqual(await signalProblems(readShipped(), SITE_DIR), []);
 });
 
-test("bad input rejects with a short message: an unknown page, section, provider, query or offset", async () => {
+test("bad input resolves with an error object that names the valid choices, within the budget", async () => {
   const { tools } = await executeAll(readShipped(), SITE_DIR);
-  const run = (name, input) => tools.find((t) => t.name === name).execute(input, { signal: new AbortController().signal });
-  await assert.rejects(run("read_page", { path: "docs/missing" }), (e) => /No page at docs\/missing\.md/.test(e.message) && e.message.length <= LIMITS.output);
-  await assert.rejects(run("read_page", { path: "docs/cli.md", section: "no-such-section" }), (e) => /No section no-such-section/.test(e.message) && e.message.length <= LIMITS.output);
-  await assert.rejects(run("read_page", { path: "docs/cli.md", offset: -1 }), /offset must be a whole number/);
-  await assert.rejects(run("get_ci_recipe", { provider: "travis" }), /provider must be one of/);
-  await assert.rejects(run("search_docs", { query: "a" }), /two or more letters/);
+  assert.deepEqual(await badInputProblems(tools), []);
 });
 
 test("with no modelContext the script registers nothing and throws nothing", async () => {
@@ -102,10 +101,15 @@ test("the budget guard fails: a name over 30 characters, a description over 500,
   assert.ok(contractProblems(longParamName).some((p) => /the parameter q+ is 31 characters, over 30/.test(p)));
 });
 
-test("the budget guard fails: an output over 1500 characters, and fewer than five tools", async () => {
+test("the budget guard fails: a result over 1500 serialised characters, and fewer than five tools", async () => {
   const tools = await registeredTools();
-  assert.ok(contractProblems(tools, { list_pages: "x".repeat(LIMITS.output + 1) }).some((p) => /output is \d+ characters, over 1500/.test(p)));
+  assert.ok(contractProblems(tools, { list_pages: { pad: "x".repeat(LIMITS.output) } }).some((p) => /serialised result is \d+ characters, over 1500/.test(p)));
   assert.ok(contractProblems(tools.slice(0, 4)).some((p) => /only 4 tools/.test(p)));
+});
+
+test("the result guard fails: a result that is JSON text rather than an object", async () => {
+  const tools = await registeredTools();
+  assert.ok(contractProblems(tools, { list_pages: JSON.stringify({ total_pages: 1 }) }).some((p) => /must be an object/.test(p)));
 });
 
 test("the wording guard fails: a description that does not start with Returns, or uses negative wording", async () => {
@@ -135,14 +139,32 @@ test("the dash guard fails: an en or em dash anywhere in the script", () => {
   assert.ok(staticProblems(`${readShipped()}\n// a dash \u2014 here`).some((p) => /en or em dash/.test(p)));
 });
 
-test("the output guard fails: a raised LIMIT lets outputs exceed the budget", async () => {
+test("the output guard fails: a raised LIMIT lets results exceed the budget", async () => {
   const raised = mutate("const LIMIT = 1500;", "const LIMIT = 5000;");
   const { tools, outputs, errors } = await executeAll(raised, SITE_DIR);
   assert.ok(budgetProblems(tools, outputs, errors).some((p) => /over 1500/.test(p)));
 });
 
+test("the result guard fails: a tool that returns JSON text, serialised twice", async () => {
+  const doubled = mutate("return at(cut);", "return JSON.stringify(at(cut));");
+  const { tools, outputs, errors } = await executeAll(doubled, SITE_DIR);
+  assert.ok(budgetProblems(tools, outputs, errors).some((p) => /must be an object/.test(p)));
+});
+
+test("the error guard fails: a bad page that rejects instead of resolving with an error object", async () => {
+  const thrown = mutate("if (!page) return missingPage(idx, input.path);", 'if (!page) throw new DOMException("Not found", "OperationError");');
+  const { tools } = await executeAll(thrown, SITE_DIR);
+  assert.ok((await badInputProblems(tools)).some((p) => /rejected with OperationError/.test(p)));
+});
+
+test("the echo guard fails: an unknown section whose name is echoed without a bound", async () => {
+  const unbounded = mutate("No section ${echo(String(wanted).trim())} on", "No section ${String(wanted).trim()} on");
+  const { tools } = await executeAll(unbounded, SITE_DIR);
+  assert.ok((await badInputProblems(tools)).some((p) => /error object serialises to \d+ characters/.test(p)));
+});
+
 test("the content guard fails: a read_page that returns the wrong section", async () => {
-  const wrong = mutate("const section = findSection(page, input.section);", 'const section = findSection(page, "options");');
+  const wrong = mutate("const section = sectionNamed(page, input.section);", 'const section = sectionNamed(page, "options");');
   const { outputs } = await executeAll(wrong, SITE_DIR);
-  assert.ok(contentProblems(outputs, readIndex(SITE_DIR), SITE_DIR).some((p) => /did not return the changed-hook section/.test(p)));
+  assert.ok(contentProblems(outputs, readIndex(SITE_DIR)).some((p) => /did not return the changed-hook section/.test(p)));
 });

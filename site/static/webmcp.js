@@ -2,17 +2,27 @@
 // The tools read the same build as the pages: the Markdown twins and docs-index.json,
 // by same-origin fetch. Nothing is written, sent or stored. Where the browser exposes no
 // modelContext (Chrome needs an origin trial for WebMCP), this file does nothing.
+//
+// The browser serialises each value that execute() resolves with, once. So every result is
+// an object, measured as the JSON text the agent receives, and kept within LIMIT characters.
+// Bad input resolves with an error object that names the valid choices. Only a failed
+// request or an aborted signal rejects.
 (() => {
   "use strict";
 
   const modelContext = document.modelContext || navigator.modelContext;
   if (!modelContext || typeof modelContext.registerTool !== "function") return;
 
-  // Every output is at most this many characters: the JSON that the tool returns.
+  // The most characters one tool result may serialise to.
   const LIMIT = 1500;
+  // Input that a tool echoes back (a path, a section name, a query) is cut to this length.
+  const ECHO = 100;
   const script = document.currentScript || document.querySelector('script[src$="webmcp.js"]');
   const base = new URL("./", script ? script.src : location.href);
   let index = null;
+
+  const measure = (value) => JSON.stringify(value).length;
+  const echo = (value) => String(value ?? "").slice(0, ECHO);
 
   const aborted = (signal) => {
     if (signal && signal.aborted) throw new DOMException("The tool call was aborted.", "AbortError");
@@ -34,40 +44,45 @@
   // The body of a twin is the text after its canonical line and the blank line that follows.
   const bodyOf = (text) => (text.startsWith("Canonical: ") ? text.slice(text.indexOf("\n\n") + 2) : text);
 
-  // Returns the envelope made from the longest prefix of `text` whose JSON fits LIMIT.
-  // make(slice, truncated) builds the envelope for a prefix of `text`.
+  // The result for the longest prefix of `text` whose serialised result fits LIMIT.
+  // make(slice, truncated) builds the result object for a prefix of `text`.
   const fitWindow = (text, make) => {
-    const json = (n) => JSON.stringify(make(text.slice(0, n), n < text.length));
-    if (json(text.length).length <= LIMIT) return json(text.length);
+    const at = (n) => make(text.slice(0, n), n < text.length);
+    if (measure(at(text.length)) <= LIMIT) return at(text.length);
     let lo = 0;
     let hi = text.length;
     while (lo < hi) {
       const mid = (lo + hi + 1) >> 1;
-      if (json(mid).length <= LIMIT) lo = mid;
+      if (measure(at(mid)) <= LIMIT) lo = mid;
       else hi = mid - 1;
     }
     let cut = lo;
     const newline = cut > 0 ? text.lastIndexOf("\n", cut - 1) : -1;
     if (newline >= 0 && newline > cut - 200) cut = newline + 1;
     if (cut > 0 && /[\ud800-\udbff]/.test(text[cut - 1])) cut -= 1;
-    return json(cut);
+    return at(cut);
   };
 
-  // Returns the envelope for as many leading items as fit LIMIT.
+  // The result for as many leading items as fit LIMIT. make(shown, truncated).
   const fitList = (items, make) => {
     for (let n = items.length; n > 0; n--) {
-      const json = JSON.stringify(make(items.slice(0, n), n < items.length));
-      if (json.length <= LIMIT) return json;
+      const result = make(items.slice(0, n), n < items.length);
+      if (measure(result) <= LIMIT) return result;
     }
-    return JSON.stringify(make([], items.length > 0));
+    return make([], items.length > 0);
   };
 
-  const parseOffset = (value, length) => {
+  // The offset a tool was given, or null when it is not a whole number from 0 to length.
+  const offsetOf = (value, length) => {
     if (value === undefined) return 0;
     const n = Number(value);
-    if (!Number.isInteger(n) || n < 0 || n > length) throw new Error(`offset must be a whole number from 0 to ${length}.`);
-    return n;
+    return Number.isInteger(n) && n >= 0 && n <= length ? n : null;
   };
+
+  const offsetError = (length) => ({
+    error: `offset must be a whole number from 0 to ${length}.`,
+    valid_range: [0, length],
+  });
 
   const normalisePath = (raw) => {
     let path = String(raw ?? "").trim().replace(/^https?:\/\/stoop\.build\//i, "").replace(/^\/+/, "");
@@ -78,23 +93,28 @@
     return path;
   };
 
-  const findPage = (idx, raw) => {
+  const pageNamed = (idx, raw) => {
     const path = normalisePath(raw);
-    const page = idx.pages.find((p) => p.path === path);
-    if (!page) throw new Error(`No page at ${path}. The pages are ${idx.pages.map((p) => p.path).join(", ")}.`);
-    return page;
+    return idx.pages.find((p) => p.path === path) ?? null;
   };
 
-  const findSection = (page, wanted) => {
+  const missingPage = (idx, raw) => fitList(idx.pages.map((p) => p.path), (shown, truncated) => ({
+    error: `No page at ${echo(normalisePath(raw))}. Use one of the paths in pages.`,
+    pages: shown,
+    truncated,
+  }));
+
+  const sectionNamed = (page, wanted) => {
     const key = String(wanted).trim();
     const lower = key.toLowerCase();
-    const section = page.sections.find((s) => s.id === key) ?? page.sections.find((s) => s.title.toLowerCase() === lower);
-    if (!section) {
-      const names = page.sections.map((s) => s.id ?? s.title).join(", ").slice(0, 1000);
-      throw new Error(`No section ${key} on ${page.path}. The sections are ${names}.`);
-    }
-    return section;
+    return page.sections.find((s) => s.id === key) ?? page.sections.find((s) => s.title.toLowerCase() === lower) ?? null;
   };
+
+  const missingSection = (page, wanted) => fitList(page.sections.map((s) => s.id ?? s.title), (shown, truncated) => ({
+    error: `No section ${echo(String(wanted).trim())} on ${page.path}. Use one of the sections listed.`,
+    sections: shown,
+    truncated,
+  }));
 
   const snippetAt = (text, at) => {
     const from = Math.max(0, at - 60);
@@ -116,7 +136,7 @@
     },
     {
       name: "read_page",
-      description: "Returns one page of the stoop docs as Markdown, or one section of it. Long text is cut to fit and reports total_chars, with next_offset or next_section to continue.",
+      description: "Returns one page of the stoop docs as Markdown, or one section of it. Long text is cut to fit and reports total_chars, with next_offset or next_section to continue. An unknown path or section returns an error that lists the valid choices.",
       inputSchema: {
         type: "object",
         properties: {
@@ -130,37 +150,40 @@
       annotations: { readOnlyHint: true, untrustedContentHint: false, consequentialHint: false },
       execute: async (input = {}, { signal } = {}) => {
         const idx = await getIndex(signal);
-        const page = findPage(idx, input.path);
+        const page = pageNamed(idx, input.path);
+        if (!page) return missingPage(idx, input.path);
         const text = bodyOf(await getText(page.path, signal));
         if (text.length !== page.body_length) throw new Error(`${page.path} changed after the index was built. Reload the page and try again.`);
         let start = 0;
         let end = text.length;
         let label = null;
         if (input.section !== undefined) {
-          const section = findSection(page, input.section);
+          const section = sectionNamed(page, input.section);
+          if (!section) return missingSection(page, input.section);
           start = section.start;
           end = section.tree_end;
           label = section.id ?? section.title;
         }
         const selected = text.slice(start, end);
-        const offset = parseOffset(input.offset, selected.length);
+        const offset = offsetOf(input.offset, selected.length);
+        if (offset === null) return offsetError(selected.length);
         return fitWindow(selected.slice(offset), (slice, truncated) => {
           const cut = start + offset + slice.length;
-          const env = { path: page.path, total_chars: selected.length, offset, returned_chars: slice.length, truncated };
-          if (label !== null) env.section = label;
+          const result = { path: page.path, total_chars: selected.length, offset, returned_chars: slice.length, truncated };
+          if (label !== null) result.section = label;
           if (truncated) {
-            env.next_offset = offset + slice.length;
+            result.next_offset = offset + slice.length;
             const after = page.sections.find((s) => s.start >= cut);
-            if (after) env.next_section = after.id ?? after.title;
+            if (after) result.next_section = after.id ?? after.title;
           }
-          env.markdown = slice;
-          return env;
+          result.markdown = slice;
+          return result;
         });
       },
     },
     {
       name: "search_docs",
-      description: "Returns up to five sections of the stoop docs that match a query, ranked by title and text matches, each with a snippet and the path to read with read_page.",
+      description: "Returns up to five sections of the stoop docs that match a query, ranked by title and text matches, each with a snippet and the path to read with read_page. A query with only one-letter words returns an error.",
       inputSchema: {
         type: "object",
         properties: {
@@ -173,8 +196,8 @@
       execute: async (input = {}, { signal } = {}) => {
         const idx = await getIndex(signal);
         const query = String(input.query ?? "");
-        const terms = query.toLowerCase().split(/\s+/).filter((t) => t.length >= 2);
-        if (!terms.length) throw new Error("query needs at least one word of two or more letters.");
+        const terms = query.toLowerCase().split(/\s+/).filter((t) => t.length >= 2).slice(0, 10);
+        if (!terms.length) return { error: "query needs at least one word of two or more letters.", received: echo(query) };
         const hits = [];
         for (const page of idx.pages) {
           for (const section of page.sections) {
@@ -200,7 +223,7 @@
           heading: section.title,
           snippet: snippetAt(text, at),
         }));
-        return fitList(top, (shown, truncated) => ({ query: query.slice(0, 100), total_hits: hits.length, truncated, hits: shown }));
+        return fitList(top, (shown, truncated) => ({ query: echo(query), total_hits: hits.length, truncated, hits: shown }));
       },
     },
     {
@@ -210,12 +233,12 @@
       annotations: { readOnlyHint: true, untrustedContentHint: false, consequentialHint: false },
       execute: async (_input, { signal } = {}) => {
         const idx = await getIndex(signal);
-        return JSON.stringify({ command: idx.install.command, platform: idx.install.platform, docs: idx.install.docs });
+        return { command: idx.install.command, platform: idx.install.platform, docs: idx.install.docs };
       },
     },
     {
       name: "get_ci_recipe",
-      description: "Returns the copyable CI recipe for one provider from the stoop CI page, cut to fit with total_chars and next_offset when it is long.",
+      description: "Returns the copyable CI recipe for one provider from the stoop CI page, cut to fit with total_chars and next_offset when it is long. An unknown provider returns an error that lists the providers.",
       inputSchema: {
         type: "object",
         properties: {
@@ -229,14 +252,17 @@
       execute: async (input = {}, { signal } = {}) => {
         const idx = await getIndex(signal);
         const provider = String(input.provider ?? "").toLowerCase();
-        if (!Object.hasOwn(idx.recipes, provider)) throw new Error("provider must be one of github, gitlab, circleci or buildkite.");
+        if (!Object.hasOwn(idx.recipes, provider)) {
+          return { error: "provider must be one of github, gitlab, circleci or buildkite.", providers: Object.keys(idx.recipes), received: echo(input.provider) };
+        }
         const recipe = idx.recipes[provider];
-        const offset = parseOffset(input.offset, recipe.code.length);
+        const offset = offsetOf(input.offset, recipe.code.length);
+        if (offset === null) return offsetError(recipe.code.length);
         return fitWindow(recipe.code.slice(offset), (slice, truncated) => {
-          const env = { provider, title: recipe.title, language: recipe.language, docs: recipe.docs, total_chars: recipe.code.length, offset, returned_chars: slice.length, truncated };
-          if (truncated) env.next_offset = offset + slice.length;
-          env.code = slice;
-          return env;
+          const result = { provider, title: recipe.title, language: recipe.language, docs: recipe.docs, total_chars: recipe.code.length, offset, returned_chars: slice.length, truncated };
+          if (truncated) result.next_offset = offset + slice.length;
+          result.code = slice;
+          return result;
         });
       },
     },

@@ -1,8 +1,9 @@
-// The WebMCP contract for stoop's tools. It is checked against what the browser
-// registered and what each tool returned, so it judges the shipped script, not a copy.
-// Limits: tool and parameter names at most 30 characters, tool descriptions 500,
-// parameter descriptions 150, and a single tool output 1500 characters. Descriptions
-// are positive ("Returns ...") and every tool states its three annotations.
+// The WebMCP contract for stoop's tools. It is checked against what the browser registered
+// and what each tool resolved with, so it judges the shipped script itself. Limits: tool and
+// parameter names at most 30 characters, tool descriptions 500, parameter descriptions 150,
+// and a result at most 1500 characters once serialised. A result is an object, which the
+// browser serialises once, so the length measured is the JSON text the agent receives.
+// Descriptions are positive ("Returns ..."), and every tool states its three annotations.
 export const LIMITS = { name: 30, parameter: 30, description: 500, parameterDescription: 150, output: 1500, tools: 5 };
 
 export const ANNOTATIONS = ["readOnlyHint", "untrustedContentHint", "consequentialHint"];
@@ -48,8 +49,12 @@ export function contractProblems(tools, outputs = {}) {
 
     if (Object.hasOwn(outputs, tool.name)) {
       const output = outputs[tool.name];
-      if (typeof output !== "string") problems.push(`${where}: the output is not a string`);
-      else if (output.length > LIMITS.output) problems.push(`${where}: the output is ${output.length} characters, over ${LIMITS.output}`);
+      if (output === null || typeof output !== "object") {
+        problems.push(`${where}: the result must be an object, so the agent receives structured data and not JSON text`);
+      } else {
+        const size = JSON.stringify(output).length;
+        if (size > LIMITS.output) problems.push(`${where}: the serialised result is ${size} characters, over ${LIMITS.output}`);
+      }
     }
   }
   return problems;

@@ -1,17 +1,20 @@
 // The WebMCP tools in an isolated headless Chrome, on the built site served over loopback.
 // A stub document.modelContext is installed before the page's scripts run, so the shipped
-// webmcp.js registers its tools against it. Each tool is then executed in the page, and
-// the same budget, content and pagination guards as the in-memory tests run on the results.
+// webmcp.js registers its tools against it. Each tool is then executed in the page, and the
+// same budget, content and error guards as the in-memory tests run on what it resolves with.
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { ensureBuilt, SITE_DIR } from "./support/build.mjs";
 import { findChrome, launchChrome, newTarget, serveSite } from "./support/chrome.mjs";
-import { contractProblems, LIMITS } from "./support/contract.mjs";
+import { LIMITS } from "./support/contract.mjs";
 import { CALLS, budgetProblems, contentProblems, readIndex } from "./support/guards.mjs";
 
 const NAMES = ["list_pages", "read_page", "search_docs", "get_install_command", "get_ci_recipe"];
+
+// The size of a result as the agent receives it: the JSON text of the object a tool resolved with.
+const serialised = (value) => JSON.stringify(value).length;
 
 // Records every tool the page registers. It runs before any page script, so webmcp.js
 // sees document.modelContext exactly as a browser with the origin trial would.
@@ -63,50 +66,71 @@ async function openPage(path, stub = DOCUMENT_STUB) {
 
 const toolDefinitions = (cdp) => cdp.evaluate(`JSON.parse(JSON.stringify([...window.__tools.values()].map(({ execute, ...tool }) => tool)))`);
 
+// Runs one tool in the page with an input, and returns what it resolved with.
+const callTool = (cdp, name, input) => cdp.evaluate(`window.__tools.get(${JSON.stringify(name)}).execute(${JSON.stringify(input)}, { signal: new AbortController().signal })`);
+
 test("the script registers the five read-only tools on a docs page and on the home page", async () => {
   for (const path of ["docs/cli.html", "index.html"]) {
     const { cdp, problems } = await openPage(path);
     const tools = await toolDefinitions(cdp);
     assert.deepEqual(tools.map((t) => t.name), NAMES, `${path} registers the tools in order`);
-    assert.deepEqual(contractProblems(tools), [], `${path} meets the contract`);
+    assert.deepEqual(budgetProblems(tools, {}), [], `${path} meets the contract`);
     assert.deepEqual(problems, [], `${path} throws nothing while loading`);
     cdp.close();
   }
 });
 
-test("every tool runs in the page, stays within the output budget, and returns the right content", async () => {
+test("every tool runs in the page, resolves with an object within the budget, and returns the right content", async () => {
   const { cdp, problems } = await openPage("docs/cli.html");
   const tools = await toolDefinitions(cdp);
   const outputs = {};
   const errors = {};
   for (const name of NAMES) {
     try {
-      outputs[name] = await cdp.evaluate(`window.__tools.get(${JSON.stringify(name)}).execute(${JSON.stringify(CALLS[name])}, { signal: new AbortController().signal })`);
+      outputs[name] = await callTool(cdp, name, CALLS[name]);
     } catch (error) {
       errors[name] = error.message;
     }
   }
   assert.deepEqual(budgetProblems(tools, outputs, errors), []);
-  assert.deepEqual(contentProblems(outputs, readIndex(SITE_DIR), SITE_DIR), []);
-  for (const name of NAMES) assert.ok(outputs[name].length <= LIMITS.output, `${name} is ${outputs[name].length} characters`);
+  assert.deepEqual(contentProblems(outputs, readIndex(SITE_DIR)), []);
+  for (const name of NAMES) assert.ok(serialised(outputs[name]) <= LIMITS.output, `${name} serialises to ${serialised(outputs[name])} characters`);
   assert.deepEqual(problems, []);
   cdp.close();
 });
 
-test("bad input rejects in the page with a message that fits the budget", async () => {
-  const { cdp } = await openPage("docs/cli.html");
-  const rejects = async (name, input) => {
-    try {
-      await cdp.evaluate(`window.__tools.get(${JSON.stringify(name)}).execute(${JSON.stringify(input)}, { signal: new AbortController().signal })`);
-      return null;
-    } catch (error) {
-      return error.message;
-    }
-  };
-  const missing = await rejects("read_page", { path: "docs/missing" });
-  assert.match(missing, /No page at docs\/missing\.md/);
-  assert.ok(missing.length <= LIMITS.output);
-  assert.match(await rejects("get_ci_recipe", { provider: "travis" }), /provider must be one of/);
+test("bad input resolves with an error object that names the valid choices, within the budget", async () => {
+  const { cdp, problems } = await openPage("docs/cli.html");
+  const cli = readIndex(SITE_DIR).pages.find((p) => p.path === "docs/cli.md");
+
+  const missing = await callTool(cdp, "read_page", { path: "docs/missing" });
+  assert.match(missing.error, /No page at docs\/missing\.md/);
+  assert.ok(missing.pages.includes("docs/cli.md"), "the error lists the pages");
+  assert.ok(serialised(missing) <= LIMITS.output, "the error fits the budget");
+
+  const longPath = await callTool(cdp, "read_page", { path: "x".repeat(50000) });
+  assert.ok(serialised(longPath) <= LIMITS.output, "a 50000-character path stays within the budget");
+  assert.ok(longPath.error.length < 300, "the echoed path is cut");
+
+  const section = await callTool(cdp, "read_page", { path: "docs/cli.md", section: "no-such-section" });
+  assert.match(section.error, /No section no-such-section on docs\/cli\.md/);
+  assert.ok(section.sections.includes("changed-hook"), "the error lists the sections");
+
+  const longSection = await callTool(cdp, "read_page", { path: "docs/cli.md", section: "y".repeat(50000) });
+  assert.ok(serialised(longSection) <= LIMITS.output, "a 50000-character section stays within the budget");
+
+  const offset = await callTool(cdp, "read_page", { path: "docs/cli.md", offset: -1 });
+  assert.match(offset.error, /offset must be a whole number/);
+  assert.deepEqual(offset.valid_range, [0, cli.body_length]);
+
+  const provider = await callTool(cdp, "get_ci_recipe", { provider: "travis" });
+  assert.match(provider.error, /provider must be one of/);
+  assert.deepEqual(provider.providers, ["github", "gitlab", "circleci", "buildkite"]);
+
+  const query = await callTool(cdp, "search_docs", { query: "a" });
+  assert.match(query.error, /two or more letters/);
+  assert.ok(serialised(query) <= LIMITS.output);
+  assert.deepEqual(problems, []);
   cdp.close();
 });
 
@@ -115,9 +139,9 @@ test("following next_offset in the page rebuilds the long CI page exactly", asyn
   const parts = [];
   let offset = 0;
   for (let turn = 0; turn < 60; turn++) {
-    const out = JSON.parse(await cdp.evaluate(`window.__tools.get("read_page").execute({ path: "docs/ci.md", offset: ${offset} }, { signal: new AbortController().signal })`));
+    const out = await callTool(cdp, "read_page", { path: "docs/ci.md", offset });
     parts.push(out.markdown);
-    assert.ok(out.markdown.length <= LIMITS.output, "each window fits the budget");
+    assert.ok(serialised(out) <= LIMITS.output, "each window fits the budget");
     if (!out.truncated) break;
     assert.ok(Number.isInteger(out.next_offset), "a truncated window names where to continue");
     offset = out.next_offset;

@@ -1,6 +1,6 @@
 // Guards for the WebMCP script, shared by the in-memory tests and the browser test. Each
-// guard returns a list of problems: an empty list means it holds, and a broken copy of
-// the script must produce a non-empty list (the mutation tests prove that).
+// guard returns a list of problems: an empty list means it holds, and a broken copy of the
+// script must produce a non-empty list (the mutation tests prove that).
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { loadScript, siteFetch, SCRIPT } from "./vm-host.mjs";
@@ -13,6 +13,17 @@ export const CALLS = {
   get_install_command: {},
   get_ci_recipe: { provider: "github" },
 };
+
+// Inputs that must resolve, not reject, with an error object whose message matches the pattern.
+export const BAD_INPUTS = [
+  ["read_page", { path: "docs/missing" }, /No page at docs\/missing\.md/],
+  ["read_page", { path: "x".repeat(200000) }, /No page at x+/],
+  ["read_page", { path: "docs/cli.md", section: "no-such-section" }, /No section no-such-section on docs\/cli\.md/],
+  ["read_page", { path: "docs/cli.md", section: "y".repeat(200000) }, /No section y+ on docs\/cli\.md/],
+  ["read_page", { path: "docs/cli.md", offset: -1 }, /offset must be a whole number/],
+  ["get_ci_recipe", { provider: "travis" }, /provider must be one of/],
+  ["search_docs", { query: "a" }, /two or more letters/],
+];
 
 const DASH = /[\u2013\u2014]/;
 
@@ -69,7 +80,7 @@ export async function signalProblems(source, siteDir) {
   return problems;
 }
 
-// Executes every tool once against the built site and returns its output string.
+// Executes every tool once against the built site, and returns each tool with what it resolved with.
 export async function executeAll(source, siteDir, inputs = CALLS) {
   const { tools } = await freshTools(source, siteDir);
   const outputs = {};
@@ -84,65 +95,94 @@ export async function executeAll(source, siteDir, inputs = CALLS) {
   return { tools, outputs, errors };
 }
 
-// The contract (names, descriptions, annotations, and the 1500-character output budget).
+// The contract: names, descriptions, annotations, and the 1500-character budget per result.
 export function budgetProblems(tools, outputs, errors = {}) {
   const problems = contractProblems(tools, outputs);
   for (const [name, message] of Object.entries(errors)) problems.push(`${name} threw on its sample input: ${message}`);
-  for (const [name, message] of Object.entries(errors)) {
-    if (message.length > LIMITS.output) problems.push(`${name} error message is ${message.length} characters, over ${LIMITS.output}`);
+  return problems;
+}
+
+// Each bad input must resolve, not reject, with an error object that names the valid
+// choices and fits the budget. The echoed input is part of that size.
+export async function badInputProblems(tools) {
+  const problems = [];
+  for (const [name, input, message] of BAD_INPUTS) {
+    const tool = tools.find((t) => t.name === name);
+    const label = `${name} ${JSON.stringify(input).slice(0, 40)}`;
+    let result;
+    try {
+      result = await tool.execute(input, { signal: new AbortController().signal });
+    } catch (error) {
+      problems.push(`${label} rejected with ${error?.name ?? error}, not an error object`);
+      continue;
+    }
+    if (result === null || typeof result !== "object" || typeof result.error !== "string") {
+      problems.push(`${label} did not resolve with an error object`);
+      continue;
+    }
+    if (!message.test(result.error)) problems.push(`${label} error does not match ${message}: ${result.error.slice(0, 80)}`);
+    const size = JSON.stringify(result).length;
+    if (size > LIMITS.output) problems.push(`${label} error object serialises to ${size} characters, over ${LIMITS.output}`);
   }
   return problems;
 }
 
-// What each tool returns must be the right content, not merely short.
-export function contentProblems(outputs, index, siteDir) {
+// What each tool resolves with must be the right content, not merely small.
+export function contentProblems(outputs, index) {
   const problems = [];
-  const parse = (name) => {
-    try {
-      return JSON.parse(outputs[name]);
-    } catch {
-      problems.push(`${name} did not return JSON`);
+  const resultOf = (name) => {
+    const value = outputs[name];
+    if (value === null || typeof value !== "object") {
+      problems.push(`${name} did not resolve with an object`);
       return null;
     }
+    return value;
   };
 
-  const list = parse("list_pages");
-  if (list) {
+  const list = resultOf("list_pages");
+  if (list && Array.isArray(list.pages)) {
     if (JSON.stringify(list.fields) !== JSON.stringify(["path", "title", "summary"])) problems.push("list_pages does not name its fields");
     if (list.truncated || list.returned_pages !== index.pages.length) problems.push(`list_pages returned ${list.returned_pages} of ${index.pages.length} pages`);
     const paths = list.pages.map((row) => row[0]);
     if (JSON.stringify(paths) !== JSON.stringify(index.pages.map((p) => p.path))) problems.push("list_pages does not list every page in index order");
+  } else if (list) {
+    problems.push("list_pages has no pages array");
   }
 
-  const read = parse("read_page");
+  const read = resultOf("read_page");
   if (read) {
     const cli = index.pages.find((p) => p.path === "docs/cli.md");
-    if (read.path !== "docs/cli.md" || read.section !== "changed-hook") problems.push("read_page did not echo the page and section");
-    if (!read.markdown.startsWith("## Changed-unit hook") || !read.markdown.includes("'{changed}'")) problems.push("read_page did not return the changed-hook section");
     const section = cli.sections.find((s) => s.id === "changed-hook");
+    if (read.path !== "docs/cli.md" || read.section !== "changed-hook") problems.push("read_page did not echo the page and section");
+    if (typeof read.markdown !== "string" || !read.markdown.startsWith("## Changed-unit hook") || !read.markdown.includes("'{changed}'")) {
+      problems.push("read_page did not return the changed-hook section");
+    }
     if (read.total_chars !== section.tree_end - section.start) problems.push(`read_page total_chars ${read.total_chars} is not the section length`);
   }
 
-  const search = parse("search_docs");
-  if (search) {
+  const search = resultOf("search_docs");
+  if (search && Array.isArray(search.hits)) {
     if (!search.hits.length) problems.push("search_docs found nothing for probe");
     if (!search.hits.some((h) => h.path === "docs/blind-spots.md")) problems.push("search_docs did not find the blind-spots page for probe");
     if (search.hits.length > 5) problems.push("search_docs returned more than five hits");
     if (search.total_hits < search.hits.length) problems.push("search_docs total_hits is below the hits returned");
+  } else if (search) {
+    problems.push("search_docs has no hits array");
   }
 
-  const install = parse("get_install_command");
+  const install = resultOf("get_install_command");
   if (install && install.command !== index.install.command) problems.push("get_install_command returned a different command");
 
-  const recipe = parse("get_ci_recipe");
+  const recipe = resultOf("get_ci_recipe");
   if (recipe) {
-    if (!recipe.code.includes("stoop sh {0}")) problems.push("get_ci_recipe github lacks the defaults shell line");
+    if (typeof recipe.code !== "string" || !recipe.code.includes("stoop sh {0}")) problems.push("get_ci_recipe github lacks the defaults shell line");
     if (recipe.total_chars !== index.recipes.github.code.length) problems.push("get_ci_recipe total_chars is not the recipe length");
   }
   return problems;
 }
 
-// Pages longer than one window must be readable to the end by following next_offset.
+// Pages longer than one window must be readable to the end by following next_offset, and
+// every window must fit the budget.
 export async function paginationProblems(source, siteDir, path = "docs/ci.md") {
   const problems = [];
   const { tools } = await freshTools(source, siteDir);
@@ -151,13 +191,18 @@ export async function paginationProblems(source, siteDir, path = "docs/ci.md") {
   let offset = 0;
   let total = null;
   for (let turn = 0; turn < 50; turn++) {
-    const out = JSON.parse(await readPage.execute({ path, offset }, { signal: new AbortController().signal }));
+    const out = await readPage.execute({ path, offset }, { signal: new AbortController().signal });
+    if (out === null || typeof out !== "object" || typeof out.markdown !== "string") {
+      problems.push(`read_page returned ${String(JSON.stringify(out)).slice(0, 80)} for ${path} at ${offset}`);
+      break;
+    }
     total ??= out.total_chars;
     if (out.total_chars !== total) problems.push("total_chars changed between windows");
+    if (JSON.stringify(out).length > LIMITS.output) problems.push(`a window serialises to ${JSON.stringify(out).length} characters`);
     parts.push(out.markdown);
     if (!out.truncated) break;
-    if (out.next_offset !== offset + out.markdown.length) problems.push("next_offset does not continue where the window ended");
     if (out.next_offset === undefined) problems.push("a truncated window has no next_offset");
+    else if (out.next_offset !== offset + out.markdown.length) problems.push("next_offset does not continue where the window ended");
     offset = out.next_offset;
   }
   const whole = parts.join("");

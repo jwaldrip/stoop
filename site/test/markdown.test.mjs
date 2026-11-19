@@ -157,3 +157,8 @@ test("sections run from heading to heading, and the tree end includes sub-sectio
   assert.equal(sections.some((s) => s.title === "not a heading"), false);
   assert.equal(plainText("**Bold** [link](https://x.y/z) `code`"), "Bold link code");
 });
+
+test("a twin escapes angle brackets, so text such as <command> is not read as markup", () => {
+  assert.equal(convert("<p>run &lt;command&gt;</p>"), "run \\<command\\>\n");
+  assert.equal(convert("<p>a &lt;b&gt; c</p>"), "a \\<b\\> c\n");
+});
