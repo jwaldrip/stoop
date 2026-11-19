@@ -113,6 +113,8 @@ fn file(path: &str, bytes: &[u8]) -> input::Input {
     input::Input {
         path: path.into(),
         id: format!("f:{}", blake3::hash(bytes).to_hex()),
+        oid: None,
+        oid_basis: None,
     }
 }
 
@@ -193,7 +195,7 @@ fn record(r: &Repo, x: Rec<'_>) -> Option<String> {
                     os: "linux".into(),
                     arch: "x86_64".into(),
                     tracer: "ptrace-seccomp".into(),
-                    version: 4,
+                    version: crate::trace::version::TRACER_VERSION,
                 }),
                 env: BTreeMap::new(),
                 inputs: x.inputs.clone(),
@@ -753,6 +755,8 @@ fn skip_json_names_exact_record_and_ordered_proofs() {
     second.inputs.push(input::Input {
         path: "missing.txt".into(),
         id: "a".into(),
+        oid: None,
+        oid_basis: None,
     });
     store.save(&second_key, second.clone()).unwrap();
     saved.steps[1].proof = second.digest();
@@ -1304,6 +1308,8 @@ fn forged_proof_text_cannot_inject_workflow_commands() {
         path: "a.txt\n::error title=stoop-injected::text from an unattested refs/stoop writer"
             .into(),
         id: format!("f:{}", "0".repeat(64)),
+        oid: None,
+        oid_basis: None,
     }];
     record(&r, x).unwrap();
     let out = r.base.join("github_output");
@@ -1356,7 +1362,7 @@ fn control_break_it_fixtures_all_run() {
             os: "linux".into(),
             arch: "x86_64".into(),
             tracer: "ptrace-seccomp".into(),
-            version: 4,
+            version: crate::trace::version::TRACER_VERSION,
         }),
         env: BTreeMap::new(),
         inputs: vec![],
@@ -1394,6 +1400,8 @@ fn control_break_it_fixtures_all_run() {
     x.inputs.push(input::Input {
         path: r.event.to_string_lossy().into_owned(),
         id: format!("f:{}", blake3::hash(b"{\"old\":1}").to_hex()),
+        oid: None,
+        oid_basis: None,
     });
     record(&r, x).unwrap();
     let o = plan(&r, &["--format", "json"], &[]);
@@ -1594,6 +1602,8 @@ fn legacy_commands_and_markdown_are_inert_in_output() {
     x.inputs = vec![input::Input {
         path: "x##[error]message::warning::[link](https:/example.invalid)".into(),
         id: "f:000".into(),
+        oid: None,
+        oid_basis: None,
     }];
     record(&r, x).unwrap();
     let summary = r.base.join("summary");

@@ -681,7 +681,7 @@ mod tests {
                 os: "linux".into(),
                 arch: "x86_64".into(),
                 tracer: "ptrace-seccomp".into(),
-                version: 4,
+                version: crate::trace::version::TRACER_VERSION,
             }),
             env: BTreeMap::new(),
             inputs: vec![input::Input {
@@ -690,6 +690,8 @@ mod tests {
                     "f:{}",
                     blake3::hash(include_bytes!("../../tests/fixtures/plan/a.txt")).to_hex()
                 ),
+                oid: None,
+                oid_basis: None,
             }],
             outputs: vec![],
             removed: vec![],

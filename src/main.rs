@@ -2,12 +2,15 @@ mod attest;
 #[allow(dead_code)]
 mod gha;
 #[allow(dead_code)]
+mod gitprobe;
+#[allow(dead_code)]
 mod gittree;
 mod ignore;
 mod input;
 #[allow(dead_code)]
 mod job;
 mod journal;
+mod oid_attrs;
 mod pathutil;
 #[allow(dead_code)]
 mod plan;

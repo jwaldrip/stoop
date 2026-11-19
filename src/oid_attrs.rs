@@ -1,0 +1,1074 @@
+//! Evidence that hashing raw working-tree bytes is safe for Git object IDs.
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OidBasis {
+    pub text: String,
+    pub eol: String,
+    pub filter: String,
+    pub ident: String,
+    pub working_tree_encoding: String,
+    pub export_subst: String,
+    pub crlf: String,
+    pub autocrlf: String,
+}
+
+impl OidBasis {
+    /// Raw bytes are Git blob bytes only when no conversion is configured.
+    pub fn allows_oid(&self) -> bool {
+        [
+            &self.text,
+            &self.eol,
+            &self.filter,
+            &self.ident,
+            &self.working_tree_encoding,
+            &self.export_subst,
+            &self.crlf,
+        ]
+        .iter()
+        .all(|value| value.as_str() == "unspecified")
+            && (self.autocrlf == "unset"
+                || self.autocrlf.eq_ignore_ascii_case("false")
+                || self.autocrlf.eq_ignore_ascii_case("no")
+                || self.autocrlf.eq_ignore_ascii_case("off")
+                || self.autocrlf == "0")
+    }
+}
+
+/// The Git and attribute state observed before tracing begins.
+#[derive(Clone, Debug)]
+pub struct Epoch {
+    pub basis: HashMap<String, OidBasis>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub git_dir: PathBuf,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub common_dir: PathBuf,
+}
+
+// Limit every response, including large index and attribute reports. An
+// oversized repository is unknown rather than evidence for an OID.
+const MAX_OUTPUT: usize = 64 * 1024 * 1024;
+
+fn valid_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.as_bytes().contains(&0)
+        && path
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+}
+
+fn safe_file_or_absent(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => m.file_type().is_file() && m.nlink() == 1,
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+fn safe_default_attributes() -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return false;
+    };
+    if !home.is_absolute() {
+        return false;
+    }
+    let config_home = match std::env::var_os("XDG_CONFIG_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        Some(path) if path.is_absolute() => path,
+        Some(_) => return false,
+        None => home.join(".config"),
+    };
+    safe_file_or_absent(&config_home.join("git/attributes"))
+}
+
+fn safe_dir_or_absent(path: &Path) -> bool {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => m.file_type().is_dir(),
+        Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+    }
+}
+
+fn nul_fields(bytes: &[u8]) -> Option<impl Iterator<Item = &[u8]>> {
+    let (bytes, count) = if bytes.is_empty() {
+        (bytes, 0)
+    } else {
+        (bytes.strip_suffix(&[0])?, usize::MAX)
+    };
+    Some(bytes.split(|b| *b == 0).take(count))
+}
+
+fn repo_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let root = root.canonicalize().ok()?;
+    let dot_git = root.join(".git");
+    // Gitfiles, symlinks, separate gitdirs and linked worktrees need topology
+    // tracking beyond a simple worktree. Decline them instead of guessing.
+    if !std::fs::symlink_metadata(&dot_git)
+        .ok()?
+        .file_type()
+        .is_dir()
+        || !safe_file_or_absent(&dot_git.join("config"))
+        || !safe_file_or_absent(&dot_git.join("config.worktree"))
+        || !safe_file_or_absent(&dot_git.join("index"))
+        || !safe_dir_or_absent(&dot_git.join("info"))
+        || !safe_file_or_absent(&dot_git.join("info/attributes"))
+    {
+        return None;
+    }
+    let report = crate::gitprobe::output(
+        &root,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--show-toplevel",
+            "--absolute-git-dir",
+            "--git-common-dir",
+            "--show-object-format",
+        ],
+        b"",
+        MAX_OUTPUT,
+    )?;
+    let report = report.strip_suffix(b"\n")?;
+    let mut lines = report.split(|byte| *byte == b'\n');
+    let top = Path::new(OsStr::from_bytes(lines.next()?))
+        .canonicalize()
+        .ok()?;
+    let git_dir = Path::new(OsStr::from_bytes(lines.next()?))
+        .canonicalize()
+        .ok()?;
+    let common_dir = Path::new(OsStr::from_bytes(lines.next()?))
+        .canonicalize()
+        .ok()?;
+    let format = lines.next()?;
+    if lines.next().is_some()
+        || format != b"sha1"
+        || top != root
+        || git_dir != dot_git.canonicalize().ok()?
+        || common_dir != git_dir
+    {
+        return None;
+    }
+    Some((git_dir, common_dir))
+}
+
+// Git's human-readable states collide with literal attribute values. --all
+// reports only present attributes, so escape these spellings and the escape
+// prefix. No caller can confuse a present value with an absent attribute.
+fn present_value(value: &str) -> String {
+    if matches!(value, "set" | "unset" | "unspecified") || value.starts_with("present:") {
+        format!("present:{value}")
+    } else {
+        value.to_owned()
+    }
+}
+
+fn config(root: &Path) -> Option<String> {
+    let report = crate::gitprobe::output(
+        root,
+        &[
+            "config",
+            "--null",
+            "--list",
+            "--no-includes",
+            "--show-origin",
+        ],
+        b"",
+        MAX_OUTPUT,
+    )?;
+    let mut fields = nul_fields(&report)?;
+    let mut autocrlf = "unset".to_owned();
+    while let Some(origin) = fields.next() {
+        let entry = fields.next()?;
+        let (key, value) = match entry.iter().position(|byte| *byte == b'\n') {
+            Some(i) => (&entry[..i], &entry[i + 1..]),
+            None => (entry, b"true".as_slice()),
+        };
+        let key = std::str::from_utf8(key).ok()?.to_ascii_lowercase();
+        if key.is_empty()
+            || key == "core.attributesfile"
+            || key == "attr.tree"
+            || key == "core.worktree"
+            || key.starts_with("include.")
+            || key.starts_with("includeif.")
+        {
+            return None;
+        }
+        if let Some(path) = origin.strip_prefix(b"file:") {
+            let path = Path::new(OsStr::from_bytes(path));
+            let path = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                root.join(path)
+            };
+            // A config emitted by Git must still exist and must not redirect
+            // to another file or be a FIFO.
+            let metadata = std::fs::symlink_metadata(&path).ok()?;
+            if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+                return None;
+            }
+        } else if origin != b"command line:" {
+            return None;
+        }
+        if key == "core.autocrlf" {
+            let value = std::str::from_utf8(value).ok()?;
+            autocrlf = present_value(value);
+        }
+    }
+    Some(autocrlf)
+}
+
+fn attributes_file(path: &str) -> bool {
+    path == ".gitattributes" || path.ends_with("/.gitattributes")
+}
+
+#[derive(Default)]
+struct Index {
+    paths: HashSet<String>,
+    gitlinks: HashSet<String>,
+    // Tracked attribute files. Git can read one from the index when its worktree
+    // copy is missing, as in a sparse checkout, so each is checked below.
+    attribute_files: HashSet<String>,
+}
+
+fn index_paths(root: &Path) -> Option<Index> {
+    let report = crate::gitprobe::output(root, &["ls-files", "--stage", "-z"], b"", MAX_OUTPUT)?;
+    let mut index = Index::default();
+    for entry in nul_fields(&report)? {
+        let tab = entry.iter().position(|byte| *byte == b'\t')?;
+        let mut header = entry[..tab].split(|byte| *byte == b' ');
+        let mode = header.next()?;
+        let oid = header.next()?;
+        let stage = header.next()?;
+        if header.next().is_some()
+            || oid.len() != 40
+            || !oid.iter().all(u8::is_ascii_hexdigit)
+            || stage != b"0"
+        {
+            return None;
+        }
+        let path = std::str::from_utf8(&entry[tab + 1..])
+            .ok()
+            .filter(|path| valid_path(path));
+        match mode {
+            b"160000" => {
+                // Everything beneath a gitlink is excluded. A gitlink whose name cannot be
+                // represented would leave its scope unknown, so the whole snapshot fails.
+                let path = path?;
+                if attributes_file(path)
+                    || index.paths.contains(path)
+                    || !index.gitlinks.insert(path.to_owned())
+                {
+                    return None;
+                }
+            }
+            b"100644" | b"100755" | b"120000" => {
+                // A path that cannot be represented has no evidence and so no OID.
+                let Some(path) = path else { continue };
+                if attributes_file(path) {
+                    if mode == b"120000" {
+                        return None;
+                    }
+                    index.attribute_files.insert(path.to_owned());
+                }
+                if !index.paths.insert(path.to_owned()) {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+    }
+    Some(index)
+}
+
+fn beneath_gitlink(path: &str, gitlinks: &HashSet<String>) -> bool {
+    gitlinks.contains(path)
+        || path
+            .match_indices('/')
+            .any(|(i, _)| gitlinks.contains(&path[..i]))
+}
+
+// An attribute file applies to its own directory and everything beneath it. The
+// empty name stands for the root.
+fn beneath_directory(path: &str, dirs: &HashSet<String>) -> bool {
+    dirs.contains("")
+        || path
+            .match_indices('/')
+            .any(|(i, _)| dirs.contains(&path[..i]))
+}
+
+fn regular_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
+}
+
+fn known_paths(root: &Path) -> Option<HashSet<String>> {
+    let mut index = index_paths(root)?;
+    let report = crate::gitprobe::output(
+        root,
+        &["ls-files", "--others", "--exclude-standard", "-z"],
+        b"",
+        MAX_OUTPUT,
+    )?;
+    for entry in nul_fields(&report)? {
+        if let Some(path) = std::str::from_utf8(entry)
+            .ok()
+            .filter(|path| valid_path(path))
+        {
+            index.paths.insert(path.to_owned());
+        }
+    }
+    // A tracked attribute file missing from the worktree, as in a sparse checkout,
+    // may still apply to its directory. Paths beneath it have unknown attributes.
+    let unmaterialized: HashSet<String> = index
+        .attribute_files
+        .iter()
+        .filter(|file| !regular_file(&root.join(file)))
+        .map(|file| {
+            file.strip_suffix(".gitattributes")
+                .unwrap_or("")
+                .trim_end_matches('/')
+                .to_owned()
+        })
+        .collect();
+    let mut paths = index.paths;
+    paths.retain(|path| {
+        !beneath_gitlink(path, &index.gitlinks) && !beneath_directory(path, &unmaterialized)
+    });
+    Some(paths)
+}
+
+// Do not let a symlink, hard link or special file redirect a worktree attribute
+// source. A missing file is fine; a tracked one that is missing is handled in known_paths.
+fn safe_worktree_sources(root: &Path, paths: &HashSet<String>) -> bool {
+    if !safe_file_or_absent(&root.join(".gitattributes")) {
+        return false;
+    }
+    let mut checked = HashSet::new();
+    for path in paths {
+        for (i, _) in path.match_indices('/') {
+            let dir = &path[..i];
+            if checked.insert(dir)
+                && (!safe_dir_or_absent(&root.join(dir))
+                    || !safe_file_or_absent(&root.join(dir).join(".gitattributes")))
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn empty_basis(autocrlf: &str) -> OidBasis {
+    OidBasis {
+        text: "unspecified".into(),
+        eol: "unspecified".into(),
+        filter: "unspecified".into(),
+        ident: "unspecified".into(),
+        working_tree_encoding: "unspecified".into(),
+        export_subst: "unspecified".into(),
+        crlf: "unspecified".into(),
+        autocrlf: autocrlf.to_owned(),
+    }
+}
+
+fn attributes(
+    mut basis: HashMap<String, OidBasis>,
+    report: &[u8],
+) -> Option<HashMap<String, OidBasis>> {
+    let mut seen = HashSet::new();
+    let mut fields = nul_fields(report)?;
+    while let Some(path) = fields.next() {
+        let attr = fields.next()?;
+        let value = fields.next()?;
+        if attr.is_empty() || !seen.insert((path, attr)) {
+            return None;
+        }
+        let path = std::str::from_utf8(path).ok()?;
+        let item = basis.get_mut(path)?;
+        let value = std::str::from_utf8(value).ok()?;
+        let field = match attr {
+            b"text" => &mut item.text,
+            b"eol" => &mut item.eol,
+            b"filter" => &mut item.filter,
+            b"ident" => &mut item.ident,
+            b"working-tree-encoding" => &mut item.working_tree_encoding,
+            b"export-subst" => &mut item.export_subst,
+            b"crlf" => &mut item.crlf,
+            _ => continue,
+        };
+        *field = present_value(value);
+    }
+    Some(basis)
+}
+
+/// Git variables that cannot change which attribute sources, object format or
+/// directories Git uses. Shells export some of them by default, so declining on
+/// them would leave every interactive run unrecorded.
+const HARMLESS_GIT_ENV: &[&[u8]] = &[
+    b"GIT_ASKPASS",
+    b"GIT_EDITOR",
+    b"GIT_MERGE_AUTOEDIT",
+    b"GIT_PAGER",
+    b"GIT_SEQUENCE_EDITOR",
+    b"GIT_TERMINAL_PROMPT",
+];
+
+/// Capture the repository's configuration and attribute batch for the known
+/// worktree paths, for this process. An inherited `GIT_*` variable declines the
+/// capture unless it is in `HARMLESS_GIT_ENV`, because Git's environment can
+/// select attribute sources, object formats or directories that this capture
+/// does not model.
+pub fn capture(root: &Path) -> Option<Epoch> {
+    let declined = std::env::vars_os().any(|(key, _)| {
+        let key = key.as_os_str().as_bytes();
+        key.starts_with(b"GIT_") && !HARMLESS_GIT_ENV.contains(&key)
+    });
+    if declined {
+        return None;
+    }
+    snapshot(root)
+}
+
+/// The repository's configuration and attribute batch, read without consulting
+/// this process's environment. Unsupported topology, ambiguous state or a failed
+/// Git probe returns no epoch, not a guessed basis.
+pub(crate) fn snapshot(root: &Path) -> Option<Epoch> {
+    if !safe_default_attributes() {
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let (git_dir, common_dir) = repo_dirs(&root)?;
+    let autocrlf = config(&root)?;
+    let paths = known_paths(&root)?;
+    if !safe_worktree_sources(&root, &paths) {
+        return None;
+    }
+    let mut input = Vec::new();
+    let mut basis = HashMap::with_capacity(paths.len());
+    for path in paths {
+        input.extend_from_slice(path.as_bytes());
+        input.push(0);
+        basis.insert(path, empty_basis(&autocrlf));
+    }
+    let report = crate::gitprobe::output(
+        &root,
+        &["check-attr", "--all", "-z", "--stdin"],
+        &input,
+        MAX_OUTPUT,
+    )?;
+    Some(Epoch {
+        basis: attributes(basis, &report)?,
+        git_dir,
+        common_dir,
+    })
+}
+
+/// Observe conversion evidence even when it makes the path ineligible.
+#[cfg(test)]
+pub fn observe(root: &Path, path: &str) -> Option<OidBasis> {
+    snapshot(root)?.basis.remove(path)
+}
+
+/// Evidence for a known path only when Git hashes its raw bytes.
+#[cfg(test)]
+pub fn check(root: &Path, path: &str) -> Option<OidBasis> {
+    observe(root, path).filter(OidBasis::allows_oid)
+}
+
+#[cfg(test)]
+/// Restrict evidence to known, conversion-free paths.
+pub fn check_many(root: &Path, paths: &[String]) -> HashMap<String, OidBasis> {
+    let Some(mut epoch) = snapshot(root) else {
+        return HashMap::new();
+    };
+    paths
+        .iter()
+        .filter_map(|path| {
+            let basis = epoch.basis.remove(path)?;
+            basis.allows_oid().then(|| (path.clone(), basis))
+        })
+        .collect()
+}
+
+/// An unknown or nonempty directory may hide an attribute source.
+#[cfg(any(target_os = "linux", test))]
+pub fn directory_removal_invalidates(path: &Path) -> bool {
+    !std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    struct Repo(PathBuf);
+
+    impl Repo {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "stoop-oid-attrs-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            fs::create_dir(&path).unwrap();
+            let repo = Self(path);
+            repo.git(&["init", "-q"]);
+            repo.write("plain.txt", "plain\n");
+            repo.write("file.txt", "file\n");
+            repo
+        }
+
+        fn git(&self, args: &[&str]) {
+            let mut cmd = Command::new("git");
+            for (key, _) in std::env::vars_os() {
+                if key.as_os_str().as_bytes().starts_with(b"GIT_") {
+                    cmd.env_remove(key);
+                }
+            }
+            let out = cmd
+                .current_dir(&self.0)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_TERMINAL_PROMPT", "0")
+                .args(args)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "fixture git failed");
+        }
+
+        fn write(&self, path: &str, contents: &str) {
+            let path = self.0.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, contents).unwrap();
+        }
+    }
+
+    impl Drop for Repo {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn directory_removal_requires_proven_empty() {
+        let repo = Repo::new();
+        let dir = repo.0.join("nested");
+        assert!(directory_removal_invalidates(&dir));
+        fs::create_dir(&dir).unwrap();
+        assert!(!directory_removal_invalidates(&dir));
+        fs::write(dir.join(".gitattributes"), "* text\n").unwrap();
+        assert!(directory_removal_invalidates(&dir));
+    }
+
+    #[test]
+    fn defaults_and_exact_autocrlf_state() {
+        let repo = Repo::new();
+        let default = check(&repo.0, "plain.txt").unwrap();
+        assert_eq!(
+            default,
+            OidBasis {
+                text: "unspecified".into(),
+                eol: "unspecified".into(),
+                filter: "unspecified".into(),
+                ident: "unspecified".into(),
+                working_tree_encoding: "unspecified".into(),
+                export_subst: "unspecified".into(),
+                crlf: "unspecified".into(),
+                autocrlf: "unset".into(),
+            }
+        );
+        for value in ["false", "FALSE", "off", "no", "0"] {
+            repo.git(&["config", "--local", "core.autocrlf", value]);
+            assert_eq!(check(&repo.0, "plain.txt").unwrap().autocrlf, value);
+        }
+        for value in ["true", "input", "yes", "on", "1", "garbage"] {
+            repo.git(&["config", "--local", "core.autocrlf", value]);
+            assert!(check(&repo.0, "plain.txt").is_none());
+        }
+        repo.git(&["config", "--local", "--unset-all", "core.autocrlf"]);
+        assert_eq!(check(&repo.0, "plain.txt").unwrap().autocrlf, "unset");
+    }
+
+    #[test]
+    fn explicit_conversion_attributes_are_never_admitted() {
+        let repo = Repo::new();
+        for attr in [
+            "text",
+            "text=auto",
+            "-text",
+            "eol=lf",
+            "eol=crlf",
+            "-eol",
+            "ident",
+            "-ident",
+            "filter=driver",
+            "-filter",
+            "working-tree-encoding=UTF-16LE",
+            "-working-tree-encoding",
+            "export-subst",
+            "-export-subst",
+            "crlf",
+            "-crlf",
+            "crlf=input",
+        ] {
+            repo.write(".gitattributes", &format!("* {attr}\n"));
+            assert!(check(&repo.0, "file.txt").is_none(), "accepted {attr}");
+        }
+        repo.write(".gitattributes", "* !text\n");
+        assert!(check(&repo.0, "file.txt").is_some());
+    }
+
+    #[test]
+    fn literal_state_names_cannot_hide_filter_drivers() {
+        let repo = Repo::new();
+        for name in ["unset", "unspecified"] {
+            let key = format!("filter.{name}.clean");
+            let marker = repo.0.join(format!("driver-{name}"));
+            let driver = format!("touch {}", marker.display());
+            repo.git(&["config", "--local", &key, &driver]);
+            repo.write(".gitattributes", &format!("* filter={name}\n"));
+            assert_eq!(
+                observe(&repo.0, "file.txt").unwrap().filter,
+                format!("present:{name}")
+            );
+            assert!(check(&repo.0, "file.txt").is_none());
+            assert!(!marker.exists());
+        }
+    }
+
+    #[test]
+    fn snapshot_preserves_conversion_evidence_and_known_path_scope() {
+        let repo = Repo::new();
+        repo.write(
+            ".gitattributes",
+            "file.txt eol=crlf\nplain.txt custom=unspecified\n",
+        );
+        repo.write(".gitignore", "ignored.txt\n");
+        repo.write("ignored.txt", "ignored\n");
+        repo.git(&["add", "--", "plain.txt"]);
+        let epoch = snapshot(&repo.0).unwrap();
+        let plain = &epoch.basis["plain.txt"];
+        assert_eq!(plain.eol, "unspecified");
+        assert!(plain.allows_oid());
+        let converted = &epoch.basis["file.txt"];
+        assert_eq!(converted.eol, "crlf");
+        assert!(!converted.allows_oid());
+        assert!(!epoch.basis.contains_key("ignored.txt"));
+        assert!(!epoch.basis.contains_key("never-seen.txt"));
+        assert_eq!(epoch.git_dir, repo.0.join(".git").canonicalize().unwrap());
+        assert_eq!(epoch.common_dir, epoch.git_dir);
+    }
+
+    #[test]
+    fn present_attribute_state_names_are_not_absence() {
+        let repo = Repo::new();
+        for (attr, expected) in [
+            ("text", "present:set"),
+            ("-text", "present:unset"),
+            ("text=unset", "present:unset"),
+            ("text=unspecified", "present:unspecified"),
+            ("text=present:unset", "present:present:unset"),
+        ] {
+            repo.write(".gitattributes", &format!("file.txt {attr}\n"));
+            let basis = observe(&repo.0, "file.txt").unwrap();
+            assert_eq!(basis.text, expected, "{attr}");
+            assert!(!basis.allows_oid(), "{attr}");
+        }
+        repo.write(".gitattributes", "file.txt !text\n");
+        let basis = observe(&repo.0, "file.txt").unwrap();
+        assert_eq!(basis.text, "unspecified");
+        assert!(basis.allows_oid());
+    }
+
+    #[test]
+    fn known_gitlink_and_descendants_are_not_parent_blob_candidates() {
+        let parent = Repo::new();
+        let child = Repo::new();
+        child.git(&["add", "--", "plain.txt", "file.txt"]);
+        child.git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.org",
+            "commit",
+            "-qm",
+            "initial",
+        ]);
+        parent.git(&[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            child.0.to_str().unwrap(),
+            "module",
+        ]);
+        let epoch = snapshot(&parent.0).unwrap();
+        assert!(parent.0.join("module/plain.txt").is_file());
+        assert!(!epoch.basis.contains_key("module"));
+        assert!(!epoch.basis.contains_key("module/plain.txt"));
+        assert!(epoch.basis["plain.txt"].allows_oid());
+    }
+
+    #[test]
+    fn tracked_attributes_missing_from_the_worktree_leave_their_directory_unknown() {
+        let repo = Repo::new();
+        repo.write("sub/.gitattributes", "* text\n");
+        repo.write("sub/file.txt", "file\n");
+        repo.git(&["add", "--", "sub/.gitattributes"]);
+        fs::remove_file(repo.0.join("sub/.gitattributes")).unwrap();
+        let epoch = snapshot(&repo.0).unwrap();
+        assert!(!epoch.basis.contains_key("sub/file.txt"));
+        assert!(!epoch.basis.contains_key("sub/.gitattributes"));
+        assert!(epoch.basis["plain.txt"].allows_oid());
+    }
+
+    #[test]
+    fn sha256_repository_has_no_epoch() {
+        let path = std::env::temp_dir().join(format!(
+            "stoop-oid-sha256-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        let repo = Repo(path);
+        repo.git(&["init", "-q", "--object-format=sha256"]);
+        repo.write("file.txt", "file\n");
+        assert!(snapshot(&repo.0).is_none());
+    }
+
+    #[test]
+    fn clean_git_env_probe_child() {
+        if let Some(root) = std::env::var_os("STOOP_CLEAN_GIT_ENV_PROBE") {
+            let epoch = capture(Path::new(&root)).unwrap();
+            assert!(epoch.basis["plain.txt"].allows_oid());
+        }
+    }
+
+    #[test]
+    fn git_env_absent_allows_safe_worktree() {
+        let repo = Repo::new();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "oid_attrs::tests::clean_git_env_probe_child"])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &repo.0)
+            .env("STOOP_CLEAN_GIT_ENV_PROBE", &repo.0)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    #[test]
+    fn redirected_attribute_files_in_the_worktree_are_rejected() {
+        use std::os::unix::fs::symlink;
+        let repo = Repo::new();
+        repo.write("attributes-target", "file.txt text\n");
+        symlink("attributes-target", repo.0.join(".gitattributes")).unwrap();
+        assert!(snapshot(&repo.0).is_none());
+        fs::remove_file(repo.0.join(".gitattributes")).unwrap();
+        symlink(
+            "../../attributes-target",
+            repo.0.join(".git/info/attributes"),
+        )
+        .unwrap();
+        assert!(snapshot(&repo.0).is_none());
+    }
+
+    #[test]
+    fn worktree_nested_info_and_configured_attribute_files_apply() {
+        let repo = Repo::new();
+        repo.write(".gitattributes", "*.root text\n");
+        repo.write("nested/.gitattributes", "*.nested ident\n");
+        repo.write(".git/info/attributes", "*.info filter=driver\n");
+        repo.write(
+            "custom-attributes",
+            "*.global working-tree-encoding=UTF-16LE\n",
+        );
+        let attr_path = repo.0.join("custom-attributes");
+        repo.git(&[
+            "config",
+            "--local",
+            "core.attributesFile",
+            attr_path.to_str().unwrap(),
+        ]);
+        for path in [
+            "file.root",
+            "nested/file.nested",
+            "file.info",
+            "file.global",
+        ] {
+            assert!(check(&repo.0, path).is_none(), "accepted {path}");
+        }
+        assert!(check(&repo.0, "other.txt").is_none());
+    }
+
+    #[test]
+    fn included_git_config_is_not_assumed_safe() {
+        let repo = Repo::new();
+        repo.write("config-extra", "[core]\n\tautocrlf = false\n");
+        repo.git(&["config", "--local", "include.path", "../config-extra"]);
+        assert!(check(&repo.0, "plain.txt").is_none());
+    }
+
+    #[test]
+    fn configured_attribute_tree_is_not_assumed_safe() {
+        let repo = Repo::new();
+        repo.git(&["config", "--local", "attr.tree", "HEAD"]);
+        assert!(check(&repo.0, "plain.txt").is_none());
+    }
+
+    #[test]
+    fn configured_attribute_file_declines_the_snapshot() {
+        let repo = Repo::new();
+        repo.write("custom-attributes", "*.txt text\n");
+        let attr_path = repo.0.join("custom-attributes");
+        repo.git(&[
+            "config",
+            "--local",
+            "core.attributesFile",
+            attr_path.to_str().unwrap(),
+        ]);
+        assert!(snapshot(&repo.0).is_none());
+    }
+
+    #[test]
+    fn conditional_git_config_include_is_not_assumed_safe() {
+        let repo = Repo::new();
+        repo.git(&[
+            "config",
+            "--local",
+            "includeIf.gitdir:/nonexistent/.path",
+            "config-extra",
+        ]);
+        assert!(check(&repo.0, "plain.txt").is_none());
+    }
+
+    #[test]
+    fn batch_handles_odd_names_duplicates_and_unsafe_paths() {
+        let repo = Repo::new();
+        repo.write(".gitattributes", "*.converted filter=driver\n");
+        let names = [
+            "--leading option",
+            "line\nfeed\t'quoted'\\name",
+            "accent-é.txt",
+            "normal.converted",
+            "../outside",
+            "/absolute",
+            "bad\0name",
+            "--leading option",
+        ];
+        for path in &names[..4] {
+            repo.write(path, "contents\n");
+        }
+        let paths: Vec<_> = names.iter().map(|s| (*s).to_owned()).collect();
+        let result = check_many(&repo.0, &paths);
+        assert_eq!(result.len(), 3);
+        for path in &names[..3] {
+            assert!(result.contains_key(*path));
+        }
+        for path in &names[3..7] {
+            assert!(!result.contains_key(*path));
+        }
+    }
+
+    #[test]
+    fn rejects_failed_git_and_parent_repository_discovery() {
+        let repo = Repo::new();
+        fs::create_dir(repo.0.join("child")).unwrap();
+        assert!(check(&repo.0.join("child"), "file").is_none());
+        assert!(check(&repo.0.join("missing"), "file").is_none());
+        repo.write(".git/config", "[broken\n");
+        assert!(check(&repo.0, "file").is_none());
+    }
+
+    #[test]
+    fn malformed_duplicate_and_unexpected_attribute_records_fail_closed() {
+        let basis = HashMap::from([("one".to_owned(), empty_basis("unset"))]);
+        let empty = attributes(basis.clone(), b"").unwrap();
+        assert!(empty["one"].allows_oid());
+        for invalid in [
+            b"other\0custom\0value\0".as_slice(),
+            b"one\0custom\0value".as_slice(),
+            b"one\0custom\0value\0one\0custom\0value\0".as_slice(),
+            b"one\0text\0".as_slice(),
+        ] {
+            assert!(attributes(basis.clone(), invalid).is_none());
+        }
+        let present = attributes(basis, b"one\0filter\0unspecified\0").unwrap();
+        assert_eq!(present["one"].filter, "present:unspecified");
+        assert!(!present["one"].allows_oid());
+    }
+
+    #[test]
+    fn fifo_probe_child() {
+        if let Some(root) = std::env::var_os("STOOP_FIFO_PROBE") {
+            assert!(capture(Path::new(&root)).is_none());
+        }
+    }
+
+    #[test]
+    fn fifo_attribute_source_does_not_hang() {
+        use std::os::unix::process::CommandExt;
+        use std::time::{Duration, Instant};
+        let repo = Repo::new();
+        let fifo = repo.0.join("attrs-fifo");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        repo.git(&[
+            "config",
+            "--local",
+            "core.attributesFile",
+            fifo.to_str().unwrap(),
+        ]);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "oid_attrs::tests::fifo_probe_child",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &repo.0)
+            .env("STOOP_FIFO_PROBE", &repo.0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                let _ = child.wait();
+                panic!("attribute source FIFO blocked recording");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn global_config_fifo_is_bounded_by_the_deadline() {
+        use std::os::unix::process::CommandExt;
+        use std::time::{Duration, Instant};
+        let repo = Repo::new();
+        let home = repo.0.join("home");
+        fs::create_dir(&home).unwrap();
+        let fifo = home.join(".gitconfig");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "oid_attrs::tests::fifo_probe_child",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &home)
+            .env("STOOP_FIFO_PROBE", &repo.0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                let _ = child.wait();
+                panic!("global Git config FIFO blocked recording");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn git_env_probe_child() {
+        if let Some(root) = std::env::var_os("STOOP_GIT_ENV_PROBE") {
+            assert!(capture(Path::new(&root)).is_none());
+        }
+    }
+
+    #[test]
+    fn redirected_attribute_source_is_never_treated_as_safe() {
+        let repo = Repo::new();
+        for (name, value) in [
+            ("GIT_ATTR_SOURCE", "HEAD"),
+            ("GIT_DIR", "/nonexistent"),
+            ("GIT_COMMON_DIR", "/nonexistent"),
+            ("GIT_WORK_TREE", "/nonexistent"),
+            ("GIT_INDEX_FILE", "/nonexistent"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+            ("GIT_CONFIG_COUNT", "0"),
+            ("GIT_UNRECOGNIZED_OVERRIDE", "1"),
+        ] {
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "oid_attrs::tests::git_env_probe_child"])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .env("HOME", &repo.0)
+                .env("STOOP_GIT_ENV_PROBE", &repo.0)
+                .env(name, value)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+    }
+
+    #[test]
+    fn harmless_git_env_probe_child() {
+        if let Some(root) = std::env::var_os("STOOP_HARMLESS_GIT_ENV_PROBE") {
+            assert!(capture(Path::new(&root)).is_some());
+        }
+    }
+
+    #[test]
+    fn harmless_git_variables_keep_the_snapshot() {
+        let repo = Repo::new();
+        for name in HARMLESS_GIT_ENV {
+            let name = std::str::from_utf8(name).unwrap();
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "oid_attrs::tests::harmless_git_env_probe_child"])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .env("HOME", &repo.0)
+                .env("STOOP_HARMLESS_GIT_ENV_PROBE", &repo.0)
+                .env(name, "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+    }
+}

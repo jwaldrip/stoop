@@ -245,10 +245,7 @@ fn known_github(name: &str) -> bool {
     name == "GITHUB_JOB" || crate::gha::context::VERIFIED_VARS.contains(&name)
 }
 
-/// Recorder semantics older than this floor may produce unsound plan proofs.
-/// When recorder changes make earlier proofs unsound, bump this floor and
-/// `TRACER_VERSION` together. This is not the planner runner's runtime version.
-const MIN_PLANNABLE_RECORDER_VERSION: u32 = 4;
+use crate::trace::version::MIN_PLANNABLE_RECORDER_VERSION;
 
 /// Resolve only runner labels whose platform is known without executing the job.
 fn declared_platform(runs_on: &serde_json::Value) -> Option<(&'static str, &'static str)> {
@@ -432,9 +429,8 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
     for ((index, key, age), saved) in steps.iter().zip(&record.steps) {
         let loaded = ctx.proofs.load(key);
         let has_legacy = loaded.iter().any(|p| p.provenance.is_none());
-        let empty = loaded.is_empty();
         let Some(proof) = loaded.into_iter().find(|p| p.digest() == saved.proof) else {
-            if (empty && ctx.proofs.export(key).is_some()) || has_legacy {
+            if has_legacy {
                 return decision(
                     Code::ProofPlatform,
                     format!("step {index}: proof lacks provenance"),
@@ -1011,6 +1007,8 @@ mod tests {
         Input {
             path: path.into(),
             id: id.into(),
+            oid: None,
+            oid_basis: None,
         }
     }
     fn proof(inputs: Vec<Input>) -> Proof {
@@ -1125,7 +1123,12 @@ mod tests {
 
     #[test]
     fn older_recorder_semantics_are_not_plannable() {
-        for (version, expected) in [(3, Code::ProofPlatform), (4, Code::Proved)] {
+        for (version, expected) in [
+            (3, Code::ProofPlatform),
+            (4, Code::ProofPlatform),
+            (5, Code::ProofPlatform),
+            (MIN_PLANNABLE_RECORDER_VERSION, Code::Proved),
+        ] {
             let mut f = Fixture::new();
             let mut p = proof(vec![]);
             p.provenance.as_mut().unwrap().version = version;
@@ -1136,7 +1139,7 @@ mod tests {
                 "version {version}: {}",
                 result.detail
             );
-            if version == 3 {
+            if version < MIN_PLANNABLE_RECORDER_VERSION {
                 assert!(result.detail.contains("recorder too old: re-record"));
             }
         }
@@ -1144,7 +1147,12 @@ mod tests {
 
     #[test]
     fn older_recorder_is_blocked_on_custom_runner_host_fallback() {
-        for (version, expected) in [(3, Code::ProofPlatform), (4, Code::Proved)] {
+        for (version, expected) in [
+            (3, Code::ProofPlatform),
+            (4, Code::ProofPlatform),
+            (5, Code::ProofPlatform),
+            (MIN_PLANNABLE_RECORDER_VERSION, Code::Proved),
+        ] {
             let mut f = Fixture::new();
             f.spec.runs_on = serde_json::json!("custom-runner");
             let mut p = proof(vec![]);
@@ -1160,7 +1168,7 @@ mod tests {
                 "version {version}: {}",
                 result.detail
             );
-            if version == 3 {
+            if version < MIN_PLANNABLE_RECORDER_VERSION {
                 assert!(result.detail.contains("recorder too old: re-record"));
             }
         }
@@ -1175,19 +1183,29 @@ mod tests {
     }
 
     #[test]
-    fn legacy_proof_with_old_digest_reports_missing_provenance() {
+    fn older_proof_files_are_missing_even_with_a_matching_digest() {
+        let mut f = Fixture::new();
+        let p = proof(vec![]);
+        f.install(vec![p.clone()]);
+        for version in [0, 1, 2, 3] {
+            let file = serde_json::json!({"v": version, "key": "sh-0", "proofs": [p]});
+            fs::write(
+                f.root.join("store/proofs/sh-0.json"),
+                serde_json::to_vec(&file).unwrap(),
+            )
+            .unwrap();
+            let result = f.decide(BTreeMap::new());
+            assert_eq!(result.code, Code::ProofMissing, "{}", result.detail);
+            assert!(result.detail.contains("proof missing"), "{}", result.detail);
+        }
+    }
+
+    #[test]
+    fn proof_without_provenance_and_old_digest_reports_missing_provenance() {
         let mut f = Fixture::new();
         let mut p = proof(vec![]);
         p.provenance = None;
-        f.install(vec![p.clone()]);
-        let mut raw = serde_json::to_value(&p).unwrap();
-        raw.as_object_mut().unwrap().remove("provenance");
-        let file = serde_json::json!({"v": 1, "key": "sh-0", "proofs": [raw]});
-        fs::write(
-            f.root.join("store/proofs/sh-0.json"),
-            serde_json::to_vec(&file).unwrap(),
-        )
-        .unwrap();
+        f.install(vec![p]);
         let mut record = f.jobs.load("job-test").remove(0);
         record.steps[0].proof = "p-old-digest".into();
         f.jobs.save("job-test", record).unwrap();
@@ -1208,10 +1226,14 @@ mod tests {
     #[test]
     fn proved_evidence_binds_record_and_proofs_in_step_order() {
         let mut f = Fixture::new();
-        f.install(vec![
+        let mut proofs = vec![
             proof(vec![input("absent", "a")]),
             proof(vec![input("dir/a", &file_id(b"tracked"))]),
-        ]);
+        ];
+        if proofs[0].digest() < proofs[1].digest() {
+            proofs.swap(0, 1);
+        }
+        f.install(proofs);
         let record = f.jobs.load("job-test").remove(0);
         let expected: Vec<_> = record.steps.iter().map(|step| step.proof.clone()).collect();
         assert!(

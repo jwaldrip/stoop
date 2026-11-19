@@ -26,7 +26,21 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zsh fish dash
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Compare recorder performance with base
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        run: |
+          head=$(git rev-parse HEAD)
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          base=$(git rev-parse FETCH_HEAD)
+          echo "base=$base head=$head"
+          git switch --detach "$base"
+          cargo build --release --target-dir "$RUNNER_TEMP/stoop-base"
+          git switch --detach "$head"
+          STOOP_BENCH_BASE_BIN="$RUNNER_TEMP/stoop-base/release/stoop" STOOP_DEBUG=1 cargo test --release --test record_e2e recorder_base_vs_head_timing_fixture -- --nocapture
       - run: cargo test
+      - name: Verify blob IDs above 2 GiB
+        run: cargo test --release --test record_e2e sparse_input_over_two_gib_keeps_its_blob_oid -- --ignored --nocapture
       - name: Changed-unit hook in a run step (brace and environment spellings)
         shell: bash
         run: |
