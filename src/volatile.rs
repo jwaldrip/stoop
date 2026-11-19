@@ -2250,6 +2250,9 @@ mod review_tests {
         );
         let staging = observe(&s, name, Some("staging"));
         assert!(staging.plan.excluded.is_empty(), "{:?}", staging.plan);
+        // Revoked, not refused: one new identifier does not learn the name again.
+        let once = observe(&s, name, Some("d1e2f3a4"));
+        assert!(once.plan.excluded.is_empty(), "{:?}", once.plan);
         std::env::remove_var(name);
     }
 
@@ -2260,7 +2263,19 @@ mod review_tests {
         for value in V {
             observe(&s, name, Some(value));
         }
-        let unset = observe(&s, name, None);
+        // A run's candidates come from the environment, so an unset name is not among them.
+        let unset = decide(&Request {
+            store: &s,
+            key: "k",
+            candidates: &[],
+            mention: "",
+            forced: &[],
+            salt: None,
+            learn: true,
+            persist: true,
+            now: 1,
+            ignore: &[],
+        });
         assert!(unset.plan.excluded.is_empty(), "{:?}", unset.plan);
         assert!(
             unset.plan.counted.contains(&name.to_string()),
