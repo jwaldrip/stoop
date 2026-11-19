@@ -137,7 +137,7 @@ pub use linux::run;
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
 pub fn run(
-    _argv: &[String],
+    _argv: &[std::ffi::OsString],
     _cwd: &Path,
     _allow_network: bool,
     _scope: Option<&Scope<'_>>,
