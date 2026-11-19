@@ -11,7 +11,7 @@ use crate::{attest, gha, input, job, proof, run, sync};
 use serde_json::{json, Value};
 use spec::{Code, Decision, JobSpec, RecordCheck, StepSpec};
 use std::path::{Path, PathBuf};
-const HELP: &str = "stoop plan [--workflow PATH] [--rev REV] [--plan-job ID] [--format human|json|github] [--output FILE] [--root DIR] [--store DIR] [--sync git[:REMOTE]] [--max-age DUR] [--allow-uses OWNER/REPO[@REF]] [--explain] [--quiet]\nPlan-time skips are experimental. --max-age must be positive and at most 7d. --allow-uses is for local dry runs only.\n";
+const HELP: &str = "stoop plan [--workflow PATH] [--rev REV] [--plan-job ID] [--format human|json|github] [--output FILE] [--root DIR] [--store DIR] [--sync git[:REMOTE]] [--max-age DUR] [--allow-uses OWNER/REPO[@REF]] [--prefilter on|off|check] [--explain] [--quiet]\nPlan-time skips are experimental. --max-age must be positive and at most 7d. --allow-uses is for local dry runs only. --prefilter off hashes every file; check runs both ways and fails on any difference.\n";
 struct Options {
     workflow: Option<String>,
     rev: String,
@@ -24,6 +24,7 @@ struct Options {
     max_age: u64,
     explain: bool,
     quiet: bool,
+    prefilter: eval::Prefilter,
     allowed: Vec<String>,
 }
 fn parse(args: &[String]) -> Result<Option<Options>, String> {
@@ -44,6 +45,7 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
         max_age: run::DEFAULT_MAX_AGE,
         explain: false,
         quiet: false,
+        prefilter: eval::Prefilter::On,
         allowed: Vec::new(),
     };
     let mut iter = args.iter();
@@ -76,6 +78,14 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
             "--max-age" => o.max_age = run::parse_age(&value()?)?,
             "--explain" => o.explain = true,
             "--quiet" => o.quiet = true,
+            "--prefilter" => {
+                o.prefilter = match value()?.as_str() {
+                    "on" => eval::Prefilter::On,
+                    "off" => eval::Prefilter::Off,
+                    "check" => eval::Prefilter::Check,
+                    other => return Err(format!("unknown prefilter {other}")),
+                }
+            }
             _ => return Err(format!("unknown option {arg}")),
         }
     }
@@ -515,6 +525,7 @@ fn build<S: attest::KeySource>(
         event_path,
         event,
         explain: o.explain,
+        prefilter: o.prefilter,
     };
     let mut results = Vec::new();
     let mut skip = Vec::new();
@@ -576,12 +587,16 @@ mod tests {
     fn injected_planner_proves_an_attested_record() {
         if let Some(root) = std::env::var_os("STOOP_TEST_PLAN_CHILD") {
             let root = PathBuf::from(root);
-            let args = vec![
+            let mut args = vec![
                 "--workflow".into(),
                 ".github/workflows/ci.yml".into(),
                 "--format".into(),
                 "json".into(),
             ];
+            if let Some(mode) = std::env::var_os("STOOP_TEST_PREFILTER") {
+                args.push("--prefilter".into());
+                args.push(mode.to_string_lossy().into_owned());
+            }
             let opts = parse(&args).unwrap().unwrap();
             let mut plan = json!({"skip": [], "jobs": []});
             build(
@@ -601,6 +616,19 @@ mod tests {
             } else {
                 assert_eq!(plan["skip"], json!(["a"]));
                 assert_eq!(plan["jobs"][0]["code"], "proved");
+            }
+            if std::env::var_os("STOOP_TEST_NO_RECORD").is_none() {
+                let checked = &plan["jobs"][0]["legs"][0]["checked"];
+                let counts = (
+                    checked["by_oid"].as_u64(),
+                    checked["hashed"].as_u64(),
+                    checked["blob_reads"].as_u64(),
+                );
+                if std::env::var("STOOP_TEST_PREFILTER").as_deref() == Ok("off") {
+                    assert_eq!(counts, (Some(0), Some(1), Some(1)));
+                } else {
+                    assert_eq!(counts, (Some(1), Some(0), Some(0)));
+                }
             }
             return;
         }
@@ -654,6 +682,17 @@ mod tests {
         .unwrap()
         .trim()
         .to_string();
+        let blob = String::from_utf8(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["rev-parse", "HEAD:a.txt"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
         let event = root.join("event.json");
         std::fs::write(&event, r#"{"repository":{"default_branch":"main"}}"#).unwrap();
         let api_root =
@@ -690,8 +729,17 @@ mod tests {
                     "f:{}",
                     blake3::hash(include_bytes!("../../tests/fixtures/plan/a.txt")).to_hex()
                 ),
-                oid: None,
-                oid_basis: None,
+                oid: Some(format!("sha1:{blob}")),
+                oid_basis: Some(crate::oid_attrs::OidBasis {
+                    text: "unspecified".into(),
+                    eol: "unspecified".into(),
+                    filter: "unspecified".into(),
+                    ident: "unspecified".into(),
+                    working_tree_encoding: "unspecified".into(),
+                    export_subst: "unspecified".into(),
+                    crlf: "unspecified".into(),
+                    autocrlf: "unset".into(),
+                }),
             }],
             outputs: vec![],
             removed: vec![],
@@ -763,6 +811,18 @@ mod tests {
             String::from_utf8_lossy(&child.stdout),
             String::from_utf8_lossy(&child.stderr)
         );
+        for mode in ["on", "off", "check"] {
+            let child = child_command()
+                .env("STOOP_TEST_PREFILTER", mode)
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "{mode}: {}\n{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+        }
         assert!(jobs.forget(key).unwrap());
         let child = child_command()
             .env("STOOP_TEST_NO_RECORD", "1")
@@ -777,5 +837,20 @@ mod tests {
         drop(api);
         std::fs::remove_dir_all(api_root).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn prefilter_flag_takes_on_off_or_check() {
+        for (value, mode) in [
+            ("on", eval::Prefilter::On),
+            ("off", eval::Prefilter::Off),
+            ("check", eval::Prefilter::Check),
+        ] {
+            let args = vec!["--prefilter".to_string(), value.to_string()];
+            assert_eq!(parse(&args).unwrap().unwrap().prefilter, mode);
+        }
+        assert_eq!(parse(&[]).unwrap().unwrap().prefilter, eval::Prefilter::On);
+        let bogus = vec!["--prefilter".to_string(), "bogus".to_string()];
+        assert!(parse(&bogus).is_err());
+        assert_eq!(cmd(&bogus), 2);
     }
 }
