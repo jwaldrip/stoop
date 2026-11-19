@@ -188,4 +188,9 @@ fn a_placeholder_inside_a_shell_string_is_refused_only_when_the_shell_is_recogni
     assert_eq!(out.status.code(), Some(2), "{}", err(&out));
     assert!(err(&out).contains("substituted into shell code"), "{}", err(&out));
     assert_eq!(dir.log(), None);
+    // Not shell code: the same brace placeholder as an option value is a placeholder.
+    let out = dir.shell("bash", &["-c"], "stoop run -- ./runner -c '{changed:*.t}'");
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(!err(&out).contains("substituted"), "{}", err(&out));
+    assert_eq!(dir.log().as_deref(), Some("changed=<>\n"));
 }

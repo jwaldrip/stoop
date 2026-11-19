@@ -82,6 +82,7 @@ fn full_form_removes_the_placeholder_and_its_option() {
         vec!["-f={changed}"],
         vec!["-f{changed}"],
         vec!["--files", "base.t", "--files", "{changed:*.t|!slow/**}"],
+        vec!["--files=base.t", "--files={changed:*.t}"],
         vec!["{changed:*.t}"],
         vec!["--files", "$STOOP_CHANGED"],
         vec!["--files=${STOOP_CHANGED:*.t}"],
@@ -134,6 +135,28 @@ fn malformed_and_shell_mangled_placeholders_fail_before_launch() {
         );
         assert!(!f.root.join("log").exists(), "bad={bad:?}");
     }
+}
+
+#[test]
+fn a_placeholder_embedded_in_a_word_with_spaces_is_refused_before_launch() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["echo {changed} now"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(err(&out).contains("embedded"), "{}", err(&out));
+    assert!(!f.root.join("log").exists());
+}
+
+#[test]
+fn a_hook_run_prints_the_words_it_removed_without_tracing() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--files", "{changed}"], false);
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(
+        err(&out).contains("removed [\"--files\", \"{changed}\"]"),
+        "{}",
+        err(&out)
+    );
+    assert_eq!(f.log(), "changed=<>\n");
 }
 
 #[test]
