@@ -817,6 +817,20 @@ mod tests {
     }
 
     #[test]
+    fn configured_attribute_file_declines_the_snapshot() {
+        let repo = Repo::new();
+        repo.write("custom-attributes", "*.txt text\n");
+        let attr_path = repo.0.join("custom-attributes");
+        repo.git(&[
+            "config",
+            "--local",
+            "core.attributesFile",
+            attr_path.to_str().unwrap(),
+        ]);
+        assert!(snapshot(&repo.0).is_none());
+    }
+
+    #[test]
     fn conditional_git_config_include_is_not_assumed_safe() {
         let repo = Repo::new();
         repo.git(&[

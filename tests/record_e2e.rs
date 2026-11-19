@@ -610,7 +610,7 @@ fn git_root_records_original_content_prior_but_never_output_blob_ids() {
     w.commit_all();
     let p = recorded(
         &w,
-        "sed -i s/old/new/ config.txt && chmod -x executable.sh && rmdir empty-dir && echo output > built.txt",
+        "printf 'new\\n' > config.txt && chmod -x executable.sh && rmdir empty-dir && echo output > built.txt",
     );
 
     for (path, old, kind) in [
@@ -652,6 +652,29 @@ fn git_root_records_original_content_prior_but_never_output_blob_ids() {
     let link = entry(&link_proof, "priors", "link");
     assert_eq!(link["id"], "l:config.txt");
     assert_unknown_oid_basis(link);
+    w.clean();
+}
+
+#[test]
+fn owner_change_makes_every_oid_of_its_run_unknown() {
+    let w = Ws::new("oid-chown");
+    w.init_git();
+    w.commit_all();
+    let p = recorded(
+        &w,
+        "cat in.txt >/dev/null && chown \"$(id -u):$(id -g)\" in.txt",
+    );
+    assert_unknown_oid_basis(entry(&p, "inputs", "in.txt"));
+    w.clean();
+}
+
+#[test]
+fn sed_in_place_is_an_uncertain_owner_change() {
+    let w = Ws::new("oid-sed-owner");
+    w.init_git();
+    w.commit_all();
+    let p = recorded(&w, "sed -i s/one/two/ in.txt");
+    assert_unknown_oid_basis(entry(&p, "priors", "in.txt"));
     w.clean();
 }
 
