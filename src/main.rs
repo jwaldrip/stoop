@@ -133,7 +133,13 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
         _ => "run".to_string(),
     };
     if cmd == "plan" {
+        #[cfg(unix)]
         return plan::cmd(&args);
+        #[cfg(windows)]
+        {
+            eprintln!("stoop: `stoop plan` is not available on Windows yet");
+            return 2;
+        }
     }
     if cmd == "mcp" {
         #[cfg(unix)]

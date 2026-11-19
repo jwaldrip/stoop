@@ -186,33 +186,33 @@ mod windows {
     pub fn absolute_key(p: &Path) -> String {
         let mut key = String::new();
         let mut components = p.components().peekable();
-        match components.peek() {
-            Some(Component::Prefix(prefix)) => {
-                match prefix.kind() {
-                    Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
-                        write!(key, "/{}:", (letter as char).to_ascii_uppercase()).unwrap();
-                    }
-                    Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
-                        key.push_str("//");
-                        push_name(server, false, &mut key);
-                        key.push('/');
-                        push_name(share, false, &mut key);
-                    }
-                    _ => {
-                        key.push('/');
-                        let text = prefix.as_os_str().to_string_lossy().replace('\\', "/");
-                        key.push_str(text.trim_start_matches('/'));
-                    }
+        if let Some(Component::Prefix(prefix)) = components.peek() {
+            match prefix.kind() {
+                Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                    write!(key, "/{}:", (letter as char).to_ascii_uppercase()).unwrap();
                 }
-                components.next();
+                Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                    key.push_str("//");
+                    push_name(server, false, &mut key);
+                    key.push('/');
+                    push_name(share, false, &mut key);
+                }
+                _ => {
+                    key.push('/');
+                    let text = prefix.as_os_str().to_string_lossy().replace('\\', "/");
+                    key.push_str(text.trim_start_matches('/'));
+                }
             }
-            _ => key.push('/'),
+            components.next();
         }
         for component in components {
             if let Component::Normal(name) = component {
                 key.push('/');
                 push_name(name, false, &mut key);
             }
+        }
+        if key.is_empty() {
+            key.push('/');
         }
         key
     }
@@ -260,10 +260,8 @@ mod windows {
                 }
             ));
         }
-        PathBuf::from(format!(
-            r"\\?\{}",
-            unescape(rest).to_string_lossy().replace('/', r"\")
-        ))
+        // No drive letter: a path rooted on whichever drive is current.
+        PathBuf::from(unescape(key).to_string_lossy().replace('/', r"\"))
     }
 }
 
@@ -657,6 +655,7 @@ mod windows_tests {
                 r"\\server\share\f.txt",
             ),
             (r"E:\", "/E:", r"E:\"),
+            (r"\usr\lib\x", "/usr/lib/x", r"\usr\lib\x"),
         ] {
             assert_eq!(key(path), expected, "{path}");
             assert_eq!(back(expected), PathBuf::from(restored), "{expected}");

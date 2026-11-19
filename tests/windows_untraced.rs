@@ -85,9 +85,9 @@ fn an_ntstatus_exit_code_is_the_code_stoop_exits_with() {
 fn a_run_that_passes_is_run_again_because_nothing_was_recorded() {
     let w = Work::new("again");
     let counter = w.dir.join("count.txt");
-    let script = format!("echo x>> \"{}\"", counter.display());
+    let script = "echo x>> count.txt";
     for _ in 0..2 {
-        let out = w.stoop(&["run", "--root", ".", "--", "cmd", "/c", &script]);
+        let out = w.stoop(&["run", "--root", ".", "--", "cmd", "/c", script]);
         assert_eq!(out.status.code(), Some(0), "{}", text(&out.stderr));
     }
     let lines = fs::read_to_string(&counter).unwrap().lines().count();
@@ -137,14 +137,29 @@ fn a_missing_command_exits_127() {
 
 #[test]
 fn stoop_sh_runs_the_script_under_bash_and_returns_its_status() {
-    if Command::new("bash").arg("--version").output().is_err() {
-        eprintln!("skipped: bash is not on PATH here");
+    // `bash` on a Windows runner's PATH can be the WSL launcher, which does not run scripts.
+    // `stoop sh` needs Git for Windows' bash, so put it first.
+    let git_bin = std::path::Path::new(r"C:\Program Files\Git\bin");
+    if !git_bin.join("bash.exe").exists() {
+        eprintln!("skipped: Git for Windows' bash is not installed here");
         return;
     }
     let w = Work::new("sh");
     let script = w.dir.join("step.sh");
     fs::write(&script, "echo ran-under-bash\nexit 4\n").unwrap();
-    let out = w.stoop(&["sh", script.to_str().unwrap()]);
+    let path = format!(
+        "{};{}",
+        git_bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new(env!("CARGO_BIN_EXE_stoop"))
+        .args(["sh", &script.to_str().unwrap().replace('\\', "/")])
+        .current_dir(&w.dir)
+        .env("STOOP_STORE", w.dir.join("store"))
+        .env("PATH", path)
+        .env_remove("STOOP_OFF")
+        .output()
+        .unwrap();
     let stderr = text(&out.stderr);
     assert_eq!(out.status.code(), Some(4), "{stderr}");
     assert!(text(&out.stdout).contains("ran-under-bash"), "{stderr}");

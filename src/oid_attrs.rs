@@ -489,18 +489,18 @@ pub(crate) fn snapshot(root: &Path) -> Option<Epoch> {
 }
 
 /// Observe conversion evidence even when it makes the path ineligible.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn observe(root: &Path, path: &str) -> Option<OidBasis> {
     snapshot(root)?.basis.remove(path)
 }
 
 /// Evidence for a known path only when Git hashes its raw bytes.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub fn check(root: &Path, path: &str) -> Option<OidBasis> {
     observe(root, path).filter(OidBasis::allows_oid)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 /// Restrict evidence to known, conversion-free paths.
 pub fn check_many(root: &Path, paths: &[String]) -> HashMap<String, OidBasis> {
     let Some(mut epoch) = snapshot(root) else {
@@ -516,12 +516,12 @@ pub fn check_many(root: &Path, paths: &[String]) -> HashMap<String, OidBasis> {
 }
 
 /// An unknown or nonempty directory may hide an attribute source.
-#[cfg(any(target_os = "linux", test))]
+#[cfg(any(target_os = "linux", all(test, unix)))]
 pub fn directory_removal_invalidates(path: &Path) -> bool {
     !std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;

@@ -536,6 +536,7 @@ fn published_records_are_accepted_only_through_the_verifier() {
     }
 }
 
+#[cfg(unix)]
 #[test]
 fn captured_request_credentials_still_attest_a_job_for_the_verifier() {
     const CHILD: &str = "STOOP_CAPTURED_ATTEST_CHILD";

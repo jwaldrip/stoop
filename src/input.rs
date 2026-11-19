@@ -408,6 +408,7 @@ mod tests {
         fs::remove_dir_all(d).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn records_oids_requires_a_safe_sha1_worktree() {
         let d = tmp("git-entry");
