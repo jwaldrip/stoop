@@ -10,10 +10,12 @@ use crate::proof::{now, sanitize, Proof, Store};
 use crate::sync::Remote;
 use crate::trace::{self, Trace};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Instant;
 
 #[derive(Default)]
@@ -47,6 +49,70 @@ pub struct Opts {
     pub max_age: Option<u64>,
     pub defer_push: bool,
     pub argv: Vec<String>,
+    /// Explicitly passed OIDC request variables; such a run is never recorded.
+    pub pass_env: Vec<&'static str>,
+    pub allow_id_token: bool,
+}
+
+pub const ID_TOKEN_VARS: [&str; 2] = [
+    "ACTIONS_ID_TOKEN_REQUEST_URL",
+    "ACTIONS_ID_TOKEN_REQUEST_TOKEN",
+];
+static ID_TOKEN_ENV: OnceLock<[Option<OsString>; 2]> = OnceLock::new();
+
+/// Called before any thread or child exists. The journal retains the values,
+/// but every subprocess inherits an environment without them.
+pub fn capture_id_token_env() {
+    let values = ID_TOKEN_VARS.map(std::env::var_os);
+    let _ = ID_TOKEN_ENV.set(values);
+    for name in ID_TOKEN_VARS {
+        while std::env::var_os(name).is_some() {
+            std::env::remove_var(name);
+        }
+    }
+}
+
+pub fn id_token_value(name: &str) -> Option<OsString> {
+    let index = ID_TOKEN_VARS
+        .iter()
+        .position(|candidate| *candidate == name)?;
+    match ID_TOKEN_ENV.get() {
+        Some(values) => values[index].clone(),
+        None => std::env::var_os(name),
+    }
+}
+
+pub fn id_token_string(name: &str) -> Option<String> {
+    id_token_value(name)
+        .and_then(|value| value.into_string().ok())
+        .filter(|value| !value.trim().is_empty())
+}
+
+pub fn parse_pass_env(raw: Option<&OsStr>, allow: bool) -> Result<Vec<&'static str>, String> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let raw = raw.to_str().ok_or("STOOP_PASS_ENV must be UTF-8")?;
+    let mut names = Vec::new();
+    for name in raw
+        .split(|ch: char| ch == ',' || ch.is_whitespace())
+        .filter(|name| !name.is_empty())
+    {
+        let name = ID_TOKEN_VARS
+            .iter()
+            .copied()
+            .find(|known| *known == name)
+            .ok_or("STOOP_PASS_ENV may list only the two OIDC request variable names")?;
+        if !allow {
+            return Err(
+                "STOOP_PASS_ENV requires --allow-id-token for OIDC request variables".into(),
+            );
+        }
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    Ok(names)
 }
 
 /// Nearest ancestor holding a `.git`, else the working directory.
@@ -358,11 +424,15 @@ fn ago(created: u64) -> String {
     }
 }
 
-fn plain(argv: &[String]) -> i32 {
-    match std::process::Command::new(&argv[0])
-        .args(&argv[1..])
-        .status()
-    {
+fn plain(argv: &[String], pass_env: &[&str]) -> i32 {
+    let mut command = std::process::Command::new(&argv[0]);
+    command.args(&argv[1..]);
+    for name in pass_env {
+        if let Some(value) = id_token_value(name) {
+            command.env(name, value);
+        }
+    }
+    match command.status() {
         Ok(s) => {
             use std::os::unix::process::ExitStatusExt;
             s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
@@ -434,6 +504,26 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             status: 2,
             key: initial_key,
             how: How::Untraced,
+        };
+    }
+    if !o.pass_env.is_empty() {
+        if explain {
+            if !o.quiet {
+                eprintln!("stoop: would run without a proof: OIDC request credentials are explicitly passed");
+            }
+            return Outcome {
+                status: 1,
+                key: initial_key,
+                how: How::Unrecorded("OIDC request credentials passed".into()),
+            };
+        }
+        if !o.quiet {
+            eprintln!("stoop: running untraced without a proof: OIDC request credentials are explicitly passed");
+        }
+        return Outcome {
+            status: plain(&o.argv, &o.pass_env),
+            key: initial_key,
+            how: How::Unrecorded("OIDC request credentials passed".into()),
         };
     }
     let literal = o.literal || !observe_runners;
@@ -574,7 +664,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     // STOOP_OFF runs a hook's first-run form without tracing, and its hints still print above.
     if env_switch("STOOP_OFF", true) && !explain {
         return Outcome {
-            status: plain(&o.argv),
+            status: plain(&o.argv, &[]),
             key: initial_key,
             how: How::Untraced,
         };
@@ -618,7 +708,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             );
         }
         return Outcome {
-            status: plain(&o.argv),
+            status: plain(&o.argv, &[]),
             key,
             how: How::Untraced,
         };
@@ -829,7 +919,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 eprintln!("stoop: not traced ({e}); running without a proof");
             }
             return Outcome {
-                status: plain(&o.argv),
+                status: plain(&o.argv, &[]),
                 key,
                 how: How::Untraced,
             };
@@ -1326,6 +1416,107 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn pass_env_requires_exact_names_and_explicit_flag() {
+        assert!(parse_pass_env(None, false).unwrap().is_empty());
+        assert!(parse_pass_env(Some(OsStr::new(" ,  ")), false)
+            .unwrap()
+            .is_empty());
+        let both = format!(
+            "{}, {},{}",
+            ID_TOKEN_VARS[1], ID_TOKEN_VARS[0], ID_TOKEN_VARS[1]
+        );
+        assert_eq!(
+            parse_pass_env(Some(OsStr::new(&both)), true).unwrap(),
+            vec![ID_TOKEN_VARS[1], ID_TOKEN_VARS[0]]
+        );
+        assert!(parse_pass_env(Some(OsStr::new(ID_TOKEN_VARS[0])), false).is_err());
+        for bad in [
+            "PATH",
+            "actions_id_token_request_token",
+            "ACTIONS_ID_TOKEN_REQUEST_TOKEN=value",
+        ] {
+            assert!(parse_pass_env(Some(OsStr::new(bad)), true).is_err());
+        }
+        assert!(parse_pass_env(Some(OsStr::from_bytes(b"\xff")), true).is_err());
+    }
+
+    #[test]
+    fn passing_request_credentials_never_produces_a_recorded_outcome() {
+        const CHILD: &str = "STOOP_TOKEN_OUTCOME_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "run::tests::passing_request_credentials_never_produces_a_recorded_outcome",
+                    "--nocapture",
+                ])
+                .env_clear()
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        for (program, status) in [("/usr/bin/true", 0), ("/usr/bin/false", 1)] {
+            let outcome = run_outcome(
+                Opts {
+                    argv: vec![program.to_owned()],
+                    pass_env: vec![ID_TOKEN_VARS[0]],
+                    ..Default::default()
+                },
+                false,
+            );
+            assert_eq!(outcome.status, status);
+            assert!(
+                matches!(outcome.how, How::Unrecorded(_)),
+                "token-enabled runs must not be recorded or skipped"
+            );
+        }
+    }
+
+    #[test]
+    fn captured_credentials_survive_a_later_thread_without_entering_its_environment() {
+        const CHILD: &str = "STOOP_TOKEN_CAPTURE_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "run::tests::captured_credentials_survive_a_later_thread_without_entering_its_environment", "--nocapture"])
+                .env_clear()
+                .env(CHILD, "1")
+                .env(ID_TOKEN_VARS[0], "fixture-url")
+                .env(ID_TOKEN_VARS[1], OsString::from_vec(b"fixture-\xff".to_vec()))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        capture_id_token_env();
+        std::thread::spawn(|| {
+            assert!(std::env::var_os(ID_TOKEN_VARS[0]).is_none());
+            assert!(std::env::var_os(ID_TOKEN_VARS[1]).is_none());
+            assert_eq!(
+                id_token_value(ID_TOKEN_VARS[0]),
+                Some(OsString::from("fixture-url"))
+            );
+            assert_eq!(
+                id_token_value(ID_TOKEN_VARS[1]).unwrap().as_bytes(),
+                b"fixture-\xff"
+            );
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn prior_oid_requires_unchanged_attributes_and_a_basis() {

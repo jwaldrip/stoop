@@ -61,7 +61,7 @@ pub fn audience(job_key: &str, record: &JobRecord) -> Result<String, String> {
 pub fn mint(job_key: &str, record: &JobRecord) -> Option<String> {
     // A job without `id-token: write` has no request URL. That is the normal case for a
     // job that does not attest, so it says nothing on every publication.
-    run::env_str("ACTIONS_ID_TOKEN_REQUEST_URL")?;
+    run::id_token_string("ACTIONS_ID_TOKEN_REQUEST_URL")?;
     match mint_token(job_key, record) {
         Ok(token) => Some(token),
         Err(reason) => {
@@ -72,9 +72,9 @@ pub fn mint(job_key: &str, record: &JobRecord) -> Option<String> {
 }
 
 fn mint_token(job_key: &str, record: &JobRecord) -> Result<String, String> {
-    let url = run::env_str("ACTIONS_ID_TOKEN_REQUEST_URL")
+    let url = run::id_token_string("ACTIONS_ID_TOKEN_REQUEST_URL")
         .ok_or("this job has no OIDC token request URL (grant `id-token: write`)")?;
-    let bearer = run::env_str("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+    let bearer = run::id_token_string("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
         .ok_or("this job has no OIDC request token (grant `id-token: write`)")?;
     let audience = audience(job_key, record)?;
     let separator = if url.contains('?') { '&' } else { '?' };

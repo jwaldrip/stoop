@@ -1123,12 +1123,8 @@ mod tests {
 
     #[test]
     fn older_recorder_semantics_are_not_plannable() {
-        for (version, expected) in [
-            (3, Code::ProofPlatform),
-            (4, Code::ProofPlatform),
-            (5, Code::ProofPlatform),
-            (MIN_PLANNABLE_RECORDER_VERSION, Code::Proved),
-        ] {
+        let current = crate::trace::version::TRACER_VERSION;
+        for (version, expected) in [(current - 1, Code::ProofPlatform), (current, Code::Proved)] {
             let mut f = Fixture::new();
             let mut p = proof(vec![]);
             p.provenance.as_mut().unwrap().version = version;
@@ -1139,7 +1135,7 @@ mod tests {
                 "version {version}: {}",
                 result.detail
             );
-            if version < MIN_PLANNABLE_RECORDER_VERSION {
+            if version < current {
                 assert!(result.detail.contains("recorder too old: re-record"));
             }
         }
@@ -1147,12 +1143,8 @@ mod tests {
 
     #[test]
     fn older_recorder_is_blocked_on_custom_runner_host_fallback() {
-        for (version, expected) in [
-            (3, Code::ProofPlatform),
-            (4, Code::ProofPlatform),
-            (5, Code::ProofPlatform),
-            (MIN_PLANNABLE_RECORDER_VERSION, Code::Proved),
-        ] {
+        let current = crate::trace::version::TRACER_VERSION;
+        for (version, expected) in [(current - 1, Code::ProofPlatform), (current, Code::Proved)] {
             let mut f = Fixture::new();
             f.spec.runs_on = serde_json::json!("custom-runner");
             let mut p = proof(vec![]);
@@ -1168,7 +1160,7 @@ mod tests {
                 "version {version}: {}",
                 result.detail
             );
-            if version < MIN_PLANNABLE_RECORDER_VERSION {
+            if version < current {
                 assert!(result.detail.contains("recorder too old: re-record"));
             }
         }
