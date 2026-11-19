@@ -43,6 +43,8 @@ pub fn is_git_name(name: &std::ffi::OsStr) -> bool {
     #[cfg(windows)]
     {
         name.to_str().is_some_and(|name| {
+            // `.git::$INDEX_ALLOCATION` names the directory itself on NTFS, as any `:stream` does.
+            let name = name.split(':').next().unwrap_or(name);
             let name = name.trim_end_matches(['.', ' ']);
             name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case("git~1")
         })
@@ -61,10 +63,7 @@ pub fn to_key(root: &Path, p: &Path) -> String {
     }
     #[cfg(windows)]
     {
-        match windows::strip_root(root, p) {
-            Some(rel) => windows::relative_key(&rel, false),
-            None => windows::absolute_key(p),
-        }
+        windows::key(root, p)
     }
 }
 
@@ -92,10 +91,7 @@ pub fn cwd_key(root: &Path, cwd: &Path) -> String {
     }
     #[cfg(windows)]
     {
-        match windows::strip_root(root, cwd) {
-            Some(rel) => windows::relative_key(&rel, true),
-            None => windows::absolute_key(cwd),
-        }
+        windows::key(root, cwd)
     }
 }
 
@@ -120,11 +116,14 @@ pub fn from_key(root: &Path, key: &str) -> PathBuf {
 
 /// Keys on Windows: `/`-separated, so they match across machines and the `.git` component
 /// check splits them the same way. A DOS path outside the root is `/C:/dir/file`, a UNC path
-/// is `//server/share/dir`. Names are never case-folded; only the root prefix is matched
-/// without regard to case. Unpaired UTF-16 surrogates are written `%uXXXX`.
+/// is `//server/share/dir`, a device path with no DOS name is `/GLOBALROOT/Device/...`, and
+/// other verbatim and device-namespace paths are `/?/name/...` and `/./name/...`. A relative
+/// path stays relative, and `..` stays `..`. Names are never case-folded; only the root prefix
+/// is matched without regard to case. `%` is written `%25`, and an unpaired UTF-16 surrogate
+/// `%uXXXX`, so a literal name can never be read back as an escape.
 #[cfg(windows)]
 mod windows {
-    use std::ffi::OsStr;
+    use std::ffi::{OsStr, OsString};
     use std::fmt::Write;
     use std::os::windows::ffi::{OsStrExt, OsStringExt};
     use std::path::{Component, Path, PathBuf, Prefix};
@@ -160,30 +159,54 @@ mod windows {
         Some(rest.as_path().to_path_buf())
     }
 
-    fn push_name(name: &OsStr, escape_percent: bool, out: &mut String) {
+    fn push_name(name: &OsStr, out: &mut String) {
         for unit in char::decode_utf16(name.encode_wide()) {
             match unit {
-                Ok('%') if escape_percent => out.push_str("%25"),
+                Ok('%') => out.push_str("%25"),
                 Ok(c) => out.push(c),
                 Err(e) => write!(out, "%u{:04X}", e.unpaired_surrogate()).unwrap(),
             }
         }
     }
 
-    pub fn relative_key(rel: &Path, escape_percent: bool) -> String {
+    fn is_rooted(p: &Path) -> bool {
+        matches!(
+            p.components().next(),
+            Some(Component::Prefix(_) | Component::RootDir)
+        )
+    }
+
+    /// The key for `p`: relative to `root` when it is below it, absolute when it is rooted
+    /// elsewhere, and relative as written when it has no root at all.
+    pub fn key(root: &Path, p: &Path) -> String {
+        match strip_root(root, p) {
+            Some(rel) => relative_key(&rel),
+            None if is_rooted(p) => absolute_key(p),
+            None => relative_key(p),
+        }
+    }
+
+    fn relative_key(rel: &Path) -> String {
         let mut key = String::new();
         for component in rel.components() {
-            if let Component::Normal(name) = component {
-                if !key.is_empty() {
-                    key.push('/');
-                }
-                push_name(name, escape_percent, &mut key);
+            if matches!(
+                component,
+                Component::CurDir | Component::Prefix(_) | Component::RootDir
+            ) {
+                continue;
+            }
+            if !key.is_empty() {
+                key.push('/');
+            }
+            match component {
+                Component::Normal(name) => push_name(name, &mut key),
+                _ => key.push_str(".."),
             }
         }
         key
     }
 
-    pub fn absolute_key(p: &Path) -> String {
+    fn absolute_key(p: &Path) -> String {
         let mut key = String::new();
         let mut components = p.components().peekable();
         if let Some(Component::Prefix(prefix)) = components.peek() {
@@ -193,22 +216,33 @@ mod windows {
                 }
                 Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
                     key.push_str("//");
-                    push_name(server, false, &mut key);
+                    push_name(server, &mut key);
                     key.push('/');
-                    push_name(share, false, &mut key);
+                    push_name(share, &mut key);
                 }
-                _ => {
-                    key.push('/');
-                    let text = prefix.as_os_str().to_string_lossy().replace('\\', "/");
-                    key.push_str(text.trim_start_matches('/'));
+                Prefix::Verbatim(name) => {
+                    if name.to_string_lossy().eq_ignore_ascii_case("GLOBALROOT") {
+                        key.push_str("/GLOBALROOT");
+                    } else {
+                        key.push_str("/?/");
+                        push_name(name, &mut key);
+                    }
+                }
+                Prefix::DeviceNS(name) => {
+                    key.push_str("/./");
+                    push_name(name, &mut key);
                 }
             }
             components.next();
         }
         for component in components {
-            if let Component::Normal(name) = component {
-                key.push('/');
-                push_name(name, false, &mut key);
+            match component {
+                Component::Normal(name) => {
+                    key.push('/');
+                    push_name(name, &mut key);
+                }
+                Component::ParentDir => key.push_str("/.."),
+                _ => {}
             }
         }
         if key.is_empty() {
@@ -217,51 +251,76 @@ mod windows {
         key
     }
 
-    /// Undoes `%uXXXX` escapes in a relative key.
-    pub fn unescape(key: &str) -> std::ffi::OsString {
+    /// Undoes the escapes of a key and turns its `/` into `\`. Text that is not a well-formed
+    /// escape is kept as it is, so a malformed key cannot panic.
+    pub fn unescape(text: &str) -> OsString {
         let mut units: Vec<u16> = Vec::new();
-        let bytes = key.as_bytes();
-        let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'%' && bytes.get(i + 1) == Some(&b'u') && i + 6 <= bytes.len() {
-                if let Ok(unit) = u16::from_str_radix(&key[i + 2..i + 6], 16) {
-                    units.push(unit);
-                    i += 6;
+        let mut rest = text;
+        while let Some(ch) = rest.chars().next() {
+            if ch == '%' {
+                if rest.get(1..3) == Some("25") {
+                    units.push(u16::from(b'%'));
+                    rest = &rest[3..];
                     continue;
                 }
+                if rest.get(1..2) == Some("u") {
+                    if let Some(hex) = rest.get(2..6) {
+                        if hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                            if let Ok(unit) = u16::from_str_radix(hex, 16) {
+                                units.push(unit);
+                                rest = &rest[6..];
+                                continue;
+                            }
+                        }
+                    }
+                }
             }
-            let ch = key[i..].chars().next().unwrap();
-            let mut buf = [0u16; 2];
-            units.extend_from_slice(ch.encode_utf16(&mut buf));
-            i += ch.len_utf8();
+            if ch == '/' {
+                units.push(u16::from(b'\\'));
+            } else {
+                let mut buf = [0u16; 2];
+                units.extend_from_slice(ch.encode_utf16(&mut buf));
+            }
+            rest = &rest[ch.len_utf8()..];
         }
-        std::ffi::OsString::from_wide(&units)
+        OsString::from_wide(&units)
     }
 
+    /// The path an absolute key names; `key` starts with `/`.
     pub fn from_absolute_key(key: &str) -> PathBuf {
+        let join = |prefix: &str, tail: &str| -> PathBuf {
+            let mut path = OsString::from(prefix);
+            path.push(unescape(tail));
+            PathBuf::from(path)
+        };
         if let Some(unc) = key.strip_prefix("//") {
-            return PathBuf::from(format!(
-                r"\\{}",
-                unescape(unc).to_string_lossy().replace('/', r"\")
-            ));
+            return join(r"\\", unc);
         }
         let rest = &key[1..];
+        if let Some(tail) = rest
+            .strip_prefix("GLOBALROOT")
+            .filter(|tail| tail.is_empty() || tail.starts_with('/'))
+        {
+            return join(r"\\?\GLOBALROOT", tail);
+        }
+        if let Some(tail) = rest.strip_prefix("?/") {
+            return join(r"\\?\", tail);
+        }
+        if let Some(tail) = rest.strip_prefix("./") {
+            return join(r"\\.\", tail);
+        }
         let bytes = rest.as_bytes();
         if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-            let tail = unescape(&rest[2..]);
-            let tail = tail.to_string_lossy().replace('/', r"\");
-            return PathBuf::from(format!(
-                "{}:{}",
-                rest.as_bytes()[0] as char,
-                if tail.is_empty() {
-                    r"\".to_owned()
-                } else {
-                    tail
-                }
-            ));
+            let drive = format!("{}:", bytes[0] as char);
+            let tail = &rest[2..];
+            return if tail.is_empty() {
+                PathBuf::from(format!(r"{drive}\"))
+            } else {
+                join(&drive, tail)
+            };
         }
         // No drive letter: a path rooted on whichever drive is current.
-        PathBuf::from(unescape(key).to_string_lossy().replace('/', r"\"))
+        join("", key)
     }
 }
 
@@ -682,7 +741,16 @@ mod windows_tests {
 
     #[test]
     fn the_git_directory_is_found_under_its_windows_spellings() {
-        for name in [".git", ".GIT", ".git.", ".git ", "GIT~1", "git~1"] {
+        for name in [
+            ".git",
+            ".GIT",
+            ".git.",
+            ".git ",
+            "GIT~1",
+            "git~1",
+            ".git::$INDEX_ALLOCATION",
+            ".GIT::$index_allocation",
+        ] {
             assert!(is_git_name(std::ffi::OsStr::new(name)), "{name}");
         }
         for name in [".gitignore", "git", ".gi", "x.git"] {
@@ -691,5 +759,59 @@ mod windows_tests {
         assert!(key(r"C:\src\repo\.GIT\config")
             .split('/')
             .any(|part| is_git_name(std::ffi::OsStr::new(part))));
+    }
+
+    #[test]
+    fn a_literal_percent_name_is_never_read_back_as_an_escape() {
+        let literal = Path::new(ROOT).join("%u0041.txt");
+        assert_eq!(to_key(Path::new(ROOT), &literal), "%25u0041.txt");
+        assert_eq!(from_key(Path::new(ROOT), "%25u0041.txt"), literal);
+        // A name that spells a surrogate escape is not the same key as a lone surrogate.
+        let spelled = Path::new(ROOT).join("a%uD800b");
+        let lone = Path::new(ROOT).join(OsString::from_wide(&[0x61, 0xD800, 0x62]));
+        assert_ne!(
+            to_key(Path::new(ROOT), &spelled),
+            to_key(Path::new(ROOT), &lone)
+        );
+        assert_eq!(from_key(Path::new(ROOT), "a%25uD800b"), spelled);
+    }
+
+    #[test]
+    fn a_malformed_key_never_panics() {
+        for text in [
+            "%uab\u{20ac}",
+            "%u",
+            "%u12",
+            "%",
+            "%2",
+            "a%zz",
+            "%uD8",
+            "%u\u{20ac}",
+        ] {
+            let _ = from_key(Path::new(ROOT), text);
+            let _ = back(&format!("/{text}"));
+        }
+    }
+
+    #[test]
+    fn device_paths_get_the_section_four_forms_and_come_back() {
+        for (path, expected, restored) in [
+            (
+                r"\\?\GLOBALROOT\Device\HarddiskVolume7\x",
+                "/GLOBALROOT/Device/HarddiskVolume7/x",
+                r"\\?\GLOBALROOT\Device\HarddiskVolume7\x",
+            ),
+            (r"\\.\pipe\x", "/./pipe/x", r"\\.\pipe\x"),
+        ] {
+            assert_eq!(key(path), expected, "{path}");
+            assert_eq!(back(expected), PathBuf::from(restored), "{expected}");
+        }
+    }
+
+    #[test]
+    fn parent_components_and_relative_paths_keep_their_meaning() {
+        assert_eq!(key(r"C:\src\repo\..\other\x"), "../other/x");
+        assert_eq!(key(r"scripts\x.sh"), "scripts/x.sh");
+        assert!(!key(r"scripts\x.sh").starts_with('/'));
     }
 }

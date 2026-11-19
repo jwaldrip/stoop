@@ -249,9 +249,10 @@ pub(crate) fn forget(store: &Path, key: &str) -> Result<bool, String> {
     Ok(true)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn store(name: &str) -> PathBuf {
@@ -273,6 +274,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_read_only_store_warns_that_the_full_command_runs() {
         let path = store("read-only");

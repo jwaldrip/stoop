@@ -43,11 +43,17 @@ pub fn exit_code(status: ExitStatus) -> i32 {
 
 /// The `bash` a `stoop sh` step runs under. On Unix, the one the shell finds. Windows searches
 /// System32 before `PATH`, where `bash.exe` is the WSL launcher and runs nothing without a
-/// distribution installed, so look through `PATH` ourselves and skip Windows' own copies.
+/// distribution installed, so look through `PATH` ourselves and skip Windows' own copies. Only
+/// absolute `PATH` entries count: an empty or relative entry would pick a `bash.exe` out of the
+/// working directory. When none is found the bare name is used, and Windows resolves it, which
+/// can be the WSL launcher.
 pub fn bash() -> std::ffi::OsString {
     #[cfg(windows)]
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
+            if !dir.is_absolute() {
+                continue;
+            }
             let lower = dir.to_string_lossy().to_ascii_lowercase();
             if lower.contains("\\windows\\system32") || lower.contains("\\windowsapps") {
                 continue;
