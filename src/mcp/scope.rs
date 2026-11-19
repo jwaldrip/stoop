@@ -34,6 +34,12 @@ pub fn server_root(explicit: Option<&Path>) -> Result<PathBuf, String> {
             plan::output::escape(&root.display().to_string())
         ));
     }
+    if root.to_str().is_none() {
+        return Err(format!(
+            "the project root {} is not valid UTF-8: stoop mcp passes its root to stoop run as text, so it cannot start here; use a project path made of UTF-8 characters",
+            plan::output::escape(&root.to_string_lossy())
+        ));
+    }
     Ok(root)
 }
 
@@ -59,7 +65,28 @@ pub fn confine(root: &Path, cwd: Option<&str>) -> Result<PathBuf, String> {
     Ok(real)
 }
 
-/// A path for an argument of the `stoop` command line, as text.
-pub fn as_arg(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+/// A path for an argument of the `stoop` command line, as text. The text is exact or the call
+/// fails: a lossy replacement would name a different directory.
+pub fn as_arg(path: &Path) -> Result<String, String> {
+    path.to_str().map(str::to_owned).ok_or_else(|| {
+        format!(
+            "{} is not valid UTF-8, so it cannot be passed to stoop run as text",
+            plan::output::escape(&path.to_string_lossy())
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::as_arg;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    #[test]
+    fn as_arg_is_the_exact_text_or_an_error() {
+        assert_eq!(as_arg(Path::new("/tmp/project")).unwrap(), "/tmp/project");
+        let not_utf8 = Path::new(OsStr::from_bytes(b"/tmp/proj\xffect"));
+        assert!(as_arg(not_utf8).is_err());
+    }
 }

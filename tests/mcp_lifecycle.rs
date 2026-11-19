@@ -6,7 +6,7 @@
 mod common;
 
 use common::*;
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -167,6 +167,34 @@ fn a_queued_request_cancelled_before_its_turn_is_never_answered() {
 }
 
 #[test]
+fn stdin_closing_mid_call_answers_nothing_queued() {
+    // A request queued behind a run is dropped when stdin ends. After the run is cancelled,
+    // nothing is answered.
+    let dir = temp_dir("life-eof-queued");
+    let pidfile = dir.join("pid.txt");
+    let mut m = Mcp::spawn(&["--allow-run"], &dir);
+    let pid = start_sleeping_run(&mut m, 1, &pidfile);
+    m.send(
+        &json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": modern(json!({}))}),
+    );
+    let (code, lines) = m.finish();
+    assert_eq!(code, Some(0), "stdin ended: the server exits 0");
+    assert!(
+        wait_gone(pid, Duration::from_secs(5)),
+        "the command outlived the server"
+    );
+    let messages = assert_protocol_only(&lines);
+    let answered: Vec<&Value> = messages
+        .iter()
+        .filter(|message| message.get("id").is_some())
+        .collect();
+    assert!(
+        answered.is_empty(),
+        "a request was answered after stdin ended: {lines:?}"
+    );
+}
+
+#[test]
 fn a_command_cannot_read_the_protocol_stream() {
     // The command reads stdin. It gets an empty stream, so the next protocol message is still
     // answered, and the output carries only what the command printed.
@@ -277,4 +305,40 @@ fn a_bidirectional_character_in_an_error_is_escaped() {
     );
     assert!(text.contains("\\u{202e}"), "{text}");
     m.finish();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_root_that_is_not_utf8_is_refused_at_start() {
+    use std::os::unix::ffi::OsStrExt;
+    // APFS refuses a directory name that is not UTF-8, so this runs on Linux only.
+    let base = temp_dir("life-utf8-root");
+    let root = base.join(std::ffi::OsStr::from_bytes(b"root-\xff"));
+    std::fs::create_dir(&root).expect("a directory whose name is not UTF-8");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stoop"));
+    cmd.args(["mcp", "--root"]).arg(&root).stdin(Stdio::null());
+    clear_env(&mut cmd);
+    let out = cmd.output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("not valid UTF-8"), "{err}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_git_root_whose_path_is_not_utf8_is_refused_at_start() {
+    use std::os::unix::ffi::OsStrExt;
+    let base = temp_dir("life-utf8-git");
+    let project = base.join(std::ffi::OsStr::from_bytes(b"repo-\xff"));
+    std::fs::create_dir_all(project.join("sub")).expect("a directory whose name is not UTF-8");
+    git(&project, &["init", "-q"]);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_stoop"));
+    cmd.arg("mcp")
+        .current_dir(project.join("sub"))
+        .stdin(Stdio::null());
+    clear_env(&mut cmd);
+    let out = cmd.output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("not valid UTF-8"), "{err}");
 }

@@ -1,7 +1,9 @@
 <!--meta {"title": "MCP server", "description": "Serve stoop to AI agents over the Model Context Protocol: decisions, recorded proofs, and runs only if you allow them.", "lede": "Connect stoop to Claude Code, VS Code with GitHub Copilot, Cursor or the Copilot CLI. An agent can ask what would run and why, read the recorded proofs and drop one. Running a command is opt-in."}-->
 <h2 id="connect">Connect a client</h2>
-<p>Run <code>stoop mcp --print-config</code> in the project. It prints one entry, which goes into the file each client reads. Every file uses a top-level <code>mcpServers</code> object:</p>
+<p>Run <code>stoop mcp --print-config</code> in the project. It prints the entry for each client's file. Claude Code, VS Code and Cursor take the first entry, and every file uses a top-level <code>mcpServers</code> object:</p>
 <pre><code>{"mcpServers": {"stoop": {"command": "stoop", "args": ["mcp"]}}}</code></pre>
+<p>The Copilot CLI file, <code>~/.copilot/mcp-config.json</code>, takes its own entry. It names the server type and the tools to enable:</p>
+<pre><code>{"mcpServers": {"stoop": {"type": "local", "command": "stoop", "args": ["mcp"], "tools": ["*"]}}}</code></pre>
 <table>
   <thead><tr><th>Client</th><th>File</th></tr></thead>
   <tbody>
@@ -12,7 +14,7 @@
   </tbody>
 </table>
 <p>The older VS Code file, <code>.vscode/mcp.json</code> with a top-level <code>servers</code> object, is the Local harness format. VS Code deprecates the Local harness and removes it in February 2027, so the config this command prints does not use that file.</p>
-<p>The server works in one project. It uses <code>--root</code> when you give one. Otherwise it uses the nearest directory with <code>.git</code>. Outside a repository it refuses to start and asks for <code>--root</code>.</p>
+<p>The server works in one project. It uses <code>--root</code> when you give one. Otherwise it uses the nearest directory with <code>.git</code>. Outside a repository it refuses to start and asks for <code>--root</code>. A root whose path is not UTF-8 is refused as well, because <code>stoop run</code> takes the root as text.</p>
 
 <h2 id="tools">Tools</h2>
 <table>
@@ -49,7 +51,7 @@
   <li><code>timed_out</code>, which is set when the command was killed at <code>timeout_s</code> seconds (default 600, at most 3600);</li>
   <li><code>stdout</code> and <code>stderr</code>, each the last 32 KiB of output with the true byte total and a <code>truncated</code> flag.</li>
 </ul>
-<p>The decision comes from stoop itself, over a status descriptor that the command never holds. The command cannot forge a skip by printing one, and its output is never parsed for a decision. A command that exits non-zero keeps its output in the result, and the call is a tool error, so the model sees the failure with its data attached. The command runs with your permissions and environment, as <code>stoop run</code> would run it. Its stdin is empty, so it cannot read the protocol stream. The argument list is passed as argv and never through a shell.</p>
+<p>The decision comes from stoop itself, over a status descriptor that stoop closes before the command starts, so the command does not inherit it. The command cannot forge a skip by printing one, and its output is never parsed for a decision. On Linux, a command that deliberately opens stoop's descriptor through <code>/proc</code> can still write a line. Closing that path needs a per-run secret, which this version does not have. A command that exits non-zero keeps its output in the result, and the call is a tool error, so the model sees the failure with its data attached. The command runs with your permissions and environment, as <code>stoop run</code> would run it. Its stdin is empty, so it cannot read the protocol stream. The argument list is passed as argv and never through a shell.</p>
 <p>Stopping works in three ways. A cancelled request kills the command's whole process group and sends no reply. Closing the server's stdin cancels the call in flight, drops what is queued, and exits 0. SIGTERM, SIGINT and SIGHUP kill the command's process group and exit. If the server is killed with SIGKILL, a watchdog shell that holds a heartbeat pipe kills the group when the pipe closes. The watchdog covers the cases a signal handler cannot. One gap remains: the server records a command's process group just after it starts the command, so a SIGKILL in that instant leaves that one command running.</p>
 
 <h2 id="safety">Scope and safety</h2>

@@ -449,7 +449,7 @@ fn explain(root: &Path, args: &Args, cancelled: &mut dyn FnMut() -> bool) -> Ste
     let mut words = vec![
         "explain".to_string(),
         "--root".into(),
-        scope::as_arg(root),
+        scope::as_arg(root)?,
         "--".into(),
     ];
     words.extend(argv);
@@ -543,7 +543,7 @@ fn run_tool(root: &Path, args: &Args, cancelled: &mut dyn FnMut() -> bool) -> St
     let mut words = vec![
         "run".to_string(),
         "--root".into(),
-        scope::as_arg(root),
+        scope::as_arg(root)?,
         "--status-fd".into(),
         exec::STATUS_FD.to_string(),
         "--".into(),
@@ -646,7 +646,7 @@ fn plan_tool(root: &Path, args: &Args, cancelled: &mut dyn FnMut() -> bool) -> S
         "json".into(),
         "--quiet".into(),
         "--root".into(),
-        scope::as_arg(root),
+        scope::as_arg(root)?,
     ];
     if let Some(workflow) = workflow {
         words.push("--workflow".into());
@@ -700,7 +700,7 @@ fn forget(root: &Path, args: &Args, cancelled: &mut dyn FnMut() -> bool) -> Step
     let words = vec![
         "forget".to_string(),
         "--root".into(),
-        scope::as_arg(root),
+        scope::as_arg(root)?,
         "--".into(),
         key.clone(),
     ];

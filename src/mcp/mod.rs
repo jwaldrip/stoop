@@ -129,10 +129,16 @@ fn shell_word(word: &str) -> String {
     }
 }
 
-/// The config each client reads. Claude Code, VS Code and GitHub Copilot read `.mcp.json`, Cursor
-/// reads `.cursor/mcp.json`, and the Copilot CLI reads its user file. All four use the same entry.
-/// The older VS Code `servers` format (`.vscode/mcp.json`) is the Local harness, which is removed
-/// in February 2027, so it is not printed.
+/// The entry the GitHub Copilot CLI reads from `~/.copilot/mcp-config.json`. The CLI documents a
+/// server type and a tools list, where `*` enables every tool, so this entry carries both.
+fn copilot_config(args: &[String]) -> serde_json::Value {
+    json!({"mcpServers": {"stoop": {"type": "local", "command": "stoop", "args": args, "tools": ["*"]}}})
+}
+
+/// The config each client reads. Claude Code and VS Code read `.mcp.json`, and Cursor reads
+/// `.cursor/mcp.json`. Both take the first entry. The Copilot CLI has its own entry, printed on its
+/// own. The older VS Code `servers` format (`.vscode/mcp.json`) is the Local harness, which is
+/// removed in February 2027, so it is not printed.
 fn print_config(options: &Options) -> i32 {
     let root = match &options.root {
         Some(root) => match std::fs::canonicalize(root) {
@@ -153,10 +159,20 @@ fn print_config(options: &Options) -> i32 {
         args.push("--allow-run".into());
     }
     if let Some(root) = &root {
-        args.push("--root".into());
-        args.push(root.display().to_string());
+        match scope::as_arg(root) {
+            Ok(text) => {
+                args.push("--root".into());
+                args.push(text);
+            }
+            Err(error) => {
+                eprintln!("stoop mcp: {error}");
+                return 2;
+            }
+        }
     }
     let servers = json!({"mcpServers": {"stoop": {"command": "stoop", "args": args}}});
+    let copilot = copilot_config(&args);
+    let copilot_pretty = serde_json::to_string_pretty(&copilot).unwrap_or_else(|_| "{}".into());
     let pretty = serde_json::to_string_pretty(&servers).unwrap_or_else(|_| "{}".into());
     let claude = std::iter::once("claude mcp add stoop -- stoop".to_string())
         .chain(args.iter().map(|word| shell_word(word)))
@@ -167,9 +183,17 @@ fn print_config(options: &Options) -> i32 {
     println!("{pretty}");
     println!();
     println!("Files:");
-    println!("  .mcp.json at the project root: Claude Code, VS Code and GitHub Copilot");
+    println!("  .mcp.json at the project root: Claude Code and VS Code");
     println!("  .cursor/mcp.json: Cursor");
-    println!("  ~/.copilot/mcp-config.json (or $COPILOT_HOME/mcp-config.json): GitHub Copilot CLI");
+    println!();
+    println!(
+        "GitHub Copilot CLI reads ~/.copilot/mcp-config.json (or $COPILOT_HOME/mcp-config.json)."
+    );
+    println!(
+        "Its entry names the server type and the tools to enable, so it is printed on its own:"
+    );
+    println!();
+    println!("{copilot_pretty}");
     println!();
     println!("Claude Code can add it from the command line instead:");
     println!("  {claude}");
@@ -179,4 +203,19 @@ fn print_config(options: &Options) -> i32 {
     );
     println!("Local harness format, which is deprecated and removed in February 2027.");
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copilot_config;
+    use serde_json::json;
+
+    #[test]
+    fn the_copilot_cli_entry_names_its_type_and_every_tool() {
+        let args = vec!["mcp".to_string(), "--allow-run".to_string()];
+        assert_eq!(
+            copilot_config(&args)["mcpServers"]["stoop"],
+            json!({"type": "local", "command": "stoop", "args": ["mcp", "--allow-run"], "tools": ["*"]})
+        );
+    }
 }

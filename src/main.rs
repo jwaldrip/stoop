@@ -132,6 +132,10 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
             return 2;
         }
     };
+    if o.status_fd.is_some() && cmd != "run" {
+        eprintln!("stoop: --status-fd is for stoop run only");
+        return 2;
+    }
     if matches!(cmd.as_str(), "run" | "explain" | "sh") {
         match run::parse_pass_env(
             std::env::var_os("STOOP_PASS_ENV").as_deref(),
@@ -447,6 +451,25 @@ fn shell_mode(o: &mut Opts, script: &OsStr, rest: &[OsString]) -> i32 {
     outcome.status
 }
 
+/// Refuses a `--status-fd` that cannot carry a report, before anything runs. Descriptors 0 to 2 are
+/// the standard streams, and stdout is the protocol stream, so a report there would corrupt it. A
+/// descriptor that is not open cannot be written, and closing it would abort the process.
+fn check_status_fd(fd: i32) -> Result<(), String> {
+    if fd < 3 {
+        return Err(format!(
+            "--status-fd {fd} must be 3 or higher: 0, 1 and 2 are the standard streams"
+        ));
+    }
+    // SAFETY: F_GETFD reads a descriptor's flags and changes nothing.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(format!(
+            "--status-fd {fd} is not open: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 /// Keeps the MCP server's status descriptor from every child: close-on-exec, set before any
 /// child exists in this process.
 fn take_status_fd(fd: i32) {
@@ -459,6 +482,10 @@ fn take_status_fd(fd: i32) {
 /// `stoop run` for the MCP server. The decision goes to the status descriptor as one JSON line.
 /// The command's stdout and stderr stay its own, and nothing parses them for a decision.
 fn report_run(o: Opts, fd: i32) -> i32 {
+    if let Err(error) = check_status_fd(fd) {
+        eprintln!("stoop: {error}");
+        return 2;
+    }
     take_status_fd(fd);
     if let Some(error) = run::hook_refusal(&o.argv) {
         eprintln!("stoop: {error}");
