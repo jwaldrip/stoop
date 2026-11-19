@@ -950,6 +950,46 @@ mod tests {
     }
 
     #[test]
+    fn global_config_fifo_is_bounded_by_the_deadline() {
+        use std::os::unix::process::CommandExt;
+        use std::time::{Duration, Instant};
+        let repo = Repo::new();
+        let home = repo.0.join("home");
+        fs::create_dir(&home).unwrap();
+        let fifo = home.join(".gitconfig");
+        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "oid_attrs::tests::fifo_probe_child",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &home)
+            .env("STOOP_FIFO_PROBE", &repo.0)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success());
+                break;
+            }
+            if Instant::now() >= deadline {
+                unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+                let _ = child.wait();
+                panic!("global Git config FIFO blocked recording");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn git_env_probe_child() {
         if let Some(root) = std::env::var_os("STOOP_GIT_ENV_PROBE") {
             assert!(capture(Path::new(&root)).is_none());
