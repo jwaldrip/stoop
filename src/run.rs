@@ -556,7 +556,7 @@ pub fn run_observed(o: Opts) -> Outcome {
 }
 
 /// The error that stops a placeholder argv before anything runs, if there is one.
-pub fn hook_refusal(argv: &[String]) -> Option<String> {
+pub fn hook_refusal(argv: &[OsString]) -> Option<String> {
     units::hook::prepare(argv).err()
 }
 

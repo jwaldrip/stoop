@@ -16,6 +16,7 @@ mod wire;
 
 use crate::plan;
 use serde_json::json;
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 const HELP: &str = "\
@@ -60,7 +61,7 @@ struct Options {
 }
 
 /// `stoop mcp [args]`. Returns the process exit status.
-pub fn cmd(args: &[String]) -> i32 {
+pub fn cmd(args: &[OsString]) -> i32 {
     let options = match parse(args) {
         Ok(Some(options)) => options,
         Ok(None) => {
@@ -92,19 +93,24 @@ pub fn cmd(args: &[String]) -> i32 {
     )
 }
 
-fn parse(args: &[String]) -> Result<Option<Options>, String> {
+fn parse(args: &[OsString]) -> Result<Option<Options>, String> {
     let mut options = Options::default();
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "-h" | "--help" => return Ok(None),
-            "--allow-run" => options.allow_run = true,
-            "--print-config" => options.print_config = true,
-            "--root" => {
+        match arg.to_str() {
+            Some("-h") | Some("--help") => return Ok(None),
+            Some("--allow-run") => options.allow_run = true,
+            Some("--print-config") => options.print_config = true,
+            Some("--root") => {
                 let dir = iter.next().ok_or("--root needs a directory")?;
                 options.root = Some(PathBuf::from(dir));
             }
-            other => return Err(format!("unknown option {}", plan::output::escape(other))),
+            _ => {
+                return Err(format!(
+                    "unknown option {}",
+                    plan::output::escape(&arg.to_string_lossy())
+                ))
+            }
         }
     }
     Ok(Some(options))
