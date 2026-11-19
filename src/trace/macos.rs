@@ -877,7 +877,7 @@ pub(crate) fn report(d: &Diagnostic, paths: bool, raw: bool) -> Vec<String> {
         .collect();
     let written: BTreeSet<PathBuf> = t.written.iter().chain(&t.created_dirs).cloned().collect();
     let mut out = vec![format!(
-        "DTrace diagnostic: {} process(es), {} path event(s), {} read, {} failed, {} written; not recorded",
+        "DTrace diagnostic: {} process(es), {} path event(s), {} read, {} failed, {} written or attempted; not recorded",
         d.processes,
         d.events,
         read.len(),

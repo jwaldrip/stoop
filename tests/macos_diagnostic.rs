@@ -227,3 +227,25 @@ fn without_the_switch_the_command_runs_untraced_as_before() {
     assert_eq!(out.status.code(), Some(4), "{stderr}");
     assert!(!stderr.contains("DTrace"), "{stderr}");
 }
+
+#[test]
+fn a_switch_value_that_is_not_utf8_is_not_an_opt_in() {
+    use std::os::unix::ffi::OsStrExt;
+    let w = Work::new("nonutf8");
+    let out = Command::new(env!("CARGO_BIN_EXE_stoop"))
+        .args([
+            "run", "--root", ".", "--key", "t", "--", "/bin/sh", "-c", "exit 4",
+        ])
+        .current_dir(&w.dir)
+        .env("STOOP_STORE", w.dir.join("store"))
+        .env(
+            "STOOP_DTRACE_DIAGNOSTIC",
+            std::ffi::OsStr::from_bytes(b"\xff"),
+        )
+        .env_remove("STOOP_OFF")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert!(!stderr.contains("DTrace"), "{stderr}");
+}
