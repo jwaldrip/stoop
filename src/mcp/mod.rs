@@ -169,8 +169,7 @@ fn print_config(options: &Options) -> i32 {
     println!("  {claude}");
     println!();
     println!(
-        "{}",
-        pretty(json!({"servers": {"stoop": {"type": "stdio", "command": "stoop", "args": args}}}))
+        "Not printed: .vscode/mcp.json with a top-level \"servers\" object. That is the VS Code"
     );
     println!("Local harness format, which is deprecated and removed in February 2027.");
     0

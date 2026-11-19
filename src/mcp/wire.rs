@@ -269,4 +269,19 @@ mod tests {
             _ => panic!("the line after an oversized one is read"),
         }
     }
+
+    #[test]
+    fn non_object_params_are_refused_for_requests_and_ignored_for_notifications() {
+        assert!(matches!(
+            parse(br#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":"hello"}"#),
+            Parsed::Invalid {
+                code: INVALID_PARAMS,
+                ..
+            }
+        ));
+        assert!(matches!(
+            parse(br#"{"jsonrpc":"2.0","method":"notifications/initialized","params":"x"}"#),
+            Parsed::Notification { .. }
+        ));
+    }
 }

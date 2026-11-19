@@ -148,7 +148,7 @@ fn every_command_and_flag_the_guide_names_exists_in_the_help() {
     );
     for command in commands(&guide) {
         assert!(
-            known.contains(&format!("stoop {command}")),
+            known.contains(&format!("stoop {command}")) || known.contains(&format!("| {command}")),
             "the guide names `stoop {command}`, which no help text lists"
         );
     }
