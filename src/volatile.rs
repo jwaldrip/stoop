@@ -1,19 +1,22 @@
 //! Environment variables that change on every run are not inputs.
 //!
 //! The environment counts as an input because a variable read never shows up in a file trace.
-//! Some variables change on every run or on every commit and say nothing about what a command
-//! produces. Two sources exclude them, and the command text overrules both:
+//! Some variables are bookkeeping: they change on every run, every commit or every terminal, and
+//! say nothing about what a command produces. Two sources exclude them. The command text overrules
+//! both: a name the text mentions, and a name forced with `--env`, always count.
 //!
-//! - the curated table below, for variables that a shell, a terminal, a multiplexer or a CI
-//!   provider documents as per run, per session or per commit;
-//! - the learner, which excludes a variable from one proof key once its opaque value has changed
-//!   on each of the last recorded runs of that key, and never repeated within the window.
+//! - The curated table below. Each name is one a tool documents as per run, per session or per
+//!   commit, and each group cites the page or source it was read from. A name that could not be
+//!   sourced is not here.
+//! - The learner. A name whose opaque value is new on each of the last few runs of the same proof
+//!   key is excluded for that key. A value that returns is evidence the name is not bookkeeping: it
+//!   is counted again, and never learned again for that key.
 //!
-//! A name the command text mentions always counts, and so does a name given with `--env`.
+//! Every invocation that reaches the decision is an observation, skips included. A skipped run's
+//! value equals an earlier proof's value, so counting only recorded runs would miss a repeat.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -21,96 +24,88 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// One reason and the names it covers. `names` match exactly; `prefixes` match by their start.
+/// One reason and the names it covers. `names` match exactly; `prefixes` match the start of a name.
+/// Families are listed by name, not by prefix: a family such as `BUILDKITE_` also holds behavioural
+/// settings (`BUILDKITE_CLEAN_CHECKOUT`, `BUILDKITE_BRANCH`) that change what a command does.
 pub struct Group {
     pub why: &'static str,
-    /// Where the names were read, or why none could be.
+    /// The page or source each name was read from, with the section where it is named. The table
+    /// test reads it; no run does.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub source: &'static str,
     pub names: &'static [&'static str],
     pub prefixes: &'static [&'static str],
 }
 
-// Each group names one kind of per-run, per-session or per-commit value. A name is here only if
-// its meaning is documented as such, or if the group's source line says that none could be read.
-// Branch and tag names are not here: a script may branch on them, and they do not change per commit.
 pub const GROUPS: &[Group] = &[
     Group {
         why: "shell clock or counter",
-        source: "bash: https://tiswww.case.edu/php/chet/bash/bashref.html ; zsh: https://zsh.sourceforge.io/Doc/Release/Parameters.html and https://zsh.sourceforge.io/Doc/Release/Zsh-Modules.html ; fish: https://fishshell.com/docs/current/language.html",
-        names: &[
-            "RANDOM",
-            "SRANDOM",
-            "SECONDS",
-            "EPOCHSECONDS",
-            "EPOCHREALTIME",
-            "BASHPID",
-            "PPID",
-            "COLUMNS",
-            "LINES",
-            "CMD_DURATION",
-        ],
+        source: "bash: https://tiswww.case.edu/php/chet/bash/bashref.html (Bash Variables); zsh: https://zsh.sourceforge.io/Doc/Release/Parameters.html (RANDOM, SECONDS) and https://zsh.sourceforge.io/Doc/Release/Zsh-Modules.html (EPOCHSECONDS, EPOCHREALTIME)",
+        names: &["RANDOM", "SRANDOM", "SECONDS", "EPOCHSECONDS", "EPOCHREALTIME"],
         prefixes: &[],
     },
     Group {
-        why: "terminal or multiplexer session",
-        source: "tmux TMUX and TMUX_PANE: https://man.openbsd.org/tmux ; GNU screen STY: https://www.gnu.org/software/screen/manual/screen.html ; xterm WINDOWID: https://invisible-island.net/xterm/manpage/xterm.html ; kitty KITTY_WINDOW_ID: https://sw.kovidgoyal.net/kitty/remote-control/ ; zellij ZELLIJ_SESSION_NAME: https://zellij.dev/documentation/integration",
+        why: "shell process id",
+        source: "bash: https://tiswww.case.edu/php/chet/bash/bashref.html (Bash Variables: BASHPID, PPID)",
+        names: &["BASHPID", "PPID"],
+        prefixes: &[],
+    },
+    Group {
+        why: "terminal size",
+        source: "bash: https://tiswww.case.edu/php/chet/bash/bashref.html (COLUMNS, LINES); zsh: https://zsh.sourceforge.io/Doc/Release/Parameters.html (COLUMNS, LINES)",
+        names: &["COLUMNS", "LINES"],
+        prefixes: &[],
+    },
+    Group {
+        why: "terminal multiplexer or window id",
+        source: "tmux TMUX, TMUX_PANE: https://man.openbsd.org/tmux (ENVIRONMENT) ; GNU screen STY and WINDOW: http://www.gnu.org/software/screen/manual/screen.html ; xterm WINDOWID: https://invisible-island.net/xterm/manpage/xterm.html ; kitty KITTY_WINDOW_ID and KITTY_LISTEN_ON: https://sw.kovidgoyal.net/kitty/remote-control/ ; zellij ZELLIJ_SESSION_NAME: https://zellij.dev/documentation/integration",
         names: &[
             "TMUX",
             "TMUX_PANE",
             "STY",
+            "WINDOW",
             "WINDOWID",
             "KITTY_WINDOW_ID",
+            "KITTY_LISTEN_ON",
             "ZELLIJ_SESSION_NAME",
         ],
         prefixes: &[],
     },
     Group {
-        why: "terminal session",
-        source: "named as per session by the owner (2026-11-18); no public reference was readable for these",
+        why: "terminal emulator instance or pane",
+        source: "WezTerm WEZTERM_PANE: https://github.com/wezterm/wezterm/blob/main/docs/cli/cli/index.markdown ; WEZTERM_UNIX_SOCKET: https://github.com/wezterm/wezterm/blob/main/wezterm-gui/src/main.rs ; Windows Terminal WT_SESSION: https://github.com/microsoft/terminal/blob/main/src/cascadia/TerminalConnection/ConptyConnection.cpp ; Alacritty ALACRITTY_SOCKET: https://github.com/alacritty/alacritty/blob/master/alacritty/src/polling/ipc.rs ; Alacritty ALACRITTY_WINDOW_ID: https://github.com/alacritty/alacritty/blob/master/alacritty_terminal/src/tty/unix.rs ; GNOME Terminal GNOME_TERMINAL_SCREEN and GNOME_TERMINAL_SERVICE: https://github.com/GNOME/gnome-terminal/blob/master/src/terminal-defines.hh ; iTerm2 ITERM_SESSION_ID: https://github.com/gnachman/iterm2/blob/master/sources/PTYSession/PTYSession.h ; iTerm2 TERM_SESSION_ID: https://iterm2.com/documentation-variables.html ; Konsole KONSOLE_DBUS_SESSION: https://github.com/KDE/konsole/blob/master/src/session/Session.cpp",
         names: &[
-            "ZELLIJ_PANE_ID",
-            "TERM_SESSION_ID",
-            "ITERM_SESSION_ID",
-            "WT_SESSION",
             "WEZTERM_PANE",
+            "WEZTERM_UNIX_SOCKET",
+            "WT_SESSION",
             "ALACRITTY_SOCKET",
-            "ALACRITTY_LOG",
+            "ALACRITTY_WINDOW_ID",
             "GNOME_TERMINAL_SCREEN",
+            "GNOME_TERMINAL_SERVICE",
+            "ITERM_SESSION_ID",
+            "TERM_SESSION_ID",
             "KONSOLE_DBUS_SESSION",
-            "KONSOLE_DBUS_WINDOW",
         ],
         prefixes: &[],
     },
     Group {
-        why: "login or SSH session",
-        source: "XDG_SESSION_ID, XDG_VTNR: https://www.freedesktop.org/software/systemd/man/latest/pam_systemd.html ; SSH_AGENT_PID: https://man.openbsd.org/ssh-agent ; DBUS_SESSION_BUS_ADDRESS: https://dbus.freedesktop.org/doc/dbus-specification.html ; SSH_CONNECTION, SSH_CLIENT, SSH_TTY, GPG_AGENT_INFO: named as per session by the owner; no public reference was readable",
+        why: "login session or SSH connection",
+        source: "systemd-logind XDG_SESSION_ID, XDG_VTNR: https://www.freedesktop.org/software/systemd/man/latest/pam_systemd.html ; D-Bus DBUS_SESSION_BUS_ADDRESS: https://dbus.freedesktop.org/doc/dbus-specification.html ; sshd SSH_CONNECTION, SSH_CLIENT, SSH_TTY: https://github.com/openssh/openssh-portable/blob/master/session.c ; ssh-agent SSH_AGENT_PID: https://man.openbsd.org/ssh-agent",
         names: &[
             "XDG_SESSION_ID",
             "XDG_VTNR",
-            "SSH_AGENT_PID",
             "DBUS_SESSION_BUS_ADDRESS",
             "SSH_CONNECTION",
             "SSH_CLIENT",
             "SSH_TTY",
-            "GPG_AGENT_INFO",
+            "SSH_AGENT_PID",
         ],
         prefixes: &[],
     },
     Group {
         why: "editor window socket",
-        source: "named as per window by the owner (2026-11-18); no public reference was readable",
+        source: "VS Code VSCODE_IPC_HOOK_CLI: https://github.com/microsoft/vscode/blob/main/src/vs/server/node/server.cli.ts ; VS Code VSCODE_GIT_IPC_HANDLE: https://github.com/microsoft/vscode/blob/main/extensions/git/src/ipc/ipcServer.ts",
         names: &["VSCODE_IPC_HOOK_CLI", "VSCODE_GIT_IPC_HANDLE"],
-        prefixes: &[],
-    },
-    Group {
-        why: "macOS login session or launch",
-        source: "named by the owner (2026-11-18); Apple publishes no reference for these names",
-        names: &[
-            "SECURITYSESSIONID",
-            "Apple_PubSub_Socket_Render",
-            "LaunchInstanceID",
-            "XPC_SERVICE_NAME",
-        ],
         prefixes: &[],
     },
     Group {
@@ -128,13 +123,8 @@ pub const GROUPS: &[Group] = &[
             "CI_PIPELINE_IID",
             "CI_PIPELINE_URL",
             "CI_PIPELINE_CREATED_AT",
+            "CI_RUNNER_ID",
         ],
-        prefixes: &[],
-    },
-    Group {
-        why: "GitLab runner identity",
-        source: "https://docs.gitlab.com/ci/variables/predefined_variables/",
-        names: &["CI_RUNNER_ID", "CI_RUNNER_DESCRIPTION", "CI_RUNNER_SHORT_TOKEN"],
         prefixes: &[],
     },
     Group {
@@ -162,41 +152,12 @@ pub const GROUPS: &[Group] = &[
         prefixes: &[],
     },
     Group {
-        why: "rotating CI job credential",
-        source: "GitLab CI_JOB_TOKEN (valid while the job runs), CI_REGISTRY_PASSWORD (equal to CI_JOB_TOKEN), CI_REPOSITORY_URL (embeds CI_JOB_TOKEN): https://docs.gitlab.com/ci/variables/predefined_variables/ ; CircleCI OIDC tokens: https://circleci.com/docs/variables/ ; Bitbucket step OIDC token: https://support.atlassian.com/bitbucket-cloud/docs/variables-and-secrets/ ; Azure SYSTEM_ACCESSTOKEN: https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables",
-        names: &[
-            "CI_JOB_TOKEN",
-            "CI_REGISTRY_PASSWORD",
-            "CI_REPOSITORY_URL",
-            "CIRCLE_OIDC_TOKEN",
-            "CIRCLE_OIDC_TOKEN_V2",
-            "CIRCLE_OIDC_TOKEN_V3",
-            "BITBUCKET_STEP_OIDC_TOKEN",
-            "SYSTEM_ACCESSTOKEN",
-        ],
-        prefixes: &[],
-    },
-    Group {
-        why: "AWS session credential",
-        source: "https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html",
-        names: &["AWS_SESSION_TOKEN"],
-        prefixes: &[],
-    },
-    Group {
         why: "Buildkite per-build, per-job or per-agent value",
         source: "https://buildkite.com/docs/pipelines/environment-variables",
         names: &[
             "BUILDKITE_BUILD_ID",
             "BUILDKITE_BUILD_NUMBER",
             "BUILDKITE_BUILD_URL",
-            "BUILDKITE_BUILD_AUTHOR",
-            "BUILDKITE_BUILD_AUTHOR_EMAIL",
-            "BUILDKITE_BUILD_CREATOR",
-            "BUILDKITE_BUILD_CREATOR_EMAIL",
-            "BUILDKITE_COMMIT",
-            "BUILDKITE_COMMIT_RESOLVED",
-            "BUILDKITE_MESSAGE",
-            "BUILDKITE_MERGE_QUEUE_BASE_COMMIT",
             "BUILDKITE_JOB_ID",
             "BUILDKITE_JOB_LOG_TMPFILE",
             "BUILDKITE_GROUP_ID",
@@ -209,25 +170,39 @@ pub const GROUPS: &[Group] = &[
             "BUILDKITE_GITHUB_REVIEW_ID",
             "BUILDKITE_ORIGIN_REVIEW_ID",
             "BUILDKITE_AGENT_ID",
-            "BUILDKITE_AGENT_NAME",
             "BUILDKITE_AGENT_PID",
         ],
         prefixes: &[],
     },
     Group {
-        why: "CircleCI per-job, per-pipeline or per-workflow value",
+        why: "Buildkite per-commit value",
+        source: "https://buildkite.com/docs/pipelines/environment-variables",
+        names: &[
+            "BUILDKITE_COMMIT",
+            "BUILDKITE_MESSAGE",
+            "BUILDKITE_BUILD_AUTHOR",
+            "BUILDKITE_BUILD_AUTHOR_EMAIL",
+            "BUILDKITE_MERGE_QUEUE_BASE_COMMIT",
+        ],
+        prefixes: &[],
+    },
+    Group {
+        why: "CircleCI per-job or per-workflow value",
         source: "https://circleci.com/docs/variables/",
         names: &[
             "CIRCLE_BUILD_NUM",
             "CIRCLE_BUILD_URL",
-            "CIRCLE_COMPARE_URL",
             "CIRCLE_PIPELINE_ID",
-            "CIRCLE_SHA1",
-            "CIRCLE_USERNAME",
             "CIRCLE_WORKFLOW_ID",
             "CIRCLE_WORKFLOW_JOB_ID",
             "CIRCLE_WORKFLOW_WORKSPACE_ID",
         ],
+        prefixes: &[],
+    },
+    Group {
+        why: "CircleCI per-commit value",
+        source: "https://circleci.com/docs/variables/",
+        names: &["CIRCLE_SHA1", "CIRCLE_COMPARE_URL"],
         prefixes: &[],
     },
     Group {
@@ -237,51 +212,96 @@ pub const GROUPS: &[Group] = &[
             "TRAVIS_BUILD_ID",
             "TRAVIS_BUILD_NUMBER",
             "TRAVIS_BUILD_WEB_URL",
+            "TRAVIS_JOB_ID",
+            "TRAVIS_JOB_NUMBER",
+            "TRAVIS_JOB_WEB_URL",
+        ],
+        prefixes: &[],
+    },
+    Group {
+        why: "Travis per-commit value",
+        source: "https://docs.travis-ci.com/user/environment-variables/",
+        names: &[
             "TRAVIS_COMMIT",
             "TRAVIS_COMMIT_MESSAGE",
             "TRAVIS_COMMIT_RANGE",
             "TRAVIS_PULL_REQUEST_SHA",
-            "TRAVIS_JOB_ID",
-            "TRAVIS_JOB_NUMBER",
-            "TRAVIS_JOB_WEB_URL",
-            "TRAVIS_JOB_RESTARTED_BY",
         ],
         prefixes: &[],
     },
     Group {
         why: "Jenkins or TeamCity per-build value",
-        source: "Jenkins: https://www.jenkins.io/doc/book/pipeline/jenkinsfile/ ; TeamCity: https://www.jetbrains.com/help/teamcity/predefined-build-parameters.html",
-        names: &["BUILD_ID", "BUILD_NUMBER", "BUILD_TAG", "BUILD_URL"],
-        prefixes: &[],
-    },
-    Group {
-        why: "Jenkins executor identity",
-        source: "https://www.jenkins.io/doc/book/pipeline/jenkinsfile/",
-        names: &["EXECUTOR_NUMBER", "NODE_NAME"],
-        prefixes: &[],
-    },
-    Group {
-        why: "Azure Pipelines per-build, per-job or per-agent value",
-        source: "https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables",
+        source: "Jenkins: https://www.jenkins.io/doc/book/pipeline/jenkinsfile/ (BUILD_ID, BUILD_NUMBER, BUILD_TAG, BUILD_URL) ; TeamCity: https://www.jetbrains.com/help/teamcity/predefined-build-parameters.html (env.BUILD_NUMBER, env.BUILD_URL, env.TEAMCITY_BUILD_PROPERTIES_FILE)",
         names: &[
-            "BUILD_BUILDID",
-            "BUILD_BUILDNUMBER",
-            "BUILD_SOURCEVERSION",
-            "BUILD_SOURCEVERSIONMESSAGE",
-            "BUILD_REQUESTEDFOR",
-            "BUILD_REQUESTEDFOREMAIL",
-            "BUILD_REQUESTEDFORID",
-            "BUILD_QUEUEDBY",
-            "SYSTEM_JOBID",
-            "SYSTEM_PULLREQUEST_SOURCECOMMITID",
-            "AGENT_ID",
-            "AGENT_NAME",
-            "AGENT_MACHINENAME",
+            "BUILD_ID",
+            "BUILD_NUMBER",
+            "BUILD_TAG",
+            "BUILD_URL",
+            "TEAMCITY_BUILD_PROPERTIES_FILE",
         ],
         prefixes: &[],
     },
     Group {
-        why: "Drone per-build, per-stage or per-commit value",
+        why: "Jenkins per-executor slot",
+        source: "https://www.jenkins.io/doc/book/pipeline/jenkinsfile/ (EXECUTOR_NUMBER)",
+        names: &["EXECUTOR_NUMBER"],
+        prefixes: &[],
+    },
+    Group {
+        why: "Jenkins per-commit value",
+        source: "Git plugin: https://plugins.jenkins.io/git/ (GIT_COMMIT, GIT_PREVIOUS_COMMIT, GIT_PREVIOUS_SUCCESSFUL_COMMIT)",
+        names: &["GIT_COMMIT", "GIT_PREVIOUS_COMMIT", "GIT_PREVIOUS_SUCCESSFUL_COMMIT"],
+        prefixes: &[],
+    },
+    Group {
+        why: "TeamCity per-commit value",
+        source: "https://www.jetbrains.com/help/teamcity/predefined-build-parameters.html (env.BUILD_VCS_NUMBER_<VCS_root_ID>)",
+        names: &[],
+        prefixes: &["BUILD_VCS_NUMBER_"],
+    },
+    Group {
+        why: "Azure Pipelines per-build, per-job or per-agent value",
+        source: "https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables (Build.BuildId, Build.BuildNumber, System.JobId, Agent.Id; a variable's environment name is its dotted name in capitals with underscores, as its example shows: Build.ArtifactStagingDirectory becomes BUILD_ARTIFACTSTAGINGDIRECTORY)",
+        names: &[
+            "BUILD_BUILDID",
+            "BUILD_BUILDNUMBER",
+            "SYSTEM_JOBID",
+            "AGENT_ID",
+        ],
+        prefixes: &[],
+    },
+    Group {
+        why: "Azure Pipelines per-commit value",
+        source: "https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables (Build.SourceVersion, Build.SourceVersionMessage, System.PullRequest.SourceCommitId)",
+        names: &[
+            "BUILD_SOURCEVERSION",
+            "BUILD_SOURCEVERSIONMESSAGE",
+            "SYSTEM_PULLREQUEST_SOURCECOMMITID",
+        ],
+        prefixes: &[],
+    },
+    Group {
+        why: "Bitbucket per-run value",
+        source: "https://support.atlassian.com/bitbucket-cloud/docs/variables-and-secrets/",
+        names: &[
+            "BITBUCKET_BUILD_NUMBER",
+            "BITBUCKET_PIPELINE_UUID",
+            "BITBUCKET_STEP_UUID",
+            "BITBUCKET_STEP_RUN_NUMBER",
+            "BITBUCKET_TRIGGER_PIPELINE_RUN_UUID",
+            "BITBUCKET_TRIGGER_STEP_UUID",
+            "BITBUCKET_MERGE_QUEUE_PR_IDS",
+        ],
+        prefixes: &[],
+    },
+    Group {
+        why: "Bitbucket per-commit value",
+        source: "https://support.atlassian.com/bitbucket-cloud/docs/variables-and-secrets/",
+        names: &["BITBUCKET_COMMIT", "BITBUCKET_PR_DESTINATION_COMMIT"],
+        prefixes: &[],
+    },
+    Group {
+        why: "Drone per-build or per-stage value",
         source: "https://docs.drone.io/pipeline/environment/reference/",
         names: &[
             "DRONE_BUILD_NUMBER",
@@ -292,12 +312,18 @@ pub const GROUPS: &[Group] = &[
             "DRONE_BUILD_PARENT",
             "DRONE_STAGE_STARTED",
             "DRONE_STAGE_FINISHED",
+        ],
+        prefixes: &[],
+    },
+    Group {
+        why: "Drone per-commit value",
+        source: "https://docs.drone.io/pipeline/environment/reference/",
+        names: &[
             "DRONE_COMMIT",
             "DRONE_COMMIT_SHA",
             "DRONE_COMMIT_BEFORE",
             "DRONE_COMMIT_AFTER",
             "DRONE_COMMIT_AUTHOR",
-            "DRONE_COMMIT_AUTHOR_AVATAR",
             "DRONE_COMMIT_AUTHOR_EMAIL",
             "DRONE_COMMIT_AUTHOR_NAME",
             "DRONE_COMMIT_LINK",
@@ -306,27 +332,7 @@ pub const GROUPS: &[Group] = &[
         prefixes: &[],
     },
     Group {
-        why: "Bitbucket per-run or per-step value",
-        source: "https://support.atlassian.com/bitbucket-cloud/docs/variables-and-secrets/",
-        names: &[
-            "BITBUCKET_BUILD_NUMBER",
-            "BITBUCKET_COMMIT",
-            "BITBUCKET_PR_DESTINATION_COMMIT",
-            "BITBUCKET_PIPELINE_UUID",
-            "BITBUCKET_STEP_UUID",
-            "BITBUCKET_STEP_RUN_NUMBER",
-            "BITBUCKET_STEP_TRIGGERER_UUID",
-            "BITBUCKET_MERGE_QUEUE_PR_IDS",
-            "BITBUCKET_TRIGGER_PIPELINE_RUN_UUID",
-            "BITBUCKET_TRIGGER_PIPELINE_UUID",
-            "BITBUCKET_TRIGGER_STEP_UUID",
-            "BITBUCKET_TRIGGER_DEPLOYMENT_UUID",
-            "BITBUCKET_TRIGGER_TEST_CASE_UUID",
-        ],
-        prefixes: &[],
-    },
-    Group {
-        why: "AWS CodeBuild per-build or per-commit value",
+        why: "AWS CodeBuild per-build value",
         source: "https://docs.aws.amazon.com/codebuild/latest/userguide/build-env-ref-env-vars.html",
         names: &[
             "CODEBUILD_BUILD_ID",
@@ -335,8 +341,14 @@ pub const GROUPS: &[Group] = &[
             "CODEBUILD_BUILD_URL",
             "CODEBUILD_PUBLIC_BUILD_URL",
             "CODEBUILD_BATCH_BUILD_IDENTIFIER",
-            "CODEBUILD_INITIATOR",
             "CODEBUILD_START_TIME",
+        ],
+        prefixes: &[],
+    },
+    Group {
+        why: "AWS CodeBuild per-commit value",
+        source: "https://docs.aws.amazon.com/codebuild/latest/userguide/build-env-ref-env-vars.html",
+        names: &[
             "CODEBUILD_SOURCE_VERSION",
             "CODEBUILD_RESOLVED_SOURCE_VERSION",
             "CODEBUILD_WEBHOOK_PREV_COMMIT",
@@ -344,13 +356,20 @@ pub const GROUPS: &[Group] = &[
         prefixes: &[],
     },
     Group {
-        why: "Semaphore per-workflow, per-pipeline, per-job or per-commit value",
+        why: "Semaphore per-workflow, per-pipeline or per-job value",
         source: "https://docs.semaphore.io/ci-cd-environment/environment-variables",
         names: &[
             "SEMAPHORE_WORKFLOW_ID",
             "SEMAPHORE_WORKFLOW_NUMBER",
             "SEMAPHORE_PIPELINE_ID",
             "SEMAPHORE_JOB_ID",
+        ],
+        prefixes: &[],
+    },
+    Group {
+        why: "Semaphore per-commit value",
+        source: "https://docs.semaphore.io/ci-cd-environment/environment-variables",
+        names: &[
             "SEMAPHORE_GIT_SHA",
             "SEMAPHORE_GIT_COMMIT_RANGE",
             "SEMAPHORE_GIT_COMMITTER",
@@ -360,7 +379,7 @@ pub const GROUPS: &[Group] = &[
         prefixes: &[],
     },
     Group {
-        why: "AppVeyor per-build, per-job or per-commit value",
+        why: "AppVeyor per-build or per-job value",
         source: "https://www.appveyor.com/docs/environment-variables/",
         names: &[
             "APPVEYOR_BUILD_ID",
@@ -368,6 +387,13 @@ pub const GROUPS: &[Group] = &[
             "APPVEYOR_BUILD_VERSION",
             "APPVEYOR_JOB_ID",
             "APPVEYOR_JOB_NUMBER",
+        ],
+        prefixes: &[],
+    },
+    Group {
+        why: "AppVeyor per-commit value",
+        source: "https://www.appveyor.com/docs/environment-variables/",
+        names: &[
             "APPVEYOR_REPO_COMMIT",
             "APPVEYOR_REPO_COMMIT_AUTHOR",
             "APPVEYOR_REPO_COMMIT_AUTHOR_EMAIL",
@@ -379,17 +405,15 @@ pub const GROUPS: &[Group] = &[
         prefixes: &[],
     },
     Group {
-        why: "GoCD per-run counter, label or revision",
+        why: "GoCD per-pipeline or per-stage counter and label",
         source: "https://docs.gocd.org/current/faq/dev_use_current_revision_in_build.html",
-        names: &[
-            "GO_PIPELINE_COUNTER",
-            "GO_PIPELINE_LABEL",
-            "GO_STAGE_COUNTER",
-            "GO_REVISION",
-            "GO_FROM_REVISION",
-            "GO_TO_REVISION",
-            "GO_TRIGGER_USER",
-        ],
+        names: &["GO_PIPELINE_COUNTER", "GO_PIPELINE_LABEL", "GO_STAGE_COUNTER"],
+        prefixes: &[],
+    },
+    Group {
+        why: "GoCD per-commit revision",
+        source: "https://docs.gocd.org/current/faq/dev_use_current_revision_in_build.html",
+        names: &["GO_REVISION", "GO_FROM_REVISION", "GO_TO_REVISION"],
         prefixes: &[
             "GO_REVISION_",
             "GO_FROM_REVISION_",
@@ -397,10 +421,26 @@ pub const GROUPS: &[Group] = &[
             "GO_DEPENDENCY_LABEL_",
         ],
     },
+    Group {
+        why: "rotating credential issued per job or per session",
+        source: "GitLab CI_JOB_TOKEN (valid while the job runs), CI_REGISTRY_PASSWORD (the job token), CI_REPOSITORY_URL (embeds it): https://docs.gitlab.com/ci/variables/predefined_variables/ ; CircleCI CIRCLE_OIDC_TOKEN and versions: https://circleci.com/docs/variables/ ; Bitbucket BITBUCKET_STEP_OIDC_TOKEN: https://support.atlassian.com/bitbucket-cloud/docs/variables-and-secrets/ ; Azure SYSTEM_ACCESSTOKEN (the security token of the running build): https://learn.microsoft.com/en-us/azure/devops/pipelines/build/variables ; AWS CLI AWS_SESSION_TOKEN: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-envvars.html",
+        names: &[
+            "CI_JOB_TOKEN",
+            "CI_REGISTRY_PASSWORD",
+            "CI_REPOSITORY_URL",
+            "CIRCLE_OIDC_TOKEN",
+            "CIRCLE_OIDC_TOKEN_V2",
+            "CIRCLE_OIDC_TOKEN_V3",
+            "BITBUCKET_STEP_OIDC_TOKEN",
+            "SYSTEM_ACCESSTOKEN",
+            "AWS_SESSION_TOKEN",
+        ],
+        prefixes: &[],
+    },
 ];
 
-/// The curated reason a name is excluded, or `None` when it is not a curated name. A name that is
-/// not UTF-8 can match none of them, because every curated name is ASCII.
+/// The curated reason a name is excluded, or `None` when it is not curated. Every curated name is
+/// ASCII, so a name that is not UTF-8 never matches.
 pub fn curated_reason(name: &str) -> Option<&'static str> {
     GROUPS
         .iter()
@@ -410,59 +450,179 @@ pub fn curated_reason(name: &str) -> Option<&'static str> {
         .map(|group| group.why)
 }
 
-/// A name the command text mentions always counts, matched by its text in the command.
-pub fn mentioned(name: &OsStr, mention: &str) -> bool {
-    let name = name.to_string_lossy();
-    !name.is_empty() && mention.contains(name.as_ref())
+/// Whether the command text names the variable. A name it names always counts.
+pub fn mentioned(name: &str, mention: &str) -> bool {
+    !name.is_empty() && mention.contains(name)
 }
 
-/// Names the learner never excludes. They are behavioural or path-like settings that a command
-/// can depend on, even when a value looks opaque. The list is conservative on purpose: a miss only
-/// costs a re-run.
+/// Names the learner never learns. They are behavioural or path-like settings that a command can
+/// depend on even when a value looks opaque. The list is conservative on purpose: a miss only costs
+/// one extra run.
 pub fn never_learn(name: &str) -> bool {
     const EXACT: &[&str] = &[
-        "PATH", "HOME", "USER", "LOGNAME", "SHELL", "LANG", "TZ", "CI", "DEBUG", "CC", "CXX", "AR",
-        "LD", "PWD", "OLDPWD", "EDITOR", "VISUAL", "PAGER", "IFS", "MAKEFLAGS", "MAKELEVEL",
-        "SHELLOPTS", "BASHOPTS", "PS1", "PS2", "PS4", "PYTHONPATH", "PYTHONHASHSEED",
-        "NODE_OPTIONS", "JAVA_HOME", "CFLAGS", "CXXFLAGS", "CPPFLAGS", "LDFLAGS", "RUSTFLAGS",
-        "RUSTDOCFLAGS", "CPATH", "PKG_CONFIG_PATH", "GOFLAGS", "GOOS", "GOARCH", "GOROOT", "GOPATH",
-        "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+        "PATH",
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "SHELL",
+        "LANG",
+        "TZ",
+        "CI",
+        "DEBUG",
+        "CC",
+        "CXX",
+        "AR",
+        "LD",
+        "PWD",
+        "OLDPWD",
+        "EDITOR",
+        "VISUAL",
+        "PAGER",
+        "IFS",
+        "MAKEFLAGS",
+        "MAKELEVEL",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PS1",
+        "PS2",
+        "PS4",
+        "PYTHONPATH",
+        "PYTHONHASHSEED",
+        "NODE_OPTIONS",
+        "JAVA_HOME",
+        "CFLAGS",
+        "CXXFLAGS",
+        "CPPFLAGS",
+        "LDFLAGS",
+        "RUSTFLAGS",
+        "RUSTDOCFLAGS",
+        "CPATH",
+        "PKG_CONFIG_PATH",
+        "GOFLAGS",
+        "GOOS",
+        "GOARCH",
+        "GOROOT",
+        "GOPATH",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "no_proxy",
     ];
     const PREFIX: &[&str] = &[
-        "LC_", "CARGO", "RUST", "NODE_", "PYTHON", "JAVA_", "GO", "NPM_", "npm_", "PIP_", "BUNDLE",
-        "GEM_", "NO_", "FORCE_", "DYLD_", "LD_", "MAKE", "CMAKE_", "PKG_", "XDG_", "HOMEBREW_",
-        "GIT_", "SSL_", "CURL_", "STOOP_",
+        "LC_",
+        "CARGO",
+        "RUST",
+        "NODE_",
+        "PYTHON",
+        "JAVA_",
+        "GO",
+        "NPM_",
+        "npm_",
+        "PIP_",
+        "BUNDLE",
+        "GEM_",
+        "NO_",
+        "FORCE_",
+        "DYLD_",
+        "LD_",
+        "MAKE",
+        "CMAKE_",
+        "PKG_",
+        "XDG_",
+        "HOMEBREW_",
+        "GIT_",
+        "SSL_",
+        "CURL_",
+        "STOOP_",
     ];
     const SUFFIX: &[&str] = &[
-        "_ENV", "_FLAGS", "_OPTS", "_OPTIONS", "_ARGS", "_MODE", "_PROFILE", "_LEVEL", "_CONFIG",
-        "_PATH", "_HOME", "_ROOT", "_DIR", "_TARGET", "_ARCH", "_PLATFORM", "_OS", "_VERSION",
-        "_SEED", "_FILE", "_LOCALE", "_LANG", "_TZ", "_SKIP", "_ONLY", "_DISABLE", "_ENABLE",
+        "_ENV",
+        "_FLAGS",
+        "_OPTS",
+        "_OPTIONS",
+        "_ARGS",
+        "_MODE",
+        "_PROFILE",
+        "_LEVEL",
+        "_CONFIG",
+        "_PATH",
+        "_HOME",
+        "_ROOT",
+        "_DIR",
+        "_TARGET",
+        "_ARCH",
+        "_PLATFORM",
+        "_OS",
+        "_VERSION",
+        "_SEED",
+        "_FILE",
+        "_LOCALE",
+        "_LANG",
+        "_TZ",
+        "_SKIP",
+        "_ONLY",
+        "_DISABLE",
+        "_ENABLE",
     ];
-    const CONTAINS: &[&str] = &["DEBUG", "VERBOSE", "TRACE", "QUIET", "COLOR", "FORCE", "DRY_RUN"];
+    const CONTAINS: &[&str] = &[
+        "DEBUG", "VERBOSE", "TRACE", "QUIET", "COLOR", "FORCE", "DRY_RUN",
+    ];
     EXACT.contains(&name)
         || PREFIX.iter().any(|p| name.starts_with(p))
         || SUFFIX.iter().any(|s| name.ends_with(s))
         || CONTAINS.iter().any(|c| name.contains(c))
 }
 
-/// Whether a value looks like an opaque identifier or a timestamp: a long token that is all hex
-/// digits, or that mixes letters and digits, or a long all-digit value. A plain word, a short
-/// version string or a boolean does not.
+/// Whether a value looks like an opaque identifier or a timestamp.
+///
+/// - a token of eight or more characters that mixes letters and digits, or is hexadecimal with a
+///   letter in it (`3f9a2c1d`, `550e8400`, a random suffix in a path);
+/// - a run of ten or more digits (epoch seconds and milliseconds, a compact date with a time);
+/// - a date with a time of day (`2024-12-31T23:59:59Z`).
+///
+/// A plain date, a short number, a version, a word or a path of words does not count. A date
+/// changes once a day, not on every run, so it is not treated as a per-run identifier.
 pub fn opaque(value: &str) -> bool {
-    if value.len() >= 8 && value.bytes().all(|b| b.is_ascii_digit()) {
+    if has_time_of_day_date(value) {
         return true;
     }
-    value.split(|c: char| !c.is_ascii_alphanumeric()).any(|token| {
-        token.len() >= 8
-            && (token.bytes().all(|b| b.is_ascii_hexdigit())
-                || (token.bytes().any(|b| b.is_ascii_digit())
-                    && token.bytes().any(|b| b.is_ascii_alphabetic())))
+    value
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .any(|token| {
+            let len = token.len();
+            let digits = token.bytes().filter(u8::is_ascii_digit).count();
+            let letters = token.bytes().filter(u8::is_ascii_alphabetic).count();
+            if digits == len {
+                return len >= 10;
+            }
+            len >= 8
+                && ((digits > 0 && letters > 0)
+                    || (token.bytes().all(|b| b.is_ascii_hexdigit())
+                        && token
+                            .bytes()
+                            .any(|b| matches!(b, b'a'..=b'f' | b'A'..=b'F'))))
+        })
+}
+
+/// `YYYY-MM-DD` followed by a time of day, with `T` or a space between them.
+fn has_time_of_day_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.windows(16).any(|w| {
+        w[0..4].iter().all(u8::is_ascii_digit)
+            && w[4] == b'-'
+            && w[5..7].iter().all(u8::is_ascii_digit)
+            && w[7] == b'-'
+            && w[8..10].iter().all(u8::is_ascii_digit)
+            && (w[10] == b'T' || w[10] == b' ')
+            && w[11..13].iter().all(u8::is_ascii_digit)
+            && w[13] == b':'
+            && w[14..16].iter().all(u8::is_ascii_digit)
     })
 }
 
-/// The digest the learner remembers for one observed value, or `None` when the value cannot count
-/// as an identifier: a value that is not UTF-8, or one that does not look opaque. The digest is
-/// keyed with the proof salt when there is one, so the learner state reveals no more than proofs do.
+/// The digest the learner remembers for one value, or `None` when the value cannot count as an
+/// identifier: it is not UTF-8, or it does not look opaque. The digest is keyed with the proof salt
+/// when there is one, so the learner state reveals no more than proofs already do.
 pub fn digest(name: &str, value: &[u8], salt: Option<&[u8]>) -> Option<String> {
     let text = std::str::from_utf8(value).ok()?;
     if !opaque(text) {
@@ -472,7 +632,7 @@ pub fn digest(name: &str, value: &[u8], salt: Option<&[u8]>) -> Option<String> {
     Some(full.trim_start_matches("s:").chars().take(16).collect())
 }
 
-/// Identifies the salt a learner state was built with, so that a changed salt starts learning again.
+/// Identifies the salt a learner state was built with, so a changed salt starts learning again.
 /// The salt itself is never stored.
 pub fn salt_id(salt: Option<&[u8]>) -> String {
     match salt {
@@ -485,32 +645,30 @@ pub fn salt_id(salt: Option<&[u8]>) -> String {
     }
 }
 
-/// What the volatile policy decided for one run's candidate names.
+/// What the policy decided for one run's candidate names. Both lists are sorted.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Plan {
-    /// Names the fingerprint counts, sorted.
+    /// Names the fingerprint counts.
     pub counted: Vec<String>,
-    /// Names the policy excludes, sorted by name, with the reason each one is excluded.
+    /// Names the policy excludes, each with the reason it is excluded.
     pub excluded: Vec<(String, String)>,
 }
 
-/// Split candidate names (environment keys) into those counted and those excluded. A name the
-/// command mentions and a name forced with `--env` always count. A curated name is excluded for its
-/// group's reason. A learned name is excluded for the learned reason.
+/// Split candidate environment keys into counted and excluded names. A name the command text
+/// mentions and a name forced with `--env` always count. A curated name is excluded for its
+/// group's reason; a learned name for the learned reason.
 pub fn plan(
     candidates: &[String],
     mention: &str,
     forced: &[String],
-    learned: &BTreeMap<String, u64>,
+    learned: &BTreeMap<String, u32>,
 ) -> Plan {
     let mut out = Plan::default();
     for key in candidates {
         let name = crate::run::env_name(key);
-        if forced.contains(key) || mentioned(&name, mention) {
+        if forced.contains(key) || mentioned(&name.to_string_lossy(), mention) {
             out.counted.push(key.clone());
-            continue;
-        }
-        if let Some(why) = curated_reason(key) {
+        } else if let Some(why) = curated_reason(key) {
             out.excluded.push((key.clone(), why.to_string()));
         } else if let Some(runs) = learned.get(key) {
             out.excluded.push((
@@ -522,28 +680,103 @@ pub fn plan(
         }
     }
     out.counted.sort();
+    out.counted.dedup();
     out.excluded.sort();
+    out.excluded.dedup_by(|a, b| a.0 == b.0);
     out
 }
 
-/// Recorded runs in a row that must each show a new opaque value before a name is learned.
-pub const MIN_RUNS: usize = 4;
-/// The most recent recorded runs the learner keeps for one name. A repeat inside this window stops
-/// learning until the repeated value leaves it.
-pub const WINDOW: usize = 8;
-const MAX_KEYS: usize = 64;
+/// Consecutive observations, each with a value the name has not had before, that learn a name.
+pub const MIN_RUNS: u32 = 4;
+/// The most distinct values kept per name. A value that has left this history can repeat unseen.
+const SEEN_MAX: usize = 16;
+/// Names kept per key. The least recently observed go first.
 const MAX_NAMES: usize = 64;
-const MAX_FILE_BYTES: u64 = 1024 * 1024;
+/// Keys kept in the store. The least recently updated go first.
+const MAX_KEYS: usize = 512;
+const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const FILE: &str = "volatile-v1.json";
 const LOCK: &str = "volatile-v1.lock";
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
-/// The names one proof key has learned, with the runs each was learned after, and a warning when
-/// the stored state was damaged or from another stoop version.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Learned {
-    pub names: BTreeMap<String, u64>,
+/// One run's input to the policy.
+pub struct Request<'a> {
+    pub store: &'a Path,
+    /// The proof key the run belongs to. Learning is per key.
+    pub key: &'a str,
+    /// Every environment key the fingerprint could count, before the policy.
+    pub candidates: &'a [String],
+    pub mention: &'a str,
+    /// Names forced to count with `--env`.
+    pub forced: &'a [String],
+    pub salt: Option<&'a [u8]>,
+    /// False turns learning off: nothing is observed and no learned name is excluded.
+    pub learn: bool,
+    /// True when this run may write the learner state: a trusted run that records. Otherwise the
+    /// observation is applied in memory only, so a run cannot exclude a name that a trusted run
+    /// would have counted.
+    pub persist: bool,
+    pub now: u64,
+}
+
+/// The policy's decision for one run, with what a run should say about it.
+#[derive(Debug, Default)]
+pub struct Outcome {
+    pub plan: Plan,
+    /// Lines for names learned or counted again on this run. Empty unless the state was written.
+    pub changes: Vec<String>,
+    /// A damaged or unwritable state: the run counts every variable it would have counted.
     pub warning: Option<String>,
+}
+
+pub fn decide(req: &Request) -> Outcome {
+    let mut candidates: Vec<String> = req.candidates.iter().chain(req.forced).cloned().collect();
+    candidates.sort();
+    candidates.dedup();
+    let mut outcome = Outcome::default();
+    let learned = if req.learn {
+        let observed = observations(&candidates, req.mention, req.forced, req.salt);
+        let salt_id = salt_id(req.salt);
+        let step = if req.persist {
+            persist(req.store, req.key, &salt_id, &observed, req.now)
+        } else {
+            in_memory(req.store, req.key, &salt_id, &observed, req.now)
+        };
+        outcome.changes = step.changes;
+        outcome.warning = step.warning;
+        step.learned
+    } else {
+        BTreeMap::new()
+    };
+    outcome.plan = plan(&candidates, req.mention, req.forced, &learned);
+    outcome
+}
+
+/// The digest of each name this run could learn: present, opaque, and neither curated, never
+/// learned, mentioned nor forced. A name absent from the map breaks any streak it was on.
+fn observations(
+    candidates: &[String],
+    mention: &str,
+    forced: &[String],
+    salt: Option<&[u8]>,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for key in candidates {
+        if forced.contains(key) || curated_reason(key).is_some() || never_learn(key) {
+            continue;
+        }
+        let name = crate::run::env_name(key);
+        if mentioned(&name.to_string_lossy(), mention) {
+            continue;
+        }
+        let Some(value) = std::env::var_os(&name) else {
+            continue;
+        };
+        if let Some(digest) = digest(key, value.as_encoded_bytes(), salt) {
+            out.insert(key.clone(), digest);
+        }
+    }
+    out
 }
 
 #[derive(Default, Deserialize, Serialize)]
@@ -553,15 +786,23 @@ struct Catalog {
     keys: BTreeMap<String, KeyState>,
 }
 
+impl Catalog {
+    fn fresh() -> Self {
+        Catalog {
+            version: 1,
+            keys: BTreeMap::new(),
+        }
+    }
+}
+
 #[derive(Clone, Default, Deserialize, Serialize)]
 struct KeyState {
-    /// Recorded runs observed for this key.
-    #[serde(default)]
-    runs: u64,
-    /// Identity of the salt the digests were keyed with; empty when unsalted.
+    /// Identity of the salt the digests were keyed with. A different salt starts again.
     #[serde(default)]
     salt: String,
-    /// Unix time of the last update, which orders eviction.
+    /// Invocations of this key that reached the decision.
+    #[serde(default)]
+    runs: u64,
     #[serde(default)]
     updated: u64,
     #[serde(default)]
@@ -570,20 +811,152 @@ struct KeyState {
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 struct NameState {
-    /// Digests of the last recorded runs in a row, oldest first, at most `WINDOW`.
+    /// Consecutive observations that each brought a new value. Reset by a gap or a repeat.
     #[serde(default)]
-    window: Vec<String>,
-    /// Runs in the window when the name was learned. Absent until it is learned, and then sticky.
+    streak: u32,
+    /// The most recent distinct digests, oldest first.
+    #[serde(default)]
+    seen: Vec<String>,
+    /// The run count at which the name was learned. Absent until then, and cleared by a repeat.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    learned: Option<u64>,
-    /// The run count at which this name was last observed.
+    learned: Option<u32>,
+    /// Once a learned name repeats, it is never learned again for this key.
+    #[serde(default)]
+    refused: bool,
+    /// The key's run count when the name was last observed.
     #[serde(default)]
     last: u64,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum Change {
+    Learned(String),
+    Revoked(String),
+}
+
+/// What one run of the policy produced: the learned names and what changed.
+struct Step {
+    learned: BTreeMap<String, u32>,
+    changes: Vec<String>,
+    warning: Option<String>,
+}
+
+impl Step {
+    fn refused(warning: String) -> Step {
+        Step {
+            learned: BTreeMap::new(),
+            changes: Vec::new(),
+            warning: Some(warning),
+        }
+    }
+}
+
+/// Apply one invocation's observations to a key's state. A repeat resets the streak, and revokes a
+/// learned name for good. A new value extends the streak, and learns the name after `MIN_RUNS`.
+/// A name absent from `observed` breaks its streak but keeps what it has learned.
+fn advance(state: &mut KeyState, observed: &BTreeMap<String, String>, now: u64) -> Vec<Change> {
+    state.runs += 1;
+    state.updated = now;
+    let run = state.runs;
+    let mut changes = Vec::new();
+    for (name, digest) in observed {
+        let entry = state.names.entry(name.clone()).or_default();
+        entry.last = run;
+        if entry.seen.contains(digest) {
+            entry.streak = 0;
+            if entry.learned.is_some() {
+                entry.learned = None;
+                entry.refused = true;
+                changes.push(Change::Revoked(name.clone()));
+            }
+            continue;
+        }
+        entry.seen.push(digest.clone());
+        if entry.seen.len() > SEEN_MAX {
+            entry.seen.remove(0);
+        }
+        if entry.learned.is_none() && !entry.refused {
+            entry.streak += 1;
+            if entry.streak >= MIN_RUNS {
+                entry.learned = Some(MIN_RUNS);
+                changes.push(Change::Learned(name.clone()));
+            }
+        }
+    }
+    for (name, entry) in state.names.iter_mut() {
+        if entry.learned.is_none() && !observed.contains_key(name) {
+            entry.streak = 0;
+        }
+    }
+    prune(state);
+    changes
+}
+
+fn prune(state: &mut KeyState) {
+    if state.names.len() <= MAX_NAMES {
+        return;
+    }
+    let mut order: Vec<(u64, String)> = state
+        .names
+        .iter()
+        .map(|(name, entry)| (entry.last, name.clone()))
+        .collect();
+    order.sort();
+    let excess = state.names.len() - MAX_NAMES;
+    for (_, name) in order.into_iter().take(excess) {
+        state.names.remove(&name);
+    }
+}
+
+fn learned_of(state: &KeyState) -> BTreeMap<String, u32> {
+    state
+        .names
+        .iter()
+        .filter_map(|(name, entry)| entry.learned.map(|runs| (name.clone(), runs)))
+        .collect()
+}
+
+/// The key's state under the current salt. A state from another salt is not reused.
+fn take_key(catalog: &mut Catalog, key: &str, salt_id: &str) -> KeyState {
+    match catalog.keys.remove(key) {
+        Some(state) if state.salt == salt_id => state,
+        _ => KeyState {
+            salt: salt_id.to_string(),
+            ..KeyState::default()
+        },
+    }
+}
+
+fn render(change: &Change) -> String {
+    match change {
+        Change::Learned(name) => format!(
+            "ignoring env {}: changes on every run (learned after {MIN_RUNS} runs)",
+            safe(name)
+        ),
+        Change::Revoked(name) => format!(
+            "counting env {} again: it returned to an earlier value, so it is not ignored for this key any more",
+            safe(name)
+        ),
+    }
+}
+
+/// Text from a damaged file or an environment name, escaped for stoop's output. A workflow command
+/// must not be smuggled through a warning. Mirrors the escaping of hook records.
+pub fn safe(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() {
+            shown.push_str(&format!("\\u{{{:x}}}", ch as u32));
+        } else {
+            shown.push(ch);
+        }
+    }
+    crate::plan::output::escape(&shown)
+}
+
 /// What a damaged state file means for this run.
 enum Damage {
-    /// Corrupt, oversized or malformed: safe to replace with a fresh state.
+    /// Missing parts, corrupt or oversized: safe to replace with a fresh state.
     Replace(String),
     /// Written by another stoop version, or unreadable: never overwritten.
     Keep(String),
@@ -596,12 +969,7 @@ fn path(store: &Path) -> PathBuf {
 fn read_catalog(store: &Path) -> Result<Catalog, Damage> {
     let file = match File::open(path(store)) {
         Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(Catalog {
-                version: 1,
-                keys: BTreeMap::new(),
-            });
-        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Catalog::fresh()),
         Err(error) => return Err(Damage::Keep(format!("it cannot be read ({error})"))),
     };
     let mut bytes = Vec::new();
@@ -624,6 +992,7 @@ fn read_catalog(store: &Path) -> Result<Catalog, Damage> {
     Ok(catalog)
 }
 
+/// An exclusive lock on the store, held for one read-modify-write. The store is created if absent.
 fn lock(store: &Path) -> io::Result<File> {
     fs::create_dir_all(store)?;
     match OpenOptions::new()
@@ -671,140 +1040,20 @@ fn write_bytes(store: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-/// Text from a damaged file, escaped for stoop's output. A workflow command must not be
-/// smuggled through a warning.
-fn safe(text: &str) -> String {
-    crate::plan::output::escape(text)
-}
-
-/// The names learned for `key`, read without writing. Damage yields no names and one warning, so
-/// a damaged state costs only the exclusions it would have made.
-pub fn load(store: &Path, key: &str, salt_id: &str) -> Learned {
-    match read_catalog(store) {
-        Ok(catalog) => Learned {
-            names: learned_of(catalog.keys.get(key), salt_id),
-            warning: None,
-        },
-        Err(Damage::Replace(why) | Damage::Keep(why)) => Learned {
-            names: BTreeMap::new(),
-            warning: Some(format!(
-                "stoop: volatile env records are unavailable ({}); counting every variable",
-                safe(&why)
-            )),
-        },
-    }
-}
-
-fn learned_of(state: Option<&KeyState>, salt_id: &str) -> BTreeMap<String, u64> {
-    let Some(state) = state.filter(|state| state.salt == salt_id) else {
-        return BTreeMap::new();
-    };
-    state
-        .names
+/// The key that goes first when space is needed: the least recently updated, never `keep`.
+fn stalest(catalog: &Catalog, keep: &str) -> Option<String> {
+    catalog
+        .keys
         .iter()
-        .filter_map(|(name, learned)| learned.learned.map(|runs| (name.clone(), runs)))
-        .collect()
+        .filter(|(name, _)| name.as_str() != keep)
+        .min_by_key(|(_, state)| state.updated)
+        .map(|(name, _)| name.clone())
 }
 
-fn all_distinct(window: &[String]) -> bool {
-    window
-        .iter()
-        .enumerate()
-        .all(|(i, digest)| !window[..i].contains(digest))
-}
-
-/// Record one recorded run of `key`. `observed` maps each candidate name to its digest, or to `None`
-/// when the name is absent or its value does not look opaque. A name that is missing from
-/// `observed` breaks its streak. A damaged state is replaced with a warning. Returns the
-/// repair note, if any.
-pub fn observe(
-    store: &Path,
-    key: &str,
-    salt_id: &str,
-    observed: &BTreeMap<String, Option<String>>,
-    now: u64,
-) -> Result<Option<String>, String> {
-    let _lock = lock(store).map_err(|error| {
-        format!("stoop: cannot lock volatile env records ({error}); counting every variable")
-    })?;
-    let (mut catalog, repaired) = match read_catalog(store) {
-        Ok(catalog) => (catalog, None),
-        Err(Damage::Replace(why)) => (
-            Catalog {
-                version: 1,
-                keys: BTreeMap::new(),
-            },
-            Some(format!(
-                "stoop: volatile env records were replaced because {}",
-                safe(&why)
-            )),
-        ),
-        Err(Damage::Keep(why)) => {
-            return Err(format!(
-                "stoop: volatile env records are kept as they are ({}); counting every variable",
-                safe(&why)
-            ));
-        }
-    };
-    let state = catalog.keys.entry(key.to_string()).or_default();
-    if state.salt != salt_id {
-        *state = KeyState {
-            salt: salt_id.to_string(),
-            ..KeyState::default()
-        };
-    }
-    state.runs += 1;
-    state.updated = now;
-    let run = state.runs;
-    for (name, digest) in observed {
-        let entry = state.names.entry(name.clone()).or_default();
-        if entry.learned.is_some() {
-            continue;
-        }
-        match digest {
-            Some(digest) => {
-                entry.window.push(digest.clone());
-                if entry.window.len() > WINDOW {
-                    entry.window.remove(0);
-                }
-                entry.last = run;
-                if entry.window.len() >= MIN_RUNS && all_distinct(&entry.window) {
-                    entry.learned = Some(entry.window.len() as u64);
-                }
-            }
-            None => entry.window.clear(),
-        }
-    }
-    for (name, entry) in state.names.iter_mut() {
-        if entry.learned.is_none() && !observed.contains_key(name) {
-            entry.window.clear();
-        }
-    }
-    state
-        .names
-        .retain(|_, entry| entry.learned.is_some() || !entry.window.is_empty());
-    while state.names.len() > MAX_NAMES {
-        let oldest = state
-            .names
-            .iter()
-            .filter(|(_, entry)| entry.learned.is_none())
-            .min_by_key(|(_, entry)| entry.last)
-            .map(|(name, _)| name.clone());
-        match oldest {
-            Some(name) => {
-                state.names.remove(&name);
-            }
-            None => break,
-        }
-    }
+/// Serialise the catalog within the key and size limits, dropping the stalest keys to fit.
+fn fit(catalog: &mut Catalog, keep: &str) -> Result<Vec<u8>, String> {
     while catalog.keys.len() > MAX_KEYS {
-        let stale = catalog
-            .keys
-            .iter()
-            .filter(|(name, _)| name.as_str() != key)
-            .min_by_key(|(_, state)| state.updated)
-            .map(|(name, _)| name.clone());
-        match stale {
+        match stalest(catalog, keep) {
             Some(name) => {
                 catalog.keys.remove(&name);
             }
@@ -812,22 +1061,13 @@ pub fn observe(
         }
     }
     loop {
-        let bytes = serde_json::to_vec(&catalog).map_err(|error| {
+        let bytes = serde_json::to_vec(catalog).map_err(|error| {
             format!("stoop: cannot save volatile env records ({error}); counting every variable")
         })?;
         if bytes.len() as u64 <= MAX_FILE_BYTES {
-            write_bytes(store, &bytes).map_err(|error| {
-                format!("stoop: cannot save volatile env records ({error}); counting every variable")
-            })?;
-            return Ok(repaired);
+            return Ok(bytes);
         }
-        let stale = catalog
-            .keys
-            .iter()
-            .filter(|(name, _)| name.as_str() != key)
-            .min_by_key(|(_, state)| state.updated)
-            .map(|(name, _)| name.clone());
-        match stale {
+        match stalest(catalog, keep) {
             Some(name) => {
                 catalog.keys.remove(&name);
             }
@@ -841,33 +1081,116 @@ pub fn observe(
     }
 }
 
+/// A trusted run: observe under the store's lock, and write the new state before deciding.
+fn persist(
+    store: &Path,
+    key: &str,
+    salt_id: &str,
+    observed: &BTreeMap<String, String>,
+    now: u64,
+) -> Step {
+    let _guard = match lock(store) {
+        Ok(guard) => guard,
+        Err(error) => {
+            return Step::refused(format!(
+                "stoop: cannot lock volatile env records ({error}); counting every variable"
+            ));
+        }
+    };
+    let (mut catalog, warning) = match read_catalog(store) {
+        Ok(catalog) => (catalog, None),
+        Err(Damage::Replace(why)) => (
+            Catalog::fresh(),
+            Some(format!(
+                "stoop: volatile env records were replaced because {}",
+                safe(&why)
+            )),
+        ),
+        Err(Damage::Keep(why)) => {
+            return Step::refused(format!(
+                "stoop: volatile env records are kept as they are ({}); counting every variable",
+                safe(&why)
+            ));
+        }
+    };
+    let mut state = take_key(&mut catalog, key, salt_id);
+    let changes = advance(&mut state, observed, now);
+    let learned = learned_of(&state);
+    catalog.keys.insert(key.to_string(), state);
+    let bytes = match fit(&mut catalog, key) {
+        Ok(bytes) => bytes,
+        Err(message) => return Step::refused(message),
+    };
+    if let Err(error) = write_bytes(store, &bytes) {
+        return Step::refused(format!(
+            "stoop: cannot save volatile env records ({error}); counting every variable"
+        ));
+    }
+    Step {
+        learned,
+        changes: changes.iter().map(render).collect(),
+        warning,
+    }
+}
+
+/// A run that may not write: observe in memory only, so the decision matches a trusted run's.
+fn in_memory(
+    store: &Path,
+    key: &str,
+    salt_id: &str,
+    observed: &BTreeMap<String, String>,
+    now: u64,
+) -> Step {
+    let mut catalog = match read_catalog(store) {
+        Ok(catalog) => catalog,
+        Err(Damage::Replace(why) | Damage::Keep(why)) => {
+            return Step::refused(format!(
+                "stoop: volatile env records are unavailable ({}); counting every variable",
+                safe(&why)
+            ));
+        }
+    };
+    let mut state = take_key(&mut catalog, key, salt_id);
+    advance(&mut state, observed, now);
+    Step {
+        learned: learned_of(&state),
+        changes: Vec::new(),
+        warning: None,
+    }
+}
+
 /// Forget what was learned for `key`. Returns whether anything was stored under it.
 pub fn forget(store: &Path, key: &str) -> Result<bool, String> {
     if !path(store).exists() {
         return Ok(false);
     }
-    let _lock = lock(store)
+    let _guard = lock(store)
         .map_err(|error| format!("stoop: cannot lock volatile env records ({error})"))?;
     let mut catalog = match read_catalog(store) {
         Ok(catalog) => catalog,
-        Err(Damage::Replace(why) | Damage::Keep(why)) => {
+        Err(Damage::Replace(_)) => Catalog::fresh(),
+        Err(Damage::Keep(why)) => {
             return Err(format!(
                 "stoop: volatile env records are unavailable ({})",
                 safe(&why)
             ));
         }
     };
-    if catalog.keys.remove(key).is_none() {
-        return Ok(false);
-    }
+    let removed = catalog.keys.remove(key).is_some();
     let bytes = serde_json::to_vec(&catalog).map_err(|error| error.to_string())?;
     write_bytes(store, &bytes)
         .map_err(|error| format!("stoop: cannot save volatile env records ({error})"))?;
-    Ok(true)
+    Ok(removed)
 }
 
-/// Every key with learned names, with each name and the runs it was learned after, sorted by key.
-pub fn list(store: &Path) -> Result<Vec<(String, Vec<(String, u64)>)>, String> {
+/// The learned names of each key: the key, then each name and the runs it was learned after.
+pub type Listing = Vec<(String, Vec<(String, u32)>)>;
+
+/// Every key with names learned under `salt_id`, with each name and the runs it was learned after.
+pub fn list(store: &Path, salt_id: &str) -> Result<Listing, String> {
+    if !path(store).exists() {
+        return Ok(Vec::new());
+    }
     let catalog = read_catalog(store).map_err(|damage| match damage {
         Damage::Replace(why) | Damage::Keep(why) => format!(
             "stoop: volatile env records are unavailable ({})",
@@ -877,10 +1200,9 @@ pub fn list(store: &Path) -> Result<Vec<(String, Vec<(String, u64)>)>, String> {
     Ok(catalog
         .keys
         .iter()
+        .filter(|(_, state)| state.salt == salt_id)
         .filter_map(|(key, state)| {
-            let learned: Vec<(String, u64)> = learned_of(Some(state), &state.salt)
-                .into_iter()
-                .collect();
+            let learned: Vec<(String, u32)> = learned_of(state).into_iter().collect();
             (!learned.is_empty()).then(|| (key.clone(), learned))
         })
         .collect())
@@ -890,75 +1212,210 @@ pub fn list(store: &Path) -> Result<Vec<(String, Vec<(String, u64)>)>, String> {
 mod tests {
     use super::*;
 
-    fn store(name: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "stoop-volatile-unit-{}-{name}",
-            std::process::id()
-        ));
+    fn dir(name: &str) -> PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("stoop-volatile-unit-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&path);
         fs::create_dir_all(&path).unwrap();
         path
     }
 
     /// Opaque values, each different from the others.
-    const V: [&str; 6] = [
-        "3f9a2c1d", "7b20e4a8", "c5d61f09", "0a8e77b2", "9d4c3e11", "e2f0b7c4",
+    const V: [&str; 8] = [
+        "3f9a2c1d", "7b20e4a8", "c5d61f09", "0a8e77b2", "9d4c3e11", "e2f0b7c4", "4a1b9d6e",
+        "b8c2f3a0",
     ];
 
-    fn seen(store: &Path, key: &str, name: &str, value: Option<&str>) {
-        let mut observed = BTreeMap::new();
-        observed.insert(
-            name.to_string(),
-            value.and_then(|v| digest(name, v.as_bytes(), None)),
-        );
-        observe(store, key, "", &observed, 1).unwrap();
+    /// Set `name` to `value` (or unset it), then decide for one trusted run of `key`.
+    fn observe(store: &Path, key: &str, name: &str, value: Option<&str>) -> Outcome {
+        match value {
+            Some(value) => std::env::set_var(name, value),
+            None => std::env::remove_var(name),
+        }
+        let names = vec![name.to_string()];
+        decide(&Request {
+            store,
+            key,
+            candidates: &names,
+            mention: "",
+            forced: &[],
+            salt: None,
+            learn: true,
+            persist: true,
+            now: 1,
+        })
     }
 
-    fn learned(store: &Path, key: &str, name: &str) -> Option<u64> {
-        load(store, key, "").names.get(name).copied()
+    fn learned_names(outcome: &Outcome) -> Vec<String> {
+        outcome
+            .plan
+            .excluded
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect()
     }
 
     #[test]
-    fn every_group_names_a_reason_and_a_source() {
+    fn every_group_names_a_reason_and_a_source_and_no_dash() {
         for group in GROUPS {
             assert!(!group.why.is_empty());
             assert!(!group.source.is_empty());
-            assert!(!group.names.is_empty() || !group.prefixes.is_empty());
-        }
-    }
-
-    #[test]
-    fn each_group_is_reachable_through_its_own_first_name() {
-        for group in GROUPS {
-            let name = group.names.first().copied().unwrap_or_else(|| {
-                group.prefixes.first().copied().unwrap()
-            });
-            let probe = format!("{name}X");
             assert!(
-                curated_reason(name).is_some() || curated_reason(&probe).is_some(),
-                "{name}"
+                !group.names.is_empty() || !group.prefixes.is_empty(),
+                "{}",
+                group.why
             );
+            for text in [group.why, group.source] {
+                assert!(
+                    !text.contains('\u{2014}') && !text.contains('\u{2013}'),
+                    "{text}"
+                );
+            }
         }
     }
 
     #[test]
-    fn per_run_names_are_curated_and_behavioural_names_are_not() {
+    fn no_curated_name_is_listed_twice() {
+        let mut seen = std::collections::BTreeSet::new();
+        for group in GROUPS {
+            for name in group.names {
+                assert!(seen.insert(*name), "{name} appears in two groups");
+            }
+        }
+    }
+
+    #[test]
+    fn per_run_names_are_curated() {
         for name in [
-            "RANDOM", "SRANDOM", "SECONDS", "EPOCHREALTIME", "BASHPID", "PPID", "TMUX_PANE",
-            "STY", "XDG_SESSION_ID", "CI_JOB_ID", "CI_JOB_TOKEN", "CI_COMMIT_SHA",
-            "CI_COMMIT_MESSAGE", "BUILDKITE_BUILD_NUMBER", "CIRCLE_BUILD_NUM", "TRAVIS_JOB_ID",
-            "SECURITYSESSIONID", "VSCODE_IPC_HOOK_CLI", "AWS_SESSION_TOKEN", "GO_PIPELINE_COUNTER",
+            "RANDOM",
+            "SRANDOM",
+            "SECONDS",
+            "EPOCHREALTIME",
+            "BASHPID",
+            "PPID",
+            "COLUMNS",
+            "TMUX_PANE",
+            "STY",
+            "WINDOWID",
+            "KITTY_WINDOW_ID",
+            "ZELLIJ_SESSION_NAME",
+            "WEZTERM_PANE",
+            "WT_SESSION",
+            "ALACRITTY_SOCKET",
+            "GNOME_TERMINAL_SCREEN",
+            "ITERM_SESSION_ID",
+            "TERM_SESSION_ID",
+            "KONSOLE_DBUS_SESSION",
+            "XDG_SESSION_ID",
+            "XDG_VTNR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "SSH_CONNECTION",
+            "SSH_CLIENT",
+            "SSH_TTY",
+            "SSH_AGENT_PID",
+            "VSCODE_IPC_HOOK_CLI",
+            "VSCODE_GIT_IPC_HANDLE",
+            "CI_JOB_ID",
+            "CI_JOB_URL",
+            "CI_COMMIT_SHA",
+            "CI_COMMIT_MESSAGE",
+            "CI_PIPELINE_ID",
+            "CI_PIPELINE_URL",
+            "CI_JOB_TOKEN",
+            "BUILDKITE_BUILD_NUMBER",
+            "BUILDKITE_JOB_ID",
+            "BUILDKITE_COMMIT",
+            "BUILDKITE_AGENT_PID",
+            "CIRCLE_BUILD_NUM",
+            "CIRCLE_SHA1",
+            "CIRCLE_WORKFLOW_JOB_ID",
+            "CIRCLE_OIDC_TOKEN",
+            "TRAVIS_BUILD_NUMBER",
+            "TRAVIS_COMMIT",
+            "TRAVIS_JOB_ID",
+            "BUILD_NUMBER",
+            "BUILD_URL",
+            "GIT_COMMIT",
+            "EXECUTOR_NUMBER",
+            "BUILD_VCS_NUMBER_1",
+            "BUILD_BUILDID",
+            "BUILD_SOURCEVERSION",
+            "SYSTEM_JOBID",
+            "SYSTEM_ACCESSTOKEN",
+            "AGENT_ID",
+            "BITBUCKET_BUILD_NUMBER",
+            "BITBUCKET_COMMIT",
+            "BITBUCKET_STEP_OIDC_TOKEN",
+            "DRONE_BUILD_NUMBER",
+            "DRONE_COMMIT_SHA",
+            "CODEBUILD_BUILD_ARN",
+            "CODEBUILD_RESOLVED_SOURCE_VERSION",
+            "SEMAPHORE_WORKFLOW_ID",
+            "SEMAPHORE_JOB_ID",
+            "SEMAPHORE_GIT_SHA",
+            "APPVEYOR_BUILD_ID",
+            "APPVEYOR_REPO_COMMIT",
+            "GO_PIPELINE_COUNTER",
+            "GO_REVISION",
+            "GO_REVISION_CODE",
+            "GO_DEPENDENCY_LABEL_pipeline",
+            "AWS_SESSION_TOKEN",
         ] {
             assert!(curated_reason(name).is_some(), "{name} should be curated");
         }
+    }
+
+    #[test]
+    fn behavioural_and_branch_and_trigger_names_stay_counted() {
         for name in [
-            "NODE_ENV", "CI", "DEBUG", "RUSTFLAGS", "CC", "PATH", "HOME", "LANG", "FOO",
-            "CI_COMMIT_REF_NAME", "CI_COMMIT_BRANCH", "CI_JOB_NAME", "CI_PIPELINE_SOURCE",
-            "CI_DEFAULT_BRANCH", "BUILDKITE_BRANCH", "CIRCLE_BRANCH", "TRAVIS_BRANCH",
-            "SEMAPHORE_GIT_BRANCH", "AWS_REGION", "TMPDIR", "__CFBundleIdentifier",
-            "TERM_PROGRAM_VERSION", "WT_PROFILE_ID", "ITERM_PROFILE", "VTE_VERSION",
-            "BUILDKITE_BUILD_CHECKOUT_PATH", "BUILDKITE_AGENT_ACCESS_TOKEN",
+            "NODE_ENV",
+            "CI",
+            "DEBUG",
+            "RUSTFLAGS",
+            "CC",
+            "PATH",
+            "HOME",
+            "LANG",
+            "FOO",
+            "TERM_PROGRAM_VERSION",
+            "VTE_VERSION",
+            "WT_PROFILE_ID",
+            "ITERM_PROFILE",
+            "DISPLAY",
+            "TMPDIR",
+            "CI_COMMIT_REF_NAME",
+            "CI_COMMIT_BRANCH",
+            "CI_JOB_NAME",
+            "CI_PIPELINE_SOURCE",
+            "CI_DEFAULT_BRANCH",
+            "CI_NODE_INDEX",
+            "CI_RUNNER_DESCRIPTION",
+            "BUILDKITE_BRANCH",
+            "BUILDKITE_CLEAN_CHECKOUT",
+            "BUILDKITE_PARALLEL_JOB",
+            "BUILDKITE_AGENT_NAME",
+            "BUILDKITE_PIPELINE_SLUG",
+            "CIRCLE_BRANCH",
+            "CIRCLE_NODE_INDEX",
+            "CIRCLE_USERNAME",
+            "TRAVIS_BRANCH",
+            "TRAVIS_JOB_RESTARTED_BY",
+            "NODE_NAME",
             "SEMAPHORE_API_TOKEN",
+            "AGENT_NAME",
+            "AGENT_MACHINENAME",
+            "BUILD_REQUESTEDFOR",
+            "CODEBUILD_INITIATOR",
+            "GO_TRIGGER_USER",
+            "GO_MATERIAL_HAS_CHANGED",
+            "VSCODE_INJECTION",
+            "VSCODE_GIT_ASKPASS_NODE",
+            "GPG_AGENT_INFO",
+            "ALACRITTY_LOG",
+            "KONSOLE_DBUS_WINDOW",
+            "JOB_URL",
+            "BUILDKITE_BUILD_CHECKOUT_PATH",
+            "SECURITYSESSIONID",
         ] {
             assert!(curated_reason(name).is_none(), "{name} must stay counted");
         }
@@ -967,10 +1424,11 @@ mod tests {
     #[test]
     fn prefixes_match_only_the_families_they_name() {
         assert!(curated_reason("GO_REVISION_CODE").is_some());
-        assert!(curated_reason("GO_REVISION").is_some());
+        assert!(curated_reason("GO_DEPENDENCY_LABEL_x").is_some());
+        assert!(curated_reason("BUILD_VCS_NUMBER_2").is_some());
         assert!(curated_reason("GO_REVISIONS").is_none());
         assert!(curated_reason("GO_REVISIO").is_none());
-        assert!(curated_reason("CI_COMMIT_SOMETHING_NEW").is_none());
+        assert!(curated_reason("BUILD_VCS_NUMBER").is_none());
         assert!(curated_reason("CI_").is_none());
     }
 
@@ -982,9 +1440,9 @@ mod tests {
 
     #[test]
     fn a_mention_counts_a_name_the_command_text_names() {
-        assert!(mentioned(OsStr::new("RANDOM"), "echo $RANDOM"));
-        assert!(!mentioned(OsStr::new("RANDOM"), "echo hi"));
-        assert!(!mentioned(OsStr::new(""), "anything"));
+        assert!(mentioned("RANDOM", "echo $RANDOM"));
+        assert!(!mentioned("RANDOM", "echo hi"));
+        assert!(!mentioned("", "anything"));
     }
 
     #[test]
@@ -1002,12 +1460,19 @@ mod tests {
         );
         assert_eq!(
             plan.counted,
-            vec!["NODE_ENV".to_string(), "RANDOM".to_string(), "TMUX_PANE".to_string()]
+            vec![
+                "NODE_ENV".to_string(),
+                "RANDOM".to_string(),
+                "TMUX_PANE".to_string()
+            ]
         );
         assert_eq!(
             plan.excluded,
             vec![
-                ("CI_JOB_ID".to_string(), "GitLab per-job or per-pipeline value".to_string()),
+                (
+                    "CI_JOB_ID".to_string(),
+                    "GitLab per-job or per-pipeline value".to_string()
+                ),
                 (
                     "FOO".to_string(),
                     "changes on every run (learned after 4 runs)".to_string()
@@ -1017,12 +1482,41 @@ mod tests {
     }
 
     #[test]
+    fn a_learned_name_that_the_command_mentions_still_counts() {
+        let candidates = vec!["FOO".to_string()];
+        let learned = BTreeMap::from([("FOO".to_string(), 4)]);
+        let plan = plan(&candidates, "echo FOO", &[], &learned);
+        assert_eq!(plan.counted, vec!["FOO".to_string()]);
+        assert!(plan.excluded.is_empty());
+    }
+
+    #[test]
     fn a_name_the_learner_never_learns_is_refused() {
         for name in [
-            "PATH", "HOME", "LANG", "LC_ALL", "CC", "CARGO_TARGET_DIR", "RUSTFLAGS", "RUSTC_WRAPPER",
-            "NODE_ENV", "NODE_OPTIONS", "GOFLAGS", "DEBUG", "TZ", "MY_TOOL_VERBOSE", "DATABASE_DIR",
-            "BUILD_SEED", "CI_CONFIG_PATH", "PYTHONHASHSEED", "STOOP_LEARN_VOLATILE", "NO_COLOR",
-            "RAILS_ENV", "SOMETHING_OPTS", "SOMETHING_MODE",
+            "PATH",
+            "HOME",
+            "LANG",
+            "LC_ALL",
+            "CC",
+            "CARGO_TARGET_DIR",
+            "RUSTFLAGS",
+            "RUSTC_WRAPPER",
+            "NODE_ENV",
+            "NODE_OPTIONS",
+            "GOFLAGS",
+            "DEBUG",
+            "TZ",
+            "MY_TOOL_VERBOSE",
+            "DATABASE_DIR",
+            "BUILD_SEED",
+            "CI_CONFIG_PATH",
+            "PYTHONHASHSEED",
+            "STOOP_LEARN_VOLATILE",
+            "NO_COLOR",
+            "RAILS_ENV",
+            "SOMETHING_OPTS",
+            "SOMETHING_MODE",
+            "TRACEPARENT_TRACE",
         ] {
             assert!(never_learn(name), "{name} must not be learned");
         }
@@ -1036,7 +1530,10 @@ mod tests {
         for value in [
             "3f9a2c1d",
             "1700000000",
+            "1700000000123",
             "20241231235959",
+            "2024-12-31T23:59:59Z",
+            "2024-12-31 23:59",
             "/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T/",
             "550e8400-e29b-41d4-a716-446655440000",
             "a1b2c3d4e5f6",
@@ -1044,8 +1541,18 @@ mod tests {
             assert!(opaque(value), "{value} should look opaque");
         }
         for value in [
-            "", "18", "1.2.3", "production", "true", "x86_64-unknown-linux-gnu", "/home/me/project",
-            "node-18.17.1", "ubuntu-latest",
+            "",
+            "18",
+            "1.2.3",
+            "production",
+            "true",
+            "x86_64-unknown-linux-gnu",
+            "/home/me/project",
+            "node-18.17.1",
+            "ubuntu-latest",
+            "20241231",
+            "2024-12-31",
+            "Python3.11.4",
         ] {
             assert!(!opaque(value), "{value:?} should not look opaque");
         }
@@ -1068,172 +1575,344 @@ mod tests {
     }
 
     #[test]
-    fn four_distinct_runs_in_a_row_learn_a_changing_name() {
-        let s = store("four");
+    fn four_fresh_values_in_a_row_learn_the_name_and_exclude_it_on_that_run() {
+        let s = dir("four");
+        let name = "VOLATILE_TEST_FOUR";
         for value in &V[..3] {
-            seen(&s, "k", "SESSION_MARK", Some(value));
+            let out = observe(&s, "k", name, Some(value));
+            assert!(out.plan.excluded.is_empty(), "{:?}", out.plan);
         }
-        assert_eq!(learned(&s, "k", "SESSION_MARK"), None, "three runs learn nothing");
-        seen(&s, "k", "SESSION_MARK", Some(V[3]));
-        assert_eq!(learned(&s, "k", "SESSION_MARK"), Some(4));
+        let out = observe(&s, "k", name, Some(V[3]));
+        assert_eq!(learned_names(&out), vec![name.to_string()]);
+        assert_eq!(
+            out.plan.excluded[0].1,
+            "changes on every run (learned after 4 runs)"
+        );
+        assert_eq!(
+            out.changes,
+            vec![format!(
+                "ignoring env {name}: changes on every run (learned after 4 runs)"
+            )]
+        );
     }
 
     #[test]
     fn a_constant_value_is_never_learned() {
-        let s = store("constant");
+        let s = dir("constant");
         for _ in 0..10 {
-            seen(&s, "k", "SESSION_MARK", Some(V[0]));
+            let out = observe(&s, "k", "VOLATILE_TEST_CONST", Some(V[0]));
+            assert!(out.plan.excluded.is_empty());
         }
-        assert_eq!(learned(&s, "k", "SESSION_MARK"), None);
     }
 
     #[test]
     fn alternating_values_are_never_learned() {
-        let s = store("alternating");
+        let s = dir("alternating");
         for i in 0..12 {
-            seen(&s, "k", "SESSION_MARK", Some(V[i % 2]));
+            let out = observe(&s, "k", "VOLATILE_TEST_ALT", Some(V[i % 2]));
+            assert!(out.plan.excluded.is_empty(), "run {i}");
         }
-        assert_eq!(learned(&s, "k", "SESSION_MARK"), None);
     }
 
     #[test]
-    fn a_repeated_value_blocks_learning_until_it_leaves_the_window() {
-        let s = store("repeat");
-        seen(&s, "k", "SESSION_MARK", Some(V[0]));
-        seen(&s, "k", "SESSION_MARK", Some(V[1]));
-        seen(&s, "k", "SESSION_MARK", Some(V[2]));
-        seen(&s, "k", "SESSION_MARK", Some(V[0]));
-        seen(&s, "k", "SESSION_MARK", Some(V[3]));
-        seen(&s, "k", "SESSION_MARK", Some(V[4]));
-        seen(&s, "k", "SESSION_MARK", Some(V[5]));
+    fn a_value_repeated_on_a_skipped_run_blocks_learning() {
+        // A run that skips reaches the decision with an earlier proof's value. Counting only
+        // recorded runs would see a, b, c, d and learn; the repeat of a must be seen.
+        let s = dir("skipped-repeat");
+        let name = "VOLATILE_TEST_SKIP";
+        for value in [V[0], V[1], V[0], V[2], V[3]] {
+            let out = observe(&s, "k", name, Some(value));
+            assert!(out.plan.excluded.is_empty(), "learned too early at {value}");
+        }
+    }
+
+    #[test]
+    fn a_repeat_resets_the_streak_and_learning_resumes_after_it() {
+        let s = dir("reset");
+        let name = "VOLATILE_TEST_RESET";
+        for value in [V[0], V[1], V[2], V[0], V[3], V[4], V[5]] {
+            observe(&s, "k", name, Some(value));
+        }
+        let out = observe(&s, "k", name, Some(V[6]));
+        assert_eq!(learned_names(&out), vec![name.to_string()]);
+    }
+
+    #[test]
+    fn a_gap_breaks_the_streak() {
+        let s = dir("gap");
+        let name = "VOLATILE_TEST_GAP";
+        for value in [V[0], V[1], V[2]] {
+            observe(&s, "k", name, Some(value));
+        }
+        assert!(observe(&s, "k", name, None).plan.excluded.is_empty());
+        for value in [V[3], V[4], V[5]] {
+            assert!(observe(&s, "k", name, Some(value)).plan.excluded.is_empty());
+        }
         assert_eq!(
-            learned(&s, "k", "SESSION_MARK"),
-            None,
-            "the repeat of V[0] is still in the window"
+            learned_names(&observe(&s, "k", name, Some(V[6]))),
+            vec![name.to_string()]
         );
-        seen(&s, "k", "SESSION_MARK", Some("0c0c0c0c"));
-        assert_eq!(learned(&s, "k", "SESSION_MARK"), Some(8));
-    }
-
-    #[test]
-    fn a_run_without_the_name_breaks_the_streak() {
-        let s = store("gap");
-        seen(&s, "k", "SESSION_MARK", Some(V[0]));
-        seen(&s, "k", "SESSION_MARK", Some(V[1]));
-        seen(&s, "k", "SESSION_MARK", None);
-        seen(&s, "k", "SESSION_MARK", Some(V[2]));
-        seen(&s, "k", "SESSION_MARK", Some(V[3]));
-        seen(&s, "k", "SESSION_MARK", Some(V[4]));
-        assert_eq!(learned(&s, "k", "SESSION_MARK"), None);
-        seen(&s, "k", "SESSION_MARK", Some(V[5]));
-        assert_eq!(learned(&s, "k", "SESSION_MARK"), Some(4));
     }
 
     #[test]
     fn a_value_that_does_not_look_opaque_breaks_the_streak() {
-        let s = store("plain");
-        seen(&s, "k", "SESSION_MARK", Some(V[0]));
-        seen(&s, "k", "SESSION_MARK", Some(V[1]));
-        seen(&s, "k", "SESSION_MARK", Some("plain"));
-        seen(&s, "k", "SESSION_MARK", Some(V[2]));
-        seen(&s, "k", "SESSION_MARK", Some(V[3]));
-        seen(&s, "k", "SESSION_MARK", Some(V[4]));
-        assert_eq!(learned(&s, "k", "SESSION_MARK"), None);
+        let s = dir("plain");
+        let name = "VOLATILE_TEST_PLAIN";
+        for value in [V[0], V[1], V[2]] {
+            observe(&s, "k", name, Some(value));
+        }
+        assert!(observe(&s, "k", name, Some("production"))
+            .plan
+            .excluded
+            .is_empty());
+        for value in [V[3], V[4], V[5]] {
+            assert!(observe(&s, "k", name, Some(value)).plan.excluded.is_empty());
+        }
     }
 
     #[test]
-    fn a_learned_name_stays_learned_and_is_not_observed_again() {
-        let s = store("sticky");
-        for value in &V[..4] {
-            seen(&s, "k", "SESSION_MARK", Some(value));
+    fn a_learned_name_that_returns_to_an_earlier_value_is_counted_again_and_never_learned_for_the_key(
+    ) {
+        let s = dir("revoke");
+        let name = "VOLATILE_TEST_REVOKE";
+        for value in [V[0], V[1], V[2], V[3]] {
+            observe(&s, "k", name, Some(value));
         }
-        for _ in 0..3 {
-            seen(&s, "k", "SESSION_MARK", Some(V[0]));
+        let back = observe(&s, "k", name, Some(V[0]));
+        assert!(
+            back.plan.excluded.is_empty(),
+            "the repeat must count on its own run"
+        );
+        assert_eq!(
+            back.changes,
+            vec![format!(
+                "counting env {name} again: it returned to an earlier value, so it is not ignored for this key any more"
+            )]
+        );
+        for value in [V[4], V[5], V[6], V[7]] {
+            assert!(observe(&s, "k", name, Some(value)).plan.excluded.is_empty());
         }
-        assert_eq!(learned(&s, "k", "SESSION_MARK"), Some(4));
     }
 
     #[test]
     fn learning_is_per_key() {
-        let s = store("per-key");
-        for value in &V[..4] {
-            seen(&s, "a", "SESSION_MARK", Some(value));
+        let s = dir("per-key");
+        let name = "VOLATILE_TEST_KEYS";
+        for value in [V[0], V[1], V[2], V[3]] {
+            observe(&s, "a", name, Some(value));
         }
-        assert_eq!(learned(&s, "a", "SESSION_MARK"), Some(4));
-        assert_eq!(learned(&s, "b", "SESSION_MARK"), None);
+        assert_eq!(
+            learned_names(&observe(&s, "a", name, Some(V[4]))),
+            vec![name.to_string()]
+        );
+        assert!(observe(&s, "b", name, Some(V[5])).plan.excluded.is_empty());
     }
 
     #[test]
     fn a_changed_salt_starts_learning_again() {
-        let s = store("salt");
-        let mut observed = BTreeMap::new();
+        let s = dir("salt");
+        let name = "VOLATILE_TEST_SALT";
+        std::env::set_var(name, "x");
+        let names = vec![name.to_string()];
+        let run = |salt: &[u8], value: &str| {
+            std::env::set_var(name, value);
+            decide(&Request {
+                store: &s,
+                key: "k",
+                candidates: &names,
+                mention: "",
+                forced: &[],
+                salt: Some(salt),
+                learn: true,
+                persist: true,
+                now: 1,
+            })
+        };
         for value in &V[..4] {
-            observed.clear();
-            observed.insert(
-                "SESSION_MARK".to_string(),
-                digest("SESSION_MARK", value.as_bytes(), Some(b"one")),
-            );
-            observe(&s, "k", &salt_id(Some(b"one")), &observed, 1).unwrap();
+            run(b"one", value);
         }
-        assert_eq!(load(&s, "k", &salt_id(Some(b"one"))).names.len(), 1);
-        assert!(load(&s, "k", &salt_id(Some(b"two"))).names.is_empty());
-        observed.clear();
-        observed.insert(
-            "SESSION_MARK".to_string(),
-            digest("SESSION_MARK", V[4].as_bytes(), Some(b"two")),
+        let other = run(b"two", V[4]);
+        assert!(
+            other.plan.excluded.is_empty(),
+            "a new salt starts from nothing"
         );
-        observe(&s, "k", &salt_id(Some(b"two")), &observed, 1).unwrap();
-        assert!(load(&s, "k", &salt_id(Some(b"two"))).names.is_empty());
+        assert_eq!(learned_names(&run(b"two", V[5])), Vec::<String>::new());
+        assert!(
+            learned_names(&run(b"one", V[6])).is_empty(),
+            "switching back starts from nothing: one key holds one salt's state"
+        );
+        std::env::remove_var(name);
     }
 
     #[test]
-    fn a_damaged_state_file_warns_and_is_replaced_on_the_next_write() {
-        let s = store("damaged");
+    fn the_mention_rule_counts_a_learned_name_again() {
+        let s = dir("mention");
+        let name = "VOLATILE_TEST_MENTION";
+        for value in [V[0], V[1], V[2], V[3]] {
+            observe(&s, "k", name, Some(value));
+        }
+        std::env::set_var(name, V[4]);
+        let names = vec![name.to_string()];
+        let out = decide(&Request {
+            store: &s,
+            key: "k",
+            candidates: &names,
+            mention: &format!("echo ${name}"),
+            forced: &[],
+            salt: None,
+            learn: true,
+            persist: true,
+            now: 1,
+        });
+        assert_eq!(out.plan.counted, vec![name.to_string()]);
+        assert!(out.plan.excluded.is_empty());
+        std::env::remove_var(name);
+    }
+
+    #[test]
+    fn a_forced_name_counts_even_when_learned() {
+        let s = dir("forced");
+        let name = "VOLATILE_TEST_FORCED";
+        for value in [V[0], V[1], V[2], V[3]] {
+            observe(&s, "k", name, Some(value));
+        }
+        std::env::set_var(name, V[4]);
+        let names = vec![name.to_string()];
+        let forced = vec![name.to_string()];
+        let out = decide(&Request {
+            store: &s,
+            key: "k",
+            candidates: &names,
+            mention: "",
+            forced: &forced,
+            salt: None,
+            learn: true,
+            persist: true,
+            now: 1,
+        });
+        assert_eq!(out.plan.counted, vec![name.to_string()]);
+        std::env::remove_var(name);
+    }
+
+    #[test]
+    fn learning_off_applies_no_learned_exclusion_and_observes_nothing() {
+        let s = dir("off");
+        let name = "VOLATILE_TEST_OFF";
+        for value in [V[0], V[1], V[2], V[3]] {
+            observe(&s, "k", name, Some(value));
+        }
+        let before = fs::read(path(&s)).unwrap();
+        std::env::set_var(name, V[4]);
+        let names = vec![name.to_string()];
+        let out = decide(&Request {
+            store: &s,
+            key: "k",
+            candidates: &names,
+            mention: "",
+            forced: &[],
+            salt: None,
+            learn: false,
+            persist: true,
+            now: 1,
+        });
+        assert!(out.plan.excluded.is_empty());
+        assert_eq!(fs::read(path(&s)).unwrap(), before);
+        std::env::remove_var(name);
+    }
+
+    #[test]
+    fn an_untrusted_run_applies_its_observation_but_never_writes_it() {
+        let s = dir("in-memory");
+        let name = "VOLATILE_TEST_MEMORY";
+        for value in [V[0], V[1], V[2]] {
+            observe(&s, "k", name, Some(value));
+        }
+        let before = fs::read(path(&s)).unwrap();
+        std::env::set_var(name, V[3]);
+        let names = vec![name.to_string()];
+        let out = decide(&Request {
+            store: &s,
+            key: "k",
+            candidates: &names,
+            mention: "",
+            forced: &[],
+            salt: None,
+            learn: true,
+            persist: false,
+            now: 1,
+        });
+        assert_eq!(
+            learned_names(&out),
+            vec![name.to_string()],
+            "the observation applies"
+        );
+        assert!(
+            out.changes.is_empty(),
+            "nothing was written, so nothing is announced"
+        );
+        assert_eq!(fs::read(path(&s)).unwrap(), before, "nothing was written");
+        std::env::remove_var(name);
+    }
+
+    #[test]
+    fn a_damaged_state_file_warns_counts_everything_and_is_replaced_by_the_next_write() {
+        let s = dir("damaged");
         fs::write(path(&s), b"{not json").unwrap();
-        let loaded = load(&s, "k", "");
-        assert!(loaded.names.is_empty());
-        let warning = loaded.warning.unwrap();
-        assert!(warning.contains("counting every variable"), "{warning}");
-        let note = observe(&s, "k", "", &BTreeMap::new(), 1).unwrap().unwrap();
-        assert!(note.contains("replaced"), "{note}");
-        assert!(load(&s, "k", "").warning.is_none());
+        let out = observe(&s, "k", "VOLATILE_TEST_DAMAGED", Some(V[0]));
+        assert!(out.plan.excluded.is_empty());
+        let warning = out.warning.unwrap();
+        assert!(warning.contains("replaced"), "{warning}");
+        assert!(observe(&s, "k", "VOLATILE_TEST_DAMAGED", Some(V[1]))
+            .warning
+            .is_none());
     }
 
     #[test]
     fn an_oversized_state_file_is_treated_as_damaged() {
-        let s = store("oversize");
+        let s = dir("oversize");
         fs::write(path(&s), vec![b' '; (MAX_FILE_BYTES + 1) as usize]).unwrap();
-        assert!(load(&s, "k", "").warning.unwrap().contains("size limit"));
+        let out = observe(&s, "k", "VOLATILE_TEST_OVERSIZE", Some(V[0]));
+        assert!(out.warning.unwrap().contains("size limit"));
     }
 
     #[test]
     fn a_state_from_another_version_is_kept_and_never_overwritten() {
-        let s = store("newer");
+        let s = dir("newer");
         let bytes = br#"{"version":2,"keys":{}}"#;
         fs::write(path(&s), bytes).unwrap();
-        assert!(observe(&s, "k", "", &BTreeMap::new(), 1)
-            .unwrap_err()
-            .contains("kept as they are"));
+        let out = observe(&s, "k", "VOLATILE_TEST_NEWER", Some(V[0]));
+        assert!(out.warning.unwrap().contains("kept as they are"));
         assert_eq!(fs::read(path(&s)).unwrap(), bytes);
     }
 
     #[test]
     fn a_damage_warning_cannot_carry_workflow_commands_from_the_file() {
-        let s = store("poisoned");
-        fs::write(path(&s), br#"{"version":"##[error]poisoned"}"#).unwrap();
-        let warning = load(&s, "k", "").warning.unwrap();
+        let s = dir("poisoned");
+        fs::write(path(&s), b"{\"version\":\"##[error]poisoned\"}").unwrap();
+        let out = observe(&s, "k", "VOLATILE_TEST_POISON", Some(V[0]));
+        let warning = out.warning.unwrap();
         assert!(!warning.contains("##["), "{warning}");
     }
 
     #[test]
     fn concurrent_observers_lose_no_runs() {
-        let s = store("concurrent");
+        let s = dir("concurrent");
         std::thread::scope(|scope| {
             for _ in 0..8 {
                 let s = &s;
                 scope.spawn(move || {
                     for _ in 0..5 {
-                        observe(s, "k", "", &BTreeMap::new(), 1).unwrap();
+                        decide(&Request {
+                            store: s,
+                            key: "k",
+                            candidates: &[],
+                            mention: "",
+                            forced: &[],
+                            salt: None,
+                            learn: true,
+                            persist: true,
+                            now: 1,
+                        });
                     }
                 });
             }
@@ -1243,36 +1922,52 @@ mod tests {
     }
 
     #[test]
-    fn forget_resets_the_key_and_leaves_other_keys_alone() {
-        let s = store("forget");
-        for value in &V[..4] {
-            seen(&s, "a", "SESSION_MARK", Some(value));
-            seen(&s, "b", "SESSION_MARK", Some(value));
+    fn forget_resets_one_key_and_leaves_the_others() {
+        let s = dir("forget");
+        let name = "VOLATILE_TEST_FORGET";
+        for value in [V[0], V[1], V[2], V[3]] {
+            observe(&s, "a", name, Some(value));
+            observe(&s, "b", name, Some(value));
         }
         assert_eq!(forget(&s, "a"), Ok(true));
         assert_eq!(forget(&s, "a"), Ok(false));
-        assert_eq!(learned(&s, "a", "SESSION_MARK"), None);
-        assert_eq!(learned(&s, "b", "SESSION_MARK"), Some(4));
-    }
-
-    #[test]
-    fn list_reports_only_keys_with_learned_names() {
-        let s = store("list");
-        for value in &V[..4] {
-            seen(&s, "learned", "SESSION_MARK", Some(value));
-        }
-        seen(&s, "quiet", "SESSION_MARK", Some(V[0]));
+        assert!(observe(&s, "a", name, Some(V[4])).plan.excluded.is_empty());
         assert_eq!(
-            list(&s).unwrap(),
-            vec![("learned".to_string(), vec![("SESSION_MARK".to_string(), 4)])]
+            learned_names(&observe(&s, "b", name, Some(V[5]))),
+            vec![name.to_string()]
         );
     }
 
     #[test]
+    fn list_reports_only_keys_with_names_learned_under_the_current_salt() {
+        let s = dir("list");
+        let name = "VOLATILE_TEST_LIST";
+        for value in [V[0], V[1], V[2], V[3]] {
+            observe(&s, "learned", name, Some(value));
+        }
+        observe(&s, "quiet", name, Some(V[0]));
+        assert_eq!(
+            list(&s, "").unwrap(),
+            vec![("learned".to_string(), vec![(name.to_string(), 4)])]
+        );
+        assert!(list(&s, "another-salt").unwrap().is_empty());
+    }
+
+    #[test]
     fn the_key_count_is_bounded_and_the_stalest_key_goes() {
-        let s = store("keys");
+        let s = dir("keys");
         for i in 0..(MAX_KEYS + 3) {
-            observe(&s, &format!("k{i}"), "", &BTreeMap::new(), i as u64).unwrap();
+            decide(&Request {
+                store: &s,
+                key: &format!("k{i}"),
+                candidates: &[],
+                mention: "",
+                forced: &[],
+                salt: None,
+                learn: true,
+                persist: true,
+                now: i as u64 + 1,
+            });
         }
         let catalog = read_catalog(&s).ok().unwrap();
         assert_eq!(catalog.keys.len(), MAX_KEYS);
@@ -1282,12 +1977,66 @@ mod tests {
 
     #[test]
     fn the_name_count_per_key_is_bounded() {
-        let s = store("names");
-        for i in 0..(MAX_NAMES + 5) {
-            let mut observed = BTreeMap::new();
-            observed.insert(format!("N{i}"), Some(format!("{i:016x}")));
-            observe(&s, "k", "", &observed, 1).unwrap();
+        let s = dir("names");
+        let names: Vec<String> = (0..(MAX_NAMES + 5))
+            .map(|i| format!("VOLATILE_TEST_N{i}"))
+            .collect();
+        for name in &names {
+            std::env::set_var(name, V[0]);
         }
-        assert!(read_catalog(&s).ok().unwrap().keys["k"].names.len() <= MAX_NAMES);
+        decide(&Request {
+            store: &s,
+            key: "k",
+            candidates: &names,
+            mention: "",
+            forced: &[],
+            salt: None,
+            learn: true,
+            persist: true,
+            now: 1,
+        });
+        for name in &names {
+            std::env::remove_var(name);
+        }
+        let catalog = read_catalog(&s).ok().unwrap();
+        assert!(catalog.keys["k"].names.len() <= MAX_NAMES);
+    }
+
+    #[test]
+    fn a_name_that_is_not_utf8_can_be_learned_by_its_exact_bytes() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+        let s = dir("non-utf8");
+        let name = OsString::from_vec(b"VOLATILE_TEST_\xff".to_vec());
+        let key = crate::run::env_key(&name);
+        let names = vec![key.clone()];
+        for value in [V[0], V[1], V[2], V[3]] {
+            std::env::set_var(&name, value);
+            decide(&Request {
+                store: &s,
+                key: "k",
+                candidates: &names,
+                mention: "",
+                forced: &[],
+                salt: None,
+                learn: true,
+                persist: true,
+                now: 1,
+            });
+        }
+        std::env::set_var(&name, V[4]);
+        let out = decide(&Request {
+            store: &s,
+            key: "k",
+            candidates: &names,
+            mention: "",
+            forced: &[],
+            salt: None,
+            learn: true,
+            persist: true,
+            now: 1,
+        });
+        std::env::remove_var(&name);
+        assert_eq!(learned_names(&out), vec![key]);
     }
 }

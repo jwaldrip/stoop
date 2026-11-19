@@ -814,6 +814,18 @@ fn evaluate(
                 return result;
             }
         }
+        // The recorder left these names out, so the planner checks no value for them. A name in
+        // both lists would be counted and excluded at once, which no recorder writes.
+        if let Some(name) = proof
+            .env_excluded
+            .iter()
+            .find(|name| proof.env.contains_key(*name))
+        {
+            return decision(
+                Code::Unplannable,
+                format!("step {index}: {name} is both counted and excluded in its proof"),
+            );
+        }
         for (name, hash) in &proof.env {
             if known_github(name) {
                 let value = if name == "GITHUB_JOB" {
@@ -1286,6 +1298,7 @@ mod tests {
             priors: Some(vec![]),
             unplannable: vec![],
             probes: BTreeMap::new(),
+            env_excluded: vec![],
         }
     }
 
@@ -2103,6 +2116,37 @@ mod tests {
         p.inputs[0].id = crate::input::file_id(false, &hash);
         replace_first(&mut f, p);
         assert_eq!(f.decide(BTreeMap::new()).code, Code::InputChanged);
+    }
+    #[test]
+    fn the_planner_never_assumes_a_name_the_recorder_excluded() {
+        let mut f = Fixture::new();
+        // A name the recorder left out is not an input: the planner neither checks its value nor
+        // lists it among the environment it assumes.
+        let mut p = proof(vec![]);
+        p.env_excluded = vec!["CI_COMMIT_SHA".into()];
+        f.install(vec![p]);
+        let decision = f.decide(BTreeMap::new());
+        assert_eq!(decision.code, Code::Proved, "{}", decision.detail);
+        let assumed = decision.evidence.unwrap().assumed_env;
+        assert!(
+            !assumed.contains(&"CI_COMMIT_SHA".to_string()),
+            "{assumed:?}"
+        );
+    }
+    #[test]
+    fn a_name_both_counted_and_excluded_makes_the_proof_unplannable() {
+        let mut f = Fixture::new();
+        let mut p = proof(vec![]);
+        p.env.insert("CI_COMMIT_SHA".into(), "abc".into());
+        p.env_excluded = vec!["CI_COMMIT_SHA".into()];
+        f.install(vec![p]);
+        let decision = f.decide(BTreeMap::new());
+        assert_eq!(decision.code, Code::Unplannable, "{}", decision.detail);
+        assert!(
+            decision.detail.contains("both counted and excluded"),
+            "{}",
+            decision.detail
+        );
     }
     #[test]
     fn checkout_conversion_attributes_are_checked_at_commit() {

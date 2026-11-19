@@ -205,6 +205,7 @@ fn record(r: &Repo, x: Rec<'_>) -> Option<String> {
                 priors: Some(vec![]),
                 unplannable: vec![],
                 probes: BTreeMap::new(),
+                env_excluded: vec![],
             };
             proof::Store::new(r.store()).save(step, p.clone()).unwrap();
             steps.push(StepRecord {
@@ -1377,6 +1378,7 @@ fn control_break_it_fixtures_all_run() {
         priors: Some(vec![]),
         unplannable: vec![],
         probes: BTreeMap::new(),
+        env_excluded: vec![],
     };
     proof::Store::new(r.store())
         .save(&step, weak.clone())
