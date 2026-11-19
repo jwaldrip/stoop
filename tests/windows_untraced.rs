@@ -163,8 +163,9 @@ fn stoop_sh_runs_the_script_under_bash_and_returns_its_status() {
         .output()
         .unwrap();
     let stderr = text(&out.stderr);
-    assert_eq!(out.status.code(), Some(4), "{stderr}");
-    assert!(text(&out.stdout).contains("ran-under-bash"), "{stderr}");
+    let shown = format!("{stderr}\nstdout: {}", text(&out.stdout));
+    assert_eq!(out.status.code(), Some(4), "{shown}");
+    assert!(text(&out.stdout).contains("ran-under-bash"), "{shown}");
 }
 
 #[test]
