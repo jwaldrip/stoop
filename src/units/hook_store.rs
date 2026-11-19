@@ -154,26 +154,31 @@ pub(crate) fn records(store: &Path, now: u64, max_age: u64) -> Result<Vec<Record
     }
 }
 
-/// Save one template. Any failure is returned as a warning; the caller still runs the command.
-pub(crate) fn record(store: &Path, record: Record, now: u64, max_age: u64) -> Result<(), String> {
+/// Save one template before the command runs, whatever its outcome. The write replaces only this
+/// key's record and keeps the newest 128; other commands' templates expire by their own age on
+/// read. Any failure is a warning, and the caller runs the full form without recording it.
+pub(crate) fn record(store: &Path, record: Record) -> Result<(), String> {
     if record.argv.len() > 128
         || serde_json::to_vec(&record)
             .map(|bytes| bytes.len() > MAX_RECORD_BYTES)
             .unwrap_or(true)
     {
         return Err(
-            "stoop: hook template is too large to record; running the command as typed".into(),
+            "stoop: hook template is too large to record; running the full command without recording it"
+                .into(),
         );
     }
     let _lock = lock(store).map_err(|error| {
-        format!("stoop: cannot lock hook records ({error}); running the command as typed")
+        format!(
+            "stoop: cannot lock hook records ({error}); running the full command without recording it"
+        )
     })?;
     let mut repaired = None;
     let mut catalog = match read_catalog(store) {
         Ok(catalog) => catalog,
         Err(Damage::Replace(why)) => {
             repaired = Some(format!(
-                "stoop: hook records were replaced because {why}; running the command as typed"
+                "stoop: hook records were replaced because {why}; running the full command"
             ));
             Catalog {
                 version: 1,
@@ -182,24 +187,26 @@ pub(crate) fn record(store: &Path, record: Record, now: u64, max_age: u64) -> Re
         }
         Err(Damage::Keep(why)) => {
             return Err(format!(
-                "stoop: hook records are kept as they are ({why}); running the command as typed"
+                "stoop: hook records are kept as they are ({why}); running the full command without recording it"
             ));
         }
     };
-    catalog
-        .records
-        .retain(|old| current(old, now, max_age) && old.key != record.key);
+    catalog.records.retain(|old| old.key != record.key);
     catalog.records.push(record);
     while catalog.records.len() > MAX_RECORDS {
         catalog.records.remove(0);
     }
     loop {
         let bytes = serde_json::to_vec(&catalog).map_err(|error| {
-            format!("stoop: cannot save hook records ({error}); running the command as typed")
+            format!(
+                "stoop: cannot save hook records ({error}); running the full command without recording it"
+            )
         })?;
         if bytes.len() as u64 <= MAX_FILE_BYTES {
             write_bytes(store, &bytes).map_err(|error| {
-                format!("stoop: cannot save hook records ({error}); running the command as typed")
+                format!(
+                    "stoop: cannot save hook records ({error}); running the full command without recording it"
+                )
             })?;
             return match repaired {
                 Some(note) => Err(note),
@@ -208,7 +215,7 @@ pub(crate) fn record(store: &Path, record: Record, now: u64, max_age: u64) -> Re
         }
         if catalog.records.len() <= 1 {
             return Err(
-                "stoop: hook templates exceed the catalog limit; running the command as typed"
+                "stoop: hook templates exceed the catalog limit; running the full command without recording it"
                     .into(),
             );
         }
@@ -269,7 +276,7 @@ mod tests {
     fn a_read_only_store_warns_that_the_full_command_runs() {
         let path = store("read-only");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
-        let warning = record(&path, template("k", 0), 0, 0).unwrap_err();
+        let warning = record(&path, template("k", 0)).unwrap_err();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(warning.contains("running the full command"), "{warning}");
         assert!(!warning.contains("as typed"), "{warning}");
@@ -279,7 +286,7 @@ mod tests {
     fn the_catalog_keeps_at_most_128_records() {
         let path = store("cap");
         for i in 0..130 {
-            record(&path, template(&format!("k{i}"), 0), 0, 0).unwrap();
+            record(&path, template(&format!("k{i}"), 0)).unwrap();
         }
         let keys: Vec<String> = read_catalog(&path)
             .ok()
@@ -296,7 +303,7 @@ mod tests {
     #[test]
     fn expired_templates_are_not_read() {
         let path = store("expiry");
-        record(&path, template("old", 0), 0, 0).unwrap();
+        record(&path, template("old", 0)).unwrap();
         assert!(records(&path, 1_000, 60).unwrap().is_empty());
     }
 }

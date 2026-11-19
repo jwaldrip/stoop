@@ -50,7 +50,6 @@ OPTIONS
   --ignore PATTERN  paths whose reads do not count (also .stoopignore)
   --no-record       check and run, but never write a proof (untrusted jobs)
   --literal         treat placeholders as ordinary text (no changed-unit hooks)
-  --no-split        keep automatic splitting off; hooks still run the full command
   --quiet           print nothing about the decision
 
 ENVIRONMENT
@@ -269,7 +268,6 @@ fn parse(args: &[String]) -> Result<(Opts, Vec<String>), String> {
             "--ignore" => o.ignore.push(val("--ignore")?),
             "--no-record" => o.no_record = true,
             "--literal" => o.literal = true,
-            "--no-split" => o.no_split = true,
             "--allow-network" => o.allow_network = true,
             "--ignore-env" => o.ignore_env.push(val("--ignore-env")?),
             "--max-age" => o.max_age = Some(run::parse_age(&val("--max-age")?)?),

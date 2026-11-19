@@ -30,7 +30,6 @@ pub struct Opts {
     pub no_record: bool,
     pub quiet: bool,
     pub literal: bool,
-    pub no_split: bool,
     /// Environment variables exempted from the whole-environment input.
     pub ignore_env: Vec<String>,
     /// Record runs that used the network (their results are invisible to a file trace).
@@ -84,8 +83,22 @@ pub fn store_for(o: &Opts, cwd: &Path, root: &Path) -> PathBuf {
         .clone()
         .or_else(|| env_str("STOOP_STORE").map(PathBuf::from))
         .unwrap_or_else(|| root.join(".stoop"));
-    let path = absolutize(cwd, &path);
-    std::fs::canonicalize(&path).unwrap_or(path)
+    canonical_path(&absolutize(cwd, &path))
+}
+
+/// The path with symlinks resolved. A path that does not exist yet resolves through its parent,
+/// so the same store has the same path before and after its first run.
+fn canonical_path(path: &Path) -> PathBuf {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
+            Ok(parent) => parent.join(name),
+            Err(_) => path.to_path_buf(),
+        },
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Scope a shared store to a repository. A configured origin identifies checkouts
@@ -369,23 +382,27 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
     run_internal(o, explain, false)
 }
 
-/// Export the hook variables as empty and launch the execution form of the command.
-fn apply_hook(o: &mut Opts, hook: &units::hook::Hook) {
-    for name in ["STOOP_CHANGED", "STOOP_CHANGED_INPUTS", "STOOP_UNITS"] {
-        if std::env::var_os(name).is_some_and(|value| !value.is_empty()) {
+/// The variables that carry a placeholder's value (spec section 4.7). Stoop owns them for each run.
+const HOOK_ENV: [&str; 5] = [
+    "STOOP_CHANGED",
+    "STOOP_CHANGED_FILE",
+    "STOOP_CHANGED_INPUTS",
+    "STOOP_CHANGED_INPUTS_FILE",
+    "STOOP_UNITS",
+];
+
+/// Set the hook variables for the child. A hook exports all of them, empty. Any other run only
+/// replaces an inherited value, and names it unless `warn` is false.
+fn clear_hook_env(hook: bool, warn: bool) {
+    for name in HOOK_ENV {
+        let inherited = std::env::var_os(name).is_some_and(|value| !value.is_empty());
+        if inherited && warn {
             eprintln!("stoop: ignoring inherited {name}; the shell may already have expanded it");
         }
+        if hook || std::env::var_os(name).is_some() {
+            std::env::set_var(name, "");
+        }
     }
-    for name in [
-        "STOOP_CHANGED",
-        "STOOP_CHANGED_FILE",
-        "STOOP_CHANGED_INPUTS",
-        "STOOP_CHANGED_INPUTS_FILE",
-        "STOOP_UNITS",
-    ] {
-        std::env::set_var(name, "");
-    }
-    o.argv.clone_from(&hook.argv);
 }
 
 /// Remove the hook records stored under one key. A damaged catalog is a warning.
@@ -421,15 +438,10 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             }
         }
     };
+    // A placeholder that reached stoop intact: the shell expanded nothing into it.
+    let intact = hook.is_some();
     if let Some(h) = &hook {
-        apply_hook(&mut o, h);
-    }
-    if env_flag("STOOP_OFF") && !explain {
-        return Outcome {
-            status: plain(&o.argv),
-            key: initial_key,
-            how: How::Untraced,
-        };
+        o.argv.clone_from(&h.argv);
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = root_for(&o, &cwd);
@@ -444,7 +456,11 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 .and_then(|v| parse_age(&v).ok())
         })
         .unwrap_or(DEFAULT_MAX_AGE);
-    let mut erased = false;
+    // An argv without a placeholder may be an expanded shape of a recorded hook. A single full
+    // form runs and never skips. Two different full forms cannot be told apart, so the command
+    // runs as typed and never skips either.
+    let mut expanded = false;
+    let mut matches = 0;
     if !literal && hook.is_none() {
         let records = match units::hook_store::records(&store_path, now(), max_age) {
             Ok(records) => records,
@@ -455,44 +471,32 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 Vec::new()
             }
         };
+        let mut found: Vec<units::hook::Hook> = Vec::new();
         for record in records
             .into_iter()
             .filter(|r| r.cwd == rel_cwd && r.scope == scope && r.label == o.key)
         {
-            let candidate = match units::hook::prepare(&record.argv) {
-                Ok(Some(candidate)) if units::hook::expanded_matches(&candidate, &o.argv) => {
-                    candidate
+            if let Ok(Some(candidate)) = units::hook::prepare(&record.argv) {
+                if units::hook::expanded_matches(&candidate, &o.argv)
+                    && !found.iter().any(|known| known.argv == candidate.argv)
+                {
+                    found.push(candidate);
                 }
-                _ => continue,
-            };
-            if hook
-                .as_ref()
-                .is_some_and(|existing| existing.argv != candidate.argv)
-            {
-                eprintln!("stoop: this command matches multiple recorded hooks; quote the placeholder or use --literal");
-                return Outcome {
-                    status: 2,
-                    key: initial_key,
-                    how: How::Untraced,
-                };
             }
-            hook = Some(candidate);
-            erased = true;
         }
-        if let Some(h) = &hook {
-            apply_hook(&mut o, h);
+        matches = found.len();
+        if matches == 1 {
+            let candidate = found.swap_remove(0);
+            o.argv.clone_from(&candidate.argv);
+            hook = Some(candidate);
+            expanded = true;
         }
     }
-    if erased {
-        let shown = hook
-            .as_ref()
-            .map(|h| h.placeholder.as_str())
-            .unwrap_or("{changed}");
-        eprintln!("stoop: the shell expanded {shown:?} from a recorded hook; running the full command; quote it");
-    } else if hook.is_none() && !literal {
-        if let Some(hint) = units::hook::empty_hint(&o.argv) {
-            eprintln!("stoop: {hint}");
-        }
+    let bypass = expanded || matches > 1;
+    // Stoop owns the hook variables for its child. A hook exports them empty. Any other run
+    // replaces an inherited value and names it, unless a placeholder reached stoop intact.
+    if !literal {
+        clear_hook_env(hook.is_some(), !intact);
     }
     let key = hook
         .as_ref()
@@ -509,22 +513,35 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 })
                 .unwrap_or_else(|| default_key(&o.argv, &rel_cwd, scope.as_deref()))
         });
-    if explain && erased {
-        let placeholder = hook
-            .as_ref()
-            .map(|h| h.placeholder.clone())
-            .unwrap_or_default();
-        eprintln!(
-            "stoop: would run full: the shell expanded the recorded hook {placeholder:?}; quote it"
-        );
-        return Outcome {
-            status: 1,
-            key,
-            how: How::Untraced,
-        };
+    // One decision line for an expanded shape, an ambiguous shape or an empty value. Explain
+    // prints it in place of the run and runs nothing; a run prints it as its hint.
+    let note = if expanded {
+        hook.as_ref().map(|h| {
+            if explain {
+                units::hook::expanded_explain(h)
+            } else {
+                units::hook::expanded_line(h)
+            }
+        })
+    } else if matches > 1 {
+        Some(units::hook::ambiguous_line(&o.argv, matches, explain))
+    } else if !literal && hook.is_none() {
+        units::hook::empty_value_line(&o.argv, explain)
+    } else {
+        None
+    };
+    if let Some(line) = note {
+        eprintln!("{line}");
+        if explain {
+            return Outcome {
+                status: 1,
+                key,
+                how: How::Untraced,
+            };
+        }
     }
     if let Some(h) = &hook {
-        if !erased && !explain && !o.no_record {
+        if !expanded && !explain && !o.no_record {
             let record = units::hook_store::Record {
                 key: key.clone(),
                 argv: h.original.clone(),
@@ -533,12 +550,20 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 label: o.key.clone(),
                 created: now(),
             };
-            if let Err(warning) = units::hook_store::record(&store_path, record, now(), max_age) {
+            if let Err(warning) = units::hook_store::record(&store_path, record) {
                 if !o.quiet {
                     eprintln!("{warning}");
                 }
             }
         }
+    }
+    // STOOP_OFF runs a hook's first-run form without tracing, and its hints still print above.
+    if env_flag("STOOP_OFF") && !explain {
+        return Outcome {
+            status: plain(&o.argv),
+            key: initial_key,
+            how: How::Untraced,
+        };
     }
     let store = Store::new(store_path);
     if explain && !o.quiet {
@@ -549,9 +574,10 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         if explain {
             match &hook {
                 Some(h) => eprintln!(
-                    "stoop: would run full {key} (not traced: {}): removed {:?}",
+                    "stoop: would run full {key} (not traced: {}): removed {}, argv {}",
                     trace::UNAVAILABLE,
-                    h.removed
+                    units::hook::show(&h.removed),
+                    units::hook::render(&h.argv)
                 ),
                 None => eprintln!(
                     "stoop: would run {key}: not traced ({}); no proof can be used",
@@ -567,8 +593,8 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         if !o.quiet {
             match &hook {
                 Some(h) => eprintln!(
-                    "stoop: run full {key} (no compatible tracer): removed {:?}",
-                    h.removed
+                    "stoop: run full {key} (no compatible tracer): removed {}",
+                    units::hook::show(&h.removed)
                 ),
                 None => eprintln!("stoop: run {key}: no compatible tracer"),
             }
@@ -619,7 +645,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
 
     // 1. Is there a proof whose inputs all still match?
     let t0 = Instant::now();
-    let mut proofs = if erased { Vec::new() } else { store.load(&key) };
+    let mut proofs = if bypass { Vec::new() } else { store.load(&key) };
     let mut pulled = false;
     let mut probe_now: Option<Option<BTreeMap<String, String>>> = None;
     let mut why;
@@ -699,7 +725,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             }
         }
         // A miss with a remote configured: someone else may already have proved this.
-        if hit_idx.is_some() || pulled || remote.is_none() || erased {
+        if hit_idx.is_some() || pulled || remote.is_none() || bypass {
             break;
         }
         pulled = true;
@@ -734,8 +760,9 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     if explain {
         match &hook {
             Some(h) => eprintln!(
-                "stoop: would run full {key} ({why}): removed {:?}",
-                h.removed
+                "stoop: would run full {key} ({why}): removed {}, argv {}",
+                units::hook::show(&h.removed),
+                units::hook::render(&h.argv)
             ),
             None => eprintln!("stoop: would run {key}: {why}"),
         }
@@ -747,7 +774,10 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     }
     if !o.quiet {
         match &hook {
-            Some(h) => eprintln!("stoop: run full {key} ({why}): removed {:?}", h.removed),
+            Some(h) => eprintln!(
+                "stoop: run full {key} ({why}): removed {}",
+                units::hook::show(&h.removed)
+            ),
             None => eprintln!("stoop: run {key}: {why}"),
         }
     }

@@ -12,11 +12,14 @@ pub(crate) struct Hook {
 }
 
 const HINT: &str = "quote it: '{changed:*.test.ts|*.spec.ts}'";
-const CHANGED: &[(&str, &str)] = &[
-    ("changed-inputs", "STOOP_CHANGED_INPUTS"),
-    ("changed", "STOOP_CHANGED"),
-    ("units", "STOOP_UNITS"),
-    ("unit", "STOOP_UNIT"),
+const MANGLED: &str = "the shell expanded {changed:...,...} into separate words; quote it and put | between patterns: '{changed:*.test.ts|*.spec.ts}'; a genuine argument of that shape needs --literal";
+/// Placeholder names, each with its environment spelling if it has one (spec section 4.2).
+const CHANGED: &[(&str, Option<&str>)] = &[
+    ("changed-inputs", Some("STOOP_CHANGED_INPUTS")),
+    ("changed", Some("STOOP_CHANGED")),
+    ("units", Some("STOOP_UNITS")),
+    // `{unit}` has no environment spelling: an affected unit is exported as STOOP_CHANGED.
+    ("unit", None),
 ];
 
 fn option(word: &str) -> bool {
@@ -201,33 +204,35 @@ fn spans(word: &str) -> Result<Vec<(usize, usize)>, String> {
     while i < word.len() {
         let rest = &word[i..];
         let mut found = None;
-        for (name, env) in CHANGED {
+        for &(name, env) in CHANGED {
             let primary = format!("{{{name}");
-            let env_braced = format!("${{{env}");
-            let env_plain = format!("${env}");
             if rest.starts_with(&primary) {
                 let j = i + primary.len();
                 if matches!(word.as_bytes().get(j), Some(b':') | Some(b'}') | None) {
                     let end = end_of(word, j).ok_or_else(|| {
                         format!(
-                            "{word:?} is cut off; the shell split it at |, ; or a space; {HINT}"
+                            "{} is cut off; the shell split it at |, ; or a space; {HINT}",
+                            quote_word(word)
                         )
                     })?;
-                    segments(&word[j..end - 1], *name == "changed-inputs")?;
+                    segments(&word[j..end - 1], name == "changed-inputs")?;
                     found = Some(end);
                     break;
                 }
             }
+            let Some(env) = env else { continue };
+            let env_braced = format!("${{{env}");
             if rest.starts_with(&env_braced) {
                 let j = i + env_braced.len();
                 if matches!(word.as_bytes().get(j), Some(b':') | Some(b'}') | None) {
-                    let end =
-                        end_of(word, j).ok_or_else(|| format!("{word:?} is cut off; {HINT}"))?;
-                    segments(&word[j..end - 1], *name == "changed-inputs")?;
+                    let end = end_of(word, j)
+                        .ok_or_else(|| format!("{} is cut off; {HINT}", quote_word(word)))?;
+                    segments(&word[j..end - 1], name == "changed-inputs")?;
                     found = Some(end);
                     break;
                 }
             }
+            let env_plain = format!("${env}");
             if rest.starts_with(&env_plain) {
                 let end = i + env_plain.len();
                 if is_boundary(word.as_bytes().get(end).copied()) {
@@ -250,15 +255,18 @@ fn mangled(word: &str) -> bool {
     if word.contains('{') {
         return false;
     }
-    CHANGED.iter().any(|(name, _)| {
-        let fragment = format!("{name}:");
-        word.starts_with(&fragment)
+    // `name::` is a qualified name, not a brace expansion: an empty segment is a usage error.
+    let shaped = |value: &str, name: &str| {
+        value.starts_with(&format!("{name}:")) && !value.starts_with(&format!("{name}::"))
+    };
+    CHANGED.iter().any(|&(name, _)| {
+        shaped(word, name)
             || word
                 .split_once('=')
-                .is_some_and(|(_, value)| value.starts_with(&fragment))
+                .is_some_and(|(_, value)| shaped(value, name))
             || (word.starts_with('-')
                 && !word.starts_with("--")
-                && word.get(2..).is_some_and(|s| s.starts_with(&fragment)))
+                && word.get(2..).is_some_and(|rest| shaped(rest, name)))
     })
 }
 
@@ -282,7 +290,8 @@ fn same_option(word: &str, name: &str) -> bool {
 }
 
 fn ambiguous(name: &str) -> String {
-    format!("cannot tell where values for {name} end; use a single-value {name}=VALUE form or run the full command without the hook; option arity configuration will be supported later")
+    let name = safe(name);
+    format!("cannot tell where the values for {name} end; attach the placeholder with =, put it right after {name} or after --, or declare the option (declarations arrive with the configuration slice)")
 }
 
 pub(crate) fn prepare(argv: &[String]) -> Result<Option<Hook>, String> {
@@ -293,7 +302,7 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Option<Hook>, String> {
     let mut placeholder = String::new();
     for (idx, word) in argv.iter().enumerate() {
         if mangled(word) {
-            return Err(format!("the shell expanded a placeholder into separate words; put | between patterns and {HINT}"));
+            return Err(MANGLED.to_string());
         }
         let parts = spans(word)?;
         if let Some((code, zero)) = shell {
@@ -500,19 +509,129 @@ pub(crate) fn expanded_matches(hook: &Hook, incoming: &[String]) -> bool {
     reachable[n * stride + m]
 }
 
-pub(crate) fn empty_hint(argv: &[String]) -> Option<String> {
-    for (i, word) in argv.iter().enumerate().skip(1) {
-        if word.is_empty() {
+/// Argv text made safe to print on one line of stoop's output. Control characters become
+/// `\u{..}` text; then the plan CLI's escape neutralises `::` and `##[` (GitHub workflow
+/// commands) and `%`.
+pub(crate) fn safe(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() {
+            shown.push_str(&format!("\\u{{{:x}}}", ch as u32));
+        } else {
+            shown.push(ch);
+        }
+    }
+    crate::plan::output::escape(&shown)
+}
+
+/// One argv word in single quotes, as refusals and cut-off messages show it.
+fn quote_word(text: &str) -> String {
+    format!("'{}'", safe(text).replace('\'', "'\\''"))
+}
+
+/// Removed words as a list, `["--files", "{changed}"]`, for the run line.
+pub(crate) fn show(words: &[String]) -> String {
+    let items: Vec<String> = words
+        .iter()
+        .map(|item| format!("\"{}\"", safe(item).replace('"', "\\\"")))
+        .collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// Words as a shell would type them, for explain output.
+pub(crate) fn render(words: &[String]) -> String {
+    words
+        .iter()
+        .map(|item| {
+            let bare = !item.is_empty()
+                && item
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_./=:,@+%".contains(&b));
+            if bare {
+                safe(item)
+            } else {
+                quote_word(item)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// The option a removed placeholder was removed with: `--files` for `--files={changed}`.
+fn option_name(word: &str) -> &str {
+    word.find(['=', '{']).map_or(word, |at| &word[..at])
+}
+
+/// The option that carried a removed placeholder, if one did.
+fn dropped_option(hook: &Hook) -> Option<&str> {
+    hook.removed
+        .iter()
+        .find(|item| option(item))
+        .map(|item| option_name(item))
+}
+
+/// The line a run prints when the shell removed a recorded placeholder.
+pub(crate) fn expanded_line(hook: &Hook) -> String {
+    let placeholder = render(std::slice::from_ref(&hook.placeholder));
+    match dropped_option(hook) {
+        Some(name) => {
+            let name = safe(name);
+            format!(
+                "stoop: the shell expanded {placeholder} after {name}; running the full command, which drops {name}; quote it"
+            )
+        }
+        None => format!(
+            "stoop: the shell expanded {placeholder} as an argument; running the full command; quote it"
+        ),
+    }
+}
+
+/// The explain line for a placeholder the shell removed from a recorded hook.
+pub(crate) fn expanded_explain(hook: &Hook) -> String {
+    format!(
+        "stoop: would run full: the shell expanded the recorded hook {}; it would run {}",
+        render(&hook.original),
+        render(&hook.argv)
+    )
+}
+
+/// The line for placeholder-free argv that matches more than one recorded full command.
+pub(crate) fn ambiguous_line(argv: &[String], matches: usize, explain: bool) -> String {
+    let typed = render(argv);
+    if explain {
+        format!(
+            "stoop: would run as typed: {typed} matches {matches} recorded hooks with different full commands; quote the placeholder or use --literal"
+        )
+    } else {
+        format!(
+            "stoop: {typed} matches {matches} recorded hooks with different full commands; running it as typed; quote the placeholder or use --literal"
+        )
+    }
+}
+
+/// The option or argument that holds the first empty value, made safe to print.
+fn empty_label(argv: &[String]) -> Option<String> {
+    for (i, item) in argv.iter().enumerate().skip(1) {
+        if item.is_empty() {
             let label = argv
-                .get(i.wrapping_sub(1))
+                .get(i - 1)
                 .filter(|s| option(s))
                 .map_or("argument", String::as_str);
-            return Some(format!("{label} has an empty value; if a shell expanded a placeholder there, quote it: '{{changed}}'"));
+            return Some(safe(label));
         }
-        if option(word) && word.ends_with('=') {
-            let label = word.trim_end_matches('=');
-            return Some(format!("{label} has an empty value; if a shell expanded a placeholder there, quote it: '{{changed}}'"));
+        if option(item) && item.ends_with('=') {
+            return Some(safe(item.trim_end_matches('=')));
         }
     }
     None
+}
+
+/// The line for an empty value that no recorded hook explains, on a run or in explain.
+pub(crate) fn empty_value_line(argv: &[String], explain: bool) -> Option<String> {
+    let label = empty_label(argv)?;
+    Some(if explain {
+        format!("stoop: would run as typed: no hook recorded with a placeholder at {label}")
+    } else {
+        format!("stoop: {label} has an empty value; if a shell expanded a placeholder there, quote it: '{{changed}}'")
+    })
 }

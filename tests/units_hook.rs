@@ -599,3 +599,18 @@ fn explain_never_launches_and_no_split_is_refused() {
     assert!(!f.root.join("log").exists());
 }
 
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[test]
+fn an_ambiguous_plain_command_never_skips_on_a_stored_proof() {
+    let f = Fixture::new();
+    assert!(f.invoke(&[], &["{changed}", "-x"], false).status.success());
+    assert!(f.invoke(&[], &["-x", "{changed}"], false).status.success());
+    let first = f.invoke(&[], &["-x"], false);
+    assert!(first.status.success(), "{}", err(&first));
+    let second = f.invoke(&[], &["-x"], false);
+    assert!(second.status.success(), "{}", err(&second));
+    assert!(!err(&second).contains("stoop: skip"), "{}", err(&second));
+}
