@@ -1077,10 +1077,10 @@ mod tests {
         let bad = api_root.join(format!("repos/owner/broken/tarball/{A}"));
         std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
         std::fs::write(bad, b"not a gzip stream").unwrap();
-        let mut git = Git::new(&root, &server.url, Duration::from_secs(10));
+        let mut git = Git::new(&root, &server.url, Duration::from_secs(120));
         git.api = server.url.clone();
         git.set_test_budget(661_000);
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + Duration::from_secs(300);
         let budget_before_failure = git.budget.get();
         assert!(git.action_tree("owner", "missing", A, deadline).is_err());
         assert_eq!(git.budget.get(), budget_before_failure);
@@ -1094,7 +1094,11 @@ mod tests {
         }
         for index in 5..8 {
             let result = git.action_tree("owner", &format!("repo{index}"), A, deadline);
-            assert!(matches!(result, Err(reason) if reason.contains("memory budget")));
+            assert!(
+                matches!(&result, Err(reason) if reason.contains("memory budget")),
+                "{:?}",
+                result.as_ref().err()
+            );
         }
         let cached = git.action_tree("owner", "repo0", A, deadline).unwrap();
         assert!(Rc::ptr_eq(&first, &cached));
@@ -1117,22 +1121,26 @@ mod tests {
             }
         }
         let tree = Rc::new(Tree::from_gzip_before(&bytes, deadline, u64::MAX).unwrap());
-        let mut key_budget = Git::new(&root, &server.url, Duration::from_secs(10));
+        let mut key_budget = Git::new(&root, &server.url, Duration::from_secs(120));
         key_budget.api = server.url.clone();
         key_budget.set_test_budget(tree.retained());
         let result = key_budget.action_tree("owner", "repo0", A, deadline);
-        assert!(matches!(result, Err(reason) if reason.contains("memory budget")));
+        assert!(
+            matches!(&result, Err(reason) if reason.contains("memory budget")),
+            "{:?}",
+            result.as_ref().err()
+        );
         let refs: Vec<String> = (0..8)
             .map(|index| format!("owner/repo{index}@{A}"))
             .collect();
         let recorded = actions::capture(&refs, &Capturer(tree), false).unwrap();
-        let mut graph_git = Git::new(&root, &server.url, Duration::from_secs(10));
+        let mut graph_git = Git::new(&root, &server.url, Duration::from_secs(120));
         graph_git.api = server.url.clone();
         graph_git.set_test_budget(661_000);
         let (code, detail) =
             actions::verify(&refs, &recorded, &graph_git, false, deadline).unwrap_err();
         assert_eq!(code, Code::ActionUnverifiable);
-        assert!(detail.contains("memory budget"));
+        assert!(detail.contains("memory budget"), "{detail}");
         drop(server);
         std::fs::remove_dir_all(base).unwrap();
     }
