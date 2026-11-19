@@ -135,3 +135,15 @@ test("a token for another site fails the build", () => {
   assert.notEqual(result.status, 0);
   assert.match(result.stderr, /does not cover https:\/\/stoop\.build/);
 });
+
+test("llms.txt links the agent guide and the MCP twin, and both are built", () => {
+  // The token tests above leave a failed build in _site, so rebuild the plain site first.
+  const restore = build({ STOOP_SITE_TOKEN_FILE: join(tmpdir(), "stoop-no-token-file-here") });
+  assert.equal(restore.status, 0, restore.stdout + restore.stderr);
+  const text = read("llms.txt");
+  assert.ok(text.includes("](https://stoop.build/AGENTS.md)"), "llms.txt links the agent guide at /AGENTS.md");
+  assert.ok(text.includes("](https://stoop.build/docs/mcp.md)"), "llms.txt links the MCP twin at /docs/mcp.md");
+  assert.ok(existsSync(join(SITE_DIR, "AGENTS.md")), "AGENTS.md is built at the site root");
+  assert.ok(existsSync(join(SITE_DIR, "docs", "mcp.md")), "the MCP twin is built");
+  assert.ok(existsSync(join(SITE_DIR, "docs", "mcp.html")), "the MCP page is built");
+});

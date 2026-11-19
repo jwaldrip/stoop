@@ -71,6 +71,7 @@ const SUMMARY = {
   "how-it-works": "The tracer, the proof, the comparison, and every reason stoop runs instead of recording.",
   ci: "Recipes for GitHub Actions, GitLab CI, CircleCI and Buildkite, and how proofs are shared.",
   cli: "Every command, option, environment variable and exit code.",
+  mcp: "Connect stoop to Claude Code, Cursor or VS Code over MCP, and why running commands is opt-in.",
   stoopignore: "Paths whose reads do not count, and outputs that need not stay in place.",
   "blind-spots": "What a file trace cannot see, and the settings that cover each gap.",
   faq: "Short answers on safety, speed, caches, monorepos, Node, macOS and prior art.",
