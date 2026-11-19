@@ -1,6 +1,6 @@
 pub mod eval;
 mod graph;
-mod output;
+pub(crate) mod output;
 #[cfg(test)]
 mod probes;
 pub mod spec;

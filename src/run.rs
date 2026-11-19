@@ -29,6 +29,7 @@ pub struct Opts {
     pub transient: Vec<String>,
     pub no_record: bool,
     pub quiet: bool,
+    pub literal: bool,
     /// Environment variables exempted from the whole-environment input.
     pub ignore_env: Vec<String>,
     /// Record runs that used the network (their results are invisible to a file trace).
@@ -82,8 +83,22 @@ pub fn store_for(o: &Opts, cwd: &Path, root: &Path) -> PathBuf {
         .clone()
         .or_else(|| env_str("STOOP_STORE").map(PathBuf::from))
         .unwrap_or_else(|| root.join(".stoop"));
-    let path = absolutize(cwd, &path);
-    std::fs::canonicalize(&path).unwrap_or(path)
+    canonical_path(&absolutize(cwd, &path))
+}
+
+/// The path with symlinks resolved. A path that does not exist yet resolves through its parent,
+/// so the same store has the same path before and after its first run.
+fn canonical_path(path: &Path) -> PathBuf {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    match (path.parent(), path.file_name()) {
+        (Some(parent), Some(name)) => match std::fs::canonicalize(parent) {
+            Ok(parent) => parent.join(name),
+            Err(_) => path.to_path_buf(),
+        },
+        _ => path.to_path_buf(),
+    }
 }
 
 /// Scope a shared store to a repository. A configured origin identifies checkouts
@@ -149,6 +164,38 @@ fn default_key(argv: &[String], rel_cwd: &str, scope: Option<&str>) -> String {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "cmd".into());
     format!("{}-{}", sanitize(&base), &h.finalize().to_hex()[..16])
+}
+
+fn hook_key(
+    hook: &units::hook::Hook,
+    label: Option<&str>,
+    cwd: &str,
+    scope: Option<&str>,
+) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"stoop-hook-v1\0");
+    for words in [&hook.original, &hook.argv] {
+        hash.update(&(words.len() as u64).to_le_bytes());
+        for word in words {
+            hash.update(&(word.len() as u64).to_le_bytes());
+            hash.update(word.as_bytes());
+        }
+    }
+    for value in [cwd, scope.unwrap_or(""), label.unwrap_or("")] {
+        hash.update(&(value.len() as u64).to_le_bytes());
+        hash.update(value.as_bytes());
+    }
+    let base = label.unwrap_or_else(|| {
+        Path::new(&hook.original[0])
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("cmd")
+    });
+    format!(
+        "hook-{}-{}",
+        sanitize(base),
+        &hash.finalize().to_hex()[..16]
+    )
 }
 
 /// The environment counts as an input, because a variable read never shows up in
@@ -335,38 +382,189 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
     run_internal(o, explain, false)
 }
 
-fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
-    let key = o.key.clone().unwrap_or_default();
+/// The variables that carry a placeholder's value (spec section 4.7). Stoop owns them for each run.
+const HOOK_ENV: [&str; 5] = [
+    "STOOP_CHANGED",
+    "STOOP_CHANGED_FILE",
+    "STOOP_CHANGED_INPUTS",
+    "STOOP_CHANGED_INPUTS_FILE",
+    "STOOP_UNITS",
+];
+
+/// Set the hook variables for the child. A hook exports all of them, empty. Any other run only
+/// replaces an inherited value, and names it unless `warn` is false.
+fn clear_hook_env(hook: bool, warn: bool) {
+    for name in HOOK_ENV {
+        let inherited = std::env::var_os(name).is_some_and(|value| !value.is_empty());
+        if inherited && warn {
+            eprintln!("stoop: ignoring inherited {name}; the shell may already have expanded it");
+        }
+        if hook || std::env::var_os(name).is_some() {
+            std::env::set_var(name, "");
+        }
+    }
+}
+
+/// Remove the hook records stored under one key. A damaged catalog is a warning.
+pub fn forget_hook_records(o: &Opts, key: &str) -> Result<bool, String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = root_for(o, &cwd);
+    units::hook_store::forget(&store_for(o, &cwd, &root), key)
+}
+
+fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
+    let initial_key = o.key.clone().unwrap_or_default();
     if o.argv.is_empty() {
         eprintln!("stoop: no command given");
         return Outcome {
             status: 2,
-            key,
+            key: initial_key,
             how: How::Untraced,
         };
     }
-    if env_flag("STOOP_OFF") && !explain {
-        return Outcome {
-            status: plain(&o.argv),
-            key,
-            how: How::Untraced,
-        };
+    let literal = o.literal || !observe_runners;
+    let mut hook = if literal {
+        None
+    } else {
+        match units::hook::prepare(&o.argv) {
+            Ok(hook) => hook,
+            Err(error) => {
+                eprintln!("stoop: {error}");
+                return Outcome {
+                    status: 2,
+                    key: initial_key,
+                    how: How::Untraced,
+                };
+            }
+        }
+    };
+    // A placeholder that reached stoop intact: the shell expanded nothing into it.
+    let intact = hook.is_some();
+    if let Some(h) = &hook {
+        o.argv.clone_from(&h.argv);
     }
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = root_for(&o, &cwd);
     let rel_cwd = cwd_key(&root, &cwd);
     let store_path = store_for(&o, &cwd, &root);
     let scope = shared_scope(&root, &store_path);
-    let key = o
-        .key
-        .as_deref()
-        .map(|key| {
-            if o.shell_key {
-                return crate::stepkey::scoped(key, scope.as_deref());
-            }
-            sanitize(key)
+    let max_age = o
+        .max_age
+        .or_else(|| {
+            std::env::var("STOOP_MAX_AGE")
+                .ok()
+                .and_then(|v| parse_age(&v).ok())
         })
-        .unwrap_or_else(|| default_key(&o.argv, &rel_cwd, scope.as_deref()));
+        .unwrap_or(DEFAULT_MAX_AGE);
+    // An argv without a placeholder may be an expanded shape of a recorded hook. A single full
+    // form runs and never skips. Two different full forms cannot be told apart, so the command
+    // runs as typed and never skips either.
+    let mut expanded = false;
+    let mut matches = 0;
+    if !literal && hook.is_none() {
+        let records = match units::hook_store::records(&store_path, now(), max_age) {
+            Ok(records) => records,
+            Err(warning) => {
+                if !o.quiet {
+                    eprintln!("{warning}");
+                }
+                Vec::new()
+            }
+        };
+        let mut found: Vec<units::hook::Hook> = Vec::new();
+        for record in records
+            .into_iter()
+            .filter(|r| r.cwd == rel_cwd && r.scope == scope && r.label == o.key)
+        {
+            if let Ok(Some(candidate)) = units::hook::prepare(&record.argv) {
+                if units::hook::expanded_matches(&candidate, &o.argv)
+                    && !found.iter().any(|known| known.argv == candidate.argv)
+                {
+                    found.push(candidate);
+                }
+            }
+        }
+        matches = found.len();
+        if matches == 1 {
+            let candidate = found.swap_remove(0);
+            o.argv.clone_from(&candidate.argv);
+            hook = Some(candidate);
+            expanded = true;
+        }
+    }
+    let bypass = expanded || matches > 1;
+    // Stoop owns the hook variables for its child. A hook exports them empty. Any other run
+    // replaces an inherited value and names it, unless a placeholder reached stoop intact.
+    if !literal {
+        clear_hook_env(hook.is_some(), !intact);
+    }
+    let key = hook
+        .as_ref()
+        .map(|h| hook_key(h, o.key.as_deref(), &rel_cwd, scope.as_deref()))
+        .unwrap_or_else(|| {
+            o.key
+                .as_deref()
+                .map(|key| {
+                    if o.shell_key {
+                        crate::stepkey::scoped(key, scope.as_deref())
+                    } else {
+                        sanitize(key)
+                    }
+                })
+                .unwrap_or_else(|| default_key(&o.argv, &rel_cwd, scope.as_deref()))
+        });
+    // One decision line for an expanded shape, an ambiguous shape or an empty value. Explain
+    // prints it in place of the run and runs nothing; a run prints it as its hint.
+    let note = if expanded {
+        hook.as_ref().map(|h| {
+            if explain {
+                units::hook::expanded_explain(h)
+            } else {
+                units::hook::expanded_line(h)
+            }
+        })
+    } else if matches > 1 {
+        Some(units::hook::ambiguous_line(&o.argv, matches, explain))
+    } else if !literal && hook.is_none() {
+        units::hook::empty_value_line(&o.argv, explain)
+    } else {
+        None
+    };
+    if let Some(line) = note {
+        eprintln!("{line}");
+        if explain {
+            return Outcome {
+                status: 1,
+                key,
+                how: How::Untraced,
+            };
+        }
+    }
+    if let Some(h) = &hook {
+        if !expanded && !explain && !o.no_record {
+            let record = units::hook_store::Record {
+                key: key.clone(),
+                argv: h.original.clone(),
+                cwd: rel_cwd.clone(),
+                scope: scope.clone(),
+                label: o.key.clone(),
+                created: now(),
+            };
+            if let Err(warning) = units::hook_store::record(&store_path, record) {
+                if !o.quiet {
+                    eprintln!("{warning}");
+                }
+            }
+        }
+    }
+    // STOOP_OFF runs a hook's first-run form without tracing, and its hints still print above.
+    if env_flag("STOOP_OFF") && !explain {
+        return Outcome {
+            status: plain(&o.argv),
+            key: initial_key,
+            how: How::Untraced,
+        };
+    }
     let store = Store::new(store_path);
     if explain && !o.quiet {
         let dir = if rel_cwd.is_empty() { "." } else { &rel_cwd };
@@ -374,10 +572,18 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     }
     if !trace::supported() {
         if explain {
-            eprintln!(
-                "stoop: would run {key}: not traced ({}); no proof can be used",
-                trace::UNAVAILABLE
-            );
+            match &hook {
+                Some(h) => eprintln!(
+                    "stoop: would run full {key} (not traced: {}): removed {}, argv {}",
+                    trace::UNAVAILABLE,
+                    units::hook::show(&h.removed),
+                    units::hook::render(&h.argv)
+                ),
+                None => eprintln!(
+                    "stoop: would run {key}: not traced ({}); no proof can be used",
+                    trace::UNAVAILABLE
+                ),
+            }
             return Outcome {
                 status: 1,
                 key,
@@ -385,7 +591,13 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             };
         }
         if !o.quiet {
-            eprintln!("stoop: run {key}: no compatible tracer");
+            match &hook {
+                Some(h) => eprintln!(
+                    "stoop: run full {key} (no compatible tracer): removed {}",
+                    units::hook::show(&h.removed)
+                ),
+                None => eprintln!("stoop: run {key}: no compatible tracer"),
+            }
             eprintln!(
                 "stoop: not traced ({}); running without a proof",
                 trace::UNAVAILABLE
@@ -433,7 +645,7 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
 
     // 1. Is there a proof whose inputs all still match?
     let t0 = Instant::now();
-    let mut proofs = store.load(&key);
+    let mut proofs = if bypass { Vec::new() } else { store.load(&key) };
     let mut pulled = false;
     let mut probe_now: Option<Option<BTreeMap<String, String>>> = None;
     let mut why;
@@ -513,7 +725,7 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             }
         }
         // A miss with a remote configured: someone else may already have proved this.
-        if hit_idx.is_some() || pulled || remote.is_none() {
+        if hit_idx.is_some() || pulled || remote.is_none() || bypass {
             break;
         }
         pulled = true;
@@ -546,7 +758,14 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         why = "STOOP_FULL is set".into();
     }
     if explain {
-        eprintln!("stoop: would run {key}: {why}");
+        match &hook {
+            Some(h) => eprintln!(
+                "stoop: would run full {key} ({why}): removed {}, argv {}",
+                units::hook::show(&h.removed),
+                units::hook::render(&h.argv)
+            ),
+            None => eprintln!("stoop: would run {key}: {why}"),
+        }
         return Outcome {
             status: 1,
             key,
@@ -554,7 +773,13 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         };
     }
     if !o.quiet {
-        eprintln!("stoop: run {key}: {why}");
+        match &hook {
+            Some(h) => eprintln!(
+                "stoop: run full {key} ({why}): removed {}",
+                units::hook::show(&h.removed)
+            ),
+            None => eprintln!("stoop: run {key}: {why}"),
+        }
     }
 
     // 2. Run it, watched. Anything that stops the watch from working just runs the command.
@@ -1044,5 +1269,27 @@ mod tests {
         trace.touched.clear();
         trace.written.insert(path);
         assert!(build_inputs(root, &mut phys, &trace, &ignore, &written).is_err());
+    }
+}
+
+#[cfg(all(test, unix))]
+mod canonical_tests {
+    use super::canonical_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_store_that_does_not_exist_yet_resolves_through_its_symlinked_parent() {
+        let base = std::env::temp_dir().join(format!("stoop-canonical-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let store = link.join(".stoop");
+        let expected: PathBuf = std::fs::canonicalize(&real).unwrap().join(".stoop");
+        assert_eq!(canonical_path(&store), expected);
+        std::fs::create_dir_all(&store).unwrap();
+        assert_eq!(canonical_path(&store), expected);
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

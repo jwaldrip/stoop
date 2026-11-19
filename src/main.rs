@@ -49,6 +49,7 @@ OPTIONS
   --sync-write      publish proofs to the remote (trusted runs only)
   --ignore PATTERN  paths whose reads do not count (also .stoopignore)
   --no-record       check and run, but never write a proof (untrusted jobs)
+  --literal         treat placeholders as ordinary text (no changed-unit hooks)
   --quiet           print nothing about the decision
 
 ENVIRONMENT
@@ -143,6 +144,10 @@ fn real_main(mut args: Vec<String>) -> i32 {
                 eprintln!("stoop: forget needs a key");
                 return 2;
             };
+            let hook = run::forget_hook_records(&o, &proof::sanitize(key));
+            if let Err(warning) = &hook {
+                eprintln!("{warning}");
+            }
             let result = if key.starts_with("job-") {
                 jobs_for(&o).forget(&proof::sanitize(key))
             } else {
@@ -150,6 +155,7 @@ fn real_main(mut args: Vec<String>) -> i32 {
             };
             match result {
                 Ok(true) => 0,
+                Ok(false) if matches!(hook, Ok(true)) => 0,
                 Ok(false) => {
                     eprintln!("stoop: no proof named {key}");
                     1
@@ -261,6 +267,7 @@ fn parse(args: &[String]) -> Result<(Opts, Vec<String>), String> {
             "--env" => o.env.push(val("--env")?),
             "--ignore" => o.ignore.push(val("--ignore")?),
             "--no-record" => o.no_record = true,
+            "--literal" => o.literal = true,
             "--allow-network" => o.allow_network = true,
             "--ignore-env" => o.ignore_env.push(val("--ignore-env")?),
             "--max-age" => o.max_age = Some(run::parse_age(&val("--max-age")?)?),
