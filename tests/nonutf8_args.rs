@@ -253,3 +253,33 @@ fn a_non_utf8_option_value_is_refused_with_a_clear_error() {
         text(&output)
     );
 }
+
+#[test]
+fn a_non_utf8_word_that_starts_with_a_dash_is_an_unknown_option() {
+    for word in [raw(b"--key=\xff"), raw(b"-\xff")] {
+        let dir = Dir::new("dash-word");
+        repo(dir.path(), &[("a.txt", "a\n")]);
+        let mut args = os(&["run"]);
+        args.push(word);
+        args.extend(os(&["--", "true"]));
+        let output = stoop(dir.path(), &args).output().unwrap();
+        assert_no_panic(&output);
+        assert_eq!(output.status.code(), Some(2), "{}", text(&output));
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unknown option"),
+            "{}",
+            text(&output)
+        );
+    }
+}
+
+#[test]
+fn a_non_utf8_word_that_looks_like_a_brace_expansion_is_an_ordinary_word() {
+    let dir = Dir::new("brace-shape");
+    repo(dir.path(), &[("a.txt", "a\n")]);
+    let args = echo_first_argument(&["run", "--"], raw(b"changed:*.t\xff"));
+    let output = stoop(dir.path(), &args).output().unwrap();
+    assert_no_panic(&output);
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(output.stdout, b"changed:*.t\xff", "{}", text(&output));
+}

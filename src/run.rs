@@ -217,7 +217,7 @@ pub(crate) fn shared_scope(root: &Path, store: &Path) -> Option<String> {
 }
 
 /// The words a hook record can hold: a record stores text, so only an argv of UTF-8 words is
-/// recordable. A hook with a word that is not UTF-8 is never recorded, so it never skips later.
+/// recordable. The hook template is never recorded, so a shell-erased form of it is not recognised.
 fn recordable_argv(words: &[std::ffi::OsString]) -> Option<Vec<String>> {
     words
         .iter()
@@ -720,8 +720,9 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     }
     if let Some(h) = &hook {
         if !expanded && !explain && !o.no_record {
-            // A record holds text. A hook with an argument that is not UTF-8 is not recorded,
-            // so it runs every time and never skips on a later run.
+            // A record holds text. A hook template with an argument that is not UTF-8 is not
+            // recorded, so a shell-erased form of this hook is not recognised. The whole-command
+            // proof is keyed by the exact bytes and is still recorded.
             let words = recordable_argv(&h.original);
             match words {
                 Some(argv) => {
@@ -741,7 +742,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 }
                 None if !o.quiet => {
                     eprintln!(
-                        "stoop: not recorded: an argument is not UTF-8, so this hook runs every time"
+                        "stoop: the hook template is not recorded, so a shell-erased form of this hook will not be recognised"
                     );
                 }
                 None => {}
@@ -1993,5 +1994,27 @@ mod env_hash_name_tests {
         let got = env_hashes(std::slice::from_ref(&key), None);
         assert_eq!(got[&key], env_hash_bytes(&key, b"v", None));
         std::env::remove_var(&name);
+    }
+}
+
+#[cfg(test)]
+mod hook_key_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    fn key(word: &[u8]) -> String {
+        let words = [
+            OsString::from("./t"),
+            OsString::from("{changed}"),
+            OsString::from_vec(word.to_vec()),
+        ];
+        let hook = units::hook::prepare(&words).unwrap().unwrap();
+        hook_key(&hook, None, "", None)
+    }
+
+    #[test]
+    fn a_hook_key_separates_non_utf8_words_by_their_exact_bytes() {
+        assert_ne!(key(b"x\xfe"), key(b"x\xff"));
     }
 }

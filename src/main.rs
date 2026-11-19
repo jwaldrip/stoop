@@ -169,13 +169,14 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
                 return 2;
             };
             // A proof is named by text. A word that is not UTF-8 names no proof, so none is removed.
-            let Some(key) = key.to_str() else {
+            let Some(key) = proof_name(key) else {
                 eprintln!(
                     "stoop: no proof named {}",
                     run::safe(&key.to_string_lossy())
                 );
                 return 1;
             };
+            let key = key.as_str();
             let hook = run::forget_hook_records(&o, &proof::sanitize(key));
             if let Err(warning) = &hook {
                 eprintln!("{warning}");
@@ -278,8 +279,15 @@ fn parse(args: &[OsString]) -> Result<(Opts, Vec<OsString>), String> {
     let mut o = Opts::default();
     let mut i = 0;
     while i < args.len() {
-        // A word that is not UTF-8 is never an option, so it is an ordinary word.
+        // A word that is not UTF-8 is an ordinary word, unless it begins with "-": that marks an
+        // option, which stoop refuses as an unknown option.
         let Some(a) = args[i].to_str() else {
+            if args[i].as_encoded_bytes().starts_with(b"-") {
+                return Err(format!(
+                    "unknown option {}",
+                    run::safe(&args[i].to_string_lossy())
+                ));
+            }
             break;
         };
         if a == "--" {
@@ -420,4 +428,22 @@ fn shell_mode(o: &mut Opts, script: &OsStr, rest: &[OsString]) -> i32 {
         }
     }
     outcome.status
+}
+
+/// The name of a proof is text. A name that is not UTF-8 names no proof, so none is removed.
+fn proof_name(key: &OsStr) -> Option<String> {
+    key.to_str().map(str::to_owned)
+}
+
+#[cfg(test)]
+mod forget_name_tests {
+    use super::proof_name;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn a_non_utf8_proof_name_names_no_proof() {
+        assert_eq!(proof_name(OsStr::new("cat-1")), Some("cat-1".to_string()));
+        assert_eq!(proof_name(OsStr::from_bytes(b"\xff")), None);
+    }
 }

@@ -342,7 +342,7 @@ pub(crate) fn prepare(exact: &[OsString]) -> Result<Option<Hook>, String> {
     let mut env_code = false;
     let mut placeholder = String::new();
     for (idx, word) in argv.iter().enumerate() {
-        if mangled(word) {
+        if exact[idx].to_str().is_some() && mangled(word) {
             return Err(MANGLED.to_string());
         }
         let parts = spans(word)?;
@@ -727,5 +727,35 @@ mod non_utf8_words {
         assert_ne!(fe, shadow(OsStr::from_bytes(b"\xff")));
         assert_ne!(fe, shadow(OsStr::new("\u{fffd}")));
         assert_eq!(shadow(OsStr::new("{changed}")), "{changed}");
+    }
+}
+
+#[cfg(test)]
+mod incoming_words_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn a_non_utf8_incoming_word_never_matches_a_recorded_replacement_character() {
+        let recorded = [
+            OsString::from("./t"),
+            OsString::from("\u{fffd}"),
+            OsString::from("--files"),
+            OsString::from("{changed}"),
+        ];
+        let hook = prepare(&recorded).unwrap().unwrap();
+        let typed = [
+            OsString::from("./t"),
+            OsString::from_vec(b"\xff".to_vec()),
+            OsString::from("--files"),
+        ];
+        assert!(!expanded_matches(&hook, &typed));
+        let utf8 = [
+            OsString::from("./t"),
+            OsString::from("\u{fffd}"),
+            OsString::from("--files"),
+        ];
+        assert!(expanded_matches(&hook, &utf8));
     }
 }
