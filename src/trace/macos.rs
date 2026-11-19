@@ -59,7 +59,6 @@ const LEFT_RUNNING: &str = "the tracer was left running after the command finish
 const STATUS_UNKNOWN: &str = "the command's exit status could not be read";
 const NOT_UTF8: &str = "a traced path was not valid UTF-8";
 const ENDED_IN_LINE: &str = "the tracer's output ended inside a line";
-const EMPTY_LINE: &str = "the tracer printed an empty line";
 const CUT_OFF: &str = "a path was long enough to be cut off by the tracer";
 const OUTPUT_LOST: &str = "the tracer's output could not be read, so the rest of it is unknown";
 
@@ -513,7 +512,8 @@ impl Observer {
             return;
         }
         if line.is_empty() {
-            self.flag(EMPTY_LINE);
+            // Not a record. Every record starts with its kind, so an empty line is never a record
+            // cut short, and it hides nothing that follows it.
             return;
         }
         if line.starts_with("dtrace:") {
@@ -1667,13 +1667,20 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_line_is_unsound() {
+    fn an_empty_line_is_not_a_record_and_hides_nothing() {
         let mut o = observer();
-        feed(&mut o, &[""]);
-        clean_end(&mut o);
-        assert!(reasons(&o.finish(0))
-            .iter()
-            .any(|r| r.contains("empty line")));
+        feed(
+            &mut o,
+            &[
+                "EV\t0.1\t100\tstat\t-\t-\t1\tx",
+                "",
+                "EXIT\t0.2\t100",
+                "STOP",
+            ],
+        );
+        let d = o.finish(0);
+        assert!(d.trace.touched.contains_key(Path::new("/work/x")));
+        assert_eq!(reasons(&d), [DIAGNOSTIC_ONLY]);
     }
 
     #[test]

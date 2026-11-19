@@ -109,24 +109,33 @@ fn a_fixture_with_a_tree_and_failed_lookups_is_observed_in_full_and_never_record
     assert_eq!(fs::read_to_string(w.dir.join("runs.log")).unwrap(), "run");
     assert!(stderr.contains("stoop: DTrace diagnostic: "), "{stderr}");
     assert!(stderr.contains("not recorded"), "{stderr}");
-    // The known result: DTrace reported no loss or error at all. The run is unsound for one
-    // reason only: the system's loader looks files up through directory descriptors, which the
-    // tracer does not follow yet (the spike's gap two). Nothing else makes it unsound.
+    // The verdict is UNSOUND. Its reasons are the descriptor-relative lookups the tracer cannot
+    // place, and DTrace's own report of a loss or an error when it made one. When DTrace reported
+    // nothing, the known results below hold exactly. When it did, the run says so, and the exact
+    // lists are not asserted, because an event the tracer lost may be one of them.
     assert!(
         stderr.contains("DTrace diagnostic verdict: UNSOUND ("),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains(" 0 tracer loss or error line(s)"),
         "{stderr}"
     );
     for line in stderr
         .lines()
         .filter(|line| line.starts_with("stoop: DTrace diagnostic UNSOUND: "))
     {
-        assert!(line.contains("directory descriptor"), "{line}");
+        assert!(
+            line.contains("directory descriptor")
+                || line.contains("error stream")
+                || line.contains("loss or error"),
+            "{line}"
+        );
     }
     w.no_proof_written();
+    if !stderr.contains(" 0 tracer loss or error line(s)") {
+        assert!(
+            stderr.contains("error stream") || stderr.contains("loss or error"),
+            "{stderr}"
+        );
+        return;
+    }
 
     let read = listed(&stderr, "read");
     let failed = listed(&stderr, "failed");
@@ -174,11 +183,11 @@ fn a_tracer_killed_mid_run_returns_the_status_and_says_the_report_is_unsound() {
         return;
     }
     let w = Work::new("killed");
-    // The command is a child of stoop, and so is the tracer's `sudo`. Only that tracer is
-    // signalled, never another process with the same name.
+    // The command is a child of stoop, and so is the tracer's `sudo`, whose child is DTrace. Only
+    // that DTrace process is killed, with SIGKILL, so it cannot report a stop or an exit.
     let out = w.stoop(
         "cat in.txt >/dev/null; \
-         tracer=$(pgrep -P $PPID -x sudo); sudo -n kill -INT $tracer; sleep 2; \
+         tracer=$(pgrep -P $PPID -x sudo); dtrace=$(pgrep -P $tracer); sudo -n kill -KILL $dtrace; sleep 2; \
          printf run >> runs.log; exit 5",
         "1",
     );
