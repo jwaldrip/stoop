@@ -656,7 +656,18 @@ fn observe(rec: Option<&mut Rec<'_>>, t: &mut Trace, lex: PathBuf, how: Use) {
         Some(Seen::Absent)
     );
     let created_here = absent_before && t.is_output(&lex);
-    let written_here = t.is_output(&lex);
+    // A file the run wrote is its own output: a later read of it says nothing about the world.
+    let rechecked = how == Use::Content
+        && matches!(
+            t.seen.as_ref().and_then(|seen| seen.get(&lex)),
+            Some(before) if !matches!(before, Seen::Dir(_) | Seen::Absent)
+        );
+    let output = rechecked
+        && (t.is_output(&lex)
+            || matches!(
+                t.seen.as_ref().and_then(|seen| seen.get(&lex)),
+                Some(Seen::Symlink { resolved: Some(target), .. }) if t.is_output(target)
+            ));
     let Some(seen) = t.seen.as_mut() else { return };
     let mut changed = false;
     match seen.get_mut(&lex) {
@@ -671,7 +682,7 @@ fn observe(rec: Option<&mut Rec<'_>>, t: &mut Trace, lex: PathBuf, how: Use) {
             // Something absent may appear later. A path the run created is its own output.
             changed = !created_here && !matches!(identity::observe(&lex, resolve), Seen::Absent);
         }
-        Some(before) if how == Use::Content && !matches!(before, Seen::Dir(_)) => {
+        Some(before) if how == Use::Content && !output && !matches!(before, Seen::Dir(_)) => {
             if identity::same_identity(before, &identity::observe(&lex, resolve)) {
                 if hash {
                     rec.read_hash(before, &lex, now);
@@ -683,10 +694,6 @@ fn observe(rec: Option<&mut Rec<'_>>, t: &mut Trace, lex: PathBuf, how: Use) {
         Some(_) => {}
     }
     if changed {
-        if written_here {
-            let key = lex.strip_prefix(&rec.root).unwrap_or(lex.as_path());
-            push_unsound(t, format!("it read {} after writing it", key.display()));
-        }
         push_changed(t, &lex);
     }
 }

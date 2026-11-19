@@ -662,9 +662,8 @@ fn a_hard_link_name_the_command_writes_changes_the_name_it_read() {
 }
 
 #[test]
-fn a_file_the_command_overwrites_and_reads_back_is_not_recorded() {
-    // The read after the write sees the command's own bytes, which the tracer cannot tell from an
-    // outside rewrite. The record is refused, with the reason named.
+fn a_file_the_command_overwrites_and_reads_back_still_records() {
+    // The command's own write is its output, so its read back of the file is not an input.
     let case = Case::new("t21-read-back");
     case.file("src/f", b"start\n");
     age();
@@ -674,10 +673,5 @@ fn a_file_the_command_overwrites_and_reads_back_is_not_recorded() {
         "echo fresh > src/f; cat src/f >/dev/null",
         &[],
     );
-    assert_not_recorded(
-        &out,
-        &case,
-        "t21-read-back",
-        "it read src/f after writing it",
-    );
+    assert_recorded(&out, &case, "t21-read-back");
 }
