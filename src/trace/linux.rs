@@ -12,6 +12,7 @@
 use super::{ExecEvent, Scope, Trace};
 use crate::ignore::Ignore;
 use crate::input::{file_id, hash_file, hash_file_with_oid};
+use crate::oid_attrs::is_absent;
 use crate::pathutil::{absolutize, to_key, without_dots, Physical};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsString};
@@ -118,6 +119,31 @@ enum Op {
     },
     /// fchmod: the file is named by its fd.
     Fchmod {
+        fd: usize,
+    },
+    /// symlink, symlinkat: a new name, and the argument that holds its target path.
+    Symlink {
+        dirfd: Option<usize>,
+        path: usize,
+        target: usize,
+    },
+    /// link, linkat: the existing file the new name refers to. `flags` may carry AT_EMPTY_PATH,
+    /// which names that file by descriptor instead.
+    LinkSource {
+        dirfd: Option<usize>,
+        path: usize,
+        flags: Option<usize>,
+    },
+    /// chown, lchown, fchownat: an owner change named by path. `flags` may carry
+    /// AT_SYMLINK_NOFOLLOW or AT_EMPTY_PATH; `nofollow` is set for lchown.
+    Owner {
+        dirfd: Option<usize>,
+        path: usize,
+        flags: Option<usize>,
+        nofollow: bool,
+    },
+    /// fchown: an owner change named by descriptor.
+    OwnerFd {
         fd: usize,
     },
     /// The operation may change attribute sources without a known pathname.
@@ -236,18 +262,19 @@ fn table() -> Vec<(i64, Vec<Op>)> {
         ),
         (
             s(libc::SYS_symlinkat),
-            vec![Create {
+            vec![Symlink {
                 dirfd: Some(1),
                 path: 2,
-                dir: false,
+                target: 0,
             }],
         ),
         (
             s(libc::SYS_linkat),
             vec![
-                Look {
+                LinkSource {
                     dirfd: Some(0),
                     path: 1,
+                    flags: Some(4),
                 },
                 Create {
                     dirfd: Some(2),
@@ -260,9 +287,24 @@ fn table() -> Vec<(i64, Vec<Op>)> {
         (s(libc::SYS_recvmsg), vec![UncertainOidState]),
         (s(libc::SYS_recvmmsg), vec![UncertainOidState]),
         (s(libc::SYS_pidfd_getfd), vec![UncertainOidState]),
-        (s(libc::SYS_fchown), vec![UncertainOidState]),
-        (s(libc::SYS_fchownat), vec![UncertainOidState]),
-        (s(libc::SYS_mknodat), vec![UncertainOidState]),
+        (s(libc::SYS_fchown), vec![OwnerFd { fd: 0 }]),
+        (
+            s(libc::SYS_fchownat),
+            vec![Owner {
+                dirfd: Some(0),
+                path: 1,
+                flags: Some(4),
+                nofollow: false,
+            }],
+        ),
+        (
+            s(libc::SYS_mknodat),
+            vec![Create {
+                dirfd: Some(0),
+                path: 1,
+                dir: false,
+            }],
+        ),
         (s(libc::SYS_connect), vec![Connect]),
         (s(libc::SYS_clone), vec![Clone { modern: false }]),
         (s(libc::SYS_clone3), vec![Clone { modern: true }]),
@@ -338,9 +380,32 @@ fn table() -> Vec<(i64, Vec<Op>)> {
     ];
     #[cfg(target_arch = "x86_64")]
     t.extend([
-        (s(libc::SYS_chown), vec![UncertainOidState]),
-        (s(libc::SYS_lchown), vec![UncertainOidState]),
-        (s(libc::SYS_mknod), vec![UncertainOidState]),
+        (
+            s(libc::SYS_chown),
+            vec![Owner {
+                dirfd: None,
+                path: 0,
+                flags: None,
+                nofollow: false,
+            }],
+        ),
+        (
+            s(libc::SYS_lchown),
+            vec![Owner {
+                dirfd: None,
+                path: 0,
+                flags: None,
+                nofollow: true,
+            }],
+        ),
+        (
+            s(libc::SYS_mknod),
+            vec![Create {
+                dirfd: None,
+                path: 0,
+                dir: false,
+            }],
+        ),
         (
             s(libc::SYS_open),
             vec![Open {
@@ -424,18 +489,19 @@ fn table() -> Vec<(i64, Vec<Op>)> {
         ),
         (
             s(libc::SYS_symlink),
-            vec![Create {
+            vec![Symlink {
                 dirfd: None,
                 path: 1,
-                dir: false,
+                target: 0,
             }],
         ),
         (
             s(libc::SYS_link),
             vec![
-                Look {
+                LinkSource {
                     dirfd: None,
                     path: 0,
+                    flags: None,
                 },
                 Create {
                     dirfd: None,
@@ -527,8 +593,6 @@ struct Rec<'a> {
     root: PathBuf,
     hashed: u64,
     oid_epoch: Option<Arc<crate::oid_attrs::Epoch>>,
-    /// Default Git configuration sources may resolve into the repository.
-    cautious_git_config: bool,
     link_walks: BTreeMap<PathBuf, Vec<PathBuf>>,
     redirected_reads: HashSet<String>,
 }
@@ -560,8 +624,6 @@ pub fn run<'a>(
     let tbl = table();
     let nrs: Vec<i64> = tbl.iter().map(|(n, _)| *n).collect();
     let filter = bpf_filter(&nrs, &denied());
-    let cautious_git_config =
-        scope.is_some_and(|s| s.oid_epoch.is_some() && cautious_git_config(s.root, &s.real_root));
     let prog = libc::sock_fprog {
         len: filter.len() as u16,
         filter: filter.as_ptr() as *mut libc::sock_filter,
@@ -617,7 +679,6 @@ pub fn run<'a>(
             ignore: s.ignore,
             root: s.root.to_path_buf(),
             oid_epoch: s.oid_epoch.clone(),
-            cautious_git_config,
             hashed: 0,
             link_walks: BTreeMap::new(),
             redirected_reads: HashSet::new(),
@@ -1197,47 +1258,8 @@ fn describe_dest(sa: &[u8]) -> String {
     }
 }
 
-/// Whether `e` says the path, or one of its parents, is not there.
-fn is_absent(e: &io::Error) -> bool {
-    e.kind() == io::ErrorKind::NotFound || e.raw_os_error() == Some(libc::ENOTDIR)
-}
-
 fn is_dir(p: &Path) -> bool {
     fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
-}
-
-/// If default Git configuration sources can be inside the repository, any
-/// ordinary write may change the configuration observed by the snapshot.
-fn cautious_git_config(root: &Path, real_root: &Path) -> bool {
-    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
-        return true;
-    };
-    let xdg = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"));
-    let mut phys = Physical::new(root, real_root);
-    for path in [
-        home.clone(),
-        home.join(".gitconfig"),
-        xdg.clone(),
-        xdg.join("git/config"),
-        xdg.join("git/attributes"),
-        PathBuf::from("/etc/gitconfig"),
-        PathBuf::from("/etc/gitattributes"),
-    ] {
-        if !path.is_absolute() || path.starts_with(root) {
-            return true;
-        }
-        let resolved = match fs::canonicalize(&path) {
-            Ok(path) => Some(path),
-            Err(error) if is_absent(&error) => phys.locate(&path).map(|location| location.path),
-            Err(_) => None,
-        };
-        if resolved.is_none_or(|path| path.starts_with(real_root)) {
-            return true;
-        }
-    }
-    false
 }
 
 /// Read an ELF PT_INTERP pathname without loading the executable into memory.
@@ -1363,10 +1385,15 @@ fn push_reason(t: &mut Trace, why: String) {
 }
 
 impl Rec<'_> {
-    /// Attribute files can be ignored by the proof but still affect every Git OID.
-    /// Unknown locations and ordinary writes outside the root are conservative:
-    /// Git can read config and attribute files at arbitrary external paths.
+    /// Whether a write, a namespace change or an owner change at `raw` can change what Git reads
+    /// for attributes or configuration. The watched set names those files (see `oid_attrs`), so
+    /// writes to other paths keep the run's blob ids. Inside the repository, the git directory
+    /// counts by the same names, and a file with a second name, an attribute file or a nested
+    /// `.git` counts too. Physical paths that cannot be placed count.
     fn invalidates_oids(&mut self, raw: &Path, follows: bool) -> bool {
+        let Some(epoch) = self.oid_epoch.clone() else {
+            return false;
+        };
         let link_meta = fs::symlink_metadata(raw);
         let metadata = if follows {
             fs::metadata(raw)
@@ -1374,13 +1401,6 @@ impl Rec<'_> {
             fs::symlink_metadata(raw)
         };
         if metadata.as_ref().is_err_and(|e| !is_absent(e)) {
-            return true;
-        }
-        if raw.file_name().is_some_and(|name| name == ".gitattributes")
-            || raw
-                .components()
-                .any(|component| component.as_os_str() == ".git")
-        {
             return true;
         }
         if metadata.as_ref().is_ok_and(|m| {
@@ -1397,27 +1417,43 @@ impl Rec<'_> {
         let Some(physical) = physical else {
             return true;
         };
+        let watched = epoch.watch.names_contain(&physical)
+            || metadata
+                .as_ref()
+                .is_ok_and(|m| epoch.watch.is_watched_file(m));
         if !physical.starts_with(self.phys.real()) {
-            return true;
+            return watched;
         }
-        if self.cautious_git_config
-            || self.oid_epoch.as_ref().is_some_and(|epoch| {
-                physical.starts_with(&epoch.git_dir) || physical.starts_with(&epoch.common_dir)
-            })
-            || physical.file_name().is_some_and(|name| {
-                matches!(
-                    name.to_str(),
-                    Some(".gitattributes" | ".gitconfig" | "gitattributes" | "gitconfig")
-                )
-            })
+        if physical.starts_with(&epoch.git_dir) || physical.starts_with(&epoch.common_dir) {
+            return watched;
+        }
+        watched
+            || physical
+                .file_name()
+                .is_some_and(|name| name == ".gitattributes")
             || physical
                 .components()
                 .any(|component| component.as_os_str() == ".git")
-        {
-            return true;
-        }
-        // An attribute file or a config file may share an inode with another name.
-        metadata.is_ok_and(|m| m.is_file() && m.nlink() > 1)
+            // An attribute file or a config file may share an inode with another name.
+            || metadata.is_ok_and(|m| m.is_file() && m.nlink() > 1)
+    }
+
+    /// Whether the name `raw` lies in the repository, or cannot be placed at all.
+    fn in_repo(&mut self, raw: &Path) -> bool {
+        let real = self.phys.real().to_path_buf();
+        self.phys
+            .locate(raw)
+            .is_none_or(|location| location.path.starts_with(&real))
+    }
+
+    /// Whether the name `raw` is a watched name, or cannot be placed at all.
+    fn watched_name(&mut self, raw: &Path) -> bool {
+        let Some(epoch) = self.oid_epoch.clone() else {
+            return false;
+        };
+        self.phys
+            .locate(raw)
+            .is_none_or(|location| epoch.watch.names_contain(&location.path))
     }
 
     fn key_text(&self, lex: &Path) -> String {
@@ -1706,7 +1742,13 @@ impl Tracer<'_> {
                 self.t.oid_attrs_changed = true;
                 return;
             };
-            if !path.is_absolute() || metadata.nlink() > 1 || rec.invalidates_oids(&path, true) {
+            // The descriptor's identity counts even when its name is gone: a hard link may have
+            // given the watched file a name outside the watched set.
+            let watched = rec
+                .oid_epoch
+                .as_ref()
+                .is_some_and(|epoch| epoch.watch.is_watched_file(&metadata));
+            if !path.is_absolute() || watched || rec.invalidates_oids(&path, true) {
                 self.t.oid_attrs_changed = true;
                 return;
             }
@@ -2121,6 +2163,11 @@ impl Tracer<'_> {
         let Some(p) = self.resolve(pid, args, dirfd, path) else {
             return;
         };
+        self.create_at(pid, p, dir);
+    }
+
+    /// A name the call creates: a directory, a symbolic link, a hard link or a node.
+    fn create_at(&mut self, pid: i32, p: PathBuf, dir: bool) {
         if dir {
             // mkdir on a path that exists fails with EEXIST and creates nothing: `mkdir -p`
             // and `create_dir_all` do this for every ancestor. The existence is an input.
@@ -2130,8 +2177,9 @@ impl Tracer<'_> {
             }
         }
         if !dir {
-            // A new symlink or hard link can change how an attribute source is reached.
-            if self.rec.is_some() {
+            // A new link or node inside the repository can change how an attribute source is
+            // reached. Outside it, only a watched name matters, and write() checks that.
+            if self.rec.as_mut().is_some_and(|rec| rec.in_repo(&p)) {
                 self.t.oid_attrs_changed = true;
             }
             self.topology_changed(pid);
@@ -2157,12 +2205,14 @@ impl Tracer<'_> {
             return;
         };
         let removes_dir = dir || flags.is_some_and(|i| args[i] as i32 & AT_REMOVEDIR != 0);
-        if removes_dir && self.rec.is_some() && crate::oid_attrs::directory_removal_invalidates(&p)
-        {
+        // Inside the repository, a removed directory may hide attribute sources and a removed
+        // symbolic link changes how they are reached. Outside it, the watched names decide.
+        let inside = self.rec.as_mut().is_some_and(|rec| rec.in_repo(&p));
+        if removes_dir && inside && crate::oid_attrs::directory_removal_invalidates(&p) {
             self.t.oid_attrs_changed = true;
         }
         if let Ok(metadata) = fs::symlink_metadata(&p) {
-            if metadata.file_type().is_symlink() && self.rec.is_some() {
+            if metadata.file_type().is_symlink() && inside {
                 self.t.oid_attrs_changed = true;
             }
             if metadata.is_dir() || metadata.file_type().is_symlink() {
@@ -2205,9 +2255,15 @@ impl Tracer<'_> {
         let symlink = a_meta.as_ref().is_some_and(|m| m.file_type().is_symlink())
             || b_meta.as_ref().is_some_and(|m| m.file_type().is_symlink());
         let directory = a_dir || (exchange && b_dir);
-        // A moved directory may contain attribute sources. A symlink changes
-        // their resolution, even when neither endpoint names an attribute file.
-        if (directory || symlink) && self.rec.is_some() {
+        // A moved directory may contain attribute sources, and a symlink changes their
+        // resolution, even when neither endpoint names an attribute file. Outside the repository
+        // only a watched name matters, and write() checks each endpoint for it.
+        if (directory || symlink)
+            && self
+                .rec
+                .as_mut()
+                .is_some_and(|rec| rec.in_repo(&a) || rec.in_repo(&b))
+        {
             self.t.oid_attrs_changed = true;
         }
         if a_dir || b_dir || symlink {
@@ -2239,7 +2295,8 @@ impl Tracer<'_> {
         match fs::symlink_metadata(raw) {
             Ok(m) if m.is_dir() => {
                 // Directory permissions can change which attribute files Git can read.
-                if self.rec.is_some() {
+                let inside = self.rec.as_mut().is_some_and(|rec| rec.in_repo(raw));
+                if inside || self.oid_sensitive(raw, follows) {
                     self.t.oid_attrs_changed = true;
                 }
                 self.touch(raw.to_path_buf(), false);
@@ -2269,6 +2326,89 @@ impl Tracer<'_> {
             }
             _ if self.rec.is_some() => self.t.oid_attrs_changed = true,
             _ => {}
+        }
+    }
+
+    /// Whether a call at `raw` changes what Git reads for attributes or configuration. Only a run
+    /// that has an attribute snapshot can lose evidence this way.
+    fn oid_sensitive(&mut self, raw: &Path, follows: bool) -> bool {
+        self.rec
+            .as_mut()
+            .is_some_and(|rec| rec.oid_epoch.is_some() && rec.invalidates_oids(raw, follows))
+    }
+
+    /// A symbolic link whose target lies in the repository, or is a watched name, brings a source
+    /// under another path, whatever the link's own name is. An unreadable target counts.
+    fn symlink_target(&mut self, pid: i32, args: &[u64; 6], link: &Path, target: usize) {
+        let Some(rec) = self.rec.as_mut() else {
+            return;
+        };
+        let Some(bytes) = read_cstr(pid, args[target]) else {
+            self.t.oid_attrs_changed = true;
+            return;
+        };
+        let target = PathBuf::from(OsString::from_vec(bytes));
+        let base = link.parent().unwrap_or(Path::new("/"));
+        let joined = without_dots(&if target.is_absolute() {
+            target
+        } else {
+            base.join(target)
+        });
+        if rec.in_repo(&joined) || rec.watched_name(&joined) {
+            self.t.oid_attrs_changed = true;
+        }
+    }
+
+    /// chown, lchown and fchownat. An owner change inside the repository counts, because a path's
+    /// owner decides whether Git can read its attribute files. Outside it, the watched names do.
+    fn owner(
+        &mut self,
+        pid: i32,
+        args: &[u64; 6],
+        dirfd: Option<usize>,
+        path: usize,
+        flags: Option<usize>,
+        nofollow: bool,
+    ) {
+        let Some(p) = self.resolve(pid, args, dirfd, path) else {
+            // fchownat with AT_EMPTY_PATH names its descriptor, not a path.
+            if let Some(fd) =
+                dirfd.filter(|_| flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0))
+            {
+                self.owner_fd(pid, args[fd] as i32);
+            }
+            return;
+        };
+        let nofollow = nofollow || flags.is_some_and(|i| args[i] as i32 & AT_SYMLINK_NOFOLLOW != 0);
+        let inside = self.rec.as_mut().is_some_and(|rec| rec.in_repo(&p));
+        if inside || self.oid_sensitive(&p, !nofollow) {
+            self.t.oid_attrs_changed = true;
+        }
+    }
+
+    /// fchown. The descriptor's name decides when it has one. A descriptor whose file is deleted
+    /// counts only by identity, and an identity that cannot be read counts.
+    fn owner_fd(&mut self, pid: i32, fd: i32) {
+        let proc_path = PathBuf::from(format!("/proc/{pid}/fd/{fd}"));
+        let identity = fs::metadata(&proc_path).ok();
+        let named = fs::read_link(&proc_path).ok().filter(|path| {
+            path.is_absolute() && !path.as_os_str().as_bytes().ends_with(b" (deleted)")
+        });
+        let Some(rec) = self.rec.as_mut() else {
+            return;
+        };
+        let risky = match named {
+            Some(path) => {
+                rec.in_repo(&path) || rec.oid_epoch.is_some() && rec.invalidates_oids(&path, true)
+            }
+            None => identity.as_ref().is_none_or(|m| {
+                rec.oid_epoch
+                    .as_ref()
+                    .is_some_and(|epoch| epoch.watch.is_watched_file(m))
+            }),
+        };
+        if risky {
+            self.t.oid_attrs_changed = true;
         }
     }
 
@@ -2371,6 +2511,35 @@ impl Tracer<'_> {
                     }
                 }
                 Op::Fchmod { fd } => self.chmod_fd(pid, args[fd] as i32),
+                Op::Symlink {
+                    dirfd,
+                    path,
+                    target,
+                } => {
+                    if let Some(p) = self.resolve(pid, &args, dirfd, path) {
+                        self.symlink_target(pid, &args, &p, target);
+                        self.create_at(pid, p, false);
+                    }
+                }
+                Op::LinkSource { dirfd, path, flags } => {
+                    let by_fd = flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0);
+                    if let Some(p) = self.resolve(pid, &args, dirfd, path) {
+                        self.touch(p.clone(), true);
+                        if self.oid_sensitive(&p, true) {
+                            self.t.oid_attrs_changed = true;
+                        }
+                    } else if let (Some(fd), true) = (dirfd, by_fd) {
+                        // AT_EMPTY_PATH names the source by descriptor, as fchownat does.
+                        self.owner_fd(pid, args[fd] as i32);
+                    }
+                }
+                Op::Owner {
+                    dirfd,
+                    path,
+                    flags,
+                    nofollow,
+                } => self.owner(pid, &args, dirfd, path, flags, nofollow),
+                Op::OwnerFd { fd } => self.owner_fd(pid, args[fd] as i32),
                 Op::UncertainOidState => {
                     if self.rec.is_some() {
                         self.t.oid_attrs_changed = true;
@@ -2406,18 +2575,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn oid_attribute_mutation_detection_is_conservative() {
-        let dir = std::env::temp_dir().join(format!(
-            "stoop-oid-write-{}-{}",
+    fn watched_names_decide_which_changes_drop_blob_ids() {
+        let base = std::env::temp_dir().join(format!(
+            "stoop-oid-watch-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        fs::create_dir(&dir).unwrap();
-        let root = fs::canonicalize(&dir).unwrap();
+        fs::create_dir_all(base.join("repo/.git/info")).unwrap();
+        fs::create_dir_all(base.join("home")).unwrap();
+        fs::create_dir_all(base.join("outside")).unwrap();
+        fs::write(base.join("repo/.git/config"), "[core]\n").unwrap();
+        fs::write(base.join("home/.gitconfig"), "[user]\n").unwrap();
+        let base = fs::canonicalize(&base).unwrap();
+        let root = base.join("repo");
+        let git_dir = root.join(".git");
         let ignore = Ignore::new(&[], None, &[]);
+        let watch =
+            crate::oid_attrs::build_watch(&git_dir, &[base.join("home/.gitconfig")]).unwrap();
         let mut rec = Rec {
             phys: Physical::new(&root, &root),
             ignore: &ignore,
@@ -2425,42 +2602,55 @@ mod tests {
             hashed: 0,
             oid_epoch: Some(Arc::new(crate::oid_attrs::Epoch {
                 basis: HashMap::new(),
-                git_dir: root.join(".git-storage"),
-                common_dir: root.join(".git-common"),
+                git_dir: git_dir.clone(),
+                common_dir: git_dir.clone(),
+                watch,
             })),
-            cautious_git_config: false,
             link_walks: BTreeMap::new(),
             redirected_reads: HashSet::new(),
         };
+
+        let outside_file = base.join("outside/file");
+        fs::write(&outside_file, b"x").unwrap();
+        assert!(!rec.invalidates_oids(&outside_file, true));
         let ordinary = root.join("ordinary");
-        fs::write(&ordinary, b"ordinary").unwrap();
+        fs::write(&ordinary, b"x").unwrap();
         assert!(!rec.invalidates_oids(&ordinary, true));
-        assert!(rec.invalidates_oids(&root.join("nested/.gitattributes"), false));
-        assert!(rec.invalidates_oids(&root.join(".git/config"), true));
-        for dir in [".git-storage", ".git-common"] {
-            fs::create_dir(root.join(dir)).unwrap();
-            let metadata = root.join(dir).join("config");
-            fs::write(&metadata, b"config").unwrap();
-            assert!(rec.invalidates_oids(&metadata, true));
-        }
-        let git_alias = root.join("metadata-alias");
-        std::os::unix::fs::symlink(root.join(".git-storage"), &git_alias).unwrap();
-        assert!(rec.invalidates_oids(&git_alias.join("config"), true));
-        assert!(rec.invalidates_oids(&root.parent().unwrap().join("outside"), true));
-        assert!(!rec.invalidates_oids(Path::new("/dev/null"), true));
+        fs::create_dir_all(git_dir.join("objects")).unwrap();
+        assert!(!rec.invalidates_oids(&git_dir.join("objects/aa"), false));
 
-        let attrs = root.join(".gitattributes");
-        fs::write(&attrs, b"* -text\n").unwrap();
-        let link = root.join("attribute-symlink");
-        std::os::unix::fs::symlink(&attrs, &link).unwrap();
-        assert!(rec.invalidates_oids(&link, true));
-        let alias = root.join("linked-attributes");
-        fs::hard_link(attrs, &alias).unwrap();
+        assert!(rec.invalidates_oids(&base.join("home/.gitconfig"), true));
+        assert!(rec.invalidates_oids(&git_dir.join("config"), true));
+        assert!(rec.invalidates_oids(&git_dir.join("info/attributes"), true));
+        assert!(rec.invalidates_oids(&git_dir.join("index"), true));
+
+        let alias = base.join("outside/alias");
+        fs::hard_link(base.join("home/.gitconfig"), &alias).unwrap();
         assert!(rec.invalidates_oids(&alias, true));
+        let link = base.join("outside/link");
+        std::os::unix::fs::symlink(git_dir.join("info"), &link).unwrap();
+        assert!(rec.invalidates_oids(&link.join("attributes"), true));
 
-        rec.cautious_git_config = true;
+        fs::create_dir_all(root.join("nested/.git")).unwrap();
+        assert!(rec.invalidates_oids(&root.join("nested/.gitattributes"), false));
+        assert!(rec.invalidates_oids(&root.join("nested/.git/config"), true));
+        fs::hard_link(&ordinary, root.join("linked")).unwrap();
         assert!(rec.invalidates_oids(&ordinary, true));
-        fs::remove_dir_all(root).unwrap();
+        // A path that cannot be placed, and a name that cannot be read, both count.
+        assert!(
+            rec.invalidates_oids(Path::new("/"), true),
+            "an unplaceable path counts"
+        );
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = base.join("locked");
+            fs::create_dir_all(locked.join("inner")).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let unreadable = rec.invalidates_oids(&locked.join("inner/file"), true);
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(unreadable, "a name that cannot be read counts");
+        }
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]

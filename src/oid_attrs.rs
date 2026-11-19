@@ -1,10 +1,11 @@
 //! Evidence that hashing raw working-tree bytes is safe for Git object IDs.
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
+use std::borrow::Cow;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::ffi::{OsStr, OsString};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// A path Git printed, as an `OsStr`. Git for Windows prints UTF-8, and a name that is not
 /// valid UTF-8 there cannot be used as evidence.
@@ -33,16 +34,28 @@ fn single_link(metadata: &std::fs::Metadata) -> bool {
     }
 }
 
+/// The device and inode that every hard link to a file shares. Stable Rust has no such identity on
+/// Windows, so a file there has none, and a watched file without one declines the snapshot.
+#[cfg(unix)]
+fn file_identity(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(_metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OidBasis {
-    pub text: String,
-    pub eol: String,
-    pub filter: String,
-    pub ident: String,
-    pub working_tree_encoding: String,
-    pub export_subst: String,
-    pub crlf: String,
-    pub autocrlf: String,
+    pub text: Cow<'static, str>,
+    pub eol: Cow<'static, str>,
+    pub filter: Cow<'static, str>,
+    pub ident: Cow<'static, str>,
+    pub working_tree_encoding: Cow<'static, str>,
+    pub export_subst: Cow<'static, str>,
+    pub crlf: Cow<'static, str>,
+    pub autocrlf: Cow<'static, str>,
 }
 
 impl OidBasis {
@@ -58,7 +71,7 @@ impl OidBasis {
             &self.crlf,
         ]
         .iter()
-        .all(|value| value.as_str() == "unspecified")
+        .all(|value| value.as_ref() == "unspecified")
             && (self.autocrlf == "unset"
                 || self.autocrlf.eq_ignore_ascii_case("false")
                 || self.autocrlf.eq_ignore_ascii_case("no")
@@ -75,6 +88,34 @@ pub struct Epoch {
     pub git_dir: PathBuf,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub common_dir: PathBuf,
+    /// The names whose change can alter what Git reads for attributes or configuration.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub watch: Watch,
+}
+
+/// Git's attribute and configuration sources, resolved once before the run. Each name on the way
+/// to a source counts (directories and symbolic links included), so renaming, removing or
+/// replacing any of them changes what Git reads. A source that exists also counts by identity, so
+/// a hard link to it does.
+#[derive(Clone, Debug, Default)]
+pub struct Watch {
+    names: BTreeSet<PathBuf>,
+    inodes: BTreeSet<(u64, u64)>,
+}
+
+impl Watch {
+    /// Whether a namespace change at this physical name, or a write to a file there, can change
+    /// what Git reads.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn names_contain(&self, physical: &Path) -> bool {
+        self.names.contains(physical)
+    }
+
+    /// Whether this metadata is a watched file, whatever name it is reached by.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn is_watched_file(&self, metadata: &std::fs::Metadata) -> bool {
+        metadata.is_file() && file_identity(metadata).is_some_and(|id| self.inodes.contains(&id))
+    }
 }
 
 // Limit every response, including large index and attribute reports. An
@@ -180,11 +221,13 @@ fn repo_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
 // Git's human-readable states collide with literal attribute values. --all
 // reports only present attributes, so escape these spellings and the escape
 // prefix. No caller can confuse a present value with an absent attribute.
-fn present_value(value: &str) -> String {
-    if matches!(value, "set" | "unset" | "unspecified") || value.starts_with("present:") {
-        format!("present:{value}")
-    } else {
-        value.to_owned()
+fn present_value(value: &str) -> Cow<'static, str> {
+    match value {
+        "set" => Cow::Borrowed("present:set"),
+        "unset" => Cow::Borrowed("present:unset"),
+        "unspecified" => Cow::Borrowed("present:unspecified"),
+        _ if value.starts_with("present:") => Cow::Owned(format!("present:{value}")),
+        _ => Cow::Owned(value.to_owned()),
     }
 }
 
@@ -209,6 +252,11 @@ fn config(root: &Path) -> Option<String> {
             Some(i) => (&entry[..i], &entry[i + 1..]),
             None => (entry, b"true".as_slice()),
         };
+        // `git var -l` prints each entry as a line, so a value with a newline could forge a
+        // `GIT_CONFIG_GLOBAL=` or `GIT_ATTR_GLOBAL=` line. No such value is trusted.
+        if value.contains(&b'\n') {
+            return None;
+        }
         let key = std::str::from_utf8(key).ok()?.to_ascii_lowercase();
         if key.is_empty()
             || key == "core.attributesfile"
@@ -237,7 +285,7 @@ fn config(root: &Path) -> Option<String> {
         }
         if key == "core.autocrlf" {
             let value = std::str::from_utf8(value).ok()?;
-            autocrlf = present_value(value);
+            autocrlf = present_value(value).into_owned();
         }
     }
     Some(autocrlf)
@@ -326,22 +374,10 @@ fn regular_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
 }
 
+/// The tracked paths that get a basis. Untracked files get none: a worktree walk for them would
+/// cost time on every run, and an untracked file has no committed blob for an id to match.
 fn known_paths(root: &Path) -> Option<HashSet<String>> {
-    let mut index = index_paths(root)?;
-    let report = crate::gitprobe::output(
-        root,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-        b"",
-        MAX_OUTPUT,
-    )?;
-    for entry in nul_fields(&report)? {
-        if let Some(path) = std::str::from_utf8(entry)
-            .ok()
-            .filter(|path| valid_path(path))
-        {
-            index.paths.insert(path.to_owned());
-        }
-    }
+    let index = index_paths(root)?;
     // A tracked attribute file missing from the worktree, as in a sparse checkout,
     // may still apply to its directory. Paths beneath it have unknown attributes.
     let unmaterialized: HashSet<String> = index
@@ -392,7 +428,11 @@ fn empty_basis(autocrlf: &str) -> OidBasis {
         working_tree_encoding: "unspecified".into(),
         export_subst: "unspecified".into(),
         crlf: "unspecified".into(),
-        autocrlf: autocrlf.to_owned(),
+        autocrlf: if autocrlf == "unset" {
+            Cow::Borrowed("unset")
+        } else {
+            Cow::Owned(autocrlf.to_owned())
+        },
     }
 }
 
@@ -464,6 +504,7 @@ pub(crate) fn snapshot(root: &Path) -> Option<Epoch> {
     let root = root.canonicalize().ok()?;
     let (git_dir, common_dir) = repo_dirs(&root)?;
     let autocrlf = config(&root)?;
+    let watch = build_watch(&git_dir, &external_sources(&root)?)?;
     let paths = known_paths(&root)?;
     if !safe_worktree_sources(&root, &paths) {
         return None;
@@ -485,6 +526,7 @@ pub(crate) fn snapshot(root: &Path) -> Option<Epoch> {
         basis: attributes(basis, &report)?,
         git_dir,
         common_dir,
+        watch,
     })
 }
 
@@ -521,6 +563,166 @@ pub fn directory_removal_invalidates(path: &Path) -> bool {
     !std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
 
+/// The configuration and attribute files Git reads from outside the repository. `git var -l` names
+/// them whether or not they exist, so a file the run creates is watched too. Git's system files are
+/// also watched by their fixed names, whatever the report says. A relative name, or a report without
+/// a global configuration and attribute file, declines.
+fn external_sources(root: &Path) -> Option<Vec<PathBuf>> {
+    let report = crate::gitprobe::output(root, &["var", "-l"], b"", MAX_OUTPUT)?;
+    external_sources_in(&report)
+}
+
+/// The external sources that a `git var -l` report names. See `external_sources`.
+fn external_sources_in(report: &[u8]) -> Option<Vec<PathBuf>> {
+    let mut sources = vec![
+        PathBuf::from("/etc/gitconfig"),
+        PathBuf::from("/etc/gitattributes"),
+    ];
+    let (mut config, mut attributes) = (false, false);
+    for line in report.split(|byte| *byte == b'\n') {
+        let Some(split) = line.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        let (key, value) = (&line[..split], &line[split + 1..]);
+        match key {
+            b"GIT_CONFIG_GLOBAL" => config = true,
+            b"GIT_ATTR_GLOBAL" => attributes = true,
+            b"GIT_CONFIG_SYSTEM" | b"GIT_ATTR_SYSTEM" => {}
+            _ => continue,
+        }
+        if !value.is_empty() {
+            let path = Path::new(os_str(value)?);
+            if !path.is_absolute() {
+                return None;
+            }
+            sources.push(path.to_path_buf());
+        }
+    }
+    (config && attributes).then_some(sources)
+}
+
+#[cfg(all(test, unix))]
+mod external_source_tests {
+    use super::external_sources_in;
+    use std::path::PathBuf;
+
+    #[test]
+    fn every_reported_name_counts_and_a_missing_global_name_declines() {
+        let report = b"user.name=x\nGIT_CONFIG_SYSTEM=/opt/git/gitconfig\nGIT_ATTR_SYSTEM=/opt/git/gitattributes\nGIT_CONFIG_GLOBAL=/h/.config/git/config\nGIT_CONFIG_GLOBAL=/h/.gitconfig\nGIT_ATTR_GLOBAL=/h/.config/git/attributes\n";
+        let sources = external_sources_in(report).unwrap();
+        for path in [
+            "/etc/gitconfig",
+            "/etc/gitattributes",
+            "/opt/git/gitconfig",
+            "/opt/git/gitattributes",
+            "/h/.config/git/config",
+            "/h/.gitconfig",
+            "/h/.config/git/attributes",
+        ] {
+            assert!(sources.contains(&PathBuf::from(path)), "{path}");
+        }
+        assert!(external_sources_in(b"GIT_CONFIG_GLOBAL=/h/.gitconfig\n").is_none());
+        assert!(external_sources_in(b"GIT_ATTR_GLOBAL=/h/attributes\n").is_none());
+        assert!(
+            external_sources_in(b"GIT_CONFIG_GLOBAL=.gitconfig\nGIT_ATTR_GLOBAL=/h/a\n").is_none()
+        );
+    }
+}
+
+pub(crate) fn is_absent(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENOTDIR)
+}
+
+/// Record every name on the way to an absolute `path`: each directory, each symbolic link and the
+/// file. Names that do not exist yet count too, since the run may create them. A file that exists
+/// is recorded by identity as well. None when a name cannot be read or the path loops.
+fn watch_path(path: &Path, watch: &mut Watch) -> Option<()> {
+    let mut pending = path_parts(path);
+    let mut current = PathBuf::from("/");
+    let mut links = 0;
+    while let Some(part) = pending.pop_front() {
+        if part == ".." {
+            current.pop();
+            continue;
+        }
+        let name = current.join(&part);
+        watch.names.insert(name.clone());
+        match std::fs::symlink_metadata(&name) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                links += 1;
+                if links > 40 {
+                    return None;
+                }
+                let target = std::fs::read_link(&name).ok()?;
+                if target.is_absolute() {
+                    current = PathBuf::from("/");
+                }
+                for part in path_parts(&target).into_iter().rev() {
+                    pending.push_front(part);
+                }
+            }
+            Ok(metadata) if pending.is_empty() => {
+                if metadata.is_file() {
+                    watch.inodes.insert(file_identity(&metadata)?);
+                }
+                return Some(());
+            }
+            Ok(metadata) if metadata.is_dir() => current = name,
+            Ok(_) => return names_below(name, &mut pending, watch),
+            Err(error) if is_absent(&error) => return names_below(name, &mut pending, watch),
+            Err(_) => return None,
+        }
+    }
+    Some(())
+}
+
+fn path_parts(path: &Path) -> VecDeque<OsString> {
+    path.components()
+        .filter_map(|part| match part {
+            Component::Normal(name) => Some(name.to_os_string()),
+            Component::ParentDir => Some(OsString::from("..")),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+        })
+        .collect()
+}
+
+/// The names beneath a name that is missing, or is not a directory. None of them can exist yet,
+/// so the run may create any of them. A parent reference past such a name cannot be followed.
+fn names_below(
+    mut name: PathBuf,
+    pending: &mut VecDeque<OsString>,
+    watch: &mut Watch,
+) -> Option<()> {
+    while let Some(part) = pending.pop_front() {
+        if part == ".." {
+            return None;
+        }
+        name.push(part);
+        watch.names.insert(name.clone());
+    }
+    Some(())
+}
+
+/// The watched set for one repository: Git's external sources, and the files of its git directory
+/// that Git reads for attributes or configuration. The index counts too: Git reads an attribute
+/// file from it when the worktree copy is missing.
+pub(crate) fn build_watch(git_dir: &Path, sources: &[PathBuf]) -> Option<Watch> {
+    let mut watch = Watch::default();
+    for source in sources {
+        watch_path(source, &mut watch)?;
+    }
+    for name in [
+        "config",
+        "config.worktree",
+        "commondir",
+        "index",
+        "info/attributes",
+    ] {
+        watch_path(&git_dir.join(name), &mut watch)?;
+    }
+    Some(watch)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -545,6 +747,9 @@ mod tests {
             repo.git(&["init", "-q"]);
             repo.write("plain.txt", "plain\n");
             repo.write("file.txt", "file\n");
+            // Fixture inputs are tracked, as committed inputs are. A file that is only written is
+            // untracked and has no basis.
+            repo.git(&["add", "--", "plain.txt", "file.txt"]);
             repo
         }
 
@@ -677,7 +882,6 @@ mod tests {
         );
         repo.write(".gitignore", "ignored.txt\n");
         repo.write("ignored.txt", "ignored\n");
-        repo.git(&["add", "--", "plain.txt"]);
         let epoch = snapshot(&repo.0).unwrap();
         let plain = &epoch.basis["plain.txt"];
         assert_eq!(plain.eol, "unspecified");
@@ -716,7 +920,6 @@ mod tests {
     fn known_gitlink_and_descendants_are_not_parent_blob_candidates() {
         let parent = Repo::new();
         let child = Repo::new();
-        child.git(&["add", "--", "plain.txt", "file.txt"]);
         child.git(&[
             "-c",
             "user.name=Test",
@@ -897,6 +1100,7 @@ mod tests {
         ];
         for path in &names[..4] {
             repo.write(path, "contents\n");
+            repo.git(&["add", "--", *path]);
         }
         let paths: Vec<_> = names.iter().map(|s| (*s).to_owned()).collect();
         let result = check_many(&repo.0, &paths);
@@ -907,6 +1111,120 @@ mod tests {
         for path in &names[3..7] {
             assert!(!result.contains_key(*path));
         }
+    }
+
+    #[test]
+    fn untracked_files_get_no_basis() {
+        let repo = Repo::new();
+        repo.write("loose.txt", "loose\n");
+        assert!(check(&repo.0, "loose.txt").is_none());
+        assert!(observe(&repo.0, "loose.txt").is_none());
+        assert!(snapshot(&repo.0).unwrap().basis.contains_key("file.txt"));
+    }
+
+    /// A scratch directory that removes itself. Its path is canonical, because watched names are
+    /// physical.
+    fn scratch(name: &str) -> Repo {
+        let path = std::env::temp_dir().join(format!(
+            "stoop-oid-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        Repo(fs::canonicalize(path).unwrap())
+    }
+
+    #[test]
+    fn watch_names_every_name_on_the_way_to_a_source() {
+        let base = scratch("watch-names");
+        fs::create_dir_all(base.0.join("a/b")).unwrap();
+        fs::write(base.0.join("a/b/file"), "x").unwrap();
+        std::os::unix::fs::symlink("a/b", base.0.join("link")).unwrap();
+        let mut watch = Watch::default();
+        watch_path(&base.0.join("link/file"), &mut watch).unwrap();
+        for name in ["link", "a", "a/b", "a/b/file"] {
+            assert!(watch.names_contain(&base.0.join(name)), "{name}");
+        }
+        assert!(watch.is_watched_file(&fs::metadata(base.0.join("a/b/file")).unwrap()));
+        let mut missing = Watch::default();
+        watch_path(&base.0.join("a/new/leaf"), &mut missing).unwrap();
+        for name in ["a/new", "a/new/leaf"] {
+            assert!(missing.names_contain(&base.0.join(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn watch_declines_loops_long_chains_and_unreadable_names() {
+        let base = scratch("watch-loops");
+        std::os::unix::fs::symlink("loop2", base.0.join("loop1")).unwrap();
+        std::os::unix::fs::symlink("loop1", base.0.join("loop2")).unwrap();
+        assert!(watch_path(&base.0.join("loop1"), &mut Watch::default()).is_none());
+        fs::write(base.0.join("target"), "x").unwrap();
+        // Forty links resolve. A forty-first declines.
+        for (links, resolves) in [(40, true), (41, false)] {
+            for i in 0..links {
+                let next = if i + 1 == links {
+                    "target".to_owned()
+                } else {
+                    format!("c{}", i + 1)
+                };
+                std::os::unix::fs::symlink(next, base.0.join(format!("c{i}"))).unwrap();
+            }
+            let watched = watch_path(&base.0.join("c0"), &mut Watch::default()).is_some();
+            assert_eq!(watched, resolves, "{links} links");
+            for i in 0..links {
+                fs::remove_file(base.0.join(format!("c{i}"))).unwrap();
+            }
+        }
+        // Root reads every name, so the unreadable case is only meaningful without it.
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = base.0.join("locked");
+            fs::create_dir_all(locked.join("inner")).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let unknown = watch_path(&locked.join("inner/file"), &mut Watch::default()).is_none();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(unknown, "a name that cannot be read counts");
+        }
+    }
+
+    #[test]
+    fn a_parent_reference_past_a_missing_name_is_unknown() {
+        let base = scratch("watch-dotdot");
+        assert!(watch_path(&base.0.join("missing/../file"), &mut Watch::default()).is_none());
+    }
+
+    #[test]
+    fn the_git_directory_sources_are_watched_whether_or_not_they_exist() {
+        let base = scratch("watch-git");
+        let git_dir = base.0.join(".git");
+        fs::create_dir_all(git_dir.join("info")).unwrap();
+        fs::create_dir_all(git_dir.join("objects/aa")).unwrap();
+        let watch = build_watch(&git_dir, &[base.0.join("home/.gitconfig")]).unwrap();
+        for name in [
+            "config",
+            "config.worktree",
+            "commondir",
+            "index",
+            "info/attributes",
+        ] {
+            assert!(watch.names_contain(&git_dir.join(name)), "{name}");
+        }
+        assert!(watch.names_contain(&base.0.join("home/.gitconfig")));
+        assert!(!watch.names_contain(&git_dir.join("objects/aa")));
+    }
+
+    #[test]
+    fn a_hard_link_to_a_watched_file_is_watched_by_identity() {
+        let base = scratch("watch-identity");
+        fs::create_dir_all(base.0.join("home")).unwrap();
+        fs::create_dir_all(base.0.join("other")).unwrap();
+        fs::write(base.0.join("home/.gitconfig"), "[user]\n").unwrap();
+        let watch = build_watch(&base.0.join(".git"), &[base.0.join("home/.gitconfig")]).unwrap();
+        let alias = base.0.join("other/alias");
+        fs::hard_link(base.0.join("home/.gitconfig"), &alias).unwrap();
+        assert!(watch.is_watched_file(&fs::metadata(&alias).unwrap()));
+        assert!(!watch.names_contain(&alias));
     }
 
     #[test]
@@ -1094,5 +1412,16 @@ mod tests {
                 String::from_utf8_lossy(&out.stdout)
             );
         }
+    }
+
+    #[test]
+    fn a_config_value_with_a_newline_declines_the_snapshot() {
+        let repo = Repo::new();
+        repo.git(&[
+            "config",
+            "stoop.injected",
+            "a\nGIT_CONFIG_GLOBAL=/nonexistent/injected",
+        ]);
+        assert!(snapshot(&repo.0).is_none());
     }
 }

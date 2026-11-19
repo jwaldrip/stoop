@@ -1844,6 +1844,12 @@ mod tests {
             .success());
         std::fs::write(root.join(".gitattributes"), "*.txt eol=crlf\n").unwrap();
         std::fs::write(root.join("file.txt"), b"line\r\n").unwrap();
+        assert!(std::process::Command::new("git")
+            .args(["add", "--", "file.txt"])
+            .current_dir(&root)
+            .status()
+            .unwrap()
+            .success());
         let mut trace = Trace::default();
         trace.touched.insert(
             root.join("file.txt"),
@@ -1867,7 +1873,7 @@ mod tests {
             .unwrap();
         assert!(input.oid.is_none());
         assert_eq!(
-            input.oid_basis.as_ref().map(|basis| basis.eol.as_str()),
+            input.oid_basis.as_ref().map(|basis| &*basis.eol),
             Some("crlf")
         );
         let converted = input.oid_basis.clone().unwrap();
@@ -1893,6 +1899,7 @@ mod tests {
             basis: std::collections::HashMap::from([("file.txt".into(), converted)]),
             git_dir: root.join(".git"),
             common_dir: root.join(".git"),
+            watch: Default::default(),
         }));
         trace.oid_attrs_changed = true;
         let (inputs, _) = build_inputs(
