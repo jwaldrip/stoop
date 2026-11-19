@@ -160,7 +160,7 @@ fn literal_mode_and_ordinary_empty_values_do_not_rewrite_argv() {
     assert_eq!(f.log(), "arg=<--files>\narg=<{changed}>\nchanged=<UNSET>\n");
 
     let f = Fixture::new();
-    let out = f.invoke(&[], &["--only", ""], true);
+    let out = f.invoke(&[], &["--only", ""], false);
     assert!(out.status.success(), "{}", err(&out));
     assert!(err(&out).contains("quote"), "{}", err(&out));
     assert_eq!(f.log(), "arg=<--only>\narg=<>\nchanged=<UNSET>\n");

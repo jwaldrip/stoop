@@ -29,6 +29,8 @@ pub struct Opts {
     pub transient: Vec<String>,
     pub no_record: bool,
     pub quiet: bool,
+    pub literal: bool,
+    pub no_split: bool,
     /// Environment variables exempted from the whole-environment input.
     pub ignore_env: Vec<String>,
     /// Record runs that used the network (their results are invisible to a file trace).
@@ -149,6 +151,38 @@ fn default_key(argv: &[String], rel_cwd: &str, scope: Option<&str>) -> String {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "cmd".into());
     format!("{}-{}", sanitize(&base), &h.finalize().to_hex()[..16])
+}
+
+fn hook_key(
+    hook: &units::hook::Hook,
+    label: Option<&str>,
+    cwd: &str,
+    scope: Option<&str>,
+) -> String {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"stoop-hook-v1\0");
+    for words in [&hook.original, &hook.argv] {
+        hash.update(&(words.len() as u64).to_le_bytes());
+        for word in words {
+            hash.update(&(word.len() as u64).to_le_bytes());
+            hash.update(word.as_bytes());
+        }
+    }
+    for value in [cwd, scope.unwrap_or(""), label.unwrap_or("")] {
+        hash.update(&(value.len() as u64).to_le_bytes());
+        hash.update(value.as_bytes());
+    }
+    let base = label.unwrap_or_else(|| {
+        Path::new(&hook.original[0])
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("cmd")
+    });
+    format!(
+        "hook-{}-{}",
+        sanitize(base),
+        &hash.finalize().to_hex()[..16]
+    )
 }
 
 /// The environment counts as an input, because a variable read never shows up in
@@ -335,20 +369,65 @@ pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
     run_internal(o, explain, false)
 }
 
-fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
-    let key = o.key.clone().unwrap_or_default();
+/// Export the hook variables as empty and launch the execution form of the command.
+fn apply_hook(o: &mut Opts, hook: &units::hook::Hook) {
+    for name in ["STOOP_CHANGED", "STOOP_CHANGED_INPUTS", "STOOP_UNITS"] {
+        if std::env::var_os(name).is_some_and(|value| !value.is_empty()) {
+            eprintln!("stoop: ignoring inherited {name}; the shell may already have expanded it");
+        }
+    }
+    for name in [
+        "STOOP_CHANGED",
+        "STOOP_CHANGED_FILE",
+        "STOOP_CHANGED_INPUTS",
+        "STOOP_CHANGED_INPUTS_FILE",
+        "STOOP_UNITS",
+    ] {
+        std::env::set_var(name, "");
+    }
+    o.argv.clone_from(&hook.argv);
+}
+
+/// Remove the hook records and proofs stored under one key.
+pub fn forget_hook_records(o: &Opts, key: &str) -> std::io::Result<bool> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = root_for(o, &cwd);
+    units::hook_store::forget(&store_for(o, &cwd, &root), key)
+}
+
+fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
+    let initial_key = o.key.clone().unwrap_or_default();
     if o.argv.is_empty() {
         eprintln!("stoop: no command given");
         return Outcome {
             status: 2,
-            key,
+            key: initial_key,
             how: How::Untraced,
         };
+    }
+    let literal = o.literal || !observe_runners;
+    let mut hook = if literal {
+        None
+    } else {
+        match units::hook::prepare(&o.argv) {
+            Ok(hook) => hook,
+            Err(error) => {
+                eprintln!("stoop: {error}");
+                return Outcome {
+                    status: 2,
+                    key: initial_key,
+                    how: How::Untraced,
+                };
+            }
+        }
+    };
+    if let Some(h) = &hook {
+        apply_hook(&mut o, h);
     }
     if env_flag("STOOP_OFF") && !explain {
         return Outcome {
             status: plain(&o.argv),
-            key,
+            key: initial_key,
             how: How::Untraced,
         };
     }
@@ -357,16 +436,115 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     let rel_cwd = cwd_key(&root, &cwd);
     let store_path = store_for(&o, &cwd, &root);
     let scope = shared_scope(&root, &store_path);
-    let key = o
-        .key
-        .as_deref()
-        .map(|key| {
-            if o.shell_key {
-                return crate::stepkey::scoped(key, scope.as_deref());
-            }
-            sanitize(key)
+    let max_age = o
+        .max_age
+        .or_else(|| {
+            std::env::var("STOOP_MAX_AGE")
+                .ok()
+                .and_then(|v| parse_age(&v).ok())
         })
-        .unwrap_or_else(|| default_key(&o.argv, &rel_cwd, scope.as_deref()));
+        .unwrap_or(DEFAULT_MAX_AGE);
+    let mut erased = false;
+    if !literal && hook.is_none() {
+        let records = match units::hook_store::records(&store_path, now(), max_age) {
+            Ok(records) => records,
+            Err(error) => {
+                eprintln!("stoop: cannot read hook records: {error}");
+                return Outcome {
+                    status: 125,
+                    key: initial_key,
+                    how: How::Untraced,
+                };
+            }
+        };
+        for record in records
+            .into_iter()
+            .filter(|r| r.cwd == rel_cwd && r.scope == scope && r.label == o.key)
+        {
+            let candidate = match units::hook::prepare(&record.argv) {
+                Ok(Some(candidate)) if units::hook::expanded_matches(&candidate, &o.argv) => {
+                    candidate
+                }
+                _ => continue,
+            };
+            if hook
+                .as_ref()
+                .is_some_and(|existing| existing.argv != candidate.argv)
+            {
+                eprintln!("stoop: this command matches multiple recorded hooks; quote the placeholder or use --literal");
+                return Outcome {
+                    status: 2,
+                    key: initial_key,
+                    how: How::Untraced,
+                };
+            }
+            hook = Some(candidate);
+            erased = true;
+        }
+        if let Some(h) = &hook {
+            apply_hook(&mut o, h);
+        }
+    }
+    if erased {
+        let shown = hook
+            .as_ref()
+            .map(|h| h.placeholder.as_str())
+            .unwrap_or("{changed}");
+        eprintln!("stoop: the shell expanded {shown:?} from a recorded hook; running the full command; quote it");
+    } else if hook.is_none() && !literal {
+        if let Some(hint) = units::hook::empty_hint(&o.argv) {
+            eprintln!("stoop: {hint}");
+        }
+    }
+    let key = hook
+        .as_ref()
+        .map(|h| hook_key(h, o.key.as_deref(), &rel_cwd, scope.as_deref()))
+        .unwrap_or_else(|| {
+            o.key
+                .as_deref()
+                .map(|key| {
+                    if o.shell_key {
+                        crate::stepkey::scoped(key, scope.as_deref())
+                    } else {
+                        sanitize(key)
+                    }
+                })
+                .unwrap_or_else(|| default_key(&o.argv, &rel_cwd, scope.as_deref()))
+        });
+    if explain && erased {
+        let placeholder = hook
+            .as_ref()
+            .map(|h| h.placeholder.clone())
+            .unwrap_or_default();
+        eprintln!(
+            "stoop: would run full: the shell expanded the recorded hook {placeholder:?}; quote it"
+        );
+        return Outcome {
+            status: 1,
+            key,
+            how: How::Untraced,
+        };
+    }
+    if let Some(h) = &hook {
+        if !erased && !explain && !o.no_record {
+            let record = units::hook_store::Record {
+                key: key.clone(),
+                argv: h.original.clone(),
+                cwd: rel_cwd.clone(),
+                scope: scope.clone(),
+                label: o.key.clone(),
+                created: now(),
+            };
+            if let Err(error) = units::hook_store::record(&store_path, record, now(), max_age) {
+                eprintln!("stoop: cannot save hook record: {error}");
+                return Outcome {
+                    status: 125,
+                    key,
+                    how: How::Untraced,
+                };
+            }
+        }
+    }
     let store = Store::new(store_path);
     if explain && !o.quiet {
         let dir = if rel_cwd.is_empty() { "." } else { &rel_cwd };
@@ -374,10 +552,17 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     }
     if !trace::supported() {
         if explain {
-            eprintln!(
-                "stoop: would run {key}: not traced ({}); no proof can be used",
-                trace::UNAVAILABLE
-            );
+            match &hook {
+                Some(h) => eprintln!(
+                    "stoop: would run full {key} (not traced: {}): removed {:?}",
+                    trace::UNAVAILABLE,
+                    h.removed
+                ),
+                None => eprintln!(
+                    "stoop: would run {key}: not traced ({}); no proof can be used",
+                    trace::UNAVAILABLE
+                ),
+            }
             return Outcome {
                 status: 1,
                 key,
@@ -433,7 +618,7 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
 
     // 1. Is there a proof whose inputs all still match?
     let t0 = Instant::now();
-    let mut proofs = store.load(&key);
+    let mut proofs = if erased { Vec::new() } else { store.load(&key) };
     let mut pulled = false;
     let mut probe_now: Option<Option<BTreeMap<String, String>>> = None;
     let mut why;
@@ -513,7 +698,7 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             }
         }
         // A miss with a remote configured: someone else may already have proved this.
-        if hit_idx.is_some() || pulled || remote.is_none() {
+        if hit_idx.is_some() || pulled || remote.is_none() || erased {
             break;
         }
         pulled = true;
@@ -546,7 +731,13 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         why = "STOOP_FULL is set".into();
     }
     if explain {
-        eprintln!("stoop: would run {key}: {why}");
+        match &hook {
+            Some(h) => eprintln!(
+                "stoop: would run full {key} ({why}): removed {:?}",
+                h.removed
+            ),
+            None => eprintln!("stoop: would run {key}: {why}"),
+        }
         return Outcome {
             status: 1,
             key,
@@ -554,7 +745,10 @@ fn run_internal(o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         };
     }
     if !o.quiet {
-        eprintln!("stoop: run {key}: {why}");
+        match &hook {
+            Some(h) => eprintln!("stoop: run full {key} ({why}): removed {:?}", h.removed),
+            None => eprintln!("stoop: run {key}: {why}"),
+        }
     }
 
     // 2. Run it, watched. Anything that stops the watch from working just runs the command.
