@@ -1154,6 +1154,8 @@ fn changes_to_git_sources_drop_every_blob_id_in_the_run() {
         ("fchown-home-config", &[("H:.gitconfig", Some("[user]\n"))], "./syscall-probe fchown-same \"$HOME/.gitconfig\""),
         ("fifo-at-xdg-attributes", &[("X:git", None)], "mkfifo \"$XDG_CONFIG_HOME/git/attributes\""),
         ("home-directory-chmod", &[("H:.gitconfig", Some("[user]\n"))], "chmod 700 \"$HOME\""),
+        ("home-config-chown-coreutils", &[("H:.gitconfig", Some("[user]\n"))], "chown \"$(id -u)\" \"$HOME/.gitconfig\""),
+        ("repo-directory-with-attributes-renamed", &[("R:sub/.gitattributes", Some("* -text\n")), ("R:sub/x.txt", Some("x\n"))], "mv sub sub2"),
     ];
     for (name, entries, script) in cases {
         let changed_script = format!("cat in.txt >/dev/null && {script}");
