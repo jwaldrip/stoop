@@ -689,3 +689,59 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    fn cmd(script: &str) -> Command {
+        let mut command = Command::new("cmd");
+        command.args(["/c", script]);
+        command
+    }
+
+    const WAIT: Duration = Duration::from_secs(20);
+
+    #[test]
+    fn zero_exit_returns_the_output() {
+        let out = run(cmd("echo abc"), b"", 100, WAIT).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "abc");
+    }
+
+    #[test]
+    fn input_reaches_the_command_and_is_closed() {
+        let out = run(
+            Command::new("findstr").arg("x"),
+            b"x1\r\ny\r\nx2\r\n",
+            100,
+            WAIT,
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out).replace("\r\n", "|"), "x1|x2|");
+    }
+
+    #[test]
+    fn a_nonzero_exit_returns_nothing() {
+        assert_eq!(run(cmd("echo abc & exit 1"), b"", 100, WAIT), None);
+    }
+
+    #[test]
+    fn output_over_the_cap_returns_nothing_and_exactly_the_cap_is_allowed() {
+        // "abc" and the line ending are five bytes.
+        assert_eq!(run(cmd("echo abc"), b"", 4, WAIT), None);
+        assert_eq!(run(cmd("echo abc"), b"", 5, WAIT).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn the_deadline_stops_a_command_that_does_not_finish() {
+        let start = Instant::now();
+        let out = run(
+            cmd("ping -n 20 127.0.0.1 >nul"),
+            b"",
+            100,
+            Duration::from_millis(400),
+        );
+        assert_eq!(out, None);
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+}
