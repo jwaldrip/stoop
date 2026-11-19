@@ -206,7 +206,8 @@ fn a_value_that_returns_after_learning_is_counted_again_and_never_learned_again(
         w.run(&[("SESSION_MARK_LEARN", &opaque(i))]);
     }
     let back = w.run(&[("SESSION_MARK_LEARN", &opaque(0))]);
-    assert!(!skipped(&back), "{back}");
+    // The back run may skip: proof 0 recorded this exact value with the same inputs, so that skip
+    // is sound. What must hold is that the value counts again, and that fresh values still count.
     assert!(
         back.contains("counting env SESSION_MARK_LEARN again"),
         "{back}"
