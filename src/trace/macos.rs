@@ -955,16 +955,16 @@ fn signal_tracer(pid: u32, signal: &str) {
         .status();
 }
 
-/// Whether the DTrace process still exists, checked as root through sudo for the same reason the
-/// signal is.
+/// Whether the DTrace process still exists. Checked with `kill(pid, 0)` and no sudo: sudo only
+/// signals, because `sudo -n` can refuse (an expired credential) and then exits 1 exactly as it
+/// does when the process is gone, which would read a refusal as "stopped". EPERM means the
+/// process exists and belongs to root, so it counts as alive; only ESRCH is gone.
 fn tracer_alive(pid: u32) -> bool {
-    Command::new("sudo")
-        .args(["-n", "/bin/kill", "-0", &pid.to_string()])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success())
+    // SAFETY: signal 0 only tests whether the pid exists.
+    if unsafe { libc::kill(pid as i32, 0) } == 0 {
+        return true;
+    }
+    io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 /// Runs `argv` once under DTrace and returns what was observed. `Err` means the command was
@@ -1015,7 +1015,7 @@ const SUDO: Control = Control {
 
 const DIRECT: Control = Control {
     signal: signal_direct,
-    alive: alive_direct,
+    alive: tracer_alive,
 };
 
 impl Control {
@@ -1037,10 +1037,6 @@ fn signal_direct(pid: u32, signal: &str) {
     unsafe { libc::kill(pid as i32, number) };
 }
 
-fn alive_direct(pid: u32) -> bool {
-    unsafe { libc::kill(pid as i32, 0) == 0 }
-}
-
 /// Stops DTrace by its own pid, through `control`, and reports whether it is gone. INT is sent
 /// first and KILL follows if DTrace survives `timeout`. Returns `false` only when DTrace still
 /// exists after KILL, which is the one fact LEFT_RUNNING reports. sudo's own exit is not
@@ -1052,6 +1048,17 @@ fn reap(tracing: &mut Child, dtrace: u32, timeout: Duration, control: Control) -
         (control.signal)(dtrace, "-KILL");
         gone = wait_gone(tracing, dtrace, timeout, control);
     }
+    if gone {
+        let _ = wait_up_to(tracing, timeout);
+    }
+    gone
+}
+
+/// For a tracer whose output has ended: DTrace has exited and sudo has reaped it, so its pid is
+/// free and may already belong to another process. Nothing is signalled; this only waits for the
+/// pid to disappear and for the launcher's child to exit.
+fn settle(tracing: &mut Child, dtrace: u32, timeout: Duration, control: Control) -> bool {
+    let gone = wait_gone(tracing, dtrace, timeout, control);
     if gone {
         let _ = wait_up_to(tracing, timeout);
     }
@@ -1140,6 +1147,7 @@ fn read_lines(
 ) {
     let mut pending: Vec<u8> = Vec::new();
     let mut chunk = [0u8; 65536];
+    let mut first = true;
     loop {
         let read = match reader.read(&mut chunk) {
             Ok(0) => break,
@@ -1156,15 +1164,23 @@ fn read_lines(
             let end = start + offset;
             let line = &pending[start..end];
             start = end + 1;
-            if let Some(pid) = line
-                .strip_prefix(b"TRACER ")
-                .and_then(|pid| std::str::from_utf8(pid).ok())
-                .and_then(|pid| pid.parse::<u32>().ok())
-            {
-                if let Some(tx) = tracer_pid.take() {
-                    let _ = tx.send(pid);
+            // The announcement is the very first line the tracer prints, and counts once. Any
+            // other `TRACER` line is not an announcement and goes to the observer as a line it
+            // cannot read. Pids 0 and 1 are never DTrace.
+            let first_line = first;
+            first = false;
+            if first_line && tracer_pid.is_some() {
+                if let Some(pid) = line
+                    .strip_prefix(b"TRACER ")
+                    .and_then(|pid| std::str::from_utf8(pid).ok())
+                    .and_then(|pid| pid.parse::<u32>().ok())
+                    .filter(|pid| *pid > 1)
+                {
+                    if let Some(tx) = tracer_pid.take() {
+                        let _ = tx.send(pid);
+                    }
+                    continue;
                 }
-                continue;
             }
             let text = match std::str::from_utf8(line) {
                 Ok(text) => text.to_owned(),
@@ -1240,7 +1256,7 @@ fn note_stderr(observer: &mut Observer, seen: &StderrSeen) {
 
 /// The launcher, with the tracer program and its timeouts supplied.
 pub(crate) fn run_with(
-    mut tracer: Command,
+    tracer: Command,
     script: &str,
     argv: &[OsString],
     cwd: &Path,
@@ -1248,7 +1264,29 @@ pub(crate) fn run_with(
     stop_timeout: Duration,
     keep_raw: bool,
 ) -> io::Result<Diagnostic> {
-    let control = Control::for_run();
+    run_controlled(
+        tracer,
+        script,
+        argv,
+        cwd,
+        ready_timeout,
+        stop_timeout,
+        keep_raw,
+        Control::for_run(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_controlled(
+    mut tracer: Command,
+    script: &str,
+    argv: &[OsString],
+    cwd: &Path,
+    ready_timeout: Duration,
+    stop_timeout: Duration,
+    keep_raw: bool,
+    control: Control,
+) -> io::Result<Diagnostic> {
     let (mut command, mut release) = start_held(argv, cwd)?;
     let root = command.id();
 
@@ -1354,9 +1392,11 @@ pub(crate) fn run_with(
         Err(_) => None,
     };
 
+    let mut stopped_by_itself = true;
     let mut observer = match done_rx.recv_timeout(stop_timeout) {
         Ok(observer) => observer,
         Err(_) => {
+            stopped_by_itself = false;
             (control.signal)(dtrace_pid, "-INT");
             match done_rx.recv_timeout(stop_timeout) {
                 Ok(mut observer) => {
@@ -1375,7 +1415,13 @@ pub(crate) fn run_with(
         Ok(seen) => note_stderr(&mut observer, &seen),
         Err(_) => observer.push_reason(STDERR_STALLED),
     }
-    if !reap(&mut tracing, dtrace_pid, stop_timeout, control) {
+    // Its output ended by itself, so DTrace has exited and its pid is not ours to signal.
+    let gone = if stopped_by_itself {
+        settle(&mut tracing, dtrace_pid, stop_timeout, control)
+    } else {
+        reap(&mut tracing, dtrace_pid, stop_timeout, control)
+    };
+    if !gone {
         observer.push_reason(LEFT_RUNNING);
     }
     if code.is_none() {
@@ -2397,6 +2443,80 @@ mod tests {
     }
 
     fn ignores_signals(_pid: u32, _signal: &str) {}
+
+    static SIGNALS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn counts_signals(_pid: u32, _signal: &str) {
+        SIGNALS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[test]
+    fn a_tracer_that_stopped_by_itself_is_never_signalled() {
+        // Its output ended and it exited, so its pid is free and may belong to another process.
+        // A signal now, sent as root, could hit that process.
+        SIGNALS.store(0, std::sync::atomic::Ordering::SeqCst);
+        let control = Control {
+            signal: counts_signals,
+            alive: tracer_alive,
+        };
+        let argv = [OsString::from("/usr/bin/true")];
+        let d = run_controlled(
+            fake("echo \"TRACER $$\"; echo READY; printf 'EXIT\\t0.2\\t%s\\nSTOP\\n' \"$0\""),
+            "",
+            &argv,
+            Path::new("/"),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            false,
+            control,
+        )
+        .unwrap();
+        assert_eq!(SIGNALS.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(!reasons(&d).iter().any(|r| r.contains("still running")));
+    }
+
+    #[test]
+    fn a_pid_that_does_not_exist_is_gone_and_a_live_one_is_not() {
+        assert!(tracer_alive(std::process::id()));
+        // launchd is owned by root: as a normal user kill(1, 0) fails with EPERM, which means
+        // the process exists. Reading that as "gone" is the sudo-refusal mistake again.
+        assert!(tracer_alive(1), "a root-owned process read as gone");
+        let mut child = Command::new("/usr/bin/true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(!tracer_alive(pid), "an exited, reaped pid reads as alive");
+    }
+
+    #[test]
+    fn only_the_first_tracer_announcement_counts_and_pids_0_and_1_never_do() {
+        for (input, expect) in [
+            (&b"TRACER 42\nREADY\n"[..], Some(42)),
+            (&b"TRACER 0\nTRACER 42\n"[..], None),
+            (&b"TRACER 1\n"[..], None),
+            (&b"TRACER 42\nTRACER 43\n"[..], Some(42)),
+        ] {
+            let (tx, rx) = mpsc::channel();
+            let mut o = observer();
+            let mut ready = None;
+            let mut pid = Some(tx);
+            read_lines(input, &mut o, &mut ready, &mut pid, false);
+            drop(pid);
+            assert_eq!(
+                rx.try_recv().ok(),
+                expect,
+                "{:?}",
+                String::from_utf8_lossy(input)
+            );
+            if input.starts_with(b"TRACER 42\nTRACER 43") {
+                let d = o.finish(0);
+                assert!(
+                    reasons(&d).iter().any(|r| r.contains("could not be read")),
+                    "a second announcement was not reported: {:?}",
+                    reasons(&d)
+                );
+            }
+        }
+    }
 
     #[test]
     fn a_tracer_that_survives_kill_is_reported_as_left_running() {
