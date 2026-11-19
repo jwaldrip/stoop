@@ -533,6 +533,62 @@ fn plain(argv: &[std::ffi::OsString], pass_env: &[&str]) -> i32 {
     }
 }
 
+/// The opt-in macOS diagnostic: run the command once under DTrace and say what it did. Nothing
+/// is recorded. `None` means the tracer could not arm and the command has not run, so the caller
+/// runs it untraced as usual.
+#[cfg(target_os = "macos")]
+fn dtrace_diagnostic(o: &Opts, cwd: &Path, key: &str) -> Option<Outcome> {
+    let diagnostic = match trace::macos::diagnose(&o.argv, cwd) {
+        Ok(diagnostic) => diagnostic,
+        Err(e) => {
+            if !o.quiet {
+                eprintln!("stoop: DTrace diagnostic unavailable ({e}); running untraced");
+            }
+            return None;
+        }
+    };
+    let trace = &diagnostic.trace;
+    if !o.quiet {
+        eprintln!(
+            "stoop: DTrace diagnostic: {} process(es), {} path event(s), {} path(s) looked at, {} written; not recorded",
+            diagnostic.processes,
+            diagnostic.events,
+            trace.touched.len(),
+            trace.written.len()
+        );
+        for reason in trace
+            .unsound
+            .iter()
+            .filter(|reason| reason.as_str() != trace::macos::DIAGNOSTIC_ONLY)
+        {
+            eprintln!(
+                "stoop: DTrace diagnostic is incomplete: {}",
+                shown_text(reason)
+            );
+        }
+        if env_str("STOOP_DTRACE_DIAGNOSTIC").is_some_and(|v| v == "list") {
+            let mut read: Vec<_> = trace.touched.keys().collect();
+            read.sort();
+            for path in read {
+                eprintln!("stoop: dtrace read {}", shown_text(&path.to_string_lossy()));
+            }
+            let mut wrote: Vec<_> = trace.written.iter().chain(&trace.created_dirs).collect();
+            wrote.sort();
+            for path in wrote {
+                eprintln!(
+                    "stoop: dtrace wrote {}",
+                    shown_text(&path.to_string_lossy())
+                );
+            }
+        }
+    }
+    Some(Outcome {
+        status: trace.status,
+        key: key.to_owned(),
+        how: How::Unrecorded("macOS diagnostic trace".into()),
+    })
+}
+
 pub enum How {
     Skipped { proof: String },
     Recorded { proof: String },
@@ -860,6 +916,12 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 key,
                 how: How::Untraced,
             };
+        }
+        #[cfg(target_os = "macos")]
+        if env_switch("STOOP_DTRACE_DIAGNOSTIC", false) {
+            if let Some(outcome) = dtrace_diagnostic(&o, &cwd, &key) {
+                return outcome;
+            }
         }
         if !o.quiet {
             match &hook {
