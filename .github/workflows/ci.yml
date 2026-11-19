@@ -34,9 +34,9 @@ jobs:
           cargo build --locked --quiet
           work="$(mktemp -d)"
           cd "$work"
-          printf 'changed\n' > a.t
-          "$GITHUB_WORKSPACE/target/debug/stoop" run --root . -- /bin/sh -c 'printf "%s\n" "$@"' sh '{changed:*.t}' > out.txt
-          test "$(cat out.txt)" = "{changed:*.t}" || { echo 'quoted placeholder did not arrive intact'; cat out.txt; exit 1; }
+          "$GITHUB_WORKSPACE/target/debug/stoop" run --root . -- /bin/sh -c 'printf "[%s]\n" "$@"' sh '{changed:*.t}' > out.txt 2> err.txt
+          test "$(cat out.txt)" = "[]" || { echo 'the full command got arguments it should not have'; cat out.txt; exit 1; }
+          grep -F 'removed ["{changed:*.t}"]' err.txt || { echo 'the quoted placeholder did not reach stoop intact'; cat err.txt; exit 1; }
 
   linux-arm:
     name: tests (Linux arm64)
