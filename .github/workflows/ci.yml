@@ -27,16 +27,21 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
-      - name: Quoting fixture under the Actions bash shell
+      - name: Changed-unit hook in a run step (brace and environment spellings)
         shell: bash
         run: |
           set -euo pipefail
           cargo build --locked --quiet
+          stoop="$GITHUB_WORKSPACE/target/debug/stoop"
           work="$(mktemp -d)"
           cd "$work"
-          "$GITHUB_WORKSPACE/target/debug/stoop" run --root . -- /bin/sh -c 'printf "[%s]\n" "$@"' sh '{changed:*.t}' > out.txt 2> err.txt
-          test "$(cat out.txt)" = "[]" || { echo 'the full command got arguments it should not have'; cat out.txt; exit 1; }
-          grep -F 'removed ["{changed:*.t}"]' err.txt || { echo 'the quoted placeholder did not reach stoop intact'; cat err.txt; exit 1; }
+          printf 'changed\n' > a.t
+          "$stoop" run --root . -- /bin/sh -c 'printf "[%s]\n" "$@"' sh '{changed:*.t}' > out.txt 2> err.txt
+          test "$(cat out.txt)" = "[]" || { echo 'the brace placeholder did not run the full command'; cat out.txt; exit 1; }
+          grep -F 'removed ["{changed:*.t}"]' err.txt || { echo 'the brace placeholder did not reach stoop intact'; cat err.txt; exit 1; }
+          "$stoop" run --root . -- /bin/sh -c 'printf "[%s]\n" "$@"' sh --files '$STOOP_CHANGED' > out2.txt 2> err2.txt
+          test "$(cat out2.txt)" = "[]" || { echo 'the environment spelling did not run the full command'; cat out2.txt; exit 1; }
+          grep -F 'removed ["--files", "$STOOP_CHANGED"]' err2.txt || { echo 'the environment spelling did not reach stoop intact'; cat err2.txt; exit 1; }
 
   linux-arm:
     name: tests (Linux arm64)
