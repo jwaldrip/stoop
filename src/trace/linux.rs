@@ -501,6 +501,7 @@ fn table() -> Vec<(i64, Vec<Op>)> {
                 LinkSource {
                     dirfd: None,
                     path: 0,
+                    flags: None,
                 },
                 Create {
                     dirfd: None,
