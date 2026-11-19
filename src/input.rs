@@ -12,7 +12,10 @@ use crate::pathutil::from_key;
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -54,8 +57,7 @@ pub fn identify_recorded(
     match fs::symlink_metadata(path) {
         Err(e) => {
             let id = match e.kind() {
-                io::ErrorKind::NotFound => "a",
-                _ if e.raw_os_error() == Some(libc::ENOTDIR) => "a",
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => "a",
                 _ => "u",
             };
             inside.then(|| (id.to_owned(), None))
@@ -79,13 +81,26 @@ pub fn identify_recorded(
                     hash_file(path).map(|hash| (hash, None))
                 };
                 match hash {
-                    Ok((hash, oid)) => Some((file_id(m.mode() & 0o111 != 0, &hash), oid)),
+                    Ok((hash, oid)) => Some((file_id(executable(&m), &hash), oid)),
                     Err(_) => inside.then(|| ("u".to_owned(), None)),
                 }
             } else {
                 None
             }
         }
+    }
+}
+
+/// Whether any execute bit is set. Windows files have none, so their ids are always `f:`.
+fn executable(metadata: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        metadata.mode() & 0o111 != 0
+    }
+    #[cfg(windows)]
+    {
+        let _ = metadata;
+        false
     }
 }
 
@@ -97,8 +112,7 @@ pub fn records_oids(root: &Path) -> bool {
 fn list_hash(dir: &Path) -> Option<String> {
     let mut names: Vec<Vec<u8>> = Vec::new();
     for e in fs::read_dir(dir).ok()? {
-        use std::os::unix::ffi::OsStrExt;
-        names.push(e.ok()?.file_name().as_bytes().to_vec());
+        names.push(e.ok()?.file_name().as_encoded_bytes().to_vec());
     }
     names.sort();
     let mut h = blake3::Hasher::new();
@@ -120,10 +134,14 @@ pub fn hash_file(path: &Path) -> io::Result<String> {
 // Do not block if a regular file is replaced with a FIFO between lstat and
 // open, or follow a newly substituted symlink. Hash the opened regular file.
 fn open_regular_file(path: &Path) -> io::Result<(fs::File, fs::Metadata)> {
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    // Open a reparse point itself rather than what it names.
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000);
+    let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.file_type().is_file() {
         return Err(io::Error::new(
@@ -390,6 +408,7 @@ mod tests {
         fs::remove_dir_all(d).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn records_oids_requires_a_safe_sha1_worktree() {
         let d = tmp("git-entry");
@@ -418,6 +437,7 @@ mod tests {
         fs::remove_dir_all(d).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn recorded_oids_only_cover_in_root_regular_files() {
         use std::os::unix::fs::{symlink, PermissionsExt};
@@ -581,6 +601,7 @@ mod tests {
         assert!(r.iter().enumerate().all(|(i, x)| *x == i * 2));
     }
 
+    #[cfg(unix)]
     #[test]
     fn file_identity_includes_executable_mode_without_changing_hash() {
         use std::os::unix::fs::PermissionsExt;
@@ -598,6 +619,7 @@ mod tests {
         fs::remove_dir_all(d).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn fifo_never_gets_an_oid() {
         use std::os::unix::ffi::OsStrExt;
@@ -610,6 +632,7 @@ mod tests {
         fs::remove_dir_all(d).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn socket_never_gets_an_oid() {
         let d = tmp("oid-socket");

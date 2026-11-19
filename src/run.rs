@@ -6,14 +6,13 @@ pub(crate) use units::hook::safe;
 
 use crate::ignore::Ignore;
 use crate::input::{identify, identify_recorded, par_map, verify, Input};
-use crate::pathutil::{absolutize, cwd_key, to_key, Physical};
+use crate::pathutil::{absolutize, cwd_key, is_git_name, to_key, Physical};
 use crate::proof::{now, sanitize, Proof, Store};
 use crate::sync::Remote;
 use crate::trace::{self, Trace};
 use crate::volatile;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -212,13 +211,13 @@ pub(crate) fn shared_scope(root: &Path, store: &Path) -> Option<String> {
                 root.join(path)
             };
             let path = std::fs::canonicalize(&path).unwrap_or_else(|_| absolutize(root, &path));
-            h.update(path.as_os_str().as_bytes());
+            h.update(path.as_os_str().as_encoded_bytes());
         } else {
             h.update(remote.as_bytes());
         }
     } else {
         h.update(b"root\0");
-        h.update(root.as_os_str().as_bytes());
+        h.update(root.as_os_str().as_encoded_bytes());
     }
     Some(h.finalize().to_hex().to_string())
 }
@@ -337,7 +336,6 @@ pub fn env_key(name: &std::ffi::OsStr) -> String {
 
 /// The environment name a fingerprint key stands for: the exact inverse of `env_key`.
 pub fn env_name(key: &str) -> std::ffi::OsString {
-    use std::os::unix::ffi::OsStringExt;
     let Some(hex) = key.strip_prefix('\u{0}') else {
         return std::ffi::OsString::from(key);
     };
@@ -349,7 +347,18 @@ pub fn env_name(key: &str) -> std::ffi::OsString {
         })
         .collect();
     match bytes {
-        Some(bytes) => std::ffi::OsString::from_vec(bytes),
+        #[cfg(unix)]
+        Some(bytes) => {
+            use std::os::unix::ffi::OsStringExt;
+            std::ffi::OsString::from_vec(bytes)
+        }
+        // Windows names are UTF-16. A name that was not valid Unicode cannot be rebuilt from
+        // its key, so it stays as the key text.
+        #[cfg(windows)]
+        Some(bytes) => match String::from_utf8(bytes) {
+            Ok(text) => std::ffi::OsString::from(text),
+            Err(_) => std::ffi::OsString::from(key),
+        },
         None => std::ffi::OsString::from(key),
     }
 }
@@ -519,10 +528,7 @@ fn plain(argv: &[std::ffi::OsString], pass_env: &[&str]) -> i32 {
         }
     }
     match command.status() {
-        Ok(s) => {
-            use std::os::unix::process::ExitStatusExt;
-            s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
-        }
+        Ok(s) => crate::sys::exit_code(s),
         Err(e) => {
             eprintln!(
                 "stoop: cannot run {}: {e}",
@@ -1446,7 +1452,7 @@ pub fn build_inputs(
                         )
                     }
                     Some(pkey) if pkey != key => {
-                        if rel.components().any(|c| c.as_os_str() == ".git") {
+                        if rel.components().any(|c| is_git_name(c.as_os_str())) {
                             if !ignore.is_ignored(pkey) {
                                 reads_git = true;
                             }
@@ -1495,7 +1501,7 @@ pub fn build_inputs(
         if trace.is_output(lex) || written_physically {
             continue;
         }
-        if inside && key.split('/').any(|c| c == ".git") {
+        if inside && key.split('/').any(|c| is_git_name(OsStr::new(c))) {
             reads_git = true;
             continue;
         }
@@ -1535,7 +1541,7 @@ pub fn build_inputs(
                 let Some(tkey) = rel.to_str() else {
                     return Err("it used a path in the repository that is not valid UTF-8".into());
                 };
-                if rel.components().any(|c| c.as_os_str() == ".git") {
+                if rel.components().any(|c| is_git_name(c.as_os_str())) {
                     if !ignore.is_ignored(tkey) {
                         reads_git = true;
                     }
@@ -1674,11 +1680,11 @@ mod flag_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::ffi::OsString;
-    use std::os::unix::ffi::OsStringExt;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
     #[test]
     fn pass_env_requires_exact_names_and_explicit_flag() {
@@ -1744,6 +1750,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn captured_credentials_survive_a_later_thread_without_entering_its_environment() {
         const CHILD: &str = "STOOP_TOKEN_CAPTURE_TEST_CHILD";
@@ -1773,7 +1780,7 @@ mod tests {
                 Some(OsString::from("fixture-url"))
             );
             assert_eq!(
-                id_token_value(ID_TOKEN_VARS[1]).unwrap().as_bytes(),
+                id_token_value(ID_TOKEN_VARS[1]).unwrap().as_encoded_bytes(),
                 b"fixture-\xff"
             );
         })
@@ -1963,6 +1970,7 @@ mod tests {
         std::fs::remove_dir_all(base).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
     fn non_utf8_traced_paths_are_not_recorded_lossily() {
         let root = Path::new("/repo");
@@ -1993,6 +2001,7 @@ mod canonical_tests {
     use super::canonical_path;
     use std::path::PathBuf;
 
+    #[cfg(unix)]
     #[test]
     fn a_store_that_does_not_exist_yet_resolves_through_its_symlinked_parent() {
         let base = std::env::temp_dir().join(format!("stoop-canonical-{}", std::process::id()));
@@ -2010,7 +2019,7 @@ mod canonical_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod non_utf8_tests {
     use super::*;
     use std::ffi::OsString;
@@ -2037,7 +2046,7 @@ mod non_utf8_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod exact_key_tests {
     use super::*;
     use std::ffi::{OsStr, OsString};
@@ -2109,7 +2118,7 @@ mod exact_key_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod argv_bytes_tests {
     use super::*;
     use std::ffi::OsString;
@@ -2150,7 +2159,7 @@ mod argv_bytes_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod env_hash_name_tests {
     use super::*;
     use std::ffi::OsString;
@@ -2167,7 +2176,7 @@ mod env_hash_name_tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod hook_key_tests {
     use super::*;
     use std::ffi::OsString;

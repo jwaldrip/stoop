@@ -104,7 +104,7 @@ The installer places the binary in `~/.local/bin`. Set `STOOP_INSTALL_DIR` to an
 
 The SHA-256 check detects corruption and a tampered mirror, but a compromised release could replace both the archive and its checksum. When `gh` is installed, the installer verifies GitHub build provenance; otherwise it reports that the check was skipped. Provenance identifies the build, not whether its source is safe. `curl | sh` trusts the domain and TLS to deliver the installer.
 
-Tracing needs Linux on x86-64 or arm64. On macOS stoop runs the command untraced, never records, and never skips. Set `STOOP_DTRACE_DIAGNOSTIC=1` on a macOS runner with passwordless `sudo` to run the command once under DTrace and print what it did; that report is never recorded. The blind spots section says what it cannot show.
+Tracing needs Linux on x86-64 or arm64. On macOS and Windows stoop runs commands untraced, never records, and never skips. macOS has one opt-in diagnostic: set `STOOP_DTRACE_DIAGNOSTIC=1` on a macOS runner with passwordless `sudo` to run the command once under DTrace and print what it did; that report is never recorded. The blind spots section says what it cannot show. There is no Windows installer yet: build it with `cargo build --release`. On Windows, `stoop mcp`, `stoop plan` and `--status-fd` are not available, and `stoop sh` needs Git for Windows' `bash` on `PATH`: it skips the WSL launcher in System32 when it finds another `bash.exe` on an absolute `PATH` entry, and uses the bare name otherwise, which Windows can resolve to that launcher.
 
 ```sh
 stoop run -- cargo test        # skip or run

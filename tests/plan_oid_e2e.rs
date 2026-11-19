@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! `stoop plan --prefilter` at the command line: other values are a usage error (exit 2), and
 //! the three modes give the same plan for a repository without records.
 

@@ -694,7 +694,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod non_utf8_words {
     use super::*;
     use std::ffi::OsStr;
@@ -730,7 +730,7 @@ mod non_utf8_words {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod incoming_words_tests {
     use super::*;
     use std::ffi::OsString;

@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! The shared agent guide (site/static/AGENTS.md) cannot drift from the binary or the site:
 //! the server embeds that exact file, and every command, flag and link it names must exist.
 

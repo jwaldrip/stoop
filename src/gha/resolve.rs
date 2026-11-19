@@ -1153,6 +1153,7 @@ mod tests {
         )
     }
 
+    #[cfg(unix)]
     #[test]
     fn git_resolves_tags_branches_and_peels_annotated_tags() {
         let root = scratch("local");
@@ -1182,6 +1183,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn git_detects_a_moved_tag_and_a_deleted_one() {
         let root = scratch("moved");
@@ -1219,6 +1221,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn git_fails_wide_on_tag_and_branch_naming_different_commits() {
         let root = scratch("clash");

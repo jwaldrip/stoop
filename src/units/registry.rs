@@ -401,11 +401,13 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn runner(requested: &str, args: &[&str], expected: Option<&str>) {
         let observed = diagnostic(&[event(None, requested, args)]);
         assert_eq!(observed.as_deref(), expected);
     }
 
+    #[cfg(unix)]
     #[test]
     fn runner_grammars_are_specific() {
         for (program, args, name) in [
@@ -457,6 +459,7 @@ mod tests {
         runner("npx", &["npx", "jest"], None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn shell_and_wrapper_ancestry_comes_from_successful_images() {
         let events = vec![
@@ -504,6 +507,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn registered_wrappers_are_only_reported_when_a_runner_execs() {
         for name in [
@@ -523,6 +527,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn shell_wrapper_requires_a_real_command_option() {
         for args in [
@@ -571,6 +576,7 @@ mod tests {
         assert!(diagnostic(&[missing_args]).is_none());
     }
 
+    #[cfg(unix)]
     #[test]
     fn separate_branches_never_borrow_each_others_wrappers() {
         let events = vec![
