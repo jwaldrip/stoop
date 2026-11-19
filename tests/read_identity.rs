@@ -535,3 +535,149 @@ fn a_stoop_sh_step_with_a_mid_run_edit_is_not_recorded() {
         .unwrap_or(0);
     assert_eq!(written, 0, "a refused stoop sh step wrote a proof:\n{err}");
 }
+
+#[test]
+fn a_link_hop_the_command_replaces_does_not_refuse_its_reader() {
+    // src/link1 leads through src/link2 to src/a. The command replaces src/link2 itself, so the
+    // change of target is its own, and the record of the reader stands.
+    let case = Case::new("t17-own-hop");
+    case.file("src/a", b"alpha\n");
+    case.file("src/b", b"bravo\n");
+    symlink("a", case.root().join("src/link2")).unwrap();
+    symlink("link2", case.root().join("src/link1")).unwrap();
+    age();
+    let script = "cat src/link1 >/dev/null; ln -s b src/link2.new && mv -f src/link2.new src/link2";
+    let out = run(&case, "t17-own-hop", script, &[]);
+    assert_recorded(&out, &case, "t17-own-hop");
+}
+
+#[test]
+fn a_link_hop_another_process_replaces_is_not_recorded() {
+    let case = Case::new("t17-outside-hop");
+    case.file("src/a", b"alpha\n");
+    case.file("src/b", b"bravo\n");
+    symlink("a", case.root().join("src/link2")).unwrap();
+    symlink("link2", case.root().join("src/link1")).unwrap();
+    age();
+    let fifo = case.fifo("t17.fifo");
+    let script = "cat src/link1 >/dev/null; cat \"$FIFO\" >/dev/null";
+    let child = spawn(&case, "t17-outside-hop", script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    let link2 = case.root().join("src/link2");
+    fs::remove_file(&link2).unwrap();
+    symlink("b", &link2).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_not_recorded(&out, &case, "t17-outside-hop", "src/link");
+}
+
+#[test]
+fn a_write_through_a_dangling_link_records_the_target_as_output() {
+    let case = Case::new("t18-own-dangling");
+    case.file("src/keep", b"keep\n");
+    symlink("new", case.root().join("src/dl")).unwrap();
+    let out = run(
+        &case,
+        "t18-own-dangling",
+        "test -e src/new; echo made > src/dl",
+        &[],
+    );
+    assert_recorded(&out, &case, "t18-own-dangling");
+}
+
+#[test]
+fn a_dangling_link_target_another_process_creates_is_not_recorded() {
+    let case = Case::new("t18-outside-dangling");
+    case.file("src/keep", b"keep\n");
+    symlink("new", case.root().join("src/dl")).unwrap();
+    age();
+    let fifo = case.fifo("t18.fifo");
+    let script = "test -e src/new; cat \"$FIFO\" >/dev/null";
+    let child = spawn(&case, "t18-outside-dangling", script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::write(case.root().join("src/new"), b"made outside\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_not_recorded(
+        &out,
+        &case,
+        "t18-outside-dangling",
+        "src/new changed while the command ran",
+    );
+}
+
+#[test]
+fn a_write_through_an_alias_inside_the_root_records_the_real_path() {
+    let case = Case::new("t19-own-alias");
+    case.file("src/keep", b"keep\n");
+    fs::create_dir_all(case.root().join("real")).unwrap();
+    symlink("real", case.root().join("alias")).unwrap();
+    let out = run(
+        &case,
+        "t19-own-alias",
+        "test -e real/x; echo made > alias/x",
+        &[],
+    );
+    assert_recorded(&out, &case, "t19-own-alias");
+}
+
+#[test]
+fn a_file_another_process_creates_at_an_alias_target_is_not_recorded() {
+    let case = Case::new("t19-outside-alias");
+    case.file("src/keep", b"keep\n");
+    fs::create_dir_all(case.root().join("real")).unwrap();
+    symlink("real", case.root().join("alias")).unwrap();
+    age();
+    let fifo = case.fifo("t19.fifo");
+    let script = "test -e real/x; cat \"$FIFO\" >/dev/null";
+    let child = spawn(&case, "t19-outside-alias", script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::write(case.root().join("real/x"), b"made outside\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_not_recorded(
+        &out,
+        &case,
+        "t19-outside-alias",
+        "real/x changed while the command ran",
+    );
+}
+
+#[test]
+fn a_hard_link_name_the_command_writes_changes_the_name_it_read() {
+    // The command reads src/a, then writes src/b, which is the same inode. The read name changed
+    // under the command, so the record is refused.
+    let case = Case::new("t20-hard-link");
+    let a = case.file("src/a", b"alpha-one\n");
+    fs::hard_link(&a, case.root().join("src/b")).unwrap();
+    age();
+    let script = "cat src/a >/dev/null; printf 'bravo-two\\n' > src/b";
+    let out = run(&case, "t20-hard-link", script, &[]);
+    assert_not_recorded(
+        &out,
+        &case,
+        "t20-hard-link",
+        "src/a changed while the command ran",
+    );
+}
+
+#[test]
+fn a_file_the_command_overwrites_and_reads_back_is_not_recorded() {
+    // The read after the write sees the command's own bytes, which the tracer cannot tell from an
+    // outside rewrite. The record is refused, with the reason named.
+    let case = Case::new("t21-read-back");
+    case.file("src/f", b"start\n");
+    age();
+    let out = run(
+        &case,
+        "t21-read-back",
+        "echo fresh > src/f; cat src/f >/dev/null",
+        &[],
+    );
+    assert_not_recorded(
+        &out,
+        &case,
+        "t21-read-back",
+        "it read src/f after writing it",
+    );
+}

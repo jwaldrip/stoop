@@ -2864,7 +2864,10 @@ fn pinned_concurrent_retarget_has_no_stale_output_after_changer_sleeps_or_exits(
 }
 
 #[test]
-fn concurrent_alias_retargets_do_not_leave_stale_cached_parents() {
+fn concurrent_alias_retargets_are_refused_with_a_named_reason() {
+    // The child writes through `x`, which leads to `y/alias`, while the parent keeps replacing
+    // `y/alias`. The run writes through a link it also replaces, so the record is refused: where a
+    // write landed is not known from the tracer's view of the link.
     for trial in 0..6 {
         let w = Ws::new(&format!("topology-race-{trial}"));
         w.write("sub/keep", "keep");
@@ -2884,16 +2887,34 @@ fn concurrent_alias_retargets_do_not_leave_stale_cached_parents() {
             y.display(),
             w.root.display()
         );
-        let p = recorded(&w, &script);
+        let (code, err) = w.sh(&script);
         let _ = fs::remove_dir_all(outside);
+        assert_eq!(code, 0, "trial {trial}: {err}");
         assert!(
-            pairs(&p, "outputs")
-                .iter()
-                .any(|(key, _)| key == "sub/final"),
-            "trial {trial}: {:?}",
-            pairs(&p, "outputs")
+            err.contains("stoop: not recorded: it wrote through the link"),
+            "trial {trial}: {err}"
         );
+        assert!(!err.contains("stoop: recorded"), "trial {trial}: {err}");
     }
+}
+
+#[test]
+fn alias_writes_without_a_retarget_still_record() {
+    let w = Ws::new("alias-steady");
+    w.write("race.py", include_str!("fixtures/alias_steady.py"));
+    let outside = std::env::temp_dir().join(format!("stoop-steady-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&outside);
+    fs::create_dir(&outside).unwrap();
+    let x = outside.join("x");
+    let y = outside.join("y");
+    fs::create_dir(&y).unwrap();
+    std::os::unix::fs::symlink(&y, &x).unwrap();
+    std::os::unix::fs::symlink(&w.root, y.join("alias")).unwrap();
+    let p = recorded(&w, &format!("python3 race.py {}", x.display()));
+    let _ = fs::remove_dir_all(outside);
+    let outputs = pairs(&p, "outputs");
+    assert!(outputs.iter().any(|(key, _)| key == "side"), "{outputs:?}");
+    assert!(outputs.iter().any(|(key, _)| key == "final"), "{outputs:?}");
 }
 
 #[test]
