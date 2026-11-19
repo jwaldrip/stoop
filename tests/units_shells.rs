@@ -180,3 +180,12 @@ fn github_actions_steps_run_in_the_actions_bash_shell() {
         assert_eq!(dir.log().as_deref(), Some("changed=<>\n"), "step {index}");
     }
 }
+
+#[test]
+fn a_placeholder_inside_a_shell_string_is_refused_only_when_the_shell_is_recognized() {
+    let dir = Dir::new();
+    let out = dir.shell("bash", &["-c"], "stoop run -- sh -c 'printf %s {changed:*.t}'");
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(err(&out).contains("substituted into shell code"), "{}", err(&out));
+    assert_eq!(dir.log(), None);
+}
