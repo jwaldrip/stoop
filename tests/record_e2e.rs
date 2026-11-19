@@ -1047,6 +1047,9 @@ fn committed_input(name: &str) -> (Ws, String) {
 /// Create files and directories beside the run: under its HOME (`H:`), its XDG_CONFIG_HOME
 /// (`X:`) or the repository (`R:`). A `None` body makes a directory.
 fn seed(w: &Ws, entries: &[(&str, Option<&str>)]) {
+    // Every run has these two directories, so a script may name them without seeding them.
+    fs::create_dir_all(w.store().join("home")).unwrap();
+    fs::create_dir_all(w.store().join("xdg")).unwrap();
     for (spec, body) in entries {
         let path = if let Some(rest) = spec.strip_prefix("H:") {
             w.store().join("home").join(rest)
