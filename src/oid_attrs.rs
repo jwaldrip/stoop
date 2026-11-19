@@ -1,10 +1,10 @@
 //! Evidence that hashing raw working-tree bytes is safe for Git object IDs.
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OidBasis {
@@ -48,6 +48,32 @@ pub struct Epoch {
     pub git_dir: PathBuf,
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub common_dir: PathBuf,
+    /// The names whose change can alter what Git reads for attributes or configuration.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub watch: Watch,
+}
+
+/// Git's attribute and configuration sources, resolved once before the run. Each name on the way
+/// to a source counts (directories and symbolic links included), so renaming, removing or
+/// replacing any of them changes what Git reads. A source that exists also counts by identity, so
+/// a hard link to it does.
+#[derive(Clone, Debug, Default)]
+pub struct Watch {
+    names: BTreeSet<PathBuf>,
+    inodes: BTreeSet<(u64, u64)>,
+}
+
+impl Watch {
+    /// Whether a namespace change at this physical name, or a write to a file there, can change
+    /// what Git reads.
+    pub fn names_contain(&self, physical: &Path) -> bool {
+        self.names.contains(physical)
+    }
+
+    /// Whether this metadata is a watched file, whatever name it is reached by.
+    pub fn is_watched_file(&self, metadata: &std::fs::Metadata) -> bool {
+        metadata.is_file() && self.inodes.contains(&(metadata.dev(), metadata.ino()))
+    }
 }
 
 // Limit every response, including large index and attribute reports. An
@@ -305,22 +331,10 @@ fn regular_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
 }
 
+/// The tracked paths that get a basis. Untracked files get none: a worktree walk for them would
+/// cost time on every run, and an untracked file has no committed blob for an id to match.
 fn known_paths(root: &Path) -> Option<HashSet<String>> {
-    let mut index = index_paths(root)?;
-    let report = crate::gitprobe::output(
-        root,
-        &["ls-files", "--others", "--exclude-standard", "-z"],
-        b"",
-        MAX_OUTPUT,
-    )?;
-    for entry in nul_fields(&report)? {
-        if let Some(path) = std::str::from_utf8(entry)
-            .ok()
-            .filter(|path| valid_path(path))
-        {
-            index.paths.insert(path.to_owned());
-        }
-    }
+    let index = index_paths(root)?;
     // A tracked attribute file missing from the worktree, as in a sparse checkout,
     // may still apply to its directory. Paths beneath it have unknown attributes.
     let unmaterialized: HashSet<String> = index
@@ -443,6 +457,7 @@ pub(crate) fn snapshot(root: &Path) -> Option<Epoch> {
     let root = root.canonicalize().ok()?;
     let (git_dir, common_dir) = repo_dirs(&root)?;
     let autocrlf = config(&root)?;
+    let watch = build_watch(&git_dir, &external_sources(&root)?)?;
     let paths = known_paths(&root)?;
     if !safe_worktree_sources(&root, &paths) {
         return None;
@@ -464,6 +479,7 @@ pub(crate) fn snapshot(root: &Path) -> Option<Epoch> {
         basis: attributes(basis, &report)?,
         git_dir,
         common_dir,
+        watch,
     })
 }
 
@@ -498,6 +514,133 @@ pub fn check_many(root: &Path, paths: &[String]) -> HashMap<String, OidBasis> {
 #[cfg(any(target_os = "linux", test))]
 pub fn directory_removal_invalidates(path: &Path) -> bool {
     !std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
+}
+
+/// The configuration and attribute files Git reads from outside the repository. `git var -l` names
+/// them whether or not they exist, so a file the run creates is watched too. The system files are
+/// listed as well, since a runner's Git can read them from a prefix the output does not show.
+/// A relative name, or a snapshot without a global configuration and attribute file, declines.
+fn external_sources(root: &Path) -> Option<Vec<PathBuf>> {
+    let report = crate::gitprobe::output(root, &["var", "-l"], b"", MAX_OUTPUT)?;
+    let mut sources = vec![
+        PathBuf::from("/etc/gitconfig"),
+        PathBuf::from("/etc/gitattributes"),
+    ];
+    let (mut config, mut attributes) = (false, false);
+    for line in report.split(|byte| *byte == b'\n') {
+        let Some(split) = line.iter().position(|byte| *byte == b'=') else {
+            continue;
+        };
+        let (key, value) = (&line[..split], &line[split + 1..]);
+        match key {
+            b"GIT_CONFIG_GLOBAL" => config = true,
+            b"GIT_ATTR_GLOBAL" => attributes = true,
+            b"GIT_CONFIG_SYSTEM" | b"GIT_ATTR_SYSTEM" => {}
+            _ => continue,
+        }
+        if !value.is_empty() {
+            let path = Path::new(OsStr::from_bytes(value));
+            if !path.is_absolute() {
+                return None;
+            }
+            sources.push(path.to_path_buf());
+        }
+    }
+    (config && attributes).then_some(sources)
+}
+
+fn is_absent(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ENOTDIR)
+}
+
+/// Record every name on the way to an absolute `path`: each directory, each symbolic link and the
+/// file. Names that do not exist yet count too, since the run may create them. A file that exists
+/// is recorded by identity as well. None when a name cannot be read or the path loops.
+fn watch_path(path: &Path, watch: &mut Watch) -> Option<()> {
+    let mut pending = path_parts(path);
+    let mut current = PathBuf::from("/");
+    let mut links = 0;
+    while let Some(part) = pending.pop_front() {
+        if part == ".." {
+            current.pop();
+            continue;
+        }
+        let name = current.join(&part);
+        watch.names.insert(name.clone());
+        match std::fs::symlink_metadata(&name) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                links += 1;
+                if links > 40 {
+                    return None;
+                }
+                let target = std::fs::read_link(&name).ok()?;
+                if target.is_absolute() {
+                    current = PathBuf::from("/");
+                }
+                for part in path_parts(&target).into_iter().rev() {
+                    pending.push_front(part);
+                }
+            }
+            Ok(metadata) if pending.is_empty() => {
+                if metadata.is_file() {
+                    watch.inodes.insert((metadata.dev(), metadata.ino()));
+                }
+                return Some(());
+            }
+            Ok(metadata) if metadata.is_dir() => current = name,
+            Ok(_) => return names_below(name, &mut pending, watch),
+            Err(error) if is_absent(&error) => return names_below(name, &mut pending, watch),
+            Err(_) => return None,
+        }
+    }
+    Some(())
+}
+
+fn path_parts(path: &Path) -> VecDeque<OsString> {
+    path.components()
+        .filter_map(|part| match part {
+            Component::Normal(name) => Some(name.to_os_string()),
+            Component::ParentDir => Some(OsString::from("..")),
+            Component::RootDir | Component::CurDir | Component::Prefix(_) => None,
+        })
+        .collect()
+}
+
+/// The names beneath a name that is missing, or is not a directory. None of them can exist yet,
+/// so the run may create any of them. A parent reference past such a name cannot be followed.
+fn names_below(
+    mut name: PathBuf,
+    pending: &mut VecDeque<OsString>,
+    watch: &mut Watch,
+) -> Option<()> {
+    while let Some(part) = pending.pop_front() {
+        if part == ".." {
+            return None;
+        }
+        name.push(part);
+        watch.names.insert(name.clone());
+    }
+    Some(())
+}
+
+/// The watched set for one repository: Git's external sources, and the files of its git directory
+/// that Git reads for attributes or configuration. The index counts too: Git reads an attribute
+/// file from it when the worktree copy is missing.
+fn build_watch(git_dir: &Path, sources: &[PathBuf]) -> Option<Watch> {
+    let mut watch = Watch::default();
+    for source in sources {
+        watch_path(source, &mut watch)?;
+    }
+    for name in [
+        "config",
+        "config.worktree",
+        "commondir",
+        "index",
+        "info/attributes",
+    ] {
+        watch_path(&git_dir.join(name), &mut watch)?;
+    }
+    Some(watch)
 }
 
 #[cfg(test)]

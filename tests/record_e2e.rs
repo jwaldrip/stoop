@@ -201,7 +201,7 @@ impl Ws {
 fn recorded(w: &Ws, script: &str) -> Value {
     let (code, err) = w.sh(script);
     assert_eq!(code, 0, "{err}");
-    assert!(err.contains("recorded"), "not recorded: {err}");
+    assert!(err.contains("stoop: recorded"), "not recorded: {err}");
     w.proof()
 }
 
@@ -1075,7 +1075,7 @@ fn writes_git_does_not_read_keep_every_blob_id() {
     let outside = std::env::temp_dir().join(format!("stoop-oid-outside-{}", std::process::id()));
     fs::create_dir_all(&outside).unwrap();
     let script = format!(
-        "cat in.txt >/dev/null && printf x > '{}' && mkdir -p \"$HOME/.cache/tool\" && printf x > \"$HOME/.cache/tool/x\" && printf x > \"$HOME/.profile\" && printf x > \"$XDG_CONFIG_HOME/tool.conf\" && printf x > \"$XDG_CONFIG_HOME/git/ignore\" && mkdir -p .git/objects/ab && printf x > .git/objects/ab/cd && printf x > .git/stoop-note && mkdir -p sibling && printf x > sibling/out",
+        "cat in.txt >/dev/null && printf x > '{}' && mkdir -p \"$HOME/.cache/tool\" && printf x > \"$HOME/.cache/tool/x\" && printf x > \"$HOME/.profile\" && printf x > \"$XDG_CONFIG_HOME/tool.conf\" && printf x > \"$XDG_CONFIG_HOME/git/ignore\" && printf x > .git/objects/stoop-object && printf x > .git/stoop-note && mkdir -p sibling && printf x > sibling/out",
         outside.join("file").display()
     );
     let p = recorded(&w, &script);
@@ -1126,7 +1126,7 @@ fn changes_to_git_sources_drop_every_blob_id_in_the_run() {
         ("hard-link-to-config", &[("H:.gitconfig", Some("[user]\n"))], "ln \"$HOME/.gitconfig\" \"$HOME/alias\" && printf 'x = 1\\n' >> \"$HOME/alias\""),
         ("symlink-to-git-info", &[("H:", None)], "ln -s \"$PWD/.git/info\" \"$HOME/link\" && printf '# x\\n' >> \"$HOME/link/attributes\""),
         ("repo-info-attributes-created", &[], "printf '# x\\n' > .git/info/attributes"),
-        ("repo-info-attributes-renamed", &[("R:.git/info/attributes", Some("# x\n"))], "mv .git/info/attributes .git/info/attributes.old"),
+        ("repo-info-attributes-renamed", &[("R:.git/info/attributes", Some("# x\n"))], "./syscall-probe rename .git/info/attributes .git/info/attributes.old"),
         ("repo-config-appended", &[], "printf '\\n[x]\\n' >> .git/config"),
         ("repo-index-written", &[], ": >> .git/index"),
         ("repo-commondir-created", &[], "printf '..\\n' > .git/commondir"),
@@ -1137,7 +1137,8 @@ fn changes_to_git_sources_drop_every_blob_id_in_the_run() {
         ("home-directory-chmod", &[("H:.gitconfig", Some("[user]\n"))], "chmod 700 \"$HOME\""),
     ];
     for (name, entries, script) in cases {
-        let (changed, oid) = seeded_run(name, entries, |_| {}, script);
+        let changed_script = format!("cat in.txt >/dev/null && {script}");
+        let (changed, oid) = seeded_run(name, entries, |_| {}, &changed_script);
         assert_unknown_oid_basis(entry(&changed, "inputs", "in.txt"));
         let (control, control_oid) = seeded_run(name, entries, |_| {}, "cat in.txt >/dev/null");
         assert_eq!(oid, control_oid, "{name}");
@@ -1229,7 +1230,7 @@ fn writes_through_links_made_before_the_run_follow_the_target() {
                 fs::hard_link(&target, &alias).unwrap();
             }
         };
-        let script = "printf 'x = 1\\n' >> \"$HOME/../alias\"";
+        let script = "cat in.txt >/dev/null; printf 'x = 1\\n' >> \"$HOME/../alias\"";
         let (changed, oid) = seeded_run(name, &entries, link, script);
         assert_unknown_oid_basis(entry(&changed, "inputs", "in.txt"));
         let (control, control_oid) = seeded_run(name, &entries, link, "cat in.txt >/dev/null");

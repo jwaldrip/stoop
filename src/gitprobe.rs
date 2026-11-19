@@ -36,7 +36,7 @@ const ALLOWED: &[&[&str]] = &[
         "--show-origin",
     ],
     &["ls-files", "--stage", "-z"],
-    &["ls-files", "--others", "--exclude-standard", "-z"],
+    &["var", "-l"],
     &["check-attr", "--all", "-z", "--stdin"],
 ];
 
@@ -403,7 +403,13 @@ mod tests {
         assert!(allowed(&["ls-files", "--stage", "-z"]));
         assert!(allowed(&["check-attr", "--all", "-z", "--stdin"]));
         assert!(!allowed(&["var", "GIT_ATTR_SYSTEM"]));
-        assert!(!allowed(&["var", "-l"]));
+        assert!(allowed(&["var", "-l"]));
+        assert!(!allowed(&[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z"
+        ]));
         assert!(!allowed(&["version"]));
         assert!(!allowed(&["ls-files"]));
         assert!(!allowed(&["ls-files", "--stage", "-z", "--debug"]));
