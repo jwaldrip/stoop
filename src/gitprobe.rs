@@ -41,7 +41,7 @@ const ALLOWED: &[&[&str]] = &[
         "--show-origin",
     ],
     &["ls-files", "--stage", "-z"],
-    &["ls-files", "--others", "--exclude-standard", "-z"],
+    &["var", "-l"],
     &["check-attr", "--all", "-z", "--stdin"],
 ];
 
@@ -61,6 +61,14 @@ pub fn output(root: &Path, args: &[&str], input: &[u8], max_bytes: usize) -> Opt
         return None;
     }
     let root = root.canonicalize().ok()?;
+    let command = probe_command(&root, args)?;
+    run(command, input, max_bytes, DEADLINE)
+}
+
+/// The command a probe runs. Every `GIT_*` variable is removed from the inherited environment, and
+/// so are `EDITOR`, `VISUAL` and `PAGER`: Git prints some of its variables from those, so a value
+/// with a newline could forge a line in `git var -l`.
+fn probe_command(root: &Path, args: &[&str]) -> Option<Command> {
     let mut command = Command::new("git");
     for (key, _) in std::env::vars_os() {
         // Windows names its variables without regard to case, so `git_dir` is `GIT_DIR` there.
@@ -75,6 +83,9 @@ pub fn output(root: &Path, args: &[&str], input: &[u8], max_bytes: usize) -> Opt
             command.env_remove(key);
         }
     }
+    for name in ["EDITOR", "VISUAL", "PAGER"] {
+        command.env_remove(name);
+    }
     if let Some(parent) = root.parent() {
         // Discovery may end at root but never above its parent.
         command.env(
@@ -84,7 +95,7 @@ pub fn output(root: &Path, args: &[&str], input: &[u8], max_bytes: usize) -> Opt
     }
     command
         .arg("-C")
-        .arg(&root)
+        .arg(root)
         .args([
             "--no-pager",
             "--no-optional-locks",
@@ -101,7 +112,7 @@ pub fn output(root: &Path, args: &[&str], input: &[u8], max_bytes: usize) -> Opt
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_NO_LAZY_FETCH", "1")
         .env("GIT_ALLOW_PROTOCOL", "");
-    run(command, input, max_bytes, DEADLINE)
+    Some(command)
 }
 
 #[cfg(unix)]
@@ -498,7 +509,13 @@ mod tests {
         assert!(allowed(&["ls-files", "--stage", "-z"]));
         assert!(allowed(&["check-attr", "--all", "-z", "--stdin"]));
         assert!(!allowed(&["var", "GIT_ATTR_SYSTEM"]));
-        assert!(!allowed(&["var", "-l"]));
+        assert!(allowed(&["var", "-l"]));
+        assert!(!allowed(&[
+            "ls-files",
+            "--others",
+            "--exclude-standard",
+            "-z"
+        ]));
         assert!(!allowed(&["version"]));
         assert!(!allowed(&["ls-files"]));
         assert!(!allowed(&["ls-files", "--stage", "-z", "--debug"]));
@@ -506,6 +523,19 @@ mod tests {
         assert!(!allowed(&["config", "--edit"]));
         assert!(!allowed(&["-c", "alias.x=!sh", "x"]));
         assert!(!allowed(&["status"]));
+    }
+
+    #[test]
+    fn a_probe_does_not_inherit_editor_visual_or_pager() {
+        let command = probe_command(Path::new("/"), &["var", "-l"]).unwrap();
+        for name in ["EDITOR", "VISUAL", "PAGER"] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(key, value)| key == std::ffi::OsStr::new(name) && value.is_none()),
+                "{name} is inherited by the probe"
+            );
+        }
     }
 
     #[test]

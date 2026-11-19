@@ -86,6 +86,14 @@ impl Ws {
         ]);
     }
 
+    /// Makes paths tracked without hashing their content, so no clean filter runs. Untracked
+    /// inputs carry no blob id, so a test that expects one tracks its inputs first.
+    fn track(&self, paths: &[&str]) {
+        let mut args = vec!["add", "--intent-to-add", "--"];
+        args.extend_from_slice(paths);
+        self.git(&args);
+    }
+
     fn clean(&self) {
         fs::remove_dir_all(&self.root).unwrap();
         fs::remove_dir_all(self.store()).unwrap();
@@ -201,7 +209,7 @@ impl Ws {
 fn recorded(w: &Ws, script: &str) -> Value {
     let (code, err) = w.sh(script);
     assert_eq!(code, 0, "{err}");
-    assert!(err.contains("recorded"), "not recorded: {err}");
+    assert!(err.contains("stoop: recorded"), "not recorded: {err}");
     w.proof()
 }
 
@@ -793,6 +801,12 @@ fn git_conversion_attributes_omit_input_and_prior_oids_without_running_filters()
     symlink("input-plain", w.root.join("alias-to-plain")).unwrap();
     attributes.push_str("input-plain !text\nprior-plain !text\nalias-to-plain filter=poison\n");
     w.write(".gitattributes", &attributes);
+    let tracked: Vec<String> = cases
+        .iter()
+        .flat_map(|(name, _, _)| [format!("input-{name}"), format!("prior-{name}")])
+        .chain(["input-plain".to_owned(), "prior-plain".to_owned()])
+        .collect();
+    w.track(&tracked.iter().map(String::as_str).collect::<Vec<_>>());
     script.push_str(
         "cat input-plain alias-to-text alias-to-plain >/dev/null; printf 'new\\n' > prior-plain",
     );
@@ -888,11 +902,12 @@ fn core_autocrlf_only_allows_unset_or_false_for_inputs_and_priors() {
     ] {
         let w = Ws::new(&format!("oid-autocrlf-{name}"));
         w.init_git();
+        w.write("input.txt", "one\r\ntwo\r\n");
+        w.write("prior.txt", "one\r\ntwo\r\n");
+        w.track(&["input.txt", "prior.txt"]);
         if let Some(setting) = setting {
             w.git(&["config", "--local", "core.autocrlf", setting]);
         }
-        w.write("input.txt", "one\r\ntwo\r\n");
-        w.write("prior.txt", "one\r\ntwo\r\n");
         let p = recorded(&w, "cat input.txt >/dev/null; printf 'new\\n' > prior.txt");
         let id = format!("f:{}", hash(b"one\r\ntwo\r\n"));
         for (field, path) in [("inputs", "input.txt"), ("priors", "prior.txt")] {
@@ -929,6 +944,7 @@ fn symlink_targets_use_physical_path_attributes() {
             ));
             w.init_git();
             w.write("real/content.txt", "one\r\ntwo\r\n");
+            w.track(&["real/content.txt"]);
             if kind == "file" {
                 symlink("real/content.txt", w.root.join("alias.txt")).unwrap();
             } else {
@@ -1019,6 +1035,321 @@ fn separate_git_dir_attribute_write_invalidates_oid_evidence() {
     w.clean();
 }
 
+/// A committed workspace whose one tracked input is `in.txt`, with that input's git blob id.
+fn committed_input(name: &str) -> (Ws, String) {
+    let w = Ws::new(name);
+    w.init_git();
+    w.commit_all();
+    let oid = w.git(&["rev-parse", "HEAD:in.txt"]);
+    (w, oid)
+}
+
+/// Create files and directories beside the run: under its HOME (`H:`), its XDG_CONFIG_HOME
+/// (`X:`) or the repository (`R:`). A `None` body makes a directory.
+fn seed(w: &Ws, entries: &[(&str, Option<&str>)]) {
+    // Every run has these two directories, so a script may name them without seeding them.
+    fs::create_dir_all(w.store().join("home")).unwrap();
+    fs::create_dir_all(w.store().join("xdg")).unwrap();
+    for (spec, body) in entries {
+        let path = if let Some(rest) = spec.strip_prefix("H:") {
+            w.store().join("home").join(rest)
+        } else if let Some(rest) = spec.strip_prefix("X:") {
+            w.store().join("xdg").join(rest)
+        } else {
+            w.root.join(spec.strip_prefix("R:").unwrap())
+        };
+        match body {
+            Some(text) => {
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, text).unwrap();
+            }
+            None => fs::create_dir_all(path).unwrap(),
+        }
+    }
+}
+
+/// Commit `in.txt`, seed the run's files, let `prepare` add links, run `script`, and return the
+/// proof with the input's blob id. The syscall probe is built so a script can name owner calls.
+fn seeded_run(
+    name: &str,
+    entries: &[(&str, Option<&str>)],
+    prepare: impl FnOnce(&Ws),
+    script: &str,
+) -> (Value, String) {
+    let (w, oid) = committed_input(name);
+    seed(&w, entries);
+    prepare(&w);
+    w.syscall_probe();
+    let p = recorded(&w, script);
+    w.clean();
+    (p, oid)
+}
+
+/// Writes that Git never reads for attributes or configuration keep every blob id: ordinary
+/// outside files, a tool cache, a sibling directory, and the object and log areas of the repository.
+#[test]
+fn writes_git_does_not_read_keep_every_blob_id() {
+    let (w, oid) = committed_input("oid-unwatched-writes");
+    seed(&w, &[("H:", None), ("X:git", None)]);
+    let outside = std::env::temp_dir().join(format!("stoop-oid-outside-{}", std::process::id()));
+    fs::create_dir_all(&outside).unwrap();
+    let script = format!(
+        "cat in.txt >/dev/null && printf x > '{}' && mkdir -p \"$HOME/.cache/tool\" && printf x > \"$HOME/.cache/tool/x\" && printf x > \"$HOME/.profile\" && printf x > \"$XDG_CONFIG_HOME/tool.conf\" && printf x > \"$XDG_CONFIG_HOME/git/ignore\" && printf x > .git/objects/stoop-object && printf x > .git/stoop-note && mkdir -p sibling && printf x > sibling/out",
+        outside.join("file").display()
+    );
+    let p = recorded(&w, &script);
+    assert_blob_oid(&p, "inputs", "in.txt", &oid);
+    fs::remove_dir_all(&outside).unwrap();
+    w.clean();
+}
+
+/// Ownership, mode and special-file changes outside the repository keep every blob id, unless
+/// they name a file Git reads (see the watched-source test below).
+#[test]
+fn outside_owner_mode_and_node_changes_keep_every_blob_id() {
+    let (w, oid) = committed_input("oid-outside-metadata");
+    w.syscall_probe();
+    let outside = std::env::temp_dir().join(format!("stoop-oid-meta-{}", std::process::id()));
+    fs::create_dir_all(outside.join("dir")).unwrap();
+    fs::write(outside.join("owned"), "owned\n").unwrap();
+    let script = format!(
+        "cat in.txt >/dev/null && ./syscall-probe chown-same '{o}/owned' && ./syscall-probe fchown-same '{o}/owned' && chmod 700 '{o}/dir' && mkfifo '{o}/pipe'",
+        o = outside.display()
+    );
+    let p = recorded(&w, &script);
+    assert_blob_oid(&p, "inputs", "in.txt", &oid);
+    fs::remove_dir_all(&outside).unwrap();
+    w.clean();
+}
+
+/// Changes to a file Git reads for attributes or configuration drop every blob id in the run.
+/// The change may be a write, a truncation, a rename, a replacement of a directory, a link, a
+/// symbolic link or an owner change. Each case has a control run with the same setup and no
+/// change, which must keep the blob id, so a decline cannot pass the test.
+#[test]
+fn changes_to_git_sources_drop_every_blob_id_in_the_run() {
+    type Case<'a> = (&'a str, &'a [(&'a str, Option<&'a str>)], &'a str);
+    let cases: &[Case] = &[
+        ("home-config-create", &[("H:", None)], "printf '[core]\\n' >> \"$HOME/.gitconfig\""),
+        ("home-config-append", &[("H:.gitconfig", Some("[user]\n"))], "printf 'x = 1\\n' >> \"$HOME/.gitconfig\""),
+        ("home-config-truncate", &[("H:.gitconfig", Some("[user]\n"))], ": > \"$HOME/.gitconfig\""),
+        ("home-config-chmod", &[("H:.gitconfig", Some("[user]\n"))], "chmod 600 \"$HOME/.gitconfig\""),
+        ("home-config-unlink", &[("H:.gitconfig", Some("[user]\n"))], "rm \"$HOME/.gitconfig\""),
+        ("home-config-renamed-away", &[("H:.gitconfig", Some("[user]\n"))], "mv \"$HOME/.gitconfig\" \"$HOME/.gitconfig.bak\""),
+        ("home-config-replaced", &[("H:.gitconfig", Some("[user]\n")), ("H:elsewhere", Some("[x]\n"))], "mv \"$HOME/elsewhere\" \"$HOME/.gitconfig\""),
+        ("xdg-config-append", &[("X:git/config", Some("[user]\n"))], "printf 'x = 1\\n' >> \"$XDG_CONFIG_HOME/git/config\""),
+        ("xdg-attributes-create", &[("X:git", None)], "printf '* -text\\n' > \"$XDG_CONFIG_HOME/git/attributes\""),
+        ("xdg-directory-replaced", &[("X:git/config", Some("[user]\n"))], "mv \"$XDG_CONFIG_HOME/git\" \"$XDG_CONFIG_HOME/git-old\" && mkdir \"$XDG_CONFIG_HOME/git\" && printf '[x]\\n' > \"$XDG_CONFIG_HOME/git/config\""),
+        ("xdg-directory-symlinked", &[("X:git/config", Some("[user]\n")), ("H:", None)], "mv \"$XDG_CONFIG_HOME/git\" \"$HOME/moved\" && ln -s \"$HOME/moved\" \"$XDG_CONFIG_HOME/git\""),
+        ("home-symlink-to-config", &[("H:.gitconfig", Some("[user]\n"))], "ln -s \"$HOME/.gitconfig\" \"$HOME/alias\""),
+        ("write-through-new-symlink", &[("X:git/config", Some("[user]\n"))], "ln -s \"$XDG_CONFIG_HOME/git/config\" \"$HOME/alias\" && printf 'x = 1\\n' >> \"$HOME/alias\""),
+        ("hard-link-to-config", &[("H:.gitconfig", Some("[user]\n"))], "ln \"$HOME/.gitconfig\" \"$HOME/alias\" && printf 'x = 1\\n' >> \"$HOME/alias\""),
+        ("repo-info-attributes-created", &[], "printf '# x\\n' > .git/info/attributes"),
+        ("repo-info-attributes-renamed", &[("R:.git/info/attributes", Some("# x\n"))], "./syscall-probe rename .git/info/attributes .git/info/attributes.old"),
+        ("repo-config-appended", &[], "printf '\\n[x]\\n' >> .git/config"),
+        ("repo-index-written", &[], ": >> .git/index"),
+        ("repo-commondir-created", &[], "printf '..\\n' > .git/commondir"),
+        ("repo-config-worktree-created", &[], ": > .git/config.worktree"),
+        ("chown-home-config", &[("H:.gitconfig", Some("[user]\n"))], "./syscall-probe chown-same \"$HOME/.gitconfig\""),
+        ("fchown-home-config", &[("H:.gitconfig", Some("[user]\n"))], "./syscall-probe fchown-same \"$HOME/.gitconfig\""),
+        ("fifo-at-xdg-attributes", &[("X:git", None)], "mkfifo \"$XDG_CONFIG_HOME/git/attributes\""),
+        ("home-directory-chmod", &[("H:.gitconfig", Some("[user]\n"))], "chmod 700 \"$HOME\""),
+        ("home-config-chown-coreutils", &[("H:.gitconfig", Some("[user]\n"))], "chown \"$(id -u)\" \"$HOME/.gitconfig\""),
+        ("repo-directory-with-attributes-renamed", &[("R:sub/.gitattributes", Some("* -text\n")), ("R:sub/x.txt", Some("x\n"))], "mv sub sub2"),
+    ];
+    for (name, entries, script) in cases {
+        let changed_script = format!("cat in.txt >/dev/null && {script}");
+        let (changed, oid) = seeded_run(name, entries, |_| {}, &changed_script);
+        assert_unknown_oid_basis(entry(&changed, "inputs", "in.txt"));
+        let (control, control_oid) = seeded_run(name, entries, |_| {}, "cat in.txt >/dev/null");
+        assert_eq!(oid, control_oid, "{name}");
+        assert_blob_oid(&control, "inputs", "in.txt", &control_oid);
+    }
+}
+
+/// A symbolic link made into the git directory is a read of `.git` through another name. The run
+/// is refused as not recorded, so no proof can skip it and no blob id is claimed.
+#[test]
+fn a_symlink_into_git_is_not_recorded() {
+    let (w, _oid) = committed_input("oid-symlink-into-git");
+    seed(&w, &[]);
+    let (code, err) = w.sh(
+        "cat in.txt >/dev/null && ln -s \"$PWD/.git/info\" \"$HOME/link\" && printf '# x\\n' >> \"$HOME/link/attributes\"",
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("not recorded: it reads .git"), "{err}");
+    w.clean();
+}
+
+/// A hard link made during the run to the worktree's `.gitattributes`, then written through its
+/// outside name, changes what Git reads for attributes. No outside name is watched, and the file
+/// is not a watched name, so the link itself must drop the run's blob ids. The same script without
+/// the link keeps them.
+#[test]
+fn a_hard_link_to_the_worktree_attributes_file_drops_blob_ids() {
+    let attributes = [("R:.gitattributes", Some("*.bin -text\n"))];
+    let (changed, _) = seeded_run(
+        "oid-link-attributes",
+        &attributes,
+        |_| {},
+        "cat in.txt >/dev/null && ln .gitattributes \"$HOME/attrs\" && printf '*.txt eol=crlf\\n' >> \"$HOME/attrs\"",
+    );
+    assert_unknown_oid_basis(entry(&changed, "inputs", "in.txt"));
+    let (control, control_oid) = seeded_run(
+        "oid-link-attributes",
+        &attributes,
+        |_| {},
+        "cat in.txt >/dev/null",
+    );
+    assert_blob_oid(&control, "inputs", "in.txt", &control_oid);
+}
+
+/// `linkat` with AT_EMPTY_PATH names its source by descriptor. The tracer judges that descriptor as
+/// it judges a named one, when the call is entered, so the run's blob ids drop whether or not the
+/// kernel lets the link succeed.
+#[test]
+fn a_link_made_from_a_descriptor_for_the_worktree_attributes_drops_blob_ids() {
+    let attributes = [("R:.gitattributes", Some("*.bin -text\n"))];
+    let (changed, _) = seeded_run(
+        "oid-link-fd-attributes",
+        &attributes,
+        |_| {},
+        "cat in.txt >/dev/null; exec 3< .gitattributes; ./syscall-probe linkat-empty 3 \"$HOME/attrs\"; printf '*.txt eol=crlf\\n' >> \"$HOME/attrs\"",
+    );
+    assert_unknown_oid_basis(entry(&changed, "inputs", "in.txt"));
+    let (control, control_oid) = seeded_run(
+        "oid-link-fd-attributes",
+        &attributes,
+        |_| {},
+        "cat in.txt >/dev/null; exec 3< .gitattributes; cat <&3 >/dev/null",
+    );
+    assert_blob_oid(&control, "inputs", "in.txt", &control_oid);
+}
+
+/// A descriptor the run inherits, open for writing on a watched file, drops every blob id in the
+/// run. The same descriptor on an ordinary file outside the repository keeps them.
+#[test]
+fn inherited_descriptors_follow_the_watched_file_rule() {
+    for (watched, expect_oid) in [(true, false), (false, true)] {
+        let name = if watched {
+            "oid-inherited-watched"
+        } else {
+            "oid-inherited-ordinary"
+        };
+        let (w, oid) = committed_input(name);
+        seed(&w, &[("H:.gitconfig", Some("[user]\n"))]);
+        let target = if watched {
+            w.store().join("home/.gitconfig")
+        } else {
+            std::env::temp_dir().join(format!("stoop-oid-inherited-{}", std::process::id()))
+        };
+        let out = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&target)
+            .unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_stoop"));
+        clear_git_env(&mut command);
+        let output = command
+            .args([
+                "run",
+                "--root",
+                w.root.to_str().unwrap(),
+                "--key",
+                "t",
+                "--",
+                "sh",
+                "-c",
+                "cat in.txt >/dev/null; echo x",
+            ])
+            .current_dir(&w.root)
+            .env("STOOP_STORE", w.store())
+            .env("HOME", w.store().join("home"))
+            .env("XDG_CONFIG_HOME", w.store().join("xdg"))
+            .env_remove("STOOP_FULL")
+            .env_remove("STOOP_OFF")
+            .env_remove("GITHUB_ACTIONS")
+            .env_remove("RUNNER_TEMP")
+            .env_remove("STOOP_SYNC")
+            .stdout(out)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{err}");
+        assert!(err.contains("recorded"), "{err}");
+        let p = w.proof();
+        if expect_oid {
+            assert_blob_oid(&p, "inputs", "in.txt", &oid);
+        } else {
+            assert_unknown_oid_basis(entry(&p, "inputs", "in.txt"));
+        }
+        if !watched {
+            fs::remove_file(&target).unwrap();
+        }
+        w.clean();
+    }
+}
+
+/// A link made before the run still reaches the watched file it names. Writing through it drops
+/// every blob id in the run, whether the link is a hard link or a symbolic one.
+#[test]
+fn writes_through_links_made_before_the_run_follow_the_target() {
+    for symbolic in [false, true] {
+        let name = if symbolic {
+            "oid-preexisting-symlink"
+        } else {
+            "oid-preexisting-hardlink"
+        };
+        let entries = [("H:.gitconfig", Some("[user]\n"))];
+        let link = move |w: &Ws| {
+            let target = w.store().join("home/.gitconfig");
+            let alias = w.store().join("alias");
+            if symbolic {
+                std::os::unix::fs::symlink(&target, &alias).unwrap();
+            } else {
+                fs::hard_link(&target, &alias).unwrap();
+            }
+        };
+        let script = "cat in.txt >/dev/null; printf 'x = 1\\n' >> \"$HOME/../alias\"";
+        let (changed, oid) = seeded_run(name, &entries, link, script);
+        assert_unknown_oid_basis(entry(&changed, "inputs", "in.txt"));
+        let (control, control_oid) = seeded_run(name, &entries, link, "cat in.txt >/dev/null");
+        assert_eq!(oid, control_oid, "{name}");
+        assert_blob_oid(&control, "inputs", "in.txt", &control_oid);
+    }
+}
+
+/// A recorded prior keeps its blob id when the same run also writes outside the repository.
+#[test]
+fn priors_keep_their_blob_ids_beside_outside_writes() {
+    let w = Ws::new("oid-prior-outside");
+    w.write("config.txt", "old\n");
+    w.init_git();
+    w.commit_all();
+    let oid = w.git(&["rev-parse", "HEAD:config.txt"]);
+    let outside = std::env::temp_dir().join(format!("stoop-oid-prior-{}", std::process::id()));
+    let script = format!(
+        "printf 'new\\n' > config.txt && printf x > '{}'",
+        outside.display()
+    );
+    let p = recorded(&w, &script);
+    assert_blob_oid(&p, "priors", "config.txt", &oid);
+    let _ = fs::remove_file(&outside);
+    w.clean();
+}
+
+/// A Git source whose path cannot be resolved declines every blob id, never a guessed one.
+#[test]
+fn an_unresolvable_git_source_declines_every_blob_id() {
+    let (w, _oid) = committed_input("oid-unresolvable-source");
+    let xdg = w.store().join("xdg");
+    fs::create_dir_all(w.store()).unwrap();
+    std::os::unix::fs::symlink(&xdg, &xdg).unwrap();
+    let p = recorded(&w, "cat in.txt >/dev/null");
+    assert_unknown_oid_basis(entry(&p, "inputs", "in.txt"));
+    w.clean();
+}
+
 #[test]
 fn sha256_repository_never_records_sha1_input_or_prior_oids() {
     let w = Ws::new("oid-sha256");
@@ -1038,6 +1369,7 @@ fn git_root_does_not_record_special_files_as_inputs() {
 
     let w = Ws::new("oid-special-files");
     w.init_git();
+    w.track(&["in.txt"]);
     let fifo = CString::new(w.root.join("fifo").as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     let listener = UnixListener::bind(w.root.join("socket")).unwrap();
@@ -1069,6 +1401,7 @@ fn sparse_input_over_two_gib_keeps_its_blob_oid() {
     let file = fs::File::create(w.root.join("large-sparse")).unwrap();
     file.set_len(len).unwrap();
     drop(file);
+    w.track(&["large-sparse"]);
     let p = recorded(&w, "head -c 1 large-sparse >/dev/null");
     let mut blake = blake3::Hasher::new();
     let zeros = vec![0; 1024 * 1024];
