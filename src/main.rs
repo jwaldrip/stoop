@@ -93,9 +93,9 @@ BLIND SPOTS
   .stoopignore.
   Variables that change on every run (a timestamp, a per-job id) are learned after four
   runs and ignored while they hold an id, unless the command text names them. A curated
-  list covers the common CI and terminal ones; a provider's names count only where its
-  marker is set. The command text is the argv words and the `stoop sh` step body, not
-  the files a command runs, so a curated name read from a file is still ignored: pass
+  list covers the common CI and terminal ones; a provider's names are ignored only where its
+  marker variable is set. The command text is the argv words and the `stoop sh` step body,
+  not the files a command runs, so a curated name read from a file is still ignored: pass
   `--env NAME` to count it. A variable that really changes what a command does, and
   takes a new value on every run, would be ignored too. `stoop forget --volatile KEY`
   resets what was learned for a key; `--env NAME` counts a name again.
@@ -580,5 +580,20 @@ mod forget_name_tests {
     fn a_non_utf8_proof_name_names_no_proof() {
         assert_eq!(proof_name(OsStr::new("cat-1")), Some("cat-1".to_string()));
         assert_eq!(proof_name(OsStr::from_bytes(b"\xff")), None);
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    use super::HELP;
+
+    #[test]
+    fn the_help_says_a_providers_names_are_ignored_only_where_its_marker_is_set() {
+        let text = HELP.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            text.contains("a provider's names are ignored only where its marker variable is set."),
+            "{text}"
+        );
+        assert!(!text.contains("count only where"), "{text}");
     }
 }
