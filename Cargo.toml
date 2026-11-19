@@ -1,6 +1,6 @@
 [package]
 name = "stoop"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Run only what matters: skip any command whose observed inputs have not changed since it last passed."
 license = "MIT"
