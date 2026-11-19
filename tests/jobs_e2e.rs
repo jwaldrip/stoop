@@ -853,6 +853,8 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
         removed: Vec<String>,
         env: BTreeMap<String, String>,
         probes: BTreeMap<String, String>,
+        #[serde(default)]
+        env_excluded: Vec<String>,
         ignore: Option<Vec<String>>,
         priors: Option<Vec<Input>>,
         unplannable: Vec<String>,
@@ -896,6 +898,7 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
                 &p.removed,
                 &p.env,
                 &p.probes,
+                &p.env_excluded,
                 &p.ignore,
                 &p.priors,
                 &p.unplannable,
@@ -938,6 +941,8 @@ fn concurrent_proof_race(proof_only: bool) {
         removed: Vec<String>,
         env: std::collections::BTreeMap<String, String>,
         probes: std::collections::BTreeMap<String, String>,
+        #[serde(default)]
+        env_excluded: Vec<String>,
         ignore: Option<Vec<String>>,
         priors: Option<Vec<Input>>,
         unplannable: Vec<String>,
@@ -1009,6 +1014,7 @@ fn concurrent_proof_race(proof_only: bool) {
             &p.removed,
             &p.env,
             &p.probes,
+            &p.env_excluded,
             &p.ignore,
             &p.priors,
             &p.unplannable,

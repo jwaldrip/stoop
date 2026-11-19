@@ -20,6 +20,7 @@ mod run;
 mod stepkey;
 mod sync;
 mod trace;
+mod volatile;
 
 use run::Opts;
 use std::ffi::{OsStr, OsString};
@@ -36,7 +37,7 @@ USAGE
   stoop explain [options] -- <command> [args...] say what would run and why
   stoop sh <script> [args...]                   shell mode for CI (see below)
   stoop ls [--store DIR]                        list recorded proofs
-  stoop forget <key> [--store DIR]              drop a proof
+  stoop forget [--volatile] <key> [--store DIR]  drop a proof (--volatile: what was learned)
   stoop plan [options]                          plan experimental job skips
   stoop mcp [--allow-run] [--root DIR]          serve stoop to AI agents (stoop mcp --help)
   stoop pull | prune [--sync git[:remote]]       fetch or expire shared proofs
@@ -47,6 +48,7 @@ OPTIONS
   --store DIR       where proofs live (default: <root>/.stoop, or $STOOP_STORE)
   --env NAME        also require this variable (the whole environment already counts)
   --ignore-env NAME exempt a variable that changes without mattering
+  --no-learn-volatile  do not learn variables that change on every run (see BLIND SPOTS)
   --allow-network   record runs that used the network (see BLIND SPOTS)
   --max-age DUR     a proof stops counting after DUR (default 7d; 0 = never)
   --probe CMD       external state to verify: CMD's output must match for a skip
@@ -65,6 +67,7 @@ ENVIRONMENT
                     (switches: empty, 0, false, no and off mean off; anything else is on)
   STOOP_PASS_ENV    comma- or space-separated OIDC request variable names to pass;
                     requires --allow-id-token and disables proof use for the run
+  STOOP_LEARN_VOLATILE=0  same as --no-learn-volatile (empty, 0, false, no and off mean off)
 
 GITHUB ACTIONS
   Put this at the top of a workflow and every `run:` step is wrapped:
@@ -88,6 +91,14 @@ BLIND SPOTS
   which bounds what the clock can hide. Output the command writes inside the
   repository must still be in place for a skip; list throwaway output in
   .stoopignore.
+  Variables that change on every run (a timestamp, a per-job id) are learned after four
+  runs and ignored while they hold an id, unless the command text names them. A curated
+  list covers the common CI and terminal ones; a provider's names count only where its
+  marker is set. The command text is the argv words and the `stoop sh` step body, not
+  the files a command runs, so a curated name read from a file is still ignored: pass
+  `--env NAME` to count it. A variable that really changes what a command does, and
+  takes a new value on every run, would be ignored too. `stoop forget --volatile KEY`
+  resets what was learned for a key; `--env NAME` counts a name again.
 ";
 
 fn main() {
@@ -164,13 +175,32 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
                     .map(|platform| format!("{platform:?}"))
                     .collect::<Vec<_>>()
                     .join(", ");
+                let ignored = proof
+                    .ignored
+                    .iter()
+                    .map(|name| run::safe(name))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let ignores = if ignored.is_empty() {
+                    String::new()
+                } else {
+                    format!("\tignores {ignored}")
+                };
                 println!(
-                    "{}\t{} proofs\t{} inputs\tcreated {}\tdir {dirs}\tplatform {platforms}",
+                    "{}\t{} proofs\t{} inputs\tcreated {}\tdir {dirs}\tplatform {platforms}{ignores}",
                     proof.key, proof.count, proof.inputs, proof.created
                 );
             }
             for (key, n, created, steps) in jobs_for(&o).list() {
                 println!("{key}\t{n} records\t{steps} steps\tcreated {created}");
+            }
+            match run::volatile_listing(&o) {
+                Ok(lines) => {
+                    for line in lines {
+                        println!("{line}");
+                    }
+                }
+                Err(error) => eprintln!("{error}"),
             }
             0
         }
@@ -188,6 +218,19 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
                 return 1;
             };
             let key = key.as_str();
+            if o.volatile_forget {
+                return match run::forget_volatile(&o, &proof::sanitize(key)) {
+                    Ok(true) => 0,
+                    Ok(false) => {
+                        eprintln!("stoop: nothing was learned under {key}");
+                        1
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        1
+                    }
+                };
+            }
             let hook = run::forget_hook_records(&o, &proof::sanitize(key));
             if let Err(warning) = &hook {
                 eprintln!("{warning}");
@@ -329,6 +372,8 @@ fn parse(args: &[OsString]) -> Result<(Opts, Vec<OsString>), String> {
             "--literal" => o.literal = true,
             "--allow-network" => o.allow_network = true,
             "--ignore-env" => o.ignore_env.push(val("--ignore-env")?),
+            "--no-learn-volatile" => o.no_learn_volatile = true,
+            "--volatile" => o.volatile_forget = true,
             "--max-age" => o.max_age = Some(run::parse_age(&val("--max-age")?)?),
             "--probe" => o.probes.push(val("--probe")?),
             "--sync" => o.sync = Some(val("--sync")?),

@@ -50,6 +50,10 @@ pub struct Proof {
     /// of its output when the run happened. A skip needs every probe to match again.
     #[serde(default)]
     pub probes: BTreeMap<String, String>,
+    /// Environment names the volatility policy left out of `env`: bookkeeping that changes on every
+    /// run, excluded by the curated table or by what was learned. A name is never in both lists.
+    #[serde(default)]
+    pub env_excluded: Vec<String>,
 }
 
 impl Proof {
@@ -61,6 +65,7 @@ impl Proof {
             &self.removed,
             &self.env,
             &self.probes,
+            &self.env_excluded,
             &self.ignore,
             &self.priors,
             &self.unplannable,
@@ -94,6 +99,8 @@ pub struct ProofSummary {
     pub inputs: usize,
     pub dirs: Vec<String>,
     pub platforms: Vec<String>,
+    /// Names the newest proof leaves out of its environment (see `Proof::env_excluded`).
+    pub ignored: Vec<String>,
 }
 
 pub struct Store {
@@ -121,6 +128,7 @@ fn same_proof(a: &Proof, b: &Proof) -> bool {
         && a.removed == b.removed
         && a.env == b.env
         && a.probes == b.probes
+        && a.env_excluded == b.env_excluded
         && a.ignore == b.ignore
         && a.priors == b.priors
         && a.unplannable == b.unplannable
@@ -273,6 +281,7 @@ impl Store {
                         inputs: p.inputs.len(),
                         dirs,
                         platforms,
+                        ignored: p.env_excluded.clone(),
                     });
                 }
             }
@@ -309,6 +318,7 @@ mod tests {
             }],
             outputs: vec![],
             probes: BTreeMap::new(),
+            env_excluded: vec![],
             removed: vec![],
             ignore: None,
             priors: None,
@@ -353,7 +363,7 @@ mod tests {
             serde_json::json!({"path": "prior", "id": "f:2", "oid": null})
         );
         let expected =
-            br#"[[{"path":"a","id":"f:1","oid":null}],[],[],{},{},null,[{"path":"prior","id":"f:2","oid":null}],[],null,null,null]"#;
+            br#"[[{"path":"a","id":"f:1","oid":null}],[],[],{},{},[],null,[{"path":"prior","id":"f:2","oid":null}],[],null,null,null]"#;
         let digest = blake3::hash(expected).to_hex();
         assert_eq!(legacy.digest(), format!("p-{}", &digest[..32]));
         assert_ne!(legacy.digest(), "p-0d2ac5193d1ccb16d01c21b0e61f858e");
@@ -700,5 +710,20 @@ mod tests {
         s.save("k", proof("f:1")).unwrap();
         assert!(s.forget("k").unwrap());
         assert!(!s.forget("k").unwrap());
+    }
+
+    #[test]
+    fn excluded_names_round_trip_and_older_files_load_without_them() {
+        let s = store("excluded");
+        let mut p = proof("f:1");
+        p.env_excluded = vec!["CI_COMMIT_SHA".into()];
+        s.save("k", p).unwrap();
+        assert_eq!(
+            s.load("k")[0].env_excluded,
+            vec!["CI_COMMIT_SHA".to_string()]
+        );
+        let older: Proof =
+            serde_json::from_str(r#"{"created":1,"argv":["x"],"env":{},"inputs":[]}"#).unwrap();
+        assert!(older.env_excluded.is_empty());
     }
 }

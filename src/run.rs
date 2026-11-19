@@ -10,6 +10,7 @@ use crate::pathutil::{absolutize, cwd_key, to_key, Physical};
 use crate::proof::{now, sanitize, Proof, Store};
 use crate::sync::Remote;
 use crate::trace::{self, Trace};
+use crate::volatile;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -36,6 +37,10 @@ pub struct Opts {
     pub literal: bool,
     /// Environment variables exempted from the whole-environment input.
     pub ignore_env: Vec<String>,
+    /// Do not learn variables that change on every run (`--no-learn-volatile`).
+    pub no_learn_volatile: bool,
+    /// `stoop forget --volatile KEY`: forget what was learned instead of a proof.
+    pub volatile_forget: bool,
     /// Record runs that used the network (their results are invisible to a file trace).
     pub allow_network: bool,
     /// Extra text searched for runner variable names (a CI step's script body).
@@ -590,6 +595,53 @@ pub fn forget_hook_records(o: &Opts, key: &str) -> Result<bool, String> {
     units::hook_store::forget(&store_for(o, &cwd, &root), key)
 }
 
+/// Forget what was learned about environment variables under `key`. Returns whether anything was.
+pub fn forget_volatile(o: &Opts, key: &str) -> Result<bool, String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = root_for(o, &cwd);
+    volatile::forget(&store_for(o, &cwd, &root), key)
+}
+
+/// `stoop ls` lines for the names learned as bookkeeping under the current salt.
+pub fn volatile_listing(o: &Opts) -> Result<Vec<String>, String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = root_for(o, &cwd);
+    let salt = env_salt();
+    let learned = volatile::list(
+        &store_for(o, &cwd, &root),
+        &volatile::salt_id(salt.as_deref()),
+    )?;
+    let mut lines = Vec::new();
+    for (key, names) in learned {
+        for (name, runs) in names {
+            lines.push(format!(
+                "volatile\t{key}\tignores {}\tlearned after {runs} runs",
+                volatile::safe(&name)
+            ));
+        }
+    }
+    Ok(lines)
+}
+
+/// Learning is on unless `--no-learn-volatile` or `STOOP_LEARN_VOLATILE` turns it off. An empty,
+/// `0`, `false`, `no` or `off` value is off. A value that is not UTF-8 is off as well: a run that
+/// does not learn counts more, so it skips less.
+pub fn learning_on(o: &Opts) -> bool {
+    if o.no_learn_volatile {
+        return false;
+    }
+    match std::env::var_os("STOOP_LEARN_VOLATILE") {
+        None => true,
+        Some(value) => match value.to_str() {
+            Some(text) => !matches!(
+                text.trim().to_ascii_lowercase().as_str(),
+                "" | "0" | "false" | "no" | "off"
+            ),
+            None => false,
+        },
+    }
+}
+
 fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     let initial_key = o.key.clone().unwrap_or_default();
     if o.argv.is_empty() {
@@ -783,6 +835,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             how: How::Untraced,
         };
     }
+    let volatile_store = store_path.clone();
     let store = Store::new(store_path);
     if explain && !o.quiet {
         let dir = if rel_cwd.is_empty() { "." } else { &rel_cwd };
@@ -836,25 +889,55 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 .and_then(|v| parse_age(&v).ok())
         })
         .unwrap_or(DEFAULT_MAX_AGE);
-    let mut env_names = ambient_env(
-        &format!(
-            "{} {}",
-            // Only the names of variables the command mentions are read from this text, and
-            // those are ASCII, so lossy text finds the same names as the exact bytes.
-            o.argv
-                .iter()
-                .map(|word| word.to_string_lossy())
-                .collect::<Vec<_>>()
-                .join(" "),
-            o.mention
-        ),
-        &o.ignore_env,
+    // The words are mentioned as lossy text: the names a command can mention are ASCII.
+    let mention = format!(
+        "{} {}",
+        o.argv
+            .iter()
+            .map(|word| word.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(" "),
+        o.mention
     );
-    env_names.extend(o.env.iter().cloned());
-    env_names.sort();
-    env_names.dedup();
+    let candidates = ambient_env(&mention, &o.ignore_env);
     let salt = env_salt();
-    let env_now = env_hashes(&env_names, salt.as_deref());
+    let volatile = volatile::decide(&volatile::Request {
+        store: &volatile_store,
+        key: &key,
+        candidates: &candidates,
+        mention: &mention,
+        forced: &o.env,
+        ignore: &o.ignore_env,
+        salt: salt.as_deref(),
+        learn: learning_on(&o),
+        // A run that does not write its record, or only explains, observes in memory: it must not
+        // change what a trusted run has learned.
+        persist: !explain && !o.no_record,
+        now: now(),
+    });
+    for line in &volatile.changes {
+        if !o.quiet {
+            eprintln!("stoop: {line}");
+        }
+    }
+    if let Some(warning) = &volatile.warning {
+        if !o.quiet {
+            eprintln!("{warning}");
+        }
+    }
+    if explain && !o.quiet {
+        for (name, why) in &volatile.plan.excluded {
+            eprintln!("stoop: ignoring env {}: {why}", volatile::safe(name));
+        }
+    }
+    let env_excluded: Vec<String> = volatile
+        .plan
+        .excluded
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    let env_now = env_hashes(&volatile.plan.counted, salt.as_deref());
+    let excluded_now: std::collections::BTreeSet<&String> = env_excluded.iter().collect();
 
     let remote = o
         .sync
@@ -895,6 +978,13 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 vec![("proof".to_string(), "expired")]
             } else if p.env != env_now {
                 vec![("env".to_string(), "changed")]
+            } else if p
+                .env_excluded
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                != excluded_now
+            {
+                vec![("env exclusions".to_string(), "changed")]
             } else {
                 let mut d: Vec<(String, &'static str)> = verify(&root, &p.inputs, explain)
                     .into_iter()
@@ -1114,6 +1204,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 scope: scope.clone(),
                 provenance: Some(trace::Provenance::current()),
                 env: env_now,
+                env_excluded,
                 inputs,
                 outputs,
                 probes,

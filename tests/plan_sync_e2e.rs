@@ -168,7 +168,7 @@ impl Fixture {
         let version = tracer_version::TRACER_VERSION;
         let provenance =
             json!({"os":"linux", "arch":"x86_64", "tracer":"ptrace-seccomp", "version":version});
-        let digest_bytes = format!("[[],[],[],{{}},{{}},[],[],[],\"\",null,{{\"os\":\"linux\",\"arch\":\"x86_64\",\"tracer\":\"ptrace-seccomp\",\"version\":{version}}}]");
+        let digest_bytes = format!("[[],[],[],{{}},{{}},[],[],[],[],\"\",null,{{\"os\":\"linux\",\"arch\":\"x86_64\",\"tracer\":\"ptrace-seccomp\",\"version\":{version}}}]");
         let digest = format!(
             "p-{}",
             &blake3::hash(digest_bytes.as_bytes()).to_hex()[..32]

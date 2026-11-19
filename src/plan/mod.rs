@@ -756,6 +756,7 @@ mod tests {
             priors: Some(vec![]),
             unplannable: vec![],
             probes: BTreeMap::new(),
+            env_excluded: vec![],
         };
         let store = root.join(".stoop");
         proof::Store::new(store.clone())

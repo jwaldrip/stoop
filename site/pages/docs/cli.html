@@ -6,8 +6,9 @@
     <tr><td><code>stoop run [options] -- &lt;command&gt; [args...]</code></td><td>Skip the command if a proof matches; otherwise run it traced and record a proof if it passes. The default, so <code>stoop -- make test</code> works too.</td></tr>
     <tr><td><code>stoop explain [options] -- &lt;command&gt; [args...]</code></td><td>Say what would happen and why, without running anything. Prints what differed in each proof it checked.</td></tr>
     <tr><td><code>stoop sh &lt;script&gt; [args...]</code></td><td>Shell mode for CI. Runs the script with <code>bash --noprofile --norc -eo pipefail</code>, keyed by the script's contents and arguments, <code>GITHUB_WORKFLOW</code>, <code>GITHUB_JOB</code> and the working directory. Made for <code>shell: stoop sh {0}</code>.</td></tr>
-    <tr><td><code>stoop ls [--store DIR]</code></td><td>List keys, working directories, recorded platforms, proof count, inputs in the newest proof, and when it was created (Unix seconds). Older proofs without platform information are shown as unknown.</td></tr>
+    <tr><td><code>stoop ls [--store DIR]</code></td><td>List keys, working directories, recorded platforms, proof count, inputs in the newest proof, and when it was created (Unix seconds). Older proofs without platform information are shown as unknown. Each proof also lists the environment variables it leaves out as <code>ignores</code>, and learned exclusions are listed as <code>volatile</code> lines.</td></tr>
     <tr><td><code>stoop forget &lt;key&gt; [--store DIR]</code></td><td>Drop every proof for a key.</td></tr>
+    <tr><td><code>stoop forget --volatile &lt;key&gt; [--store DIR]</code></td><td>Forget what was learned about environment variables for a key. They count again until they are learned once more. See <a href="blind-spots.html#volatile">variables that change on every run</a>.</td></tr>
     <tr><td><code>stoop pull [--sync git[:remote]]</code></td><td>Fetch every published proof from the remote once. Use it at the start of a job.</td></tr>
     <tr><td><code>stoop prune [--sync git[:remote]] [--max-age DUR]</code></td><td>Delete published proofs older than <code>--max-age</code> (default 7d). Needs write access.</td></tr>
     <tr><td><code>stoop --help</code>, <code>stoop --version</code></td><td>Help text and version.</td></tr>
@@ -49,9 +50,11 @@
   <dt id="opt-store">--store DIR</dt>
   <dd>Where proofs live. Defaults to <code>&lt;root&gt;/.stoop</code>, or <code>$STOOP_STORE</code>. An external store scopes automatic keys by Git origin, or by the physical root path if there is no origin. See <a href="how-it-works.html#keys">keys</a>.</dd>
   <dt id="opt-env">--env NAME</dt>
-  <dd>Count this variable too. The environment already counts, minus runner bookkeeping (<code>GITHUB_</code>, <code>RUNNER_</code>, <code>ACTIONS_</code>, <code>INPUT_</code>, <code>STOOP_</code>); use this to put one of those back. Repeatable.</dd>
+  <dd>Count this variable too. The environment already counts, minus runner bookkeeping (<code>GITHUB_</code>, <code>RUNNER_</code>, <code>ACTIONS_</code>, <code>INPUT_</code>, <code>STOOP_</code>) and the curated per-run variables; use this to put one back. A name the command text mentions counts anyway. The command text is the argv words and the <code>stoop sh</code> step body, not the files the command runs. Repeatable.</dd>
   <dt id="opt-ignore-env">--ignore-env NAME</dt>
-  <dd>Exempt a variable that changes without mattering, such as a per-run token. Repeatable.</dd>
+  <dd>Exempt a variable that changes without mattering, such as a per-run token. An exempt name is never counted, even when it was learned. Repeatable.</dd>
+  <dt id="opt-no-learn-volatile">--no-learn-volatile</dt>
+  <dd>Do not learn variables that change on every run. The curated list still applies. See <a href="blind-spots.html#volatile">variables that change on every run</a>.</dd>
   <dt id="opt-probe">--probe CMD</dt>
   <dd>External state to verify. CMD runs with <code>sh -c</code> before the command; its output is hashed into the proof and must match again for a skip. A probe that fails, or prints something different after the command finishes, means nothing is recorded. Declaring a probe accepts network use for that step. Repeatable.</dd>
   <dt id="opt-allow-network">--allow-network</dt>
@@ -85,6 +88,7 @@
     <tr><td><code>STOOP_SYNC_WRITE=1</code></td><td>Same as <code>--sync-write</code>.</td></tr>
     <tr><td><code>STOOP_PASS_ENV</code></td><td>Comma- or whitespace-separated names selected from <code>ACTIONS_ID_TOKEN_REQUEST_URL</code> and <code>ACTIONS_ID_TOKEN_REQUEST_TOKEN</code>. Each listed name requires <code>--allow-id-token</code>. See <a href="ci.html#github-actions">CI recipes</a>.</td></tr>
     <tr><td><code>STOOP_ENV_SALT</code></td><td>A secret that keys the environment hashes stored in proofs. Set it from a repository secret wherever proofs are published. See <a href="ci.html#sync">How git sync works</a>.</td></tr>
+    <tr><td><code>STOOP_LEARN_VOLATILE=0</code></td><td>Same as <code>--no-learn-volatile</code>. Empty, <code>0</code>, <code>false</code>, <code>no</code> and <code>off</code> turn learning off.</td></tr>
   </tbody>
 </table>
 <p class="note">These are switches. A variable that is empty, or set to <code>0</code>, <code>false</code>, <code>no</code> or <code>off</code>, is off; anything else is on. That makes the common CI idiom <code>STOOP_SYNC_WRITE: ${{ github.ref == 'refs/heads/main' &amp;&amp; '1' || '' }}</code> safe: the empty string on a pull request does not turn publishing on. An empty <code>STOOP_SYNC</code> or <code>STOOP_STORE</code> counts as unset.</p>

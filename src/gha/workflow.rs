@@ -1530,6 +1530,7 @@ mod tests {
             priors: Some(vec![]),
             unplannable: vec![],
             probes: BTreeMap::new(),
+            env_excluded: vec![],
         };
         store.save(keys[0], proof).unwrap();
         assert_eq!(store.load(keys[0]).len(), 1);
