@@ -69,6 +69,11 @@ fn read_catalog(store: &Path) -> Result<Catalog, Damage> {
             catalog.version
         )));
     }
+    if catalog.records.len() > MAX_RECORDS {
+        return Err(Damage::Replace(
+            "it holds more records than the limit".into(),
+        ));
+    }
     Ok(catalog)
 }
 
@@ -134,24 +139,31 @@ fn current(record: &Record, now: u64, max_age: u64) -> bool {
     max_age == 0 || now.saturating_sub(record.created) <= max_age
 }
 
-pub(crate) fn records(store: &Path, now: u64, max_age: u64) -> io::Result<Vec<Record>> {
-    Ok(read_catalog(store)?
-        .records
-        .into_iter()
-        .filter(|record| current(record, now, max_age))
-        .collect())
+/// Read the records that can be used. Damage yields no records plus one warning, so a
+/// broken catalog costs at most the hook recognition it would have provided.
+pub(crate) fn records(store: &Path, now: u64, max_age: u64) -> Result<Vec<Record>, String> {
+    match read_catalog(store) {
+        Ok(catalog) => Ok(catalog
+            .records
+            .into_iter()
+            .filter(|record| current(record, now, max_age))
+            .collect()),
+        Err(Damage::Replace(why) | Damage::Keep(why)) => Err(format!(
+            "stoop: hook records are unavailable ({why}); running the command as typed"
+        )),
+    }
 }
 
-pub(crate) fn record(store: &Path, record: Record, now: u64, max_age: u64) -> io::Result<()> {
+/// Save one template. Any failure is returned as a warning; the caller still runs the command.
+pub(crate) fn record(store: &Path, record: Record, now: u64, max_age: u64) -> Result<(), String> {
     if record.argv.len() > 128
         || serde_json::to_vec(&record)
             .map(|bytes| bytes.len() > MAX_RECORD_BYTES)
             .unwrap_or(true)
     {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "hook template exceeds size limit",
-        ));
+        return Err(
+            "stoop: hook template is too large to record; running the command as typed".into(),
+        );
     }
     let _lock = lock(store).map_err(|error| {
         format!("stoop: cannot lock hook records ({error}); running the command as typed")
@@ -185,10 +197,10 @@ pub(crate) fn record(store: &Path, record: Record, now: u64, max_age: u64) -> io
             });
         }
         if catalog.records.len() <= 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "hook template exceeds catalog limit",
-            ));
+            return Err(
+                "stoop: hook templates exceed the catalog limit; running the command as typed"
+                    .into(),
+            );
         }
         catalog.records.remove(0);
     }
@@ -199,13 +211,20 @@ pub(crate) fn forget(store: &Path, key: &str) -> Result<bool, String> {
     if !path(store).exists() {
         return Ok(false);
     }
-    let _lock = lock(store)?;
-    let mut catalog = read_catalog(store)?;
+    let _lock =
+        lock(store).map_err(|error| format!("stoop: cannot lock hook records ({error})"))?;
+    let mut catalog = match read_catalog(store) {
+        Ok(catalog) => catalog,
+        Err(Damage::Replace(why) | Damage::Keep(why)) => {
+            return Err(format!("stoop: hook records are unavailable ({why})"));
+        }
+    };
     let before = catalog.records.len();
     catalog.records.retain(|record| record.key != key);
     if before == catalog.records.len() {
         return Ok(false);
     }
-    write_catalog(store, &catalog)?;
+    write_catalog(store, &catalog)
+        .map_err(|error| format!("stoop: cannot save hook records ({error})"))?;
     Ok(true)
 }
