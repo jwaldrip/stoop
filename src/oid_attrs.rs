@@ -219,6 +219,11 @@ fn config(root: &Path) -> Option<String> {
             Some(i) => (&entry[..i], &entry[i + 1..]),
             None => (entry, b"true".as_slice()),
         };
+        // `git var -l` prints each entry as a line, so a value with a newline could forge a
+        // `GIT_CONFIG_GLOBAL=` or `GIT_ATTR_GLOBAL=` line. No such value is trusted.
+        if value.contains(&b'\n') {
+            return None;
+        }
         let key = std::str::from_utf8(key).ok()?.to_ascii_lowercase();
         if key.is_empty()
             || key == "core.attributesfile"

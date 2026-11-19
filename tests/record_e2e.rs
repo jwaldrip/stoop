@@ -1181,6 +1181,51 @@ fn a_symlink_into_git_is_not_recorded() {
     w.clean();
 }
 
+/// A hard link made during the run to the worktree's `.gitattributes`, then written through its
+/// outside name, changes what Git reads for attributes. No outside name is watched, and the file
+/// is not a watched name, so the link itself must drop the run's blob ids. The same script without
+/// the link keeps them.
+#[test]
+fn a_hard_link_to_the_worktree_attributes_file_drops_blob_ids() {
+    let attributes = [("R:.gitattributes", Some("*.bin -text\n"))];
+    let (changed, _) = seeded_run(
+        "oid-link-attributes",
+        &attributes,
+        |_| {},
+        "cat in.txt >/dev/null && ln .gitattributes \"$HOME/attrs\" && printf '*.txt eol=crlf\\n' >> \"$HOME/attrs\"",
+    );
+    assert_unknown_oid_basis(entry(&changed, "inputs", "in.txt"));
+    let (control, control_oid) = seeded_run(
+        "oid-link-attributes",
+        &attributes,
+        |_| {},
+        "cat in.txt >/dev/null",
+    );
+    assert_blob_oid(&control, "inputs", "in.txt", &control_oid);
+}
+
+/// `linkat` with AT_EMPTY_PATH names its source by descriptor. The tracer judges that descriptor as
+/// it judges a named one, when the call is entered, so the run's blob ids drop whether or not the
+/// kernel lets the link succeed.
+#[test]
+fn a_link_made_from_a_descriptor_for_the_worktree_attributes_drops_blob_ids() {
+    let attributes = [("R:.gitattributes", Some("*.bin -text\n"))];
+    let (changed, _) = seeded_run(
+        "oid-link-fd-attributes",
+        &attributes,
+        |_| {},
+        "cat in.txt >/dev/null; exec 3< .gitattributes; ./syscall-probe linkat-empty 3 \"$HOME/attrs\"; printf '*.txt eol=crlf\\n' >> \"$HOME/attrs\"",
+    );
+    assert_unknown_oid_basis(entry(&changed, "inputs", "in.txt"));
+    let (control, control_oid) = seeded_run(
+        "oid-link-fd-attributes",
+        &attributes,
+        |_| {},
+        "cat in.txt >/dev/null; exec 3< .gitattributes; cat <&3 >/dev/null",
+    );
+    assert_blob_oid(&control, "inputs", "in.txt", &control_oid);
+}
+
 /// A descriptor the run inherits, open for writing on a watched file, drops every blob id in the
 /// run. The same descriptor on an ordinary file outside the repository keeps them.
 #[test]

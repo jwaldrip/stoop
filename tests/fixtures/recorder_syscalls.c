@@ -99,6 +99,10 @@ int main(int argc, char **argv) {
         close(fd);
         return result != 0;
     }
+    if (!strcmp(op, "linkat-empty")) {
+        if (argc < 4) return 2;
+        return linkat(atoi(argv[2]), "", AT_FDCWD, argv[3], AT_EMPTY_PATH) != 0;
+    }
     if (!strcmp(op, "fchmod")) {
         int fd = open(argv[2], O_RDONLY);
         if (fd < 0) return 3;

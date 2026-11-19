@@ -127,10 +127,12 @@ enum Op {
         path: usize,
         target: usize,
     },
-    /// link, linkat: the existing file the new name refers to.
+    /// link, linkat: the existing file the new name refers to. `flags` may carry AT_EMPTY_PATH,
+    /// which names that file by descriptor instead.
     LinkSource {
         dirfd: Option<usize>,
         path: usize,
+        flags: Option<usize>,
     },
     /// chown, lchown, fchownat: an owner change named by path. `flags` may carry
     /// AT_SYMLINK_NOFOLLOW or AT_EMPTY_PATH; `nofollow` is set for lchown.
@@ -272,6 +274,7 @@ fn table() -> Vec<(i64, Vec<Op>)> {
                 LinkSource {
                     dirfd: Some(0),
                     path: 1,
+                    flags: Some(4),
                 },
                 Create {
                     dirfd: Some(2),
@@ -2517,12 +2520,16 @@ impl Tracer<'_> {
                         self.create_at(pid, p, false);
                     }
                 }
-                Op::LinkSource { dirfd, path } => {
+                Op::LinkSource { dirfd, path, flags } => {
+                    let by_fd = flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0);
                     if let Some(p) = self.resolve(pid, &args, dirfd, path) {
                         self.touch(p.clone(), true);
                         if self.oid_sensitive(&p, true) {
                             self.t.oid_attrs_changed = true;
                         }
+                    } else if let (Some(fd), true) = (dirfd, by_fd) {
+                        // AT_EMPTY_PATH names the source by descriptor, as fchownat does.
+                        self.owner_fd(pid, args[fd] as i32);
                     }
                 }
                 Op::Owner {
