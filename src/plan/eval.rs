@@ -3621,6 +3621,114 @@ mod tests {
         assert_eq!(evidence.declined.get("mode"), Some(&1));
         assert_eq!(evidence.declined.get("oid-unavailable"), Some(&1));
     }
+    /// Check compares where the two modes stop, not only their codes. Both refuse this record
+    /// with `input-changed`. On trusts the blob id of `dir/a` and reaches `nope`, which is absent.
+    /// Off hashes `dir/a` first and finds it changed. Check must report that the modes disagree.
+    #[test]
+    fn check_refuses_when_the_modes_stop_at_different_inputs() {
+        let mut f = Fixture::new();
+        let oid = tree_oid(&f.root, "dir/a");
+        f.install(vec![proof(vec![
+            with_oid("dir/a", &file_id(b"old"), &oid),
+            input("nope", &file_id(b"gone")),
+        ])]);
+        let on = outcome(&mut f, Prefilter::On).decision;
+        let off = outcome(&mut f, Prefilter::Off).decision;
+        assert_eq!(on.code, Code::InputChanged, "{}", on.detail);
+        assert_eq!(off.code, Code::InputChanged, "{}", off.detail);
+        assert_eq!(
+            on.mismatches,
+            vec![(1, "nope".to_string(), "removed".to_string())]
+        );
+        assert_eq!(
+            off.mismatches,
+            vec![(1, "dir/a".to_string(), "changed".to_string())]
+        );
+        let check = outcome(&mut f, Prefilter::Check).decision;
+        assert_eq!(check.code, Code::Error, "{}", check.detail);
+        assert!(check.detail.contains("disagrees"), "{}", check.detail);
+    }
+    /// Check also compares the step where each mode stopped. The two refuse with the same detail
+    /// and the same path, so only the step tells them apart. Step 1 holds a prior whose blob id
+    /// matches the tree but whose content id does not: On trusts it and moves on, and Off hashes
+    /// it and stops there. Step 2 names other bytes, where On stops.
+    #[test]
+    fn check_refuses_when_the_modes_stop_at_different_steps() {
+        let mut f = Fixture::new();
+        let tree = tree_oid(&f.root, "dir/a");
+        let other = blob_oid_of(&f.root, b"other");
+        let mut first = proof(vec![]);
+        first.priors = Some(vec![with_oid("dir/a", &file_id(b"old"), &tree)]);
+        let mut second = proof(vec![]);
+        second.priors = Some(vec![with_oid("dir/a", &file_id(b"tracked"), &other)]);
+        f.install(vec![first, second]);
+        let on = outcome(&mut f, Prefilter::On).decision;
+        let off = outcome(&mut f, Prefilter::Off).decision;
+        assert_eq!(on.code, Code::PriorChanged, "{}", on.detail);
+        assert_eq!(off.code, Code::PriorChanged, "{}", off.detail);
+        assert_eq!(on.detail, off.detail);
+        assert_eq!(
+            on.mismatches,
+            vec![(2, "dir/a".to_string(), "prior content changed".to_string())]
+        );
+        assert_eq!(
+            off.mismatches,
+            vec![(1, "dir/a".to_string(), "prior content changed".to_string())]
+        );
+        let check = outcome(&mut f, Prefilter::Check).decision;
+        assert_eq!(check.code, Code::Error, "{}", check.detail);
+        assert!(check.detail.contains("disagrees"), "{}", check.detail);
+    }
+    /// Counts describe one evaluation. A pass that reads no blob reports none, even when an
+    /// earlier pass on the same tree read one.
+    #[test]
+    fn blob_reads_are_counted_per_pass_on_a_shared_tree() {
+        let mut f = Fixture::new();
+        let oid = tree_oid(&f.root, "dir/a");
+        f.install(vec![proof(vec![with_oid(
+            "dir/a",
+            &file_id(b"tracked"),
+            &oid,
+        )])]);
+        let off = outcome(&mut f, Prefilter::Off);
+        assert_eq!(
+            (off.counts.by_oid, off.counts.hashed, off.counts.blob_reads),
+            (0, 1, 1)
+        );
+        let on = outcome(&mut f, Prefilter::On);
+        assert_eq!(on.decision.code, Code::Proved, "{}", on.decision.detail);
+        assert_eq!(
+            (on.counts.by_oid, on.counts.hashed, on.counts.blob_reads),
+            (1, 0, 0)
+        );
+    }
+    /// The modes can fail at different inputs. `dir/a` matches its blob by id, so On never reads
+    /// it and fails at `dir/c`, whose blob is missing. Off reads `dir/a` first and fails there.
+    /// Both return `error` with no mismatch, so only the detail tells them apart.
+    #[test]
+    fn check_refuses_when_the_modes_fail_at_different_inputs() {
+        let mut f = Fixture::new();
+        fs::write(f.root.join("dir/c"), b"c").unwrap();
+        commit_all(&f.root, "second file");
+        let a = tree_oid(&f.root, "dir/a");
+        let c = tree_oid(&f.root, "dir/c");
+        drop_loose_blob(&f.root, &a);
+        drop_loose_blob(&f.root, &c);
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        f.install(vec![proof(vec![
+            with_oid("dir/a", &file_id(b"tracked"), &a),
+            input("dir/c", &file_id(b"c")),
+        ])]);
+        let on = outcome(&mut f, Prefilter::On).decision;
+        let off = outcome(&mut f, Prefilter::Off).decision;
+        assert_eq!(on.code, Code::Error, "{}", on.detail);
+        assert_eq!(off.code, Code::Error, "{}", off.detail);
+        assert!(on.detail.contains("dir/c"), "{}", on.detail);
+        assert!(off.detail.contains("dir/a"), "{}", off.detail);
+        let check = outcome(&mut f, Prefilter::Check).decision;
+        assert_eq!(check.code, Code::Error, "{}", check.detail);
+        assert!(check.detail.contains("disagrees"), "{}", check.detail);
+    }
     fn commit_index(root: &Path, message: &str) {
         git(
             root,

@@ -1411,6 +1411,178 @@ fn clean_children_still_publish_an_attestation_the_planner_verifies() {
     assert_eq!(result["skip"], serde_json::json!([]));
 }
 
+/// Record one step through the real Linux recorder, attest it, and plan the job with the
+/// planner's verifier. `files` are committed beside the workflow. Returns the plan JSON.
+fn plan_recorded_step(name: &str, script: &str, files: &[(&str, &str)]) -> Value {
+    use std::os::unix::fs::PermissionsExt;
+    let mut w = Ws::new(name, &[script]);
+    for (path, contents) in files {
+        fs::write(w.root.join(path), contents).unwrap();
+    }
+    let runner = if cfg!(target_arch = "aarch64") {
+        "ubuntu-24.04-arm"
+    } else {
+        "ubuntu-latest"
+    };
+    let workflow = format!(
+        "name: fixture\non: push\ndefaults:\n  run:\n    shell: stoop sh {{0}}\njobs:\n  stoop-plan:\n    runs-on: ubuntu-latest\n    steps: []\n  test:\n    needs: [stoop-plan]\n    if: ${{{{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',test,') }}}}\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: |\n          {}\n",
+        script.trim_end()
+    );
+    let workflow = workflow.replace("runs-on: ubuntu-latest", &format!("runs-on: {runner}"));
+    fs::write(w.root.join(".github/workflows/ci.yml"), workflow).unwrap();
+    let mut add = vec!["add", ".github/workflows/ci.yml"];
+    add.extend(files.iter().map(|(path, _)| *path));
+    git(&w.root, &add);
+    git(
+        &w.root,
+        &[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.org",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "gated fixture",
+        ],
+    );
+    w.sha = git(&w.root, &["rev-parse", "HEAD"]);
+    git(&w.root, &["push", "-q", "origin", "HEAD:refs/heads/main"]);
+    fs::write(
+        w.temp.join("event.json"),
+        r#"{"repository":{"default_branch":"main"}}"#,
+    )
+    .unwrap();
+    let token = TokenApi::new(w.sha.clone());
+    let bin = w.temp.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let curl = bin.join("curl");
+    fs::write(&curl, "#!/bin/sh\nif [ \"$1\" = -q ]; then\n  config=$(cat)\n  case \"$config\" in\n    *token.actions.githubusercontent.com/.well-known/jwks*) cat \"$STOOP_TEST_JWKS\" ;;\n    *\"$STOOP_TEST_TOKEN_URL\"*) printf '%s\\n' \"$config\" | /usr/bin/curl \"$@\" --noproxy '*' --proto '=http,https' ;;\n    *) exit 81 ;;\n  esac\nelse\n  case \"$*\" in\n    *\"$STOOP_TEST_ACTION_API/repos/actions/checkout/tarball/\"*) exec /usr/bin/curl \"$@\" --noproxy '*' ;;\n    *) exit 82 ;;\n  esac\nfi\n").unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o755)).unwrap();
+    let jwks = w.temp.join("jwks.json");
+    fs::write(&jwks, include_bytes!("fixtures/attest/test-jwks.json")).unwrap();
+    let path = format!("{}:/usr/bin:/bin", bin.display());
+    let configure = |command: &mut Command| {
+        command
+            .env("PATH", &path)
+            .env("CI", "true")
+            .env("ACTIONS_ID_TOKEN_REQUEST_URL", &token.url)
+            .env("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "fixture-bearer")
+            .env("STOOP_TEST_TOKEN_URL", &token.url)
+            .env("STOOP_TEST_ACTION_API", &w.api.url)
+            .env("STOOP_TEST_JWKS", &jwks)
+            .env("GITHUB_REPOSITORY_ID", "12345")
+            .env("GITHUB_REPOSITORY_OWNER_ID", "6789")
+            .env(
+                "STOOP_JOB_WORKFLOW_REF",
+                "owner/repo/.github/workflows/ci.yml@refs/heads/main",
+            )
+            .env("RUNNER_OS", "Linux")
+            .env_remove("STOOP_PASS_ENV");
+    };
+    let mut command = w.command(script, "1");
+    configure(&mut command);
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        token.requests.load(Ordering::Relaxed) > 0,
+        "journal never requested the token"
+    );
+    let records = w.records();
+    assert!(
+        records[0]["records"][0]["attest"].as_str().is_some(),
+        "record was not attested: {records:?}"
+    );
+    let mut plan = Command::new(env!("CARGO_BIN_EXE_stoop"));
+    plan.args([
+        "plan",
+        "--workflow",
+        ".github/workflows/ci.yml",
+        "--format",
+        "json",
+    ])
+    .current_dir(&w.root)
+    .env_clear()
+    .env("HOME", &w.temp)
+    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+    .env("GIT_CONFIG_NOSYSTEM", "1")
+    .env("GITHUB_ACTIONS", "true")
+    .env("GITHUB_REPOSITORY", "owner/repo")
+    .env("GITHUB_WORKFLOW", "fixture")
+    .env(
+        "GITHUB_WORKFLOW_REF",
+        "owner/repo/.github/workflows/ci.yml@refs/heads/main",
+    )
+    .env("GITHUB_JOB", "stoop-plan")
+    .env("GITHUB_SHA", &w.sha)
+    .env("GITHUB_EVENT_PATH", w.temp.join("event.json"))
+    .env(
+        "GITHUB_SERVER_URL",
+        format!("file://{}", w.root.parent().unwrap().display()),
+    )
+    .env("GITHUB_API_URL", &w.api.url)
+    .env(
+        "RUNNER_WORKSPACE",
+        w.root.parent().unwrap().join("runner-work/repo"),
+    )
+    .env("STOOP_SYNC", "git");
+    configure(&mut plan);
+    let output = plan.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+/// The clean step of the attested planner test. Its one input is `a.txt`, recorded by the real
+/// recorder with its git blob id, so the planner decides it without reading a blob or hashing it.
+#[test]
+fn a_clean_step_records_blob_ids_the_planner_matches() {
+    let result = plan_recorded_step("clean-blob-ids", "cat a.txt\n", &[("a.txt", "a\n")]);
+    let job = &result["jobs"][0];
+    assert_eq!(job["code"], "proved", "{result}");
+    assert_eq!(job["legs"][0]["checked"]["by_oid"], 1, "{result}");
+    assert_eq!(job["legs"][0]["checked"]["hashed"], 0, "{result}");
+    assert_eq!(job["legs"][0]["checked"]["blob_reads"], 0, "{result}");
+}
+
+/// P2's tracer drops every blob id in a run when a step writes an ordinary file outside the
+/// repository, because Git can read configuration and attribute files at paths the tracer cannot
+/// enumerate. This pins that rule as it stands. The step is still proved, by hashing, so nothing is
+/// decided by blob id. Narrowing the rule is a deliberate change, and this is the test to update.
+#[test]
+fn a_write_outside_the_repository_drops_every_blob_id_in_the_run() {
+    let result = plan_recorded_step(
+        "outside-blob-ids",
+        "cat a.txt; printf x > \"$RUNNER_TEMP/outside\"\n",
+        &[("a.txt", "a\n")],
+    );
+    let job = &result["jobs"][0];
+    assert_eq!(job["code"], "proved", "{result}");
+    assert_eq!(job["legs"][0]["checked"]["by_oid"], 0, "{result}");
+    assert_eq!(job["legs"][0]["checked"]["hashed"], 1, "{result}");
+}
+
+/// A write to a device cannot change Git's configuration, so it leaves the blob ids alone.
+#[test]
+fn a_write_to_dev_null_keeps_blob_ids() {
+    let result = plan_recorded_step(
+        "devnull-blob-ids",
+        "cat a.txt > /dev/null\n",
+        &[("a.txt", "a\n")],
+    );
+    let job = &result["jobs"][0];
+    assert_eq!(job["code"], "proved", "{result}");
+    assert_eq!(job["legs"][0]["checked"]["by_oid"], 1, "{result}");
+}
+
 #[test]
 fn allowed_step_blocks_later_publication_after_an_attested_running_record() {
     use std::os::unix::fs::PermissionsExt;
