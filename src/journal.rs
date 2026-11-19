@@ -10,6 +10,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Strict action policy is an opt-in that only adds caution. An unreadable value turns it on, so a
+/// non-UTF-8 value can never switch strictness off.
+pub(crate) fn strict_actions() -> bool {
+    run::env_switch("STOOP_STRICT_ACTIONS", true)
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Journal {
     path: PathBuf,
@@ -25,7 +31,7 @@ impl Journal {
         matrix: Option<&str>,
         publishing: bool,
     ) -> Result<Option<Self>, String> {
-        if !run::env_flag("GITHUB_ACTIONS") {
+        if !run::env_switch("GITHUB_ACTIONS", true) {
             return Ok(None);
         }
         let Some(temp) = run::env_str("RUNNER_TEMP") else {
@@ -85,11 +91,7 @@ impl Journal {
         let key = spec.key.ok_or("job has no key")?;
         let refs = spec.actions.clone();
         let actions = if publishing {
-            record_actions(
-                &refs,
-                &resolve::Git::from_env(root),
-                run::env_flag("STOOP_STRICT_ACTIONS"),
-            )
+            record_actions(&refs, &resolve::Git::from_env(root), strict_actions())
         } else {
             BTreeMap::new()
         };
@@ -240,7 +242,7 @@ impl Journal {
             let timestamp = now().max(self.record.created.saturating_add(1));
             self.record.created = timestamp;
             self.record.attest = attest::mint(&self.key, &self.record);
-            if publish_proof && run::env_str(run::SALT_VAR).is_none() {
+            if publish_proof && run::env_salt().is_none() {
                 eprintln!("stoop: sync: publishing environment hashes without {}. In a public repository set it from a repository secret so low-entropy values cannot be guessed offline.", run::SALT_VAR);
             }
             let mut last_error = String::new();
@@ -458,5 +460,21 @@ mod tests {
         assert_eq!(code, crate::plan::spec::Code::ActionUnverifiable);
         drop(api);
         std::fs::remove_dir_all(base).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod strict_tests {
+    use super::strict_actions;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn a_non_utf8_strict_actions_value_is_on() {
+        const NAME: &str = "STOOP_STRICT_ACTIONS";
+        std::env::set_var(NAME, OsString::from_vec(b"\xff".to_vec()));
+        assert!(strict_actions());
+        std::env::remove_var(NAME);
+        assert!(!strict_actions());
     }
 }

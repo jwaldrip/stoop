@@ -22,6 +22,7 @@ mod sync;
 mod trace;
 
 use run::Opts;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
 const HELP: &str = "\
@@ -91,13 +92,17 @@ BLIND SPOTS
 
 fn main() {
     run::capture_id_token_env();
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<OsString> = std::env::args_os().skip(1).collect();
     std::process::exit(real_main(args));
 }
 
-fn real_main(mut args: Vec<String>) -> i32 {
-    let cmd = match args.first().map(String::as_str) {
-        None | Some("-h") | Some("--help") | Some("help") => {
+fn real_main(mut args: Vec<OsString>) -> i32 {
+    let Some(first) = args.first() else {
+        print!("{HELP}");
+        return 0;
+    };
+    let cmd = match first.to_str() {
+        Some("-h") | Some("--help") | Some("help") => {
             print!("{HELP}");
             return 0;
         }
@@ -112,7 +117,7 @@ fn real_main(mut args: Vec<String>) -> i32 {
             args.remove(0);
             c
         }
-        Some(_) => "run".to_string(),
+        _ => "run".to_string(),
     };
     if cmd == "plan" {
         return plan::cmd(&args);
@@ -170,6 +175,15 @@ fn real_main(mut args: Vec<String>) -> i32 {
                 eprintln!("stoop: forget needs a key");
                 return 2;
             };
+            // A proof is named by text. A word that is not UTF-8 names no proof, so none is removed.
+            let Some(key) = proof_name(key) else {
+                eprintln!(
+                    "stoop: no proof named {}",
+                    run::safe(&key.to_string_lossy())
+                );
+                return 1;
+            };
+            let key = key.as_str();
             let hook = run::forget_hook_records(&o, &proof::sanitize(key));
             if let Err(warning) = &hook {
                 eprintln!("{warning}");
@@ -271,11 +285,21 @@ fn jobs_for(o: &Opts) -> job::JobStore {
     job::JobStore::new(run::store_for(o, &cwd, &root))
 }
 
-fn parse(args: &[String]) -> Result<(Opts, Vec<String>), String> {
+fn parse(args: &[OsString]) -> Result<(Opts, Vec<OsString>), String> {
     let mut o = Opts::default();
     let mut i = 0;
     while i < args.len() {
-        let a = args[i].as_str();
+        // A word that is not UTF-8 is an ordinary word, unless it begins with "-": that marks an
+        // option, which stoop refuses as an unknown option.
+        let Some(a) = args[i].to_str() else {
+            if args[i].as_encoded_bytes().starts_with(b"-") {
+                return Err(format!(
+                    "unknown option {}",
+                    run::safe(&args[i].to_string_lossy())
+                ));
+            }
+            break;
+        };
         if a == "--" {
             i += 1;
             break;
@@ -285,9 +309,10 @@ fn parse(args: &[String]) -> Result<(Opts, Vec<String>), String> {
         }
         let mut val = |name: &str| -> Result<String, String> {
             i += 1;
-            args.get(i)
-                .cloned()
-                .ok_or_else(|| format!("{name} needs a value"))
+            let raw = args.get(i).ok_or_else(|| format!("{name} needs a value"))?;
+            raw.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{name} needs a UTF-8 value"))
         };
         match a {
             "--key" => o.key = Some(val("--key")?),
@@ -322,11 +347,14 @@ fn parse(args: &[String]) -> Result<(Opts, Vec<String>), String> {
 /// `stoop sh {0}`: GitHub Actions hands over a script file for each `run:` step.
 /// The file's name changes every time, so the key comes from its contents, and
 /// the file itself is not an input.
-fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
+fn shell_mode(o: &mut Opts, script: &OsStr, rest: &[OsString]) -> i32 {
     let body = match std::fs::read(script) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("stoop: cannot read {script}: {e}");
+            eprintln!(
+                "stoop: cannot read {}: {e}",
+                run::safe(&script.to_string_lossy())
+            );
             return 2;
         }
     };
@@ -349,24 +377,21 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
         matrix.as_deref(),
     ));
     o.shell_key = true;
-    o.transient.push(script.to_string());
+    o.transient.push(script.to_string_lossy().into_owned());
     o.transient
         .push(pathutil::to_key(&root, std::path::Path::new(script)));
     o.mention = String::from_utf8_lossy(&body).into_owned();
-    let mut argv = vec![
-        "bash".to_string(),
-        "--noprofile".into(),
-        "--norc".into(),
-        "-eo".into(),
-        "pipefail".into(),
-        script.to_string(),
-    ];
+    let mut argv: Vec<OsString> = ["bash", "--noprofile", "--norc", "-eo", "pipefail"]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+    argv.push(script.to_os_string());
     argv.extend(rest.iter().cloned());
     o.argv = argv;
     let blocked =
         run::env_str("RUNNER_TEMP").map(|t| PathBuf::from(t).join("stoop/journal.blocked"));
     if !o.pass_env.is_empty() {
-        if run::env_flag("GITHUB_ACTIONS") {
+        if run::env_switch("GITHUB_ACTIONS", true) {
             if let Some(path) = &blocked {
                 let result =
                     std::fs::create_dir_all(path.parent().expect("journal marker has a parent"))
@@ -466,4 +491,22 @@ fn emit_decision(fd: i32, value: serde_json::Value) {
     // ownership and closes it.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     let _ = writeln!(file, "{value}");
+}
+
+/// The name of a proof is text. A name that is not UTF-8 names no proof, so none is removed.
+fn proof_name(key: &OsStr) -> Option<String> {
+    key.to_str().map(str::to_owned)
+}
+
+#[cfg(test)]
+mod forget_name_tests {
+    use super::proof_name;
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    #[test]
+    fn a_non_utf8_proof_name_names_no_proof() {
+        assert_eq!(proof_name(OsStr::new("cat-1")), Some("cat-1".to_string()));
+        assert_eq!(proof_name(OsStr::from_bytes(b"\xff")), None);
+    }
 }

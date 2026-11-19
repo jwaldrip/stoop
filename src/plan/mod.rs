@@ -11,7 +11,7 @@ use crate::{attest, gha, input, job, proof, run, sync};
 use serde_json::{json, Value};
 use spec::{Code, Decision, JobSpec, RecordCheck, StepSpec};
 use std::path::{Path, PathBuf};
-const HELP: &str = "stoop plan [--workflow PATH] [--rev REV] [--plan-job ID] [--format human|json|github] [--output FILE] [--root DIR] [--store DIR] [--sync git[:REMOTE]] [--max-age DUR] [--allow-uses OWNER/REPO[@REF]] [--explain] [--quiet]\nPlan-time skips are experimental. --max-age must be positive and at most 7d. --allow-uses is for local dry runs only.\n";
+const HELP: &str = "stoop plan [--workflow PATH] [--rev REV] [--plan-job ID] [--format human|json|github] [--output FILE] [--root DIR] [--store DIR] [--sync git[:REMOTE]] [--max-age DUR] [--allow-uses OWNER/REPO[@REF]] [--prefilter on|off|check] [--explain] [--quiet]\nPlan-time skips are experimental. --max-age must be positive and at most 7d. --allow-uses is for local dry runs only. --prefilter off hashes every file; check runs both ways and fails on any difference.\n";
 struct Options {
     workflow: Option<String>,
     rev: String,
@@ -24,9 +24,10 @@ struct Options {
     max_age: u64,
     explain: bool,
     quiet: bool,
+    prefilter: eval::Prefilter,
     allowed: Vec<String>,
 }
-fn parse(args: &[String]) -> Result<Option<Options>, String> {
+fn parse(args: &[std::ffi::OsString]) -> Result<Option<Options>, String> {
     let mut o = Options {
         workflow: None,
         rev: "HEAD".into(),
@@ -44,19 +45,28 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
         max_age: run::DEFAULT_MAX_AGE,
         explain: false,
         quiet: false,
+        prefilter: eval::Prefilter::On,
         allowed: Vec::new(),
     };
     let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
+    while let Some(raw) = iter.next() {
+        // A word that is not UTF-8 names no option, so it is an unknown option.
+        let Some(arg) = raw.to_str() else {
+            return Err(format!(
+                "unknown option {}",
+                run::safe(&raw.to_string_lossy())
+            ));
+        };
         if arg == "--help" || arg == "-h" {
             return Ok(None);
         }
         let mut value = || {
-            iter.next()
-                .cloned()
-                .ok_or_else(|| format!("{arg} needs a value"))
+            let raw = iter.next().ok_or_else(|| format!("{arg} needs a value"))?;
+            raw.to_str()
+                .map(str::to_owned)
+                .ok_or_else(|| format!("{arg} needs a UTF-8 value"))
         };
-        match arg.as_str() {
+        match arg {
             "--workflow" => o.workflow = Some(value()?),
             "--rev" => o.rev = value()?,
             "--plan-job" => o.plan_job = value()?,
@@ -76,6 +86,14 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
             "--max-age" => o.max_age = run::parse_age(&value()?)?,
             "--explain" => o.explain = true,
             "--quiet" => o.quiet = true,
+            "--prefilter" => {
+                o.prefilter = match value()?.as_str() {
+                    "on" => eval::Prefilter::On,
+                    "off" => eval::Prefilter::Off,
+                    "check" => eval::Prefilter::Check,
+                    other => return Err(format!("unknown prefilter {other}")),
+                }
+            }
             _ => return Err(format!("unknown option {arg}")),
         }
     }
@@ -84,7 +102,7 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
     }
     if !o.allowed.is_empty()
         && (std::env::var_os("GITHUB_OUTPUT").is_some()
-            || (o.format == "github" && run::env_flag("GITHUB_ACTIONS")))
+            || (o.format == "github" && run::env_switch("GITHUB_ACTIONS", true)))
     {
         return Err("--allow-uses is only available for local dry runs".into());
     }
@@ -207,7 +225,7 @@ fn plan_override(w: &gha::workflow::Workflow, id: &str) -> Result<(), String> {
     }
     Ok(())
 }
-pub fn cmd(args: &[String]) -> i32 {
+pub fn cmd(args: &[std::ffi::OsString]) -> i32 {
     let o = match parse(args) {
         Ok(Some(o)) => o,
         Ok(None) => {
@@ -224,7 +242,7 @@ pub fn cmd(args: &[String]) -> i32 {
         .clone()
         .unwrap_or_else(|| run::find_root(&std::env::current_dir().unwrap_or_default()));
     let path = workflow_path(&o).unwrap_or_default();
-    let mut plan = json!({"schema":"stoop.plan/1","workflow":"","path":path,"rev":"","plan_job":o.plan_job,"full":run::env_flag("STOOP_FULL"),"skip":[],"jobs":[]});
+    let mut plan = json!({"schema":"stoop.plan/1","workflow":"","path":path,"rev":"","plan_job":o.plan_job,"full":run::env_switch("STOOP_FULL", true),"skip":[],"jobs":[]});
     let result = build(
         &o,
         &root,
@@ -372,17 +390,17 @@ fn build<S: attest::KeySource>(
     let mut global_error = plan_override(&workflow, &o.plan_job)
         .and_then(|()| gha::workflow::validate_plan_environment(&workflow, &o.plan_job))
         .err();
-    if run::env_flag("GITHUB_ACTIONS")
+    if run::env_switch("GITHUB_ACTIONS", true)
         && std::env::var("GITHUB_JOB").ok().as_deref() != Some(o.plan_job.as_str())
     {
         global_error = Some("plan job differs from GITHUB_JOB".into());
     }
-    if run::env_flag("GITHUB_ACTIONS")
+    if run::env_switch("GITHUB_ACTIONS", true)
         && std::env::var("GITHUB_SHA").ok().as_deref() != Some(tree.commit())
     {
         global_error = Some("planned revision differs from GITHUB_SHA".into());
     }
-    if run::env_flag("GITHUB_ACTIONS") {
+    if run::env_switch("GITHUB_ACTIONS", true) {
         if run::env_str("STOOP_JOB_WORKFLOW_REF") != run::env_str("GITHUB_WORKFLOW_REF")
             || run::env_str("STOOP_JOB_WORKFLOW_REF").is_none()
         {
@@ -491,7 +509,7 @@ fn build<S: attest::KeySource>(
     let verifier = verifier_factory(policy, now, ceiling);
     let resolver = gha::resolve::Git::from_env(root).with_revision(tree.commit());
     let actions =
-        gha::resolve::ActionCheck::with_strict(&resolver, run::env_flag("STOOP_STRICT_ACTIONS"));
+        gha::resolve::ActionCheck::with_strict(&resolver, crate::journal::strict_actions());
     let check = Composite {
         verifier: &verifier,
         actions: &actions,
@@ -511,10 +529,11 @@ fn build<S: attest::KeySource>(
         now,
         max_age: ceiling,
         github_vars: cx.verified_vars(&o.plan_job),
-        salt: run::env_str("STOOP_ENV_SALT"),
+        salt: run::env_salt(),
         event_path,
         event,
         explain: o.explain,
+        prefilter: o.prefilter,
     };
     let mut results = Vec::new();
     let mut skip = Vec::new();
@@ -523,22 +542,23 @@ fn build<S: attest::KeySource>(
         let gated = gate
             .as_ref()
             .is_none_or(|(code, _)| *code != Code::NotGated);
-        let decision =
-            if !graph_error && (run::env_flag("STOOP_FULL") || run::env_flag("STOOP_OFF")) {
-                run_decision(Code::Full, "STOOP_FULL or STOOP_OFF enabled")
-            } else if let Some(error) = &global_error {
-                run_decision(Code::Error, error.clone())
-            } else if (spec.blocked.is_some() || spec.key.is_none())
-                && gate
-                    .as_ref()
-                    .is_none_or(|(code, _)| *code != Code::NotGated)
-            {
-                eval::decide(spec, &mut ctx)
-            } else if let Some((code, detail)) = gate {
-                run_decision(code, detail)
-            } else {
-                eval::decide(spec, &mut ctx)
-            };
+        let decision = if !graph_error
+            && (run::env_switch("STOOP_FULL", true) || run::env_switch("STOOP_OFF", true))
+        {
+            run_decision(Code::Full, "STOOP_FULL or STOOP_OFF enabled")
+        } else if let Some(error) = &global_error {
+            run_decision(Code::Error, error.clone())
+        } else if (spec.blocked.is_some() || spec.key.is_none())
+            && gate
+                .as_ref()
+                .is_none_or(|(code, _)| *code != Code::NotGated)
+        {
+            eval::decide(spec, &mut ctx)
+        } else if let Some((code, detail)) = gate {
+            run_decision(code, detail)
+        } else {
+            eval::decide(spec, &mut ctx)
+        };
         if decision.skip {
             skip.push(spec.job.clone());
         }
@@ -576,12 +596,16 @@ mod tests {
     fn injected_planner_proves_an_attested_record() {
         if let Some(root) = std::env::var_os("STOOP_TEST_PLAN_CHILD") {
             let root = PathBuf::from(root);
-            let args = vec![
+            let mut args: Vec<std::ffi::OsString> = vec![
                 "--workflow".into(),
                 ".github/workflows/ci.yml".into(),
                 "--format".into(),
                 "json".into(),
             ];
+            if let Some(mode) = std::env::var_os("STOOP_TEST_PREFILTER") {
+                args.push("--prefilter".into());
+                args.push(mode);
+            }
             let opts = parse(&args).unwrap().unwrap();
             let mut plan = json!({"skip": [], "jobs": []});
             build(
@@ -601,6 +625,19 @@ mod tests {
             } else {
                 assert_eq!(plan["skip"], json!(["a"]));
                 assert_eq!(plan["jobs"][0]["code"], "proved");
+            }
+            if std::env::var_os("STOOP_TEST_NO_RECORD").is_none() {
+                let checked = &plan["jobs"][0]["legs"][0]["checked"];
+                let counts = (
+                    checked["by_oid"].as_u64(),
+                    checked["hashed"].as_u64(),
+                    checked["blob_reads"].as_u64(),
+                );
+                if std::env::var("STOOP_TEST_PREFILTER").as_deref() == Ok("off") {
+                    assert_eq!(counts, (Some(0), Some(1), Some(1)));
+                } else {
+                    assert_eq!(counts, (Some(1), Some(0), Some(0)));
+                }
             }
             return;
         }
@@ -654,6 +691,17 @@ mod tests {
         .unwrap()
         .trim()
         .to_string();
+        let blob = String::from_utf8(
+            Command::new("git")
+                .current_dir(&root)
+                .args(["rev-parse", "HEAD:a.txt"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
         let event = root.join("event.json");
         std::fs::write(&event, r#"{"repository":{"default_branch":"main"}}"#).unwrap();
         let api_root =
@@ -690,8 +738,17 @@ mod tests {
                     "f:{}",
                     blake3::hash(include_bytes!("../../tests/fixtures/plan/a.txt")).to_hex()
                 ),
-                oid: None,
-                oid_basis: None,
+                oid: Some(format!("sha1:{blob}")),
+                oid_basis: Some(crate::oid_attrs::OidBasis {
+                    text: "unspecified".into(),
+                    eol: "unspecified".into(),
+                    filter: "unspecified".into(),
+                    ident: "unspecified".into(),
+                    working_tree_encoding: "unspecified".into(),
+                    export_subst: "unspecified".into(),
+                    crlf: "unspecified".into(),
+                    autocrlf: "unset".into(),
+                }),
             }],
             outputs: vec![],
             removed: vec![],
@@ -763,6 +820,18 @@ mod tests {
             String::from_utf8_lossy(&child.stdout),
             String::from_utf8_lossy(&child.stderr)
         );
+        for mode in ["on", "off", "check"] {
+            let child = child_command()
+                .env("STOOP_TEST_PREFILTER", mode)
+                .output()
+                .unwrap();
+            assert!(
+                child.status.success(),
+                "{mode}: {}\n{}",
+                String::from_utf8_lossy(&child.stdout),
+                String::from_utf8_lossy(&child.stderr)
+            );
+        }
         assert!(jobs.forget(key).unwrap());
         let child = child_command()
             .env("STOOP_TEST_NO_RECORD", "1")
@@ -777,5 +846,20 @@ mod tests {
         drop(api);
         std::fs::remove_dir_all(api_root).unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn prefilter_flag_takes_on_off_or_check() {
+        for (value, mode) in [
+            ("on", eval::Prefilter::On),
+            ("off", eval::Prefilter::Off),
+            ("check", eval::Prefilter::Check),
+        ] {
+            let args: Vec<std::ffi::OsString> = vec!["--prefilter".into(), value.into()];
+            assert_eq!(parse(&args).unwrap().unwrap().prefilter, mode);
+        }
+        assert_eq!(parse(&[]).unwrap().unwrap().prefilter, eval::Prefilter::On);
+        let bogus: Vec<std::ffi::OsString> = vec!["--prefilter".into(), "bogus".into()];
+        assert!(parse(&bogus).is_err());
+        assert_eq!(cmd(&bogus), 2);
     }
 }

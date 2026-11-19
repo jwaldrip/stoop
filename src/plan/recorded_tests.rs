@@ -2,11 +2,13 @@
 //! Regenerate with `STOOP_REGENERATE_RECORDER_FIXTURES=1 cargo test --test record_e2e
 //! regenerate_planner_recorder_fixtures -- --ignored` on Linux.
 
-use super::eval::{decide, PlanCtx};
+use super::eval::{decide, PlanCtx, Prefilter};
 use super::spec::{Code, JobSpec, RecordCheck, StepSpec};
 use crate::gittree::GitTree;
+use crate::input::Input;
 use crate::job::{JobRecord, JobStore, RecordStatus, StepHow, StepRecord};
-use crate::proof::Store;
+use crate::oid_attrs::OidBasis;
+use crate::proof::{Proof, Store};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -59,6 +61,13 @@ struct Fixture {
 }
 impl Fixture {
     fn new(case: &str) -> Self {
+        Self::build(case, false)
+    }
+    /// The case as the recorder writes it inside a git worktree, with git blob ids.
+    fn with_blob_ids(case: &str) -> Self {
+        Self::build(case, true)
+    }
+    fn build(case: &str, with_ids: bool) -> Self {
         use std::os::unix::fs::PermissionsExt;
         let root = std::env::temp_dir().join(format!(
             "stoop-recorded-plan-{}-{}",
@@ -115,6 +124,13 @@ impl Fixture {
         let store = Store::new(root.join("store"));
         store.import("t", &fs::read(proof_file).unwrap()).unwrap();
         let proof = store.load("t").remove(0);
+        let proof = if with_ids {
+            let patched = with_blob_ids(&root, proof);
+            store.save("t", patched.clone()).unwrap();
+            patched
+        } else {
+            proof
+        };
         let created = proof.created;
         let runner = match proof.provenance.as_ref().map(|p| p.arch.as_str()) {
             Some("aarch64") => "ubuntu-24.04-arm",
@@ -186,6 +202,9 @@ impl Fixture {
         );
     }
     fn decision(&self) -> super::spec::Decision {
+        self.decision_mode(Prefilter::On)
+    }
+    fn decision_mode(&self, prefilter: Prefilter) -> super::spec::Decision {
         let mut tree = GitTree::load(&self.root, "HEAD").unwrap();
         decide(
             &self.spec,
@@ -201,6 +220,7 @@ impl Fixture {
                 event_path: None,
                 event: None,
                 explain: false,
+                prefilter,
             },
         )
     }
@@ -211,39 +231,162 @@ impl Drop for Fixture {
     }
 }
 
+/// The change each real recording was made for, committed by the caller.
+fn change(f: &Fixture, case: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    match case {
+        "sed" | "proc" => put(&f.root, "config.txt", "changed\n"),
+        "mkdir" => {
+            fs::remove_dir_all(f.root.join("src")).unwrap();
+            put(&f.root, "src", "not a directory");
+        }
+        "eol" => put(&f.root, ".gitattributes", "in.txt text eol=crlf\n"),
+        "chmod" => {
+            fs::set_permissions(f.root.join("s.sh"), fs::Permissions::from_mode(0o644)).unwrap()
+        }
+        "parent" => fs::remove_file(f.root.join("build/.keep")).unwrap(),
+        "failed" => put(&f.root, "missing/.keep", "keep"),
+        "app" => put(&f.root, "app/input.txt", "changed"),
+        _ => unreachable!(),
+    }
+}
+
+const CASES: [&str; 8] = [
+    "sed", "mkdir", "eol", "chmod", "parent", "failed", "proc", "app",
+];
+
+fn expected_change(case: &str) -> Code {
+    match case {
+        "mkdir" | "app" => Code::InputChanged,
+        "eol" => Code::Unplannable,
+        _ => Code::PriorChanged,
+    }
+}
+
+/// The fields that decide what a plan says. Evidence counters are compared separately.
+fn plan_key(d: &super::spec::Decision) -> (bool, Code, String, Vec<(usize, String, String)>) {
+    (
+        d.skip,
+        d.code.clone(),
+        d.detail.clone(),
+        d.mismatches.clone(),
+    )
+}
+
 #[test]
 fn real_recorded_proofs_reject_changed_input_and_prior_states() {
-    use std::os::unix::fs::PermissionsExt;
-    for case in [
-        "sed", "mkdir", "eol", "chmod", "parent", "failed", "proc", "app",
-    ] {
+    for case in CASES {
         let f = Fixture::new(case);
         let control = f.decision();
         assert_eq!(control.code, Code::Proved, "{case}: {}", control.detail);
-        match case {
-            "sed" | "proc" => put(&f.root, "config.txt", "changed\n"),
-            "mkdir" => {
-                fs::remove_dir_all(f.root.join("src")).unwrap();
-                put(&f.root, "src", "not a directory");
-            }
-            "eol" => put(&f.root, ".gitattributes", "in.txt text eol=crlf\n"),
-            "chmod" => {
-                fs::set_permissions(f.root.join("s.sh"), fs::Permissions::from_mode(0o644)).unwrap()
-            }
-            "parent" => fs::remove_file(f.root.join("build/.keep")).unwrap(),
-            "failed" => put(&f.root, "missing/.keep", "keep"),
-            "app" => put(&f.root, "app/input.txt", "changed"),
-            _ => unreachable!(),
-        }
+        change(&f, case);
         f.commit();
         let changed = f.decision();
-        let expected = match case {
-            "mkdir" | "app" => Code::InputChanged,
-            "eol" => Code::Unplannable,
-            _ => Code::PriorChanged,
-        };
-        assert_eq!(changed.code, expected, "{case}: {}", changed.detail);
+        assert_eq!(
+            changed.code,
+            expected_change(case),
+            "{case}: {}",
+            changed.detail
+        );
     }
+}
+
+/// The same recordings with git blob ids, as a recorder inside a worktree writes them. Every
+/// prefilter mode must plan them the same way, before and after the change, and the shortcut must
+/// decide at least one comparison on the control.
+#[test]
+fn real_recorded_proofs_plan_the_same_with_blob_ids_in_every_mode() {
+    for case in CASES {
+        let f = Fixture::with_blob_ids(case);
+        let control = f.decision_mode(Prefilter::On);
+        assert_eq!(control.code, Code::Proved, "{case}: {}", control.detail);
+        let tagged = f.store.load("t").iter().any(|p| {
+            p.inputs
+                .iter()
+                .chain(p.priors.iter().flatten())
+                .any(|input| input.oid.is_some())
+        });
+        let by_oid = control.evidence.as_ref().unwrap().by_oid;
+        assert_eq!(by_oid > 0, tagged, "{case}: blob ids decided {by_oid}");
+        for mode in [Prefilter::Off, Prefilter::Check] {
+            assert_eq!(
+                plan_key(&f.decision_mode(mode)),
+                plan_key(&control),
+                "{case}: {mode:?}"
+            );
+        }
+        change(&f, case);
+        f.commit();
+        let changed = f.decision_mode(Prefilter::On);
+        assert_eq!(
+            changed.code,
+            expected_change(case),
+            "{case}: {}",
+            changed.detail
+        );
+        for mode in [Prefilter::Off, Prefilter::Check] {
+            assert_eq!(
+                plan_key(&f.decision_mode(mode)),
+                plan_key(&changed),
+                "{case}: {mode:?}"
+            );
+        }
+    }
+}
+
+/// The proof a recorder inside a worktree writes: every in-repository regular file input and
+/// prior gets its git blob id and a clean basis, but only where the recorded content id hashes
+/// the file's committed bytes. Anything else keeps no id, as before.
+fn with_blob_ids(root: &Path, mut proof: Proof) -> Proof {
+    tag_blob_ids(root, &mut proof.inputs);
+    if let Some(priors) = proof.priors.as_mut() {
+        tag_blob_ids(root, priors);
+    }
+    proof
+}
+
+fn tag_blob_ids(root: &Path, inputs: &mut [Input]) {
+    for input in inputs {
+        let exec = input.id.starts_with("x:");
+        if !(exec || input.id.starts_with("f:")) {
+            continue;
+        }
+        let object = format!("HEAD:{}", input.path);
+        let object = object.as_str();
+        let Some(bytes) = git_bytes(root, &["cat-file", "blob", object]) else {
+            continue;
+        };
+        let hash = blake3::hash(&bytes).to_hex().to_string();
+        if input.id != crate::input::file_id(exec, &hash) {
+            continue;
+        }
+        let Some(oid) = git_bytes(root, &["rev-parse", object]) else {
+            continue;
+        };
+        input.oid = Some(format!("sha1:{}", String::from_utf8_lossy(&oid).trim()));
+        input.oid_basis = Some(OidBasis {
+            text: "unspecified".into(),
+            eol: "unspecified".into(),
+            filter: "unspecified".into(),
+            ident: "unspecified".into(),
+            working_tree_encoding: "unspecified".into(),
+            export_subst: "unspecified".into(),
+            crlf: "unspecified".into(),
+            autocrlf: "unset".into(),
+        });
+    }
+}
+
+fn git_bytes(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let output = Command::new("git")
+        .current_dir(root)
+        .env("HOME", root)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .args(args)
+        .output()
+        .ok()?;
+    output.status.success().then_some(output.stdout)
 }
 
 #[test]
