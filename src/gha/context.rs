@@ -139,3 +139,17 @@ impl Contexts for GhCtx {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_utf8_unreadable_verified_variable_never_matches_a_readable_hash() {
+        let mut ctx = GhCtx::from_parts(BTreeMap::new(), serde_json::Value::Null);
+        ctx.unreadable.insert("GITHUB_SHA".into());
+        let vars = ctx.verified_vars("job");
+        assert_eq!(vars["GITHUB_SHA"], UNREADABLE);
+        assert_eq!(vars["GITHUB_JOB"], "job");
+    }
+}

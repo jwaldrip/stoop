@@ -1546,3 +1546,30 @@ mod canonical_tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 }
+
+#[cfg(test)]
+mod non_utf8_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn non_utf8_switches_follow_their_fail_wide_default() {
+        const NAME: &str = "STOOP_S0_NON_UTF8_SWITCH";
+        std::env::set_var(NAME, OsString::from_vec(b"\xff".to_vec()));
+        assert!(env_switch(NAME, true));
+        assert!(!env_switch(NAME, false));
+        std::env::remove_var(NAME);
+        assert!(!env_switch(NAME, true));
+    }
+
+    #[test]
+    fn non_utf8_values_hash_their_exact_bytes() {
+        const NAME: &str = "STOOP_S0_NON_UTF8_HASH";
+        std::env::set_var(NAME, OsString::from_vec(b"\xfe".to_vec()));
+        let hashed = env_hashes(&[NAME.to_string()], None)[NAME].clone();
+        assert_eq!(hashed, env_hash_bytes(NAME, b"\xfe", None));
+        assert_ne!(hashed, env_hash(NAME, "", None));
+        std::env::remove_var(NAME);
+    }
+}
