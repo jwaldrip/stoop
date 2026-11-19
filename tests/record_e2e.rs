@@ -1392,6 +1392,26 @@ fn git_root_does_not_record_special_files_as_inputs() {
     w.clean();
 }
 
+/// Waits until `path` was last changed more than 2.1 s ago, outside the racy window. A file inside
+/// that window is hashed at its read, and a file too large to hash there refuses the record.
+fn settle(path: &std::path::Path) {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    loop {
+        let meta = fs::symlink_metadata(path).unwrap();
+        let ctime = meta.ctime() as i128 * 1_000_000_000 + meta.ctime_nsec() as i128;
+        let mtime = meta.mtime() as i128 * 1_000_000_000 + meta.mtime_nsec() as i128;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as i128;
+        if now - ctime.max(mtime) > 2_100_000_000 {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 #[ignore = "reads a sparse file larger than 2 GiB twice"]
 fn sparse_input_over_two_gib_keeps_its_blob_oid() {
@@ -1402,6 +1422,7 @@ fn sparse_input_over_two_gib_keeps_its_blob_oid() {
     file.set_len(len).unwrap();
     drop(file);
     w.track(&["large-sparse"]);
+    settle(&w.root.join("large-sparse"));
     let p = recorded(&w, "head -c 1 large-sparse >/dev/null");
     let mut blake = blake3::Hasher::new();
     let zeros = vec![0; 1024 * 1024];
