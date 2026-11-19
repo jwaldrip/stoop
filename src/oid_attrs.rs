@@ -1076,6 +1076,111 @@ mod tests {
         assert!(snapshot(&repo.0).unwrap().basis.contains_key("file.txt"));
     }
 
+    /// A scratch directory that removes itself. Its path is canonical, because watched names are
+    /// physical.
+    fn scratch(name: &str) -> Repo {
+        let path = std::env::temp_dir().join(format!(
+            "stoop-oid-{name}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir(&path).unwrap();
+        Repo(fs::canonicalize(path).unwrap())
+    }
+
+    #[test]
+    fn watch_names_every_name_on_the_way_to_a_source() {
+        let base = scratch("watch-names");
+        fs::create_dir_all(base.0.join("a/b")).unwrap();
+        fs::write(base.0.join("a/b/file"), "x").unwrap();
+        std::os::unix::fs::symlink("a/b", base.0.join("link")).unwrap();
+        let mut watch = Watch::default();
+        watch_path(&base.0.join("link/file"), &mut watch).unwrap();
+        for name in ["link", "a", "a/b", "a/b/file"] {
+            assert!(watch.names_contain(&base.0.join(name)), "{name}");
+        }
+        assert!(watch.is_watched_file(&fs::metadata(base.0.join("a/b/file")).unwrap()));
+        let mut missing = Watch::default();
+        watch_path(&base.0.join("a/new/leaf"), &mut missing).unwrap();
+        for name in ["a/new", "a/new/leaf"] {
+            assert!(missing.names_contain(&base.0.join(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn watch_declines_loops_long_chains_and_unreadable_names() {
+        let base = scratch("watch-loops");
+        std::os::unix::fs::symlink("loop2", base.0.join("loop1")).unwrap();
+        std::os::unix::fs::symlink("loop1", base.0.join("loop2")).unwrap();
+        assert!(watch_path(&base.0.join("loop1"), &mut Watch::default()).is_none());
+        fs::write(base.0.join("target"), "x").unwrap();
+        // Forty links resolve. A forty-first declines.
+        for (links, resolves) in [(40, true), (41, false)] {
+            for i in 0..links {
+                let next = if i + 1 == links {
+                    "target".to_owned()
+                } else {
+                    format!("c{}", i + 1)
+                };
+                std::os::unix::fs::symlink(next, base.0.join(format!("c{i}"))).unwrap();
+            }
+            let watched = watch_path(&base.0.join("c0"), &mut Watch::default()).is_some();
+            assert_eq!(watched, resolves, "{links} links");
+            for i in 0..links {
+                fs::remove_file(base.0.join(format!("c{i}"))).unwrap();
+            }
+        }
+        // Root reads every name, so the unreadable case is only meaningful without it.
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = base.0.join("locked");
+            fs::create_dir_all(locked.join("inner")).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let unknown = watch_path(&locked.join("inner/file"), &mut Watch::default()).is_none();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(unknown, "a name that cannot be read counts");
+        }
+    }
+
+    #[test]
+    fn a_parent_reference_past_a_missing_name_is_unknown() {
+        let base = scratch("watch-dotdot");
+        assert!(watch_path(&base.0.join("missing/../file"), &mut Watch::default()).is_none());
+    }
+
+    #[test]
+    fn the_git_directory_sources_are_watched_whether_or_not_they_exist() {
+        let base = scratch("watch-git");
+        let git_dir = base.0.join(".git");
+        fs::create_dir_all(git_dir.join("info")).unwrap();
+        fs::create_dir_all(git_dir.join("objects/aa")).unwrap();
+        let watch = build_watch(&git_dir, &[base.0.join("home/.gitconfig")]).unwrap();
+        for name in [
+            "config",
+            "config.worktree",
+            "commondir",
+            "index",
+            "info/attributes",
+        ] {
+            assert!(watch.names_contain(&git_dir.join(name)), "{name}");
+        }
+        assert!(watch.names_contain(&base.0.join("home/.gitconfig")));
+        assert!(!watch.names_contain(&git_dir.join("objects/aa")));
+    }
+
+    #[test]
+    fn a_hard_link_to_a_watched_file_is_watched_by_identity() {
+        let base = scratch("watch-identity");
+        fs::create_dir_all(base.0.join("home")).unwrap();
+        fs::create_dir_all(base.0.join("other")).unwrap();
+        fs::write(base.0.join("home/.gitconfig"), "[user]\n").unwrap();
+        let watch = build_watch(&base.0.join(".git"), &[base.0.join("home/.gitconfig")]).unwrap();
+        let alias = base.0.join("other/alias");
+        fs::hard_link(base.0.join("home/.gitconfig"), &alias).unwrap();
+        assert!(watch.is_watched_file(&fs::metadata(&alias).unwrap()));
+        assert!(!watch.names_contain(&alias));
+    }
+
     #[test]
     fn rejects_failed_git_and_parent_repository_discovery() {
         let repo = Repo::new();
