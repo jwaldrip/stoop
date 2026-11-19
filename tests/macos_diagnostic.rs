@@ -95,8 +95,8 @@ fn a_fixture_with_a_tree_and_failed_lookups_is_observed_in_full_and_never_record
         return;
     }
     let w = Work::new("fixture");
-    // 2000 lookups that fail, 1000 that succeed, 300 processes spawned and exec'd (so pids are
-    // reused), a grandchild, and writes into the repository.
+    // 2000 lookups that fail, 1000 that succeed, 300 processes spawned and exec'd, a grandchild,
+    // and writes into the repository. Pids are not reused here; the pid-reuse rule is a unit test.
     let script = "cat in.txt >/dev/null; \
         i=0; while [ $i -lt 2000 ]; do test -e \"missing/$i\"; i=$((i+1)); done; \
         i=0; while [ $i -lt 1000 ]; do test -e in.txt; i=$((i+1)); done; \
@@ -185,8 +185,16 @@ fn a_tracer_killed_mid_run_returns_the_status_and_says_the_report_is_unsound() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(5), "{stderr}");
     assert_eq!(fs::read_to_string(w.dir.join("runs.log")).unwrap(), "run");
+    // Both structural reasons are asserted, not just the verdict: the tracer died before the
+    // command's exit and never reported a clean stop. The dyld reasons cannot explain either.
     assert!(
-        stderr.contains("DTrace diagnostic verdict: UNSOUND"),
+        stderr.contains("stoop: DTrace diagnostic UNSOUND: the tracer did not report a clean stop"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "stoop: DTrace diagnostic UNSOUND: the command's exit was not seen by the tracer"
+        ),
         "{stderr}"
     );
     w.no_proof_written();
@@ -248,4 +256,91 @@ fn a_switch_value_that_is_not_utf8_is_not_an_opt_in() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(4), "{stderr}");
     assert!(!stderr.contains("DTrace"), "{stderr}");
+}
+
+/// A program that starts `/bin/cat in.txt` with posix_spawn in the directory it is given. The
+/// child changes directory through a file action, so no chdir call shows the change.
+const POSIX_CHDIR: &str = r#"#include <spawn.h>
+#include <sys/wait.h>
+extern char **environ;
+int main(int argc, char **argv) {
+    if (argc != 2) return 2;
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) return 3;
+    if (posix_spawn_file_actions_addchdir_np(&actions, argv[1]) != 0) return 4;
+    char *child_argv[] = {"cat", "in.txt", NULL};
+    pid_t pid;
+    if (posix_spawn(&pid, "/bin/cat", &actions, NULL, child_argv, environ) != 0) return 5;
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) return 6;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 7;
+}
+"#;
+
+#[test]
+fn a_child_started_by_posix_spawn_in_another_directory_makes_the_run_unsound() {
+    let name = "a_child_started_by_posix_spawn_in_another_directory_makes_the_run_unsound";
+    if skip(name) {
+        return;
+    }
+    let w = Work::new("posixcwd");
+    fs::create_dir(w.dir.join("sub")).unwrap();
+    fs::write(w.dir.join("sub").join("in.txt"), "inner").unwrap();
+    fs::write(w.dir.join("spawn.c"), POSIX_CHDIR).unwrap();
+    let built = Command::new("cc")
+        .arg(w.dir.join("spawn.c"))
+        .arg("-o")
+        .arg(w.dir.join("spawn"))
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+    let out = w.stoop("./spawn sub", "list");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains("stoop: DTrace diagnostic verdict: UNSOUND ("),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "stoop: DTrace diagnostic UNSOUND: a relative path was used where the working directory is unknown"
+        ),
+        "{stderr}"
+    );
+    w.no_proof_written();
+}
+
+#[test]
+fn a_newline_in_a_file_name_makes_the_run_unsound_and_lists_no_half_of_it() {
+    let name = "a_newline_in_a_file_name_makes_the_run_unsound_and_lists_no_half_of_it";
+    if skip(name) {
+        return;
+    }
+    let w = Work::new("newline");
+    let out = w.stoop("printf x > \"$(printf 'a\\nb')\"; exit 6", "list");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(6), "{stderr}");
+    assert!(
+        w.dir.join("a\nb").exists(),
+        "the command did not create its file"
+    );
+    assert!(
+        stderr.contains("stoop: DTrace diagnostic verdict: UNSOUND ("),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "stoop: DTrace diagnostic UNSOUND: a path did not match the length the tracer gave it"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !listed(&stderr, "wrote").contains(&w.path("a")),
+        "the first half of a split path was listed as written: {stderr}"
+    );
+    w.no_proof_written();
 }

@@ -555,7 +555,7 @@ fn dtrace_diagnostic(o: &Opts, cwd: &Path, key: &str) -> Option<Outcome> {
     Some(Outcome {
         status: diagnostic.trace.status,
         key: key.to_owned(),
-        how: How::Unrecorded("macOS DTrace diagnostic: never recorded".into()),
+        how: diagnostic_how(diagnostic.trace.status),
     })
 }
 
@@ -571,6 +571,18 @@ pub struct Outcome {
     pub status: i32,
     pub key: String,
     pub how: How,
+}
+
+/// How a diagnostic run is journaled. It is never a proof: a command that failed is a failed step,
+/// as it is when traced on Linux, and a command that passed is blocked, because nothing was
+/// recorded.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn diagnostic_how(status: i32) -> How {
+    if status == 0 {
+        How::Unrecorded("macOS DTrace diagnostic: never recorded".into())
+    } else {
+        How::Failed
+    }
 }
 
 pub fn run(o: Opts, explain: bool) -> i32 {
@@ -2174,5 +2186,17 @@ mod hook_key_tests {
     #[test]
     fn a_hook_key_separates_non_utf8_words_by_their_exact_bytes() {
         assert_ne!(key(b"x\xfe"), key(b"x\xff"));
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_how_tests {
+    use super::*;
+
+    #[test]
+    fn a_passing_diagnostic_run_is_blocked_and_a_failing_one_is_a_failed_step() {
+        assert!(matches!(diagnostic_how(0), How::Unrecorded(_)));
+        assert!(matches!(diagnostic_how(3), How::Failed));
+        assert!(matches!(diagnostic_how(-1), How::Failed));
     }
 }
