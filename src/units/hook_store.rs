@@ -238,3 +238,65 @@ pub(crate) fn forget(store: &Path, key: &str) -> Result<bool, String> {
         .map_err(|error| format!("stoop: cannot save hook records ({error})"))?;
     Ok(true)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn store(name: &str) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "stoop-store-unit-{}-{name}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    fn template(key: &str, created: u64) -> Record {
+        Record {
+            key: key.into(),
+            argv: vec!["./t".into(), "{changed}".into()],
+            cwd: String::new(),
+            scope: None,
+            label: None,
+            created,
+        }
+    }
+
+    #[test]
+    fn a_read_only_store_warns_that_the_full_command_runs() {
+        let path = store("read-only");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+        let warning = record(&path, template("k", 0), 0, 0).unwrap_err();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(warning.contains("running the full command"), "{warning}");
+        assert!(!warning.contains("as typed"), "{warning}");
+    }
+
+    #[test]
+    fn the_catalog_keeps_at_most_128_records() {
+        let path = store("cap");
+        for i in 0..130 {
+            record(&path, template(&format!("k{i}"), 0), 0, 0).unwrap();
+        }
+        let keys: Vec<String> = read_catalog(&path)
+            .ok()
+            .unwrap()
+            .records
+            .into_iter()
+            .map(|record| record.key)
+            .collect();
+        assert_eq!(keys.len(), MAX_RECORDS);
+        assert!(!keys.contains(&"k0".to_string()));
+        assert!(keys.contains(&"k129".to_string()));
+    }
+
+    #[test]
+    fn expired_templates_are_not_read() {
+        let path = store("expiry");
+        record(&path, template("old", 0), 0, 0).unwrap();
+        assert!(records(&path, 1_000, 60).unwrap().is_empty());
+    }
+}

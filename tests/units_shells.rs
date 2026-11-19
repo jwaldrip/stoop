@@ -168,7 +168,7 @@ fn make_recipe_quoting_reaches_stoop_as_the_full_command() {
 #[test]
 fn github_actions_steps_run_in_the_actions_bash_shell() {
     let dir = Dir::new();
-    let workflow = "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - name: changed tests\n        shell: bash\n        run: |\n          stoop run -- ./runner '{changed:*.t}'\n      - name: changed tests, plain scalar\n        run: stoop run -- ./runner --files '{changed}'\n";
+    let workflow = "jobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - name: changed tests\n        shell: bash\n        run: |\n          stoop run -- ./runner '{changed:*.t}'\n      - name: changed tests, plain scalar\n        run: stoop run -- ./runner --files '{changed}'\n      - name: changed tests, environment spelling\n        shell: bash\n        run: |\n          stoop run -- ./runner --files '$STOOP_CHANGED'\n";
     let document = YamlLoader::load_from_str(workflow).unwrap();
     let steps = document[0]["jobs"]["test"]["steps"].as_vec().unwrap();
     for (index, step) in steps.iter().enumerate() {
@@ -201,4 +201,22 @@ fn a_placeholder_inside_a_shell_string_is_refused_only_when_the_shell_is_recogni
     assert!(out.status.success(), "{}", err(&out));
     assert!(!err(&out).contains("substituted"), "{}", err(&out));
     assert_eq!(dir.log().as_deref(), Some("changed=<>\n"));
+}
+
+#[test]
+fn bash_dash_e_runs_each_spelling_of_a_run_step() {
+    for (index, step) in [
+        "stoop run -- ./runner '{changed:*.t}'",
+        "stoop run -- ./runner --files '$STOOP_CHANGED'",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let dir = Dir::new();
+        let file = format!("run{index}.sh");
+        fs::write(dir.root.join(&file), format!("{step}\n")).unwrap();
+        let out = dir.shell("bash", &["-e"], &file);
+        assert!(out.status.success(), "step {index}: {}", err(&out));
+        assert_eq!(dir.log().as_deref(), Some("changed=<>\n"), "step {index}");
+    }
 }

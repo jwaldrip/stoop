@@ -160,19 +160,49 @@ fn a_hook_run_prints_the_words_it_removed_without_tracing() {
 }
 
 #[test]
-fn inherited_changed_value_is_cleared_only_for_a_hook() {
+fn an_inherited_value_is_replaced_and_named_for_a_plain_run() {
     let f = Fixture::new();
     let out = f
-        .command(true)
-        .env("STOOP_CHANGED", "old-value")
+        .command(false)
+        .env("STOOP_CHANGED", "a.t")
+        .args(["run", "--"])
+        .arg(&f.runner)
+        .args(["--other", "a.t"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(err(&out).contains("ignoring inherited STOOP_CHANGED"), "{}", err(&out));
+    assert_eq!(f.log(), "arg=<--other>\narg=<a.t>\nchanged=<>\n");
+}
+
+#[test]
+fn a_quoted_placeholder_does_not_name_an_inherited_value() {
+    let f = Fixture::new();
+    let out = f
+        .command(false)
+        .env("STOOP_CHANGED", "a.t")
         .args(["run", "--"])
         .arg(&f.runner)
         .arg("{changed}")
         .output()
         .unwrap();
     assert!(out.status.success(), "{}", err(&out));
-    assert!(err(&out).contains("STOOP_CHANGED"), "{}", err(&out));
+    assert!(!err(&out).contains("inherited"), "{}", err(&out));
     assert_eq!(f.log(), "changed=<>\n");
+}
+
+#[test]
+fn an_inherited_unit_variable_is_an_ordinary_variable() {
+    let f = Fixture::new();
+    let out = f
+        .command(false)
+        .env("STOOP_UNIT", "only_this.t")
+        .args(["run", "--", "sh", "-c", "printf %s \"$STOOP_UNIT\""])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", err(&out));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "only_this.t");
+    assert!(!err(&out).contains("removed"), "{}", err(&out));
 }
 
 #[test]
@@ -189,24 +219,6 @@ fn literal_mode_and_ordinary_empty_values_do_not_rewrite_argv() {
     assert_eq!(f.log(), "arg=<--only>\narg=<>\nchanged=<UNSET>\n");
 }
 
-#[test]
-fn no_split_keeps_explicit_hooks_and_explain_never_launches() {
-    let f = Fixture::new();
-    let out = f.invoke(&["--no-split"], &["--files", "{changed}"], true);
-    assert!(out.status.success(), "{}", err(&out));
-    assert_eq!(f.log(), "changed=<>\n");
-    fs::remove_file(f.root.join("log")).unwrap();
-    let out = f
-        .command(false)
-        .args(["explain", "--"])
-        .arg(&f.runner)
-        .arg("{changed}")
-        .output()
-        .unwrap();
-    assert_eq!(out.status.code(), Some(1), "{}", err(&out));
-    assert!(err(&out).contains("{changed}"), "{}", err(&out));
-    assert!(!f.root.join("log").exists());
-}
 
 #[cfg(all(
     target_os = "linux",
@@ -296,15 +308,294 @@ fn several_values_before_the_placeholder_are_refused_with_the_documented_fix() {
     let f = Fixture::new();
     let out = f.invoke(&[], &["--files", "a", "b", "{changed}"], true);
     assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    let text = err(&out);
+    assert!(text.contains("cannot tell where the values for --files end"), "{text}");
+    assert!(text.contains("attach the placeholder with ="), "{text}");
+    assert!(text.contains("after --"), "{text}");
+    assert!(!text.contains("=VALUE"), "{text}");
+    assert!(!f.root.join("log").exists());
+}
+
+#[test]
+fn a_single_valued_python_module_option_is_refused_without_the_value_syntax() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["-m", "pytest", "{changed:test_*.py}"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(err(&out).contains("cannot tell where the values for -m end"), "{}", err(&out));
+    assert!(!err(&out).contains("=VALUE"), "{}", err(&out));
+    assert!(!f.root.join("log").exists());
+}
+
+#[test]
+fn a_repeated_option_with_an_ambiguous_value_extent_is_refused() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--files={changed}", "--files", "a", "b"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(!f.root.join("log").exists(), "the command must not run as ./t b");
+}
+
+#[test]
+fn a_brace_inside_a_filter_is_a_usage_error() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["{changed:*.t{x}}"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(!f.root.join("log").exists());
+}
+
+#[test]
+fn changed_inputs_takes_no_filter() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["{changed-inputs:*.t}"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(!f.root.join("log").exists());
+}
+
+#[test]
+fn a_placeholder_takes_one_modifier_per_group() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["{changed:cwd:root}"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(!f.root.join("log").exists());
+}
+
+#[test]
+fn an_attached_short_option_is_ambiguous_beside_a_short_placeholder() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["-fbase", "-f{changed}"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(!f.root.join("log").exists());
+}
+
+#[test]
+fn an_empty_long_option_value_gets_the_hint_and_runs_as_typed() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--files="], false);
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(err(&out).contains("--files has an empty value"), "{}", err(&out));
+    assert_eq!(f.log(), "arg=<--files=>\nchanged=<UNSET>\n");
+}
+
+#[test]
+fn a_placeholder_cannot_occupy_the_dollar_zero_of_a_shell_string() {
+    let f = Fixture::new();
+    let out = f
+        .command(true)
+        .args(["run", "--", "sh", "-c", "printf %s \"$0\"", "{changed}"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(!f.root.join("log").exists());
+}
+
+#[test]
+fn a_brace_form_with_a_short_option_prefix_is_refused() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["-fchanged:x.t"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(!f.root.join("log").exists());
+}
+
+#[test]
+fn a_double_colon_word_is_an_ordinary_argument() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["units::hook::tests"], true);
+    assert!(out.status.success(), "{}", err(&out));
+    assert_eq!(f.log(), "arg=<units::hook::tests>\nchanged=<UNSET>\n");
+}
+
+#[test]
+fn a_single_colon_brace_shape_is_refused_and_names_the_literal_escape() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--only", "unit:true"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(err(&out).contains("--literal"), "{}", err(&out));
+    assert!(!f.root.join("log").exists());
+}
+
+#[test]
+fn an_argument_hint_cannot_start_a_workflow_command_line() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--only\n::warning::injected", ""], false);
+    assert!(out.status.success(), "{}", err(&out));
+    let text = err(&out);
+    assert!(!text.contains("::warning::"), "{text}");
+    assert!(text.lines().all(|line| !line.starts_with("::") && !line.starts_with("##[")), "{text}");
+    assert!(text.contains("%3A%3Awarning"), "{text}");
+}
+
+#[test]
+fn a_removed_word_cannot_carry_a_workflow_command_prefix() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--files", "{changed:##[error]x}"], false);
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(!err(&out).contains("##["), "{}", err(&out));
+    assert!(err(&out).contains("#%23[error]x"), "{}", err(&out));
+    assert_eq!(f.log(), "changed=<>\n");
+}
+
+#[test]
+fn a_cut_off_word_cannot_carry_a_workflow_command_prefix() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["{changed:##[error]x"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(err(&out).contains("is cut off"), "{}", err(&out));
+    assert!(!err(&out).contains("##["), "{}", err(&out));
+}
+
+#[test]
+fn a_refusal_carrying_a_newline_stays_on_one_line() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["-f\n::error::injected", "a", "{changed}"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(err(&out).lines().all(|line| !line.starts_with("::")), "{}", err(&out));
+}
+
+#[test]
+fn a_recorded_template_expires_on_read() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--files", "{changed}"], false);
+    assert!(out.status.success(), "{}", err(&out));
+    set_created(&f, 0);
+    fs::remove_file(f.root.join("log")).unwrap();
+    let out = f.invoke(&[], &["--files", ""], false);
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(!err(&out).contains("the shell expanded"), "{}", err(&out));
+    assert!(err(&out).contains("--files has an empty value"), "{}", err(&out));
+    assert_eq!(f.log(), "arg=<--files>\narg=<>\nchanged=<UNSET>\n");
+}
+
+#[test]
+fn a_run_with_a_short_max_age_keeps_other_commands_templates() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--files", "{changed}"], false);
+    assert!(out.status.success(), "{}", err(&out));
+    set_created(&f, 0);
+    let out = f
+        .command(false)
+        .args(["run", "--max-age", "60", "--"])
+        .arg(&f.runner)
+        .args(["--only", "{changed}"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", err(&out));
+    let catalog: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.root.join(".stoop/hooks-v1.json")).unwrap()).unwrap();
+    let kept = catalog["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|record| record["argv"].to_string().contains("--files"));
+    assert!(kept, "{catalog}");
+}
+
+fn set_created(f: &Fixture, created: u64) {
+    let path = f.root.join(".stoop/hooks-v1.json");
+    let mut catalog: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    for record in catalog["records"].as_array_mut().unwrap() {
+        record["created"] = serde_json::json!(created);
+    }
+    fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+}
+
+#[test]
+fn explain_names_the_expanded_hook_and_the_argv_it_would_run() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--files", "{changed}"], false);
+    assert!(out.status.success(), "{}", err(&out));
+    fs::remove_file(f.root.join("log")).unwrap();
+    let out = f
+        .command(false)
+        .args(["explain", "--"])
+        .arg(&f.runner)
+        .arg("--files")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", err(&out));
+    let text = err(&out);
+    assert!(text.contains("would run full: the shell expanded the recorded hook"), "{text}");
+    assert!(text.contains("--files '{changed}'"), "{text}");
+    assert!(text.contains("it would run"), "{text}");
+    assert!(!f.root.join("log").exists());
+}
+
+#[test]
+fn explain_names_an_empty_value_with_no_recorded_hook() {
+    let f = Fixture::new();
+    let out = f
+        .command(false)
+        .args(["explain", "--"])
+        .arg(&f.runner)
+        .args(["--only", ""])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", err(&out));
     assert!(
-        err(&out).contains("cannot tell where values"),
-        "{}",
-        err(&out)
-    );
-    assert!(
-        err(&out).contains("option arity configuration"),
+        err(&out).contains("would run as typed: no hook recorded with a placeholder at --only"),
         "{}",
         err(&out)
     );
     assert!(!f.root.join("log").exists());
 }
+
+#[test]
+fn stoop_off_still_prints_the_empty_value_hint() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--only", ""], true);
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(err(&out).contains("--only has an empty value"), "{}", err(&out));
+    assert_eq!(f.log(), "arg=<--only>\narg=<>\nchanged=<UNSET>\n");
+}
+
+#[test]
+fn stoop_off_runs_an_expanded_shape_as_its_full_form() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--files", "{changed}"], false);
+    assert!(out.status.success(), "{}", err(&out));
+    let out = f.invoke(&[], &["--files", ""], true);
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(err(&out).contains("the shell expanded"), "{}", err(&out));
+    assert_eq!(f.log(), "changed=<>\n");
+}
+
+#[test]
+fn an_expanded_line_names_the_option_the_full_command_drops() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["-y", "{changed}"], false);
+    assert!(out.status.success(), "{}", err(&out));
+    let out = f.invoke(&[], &["-y"], false);
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(err(&out).contains("after -y"), "{}", err(&out));
+    assert!(err(&out).contains("drops -y"), "{}", err(&out));
+    assert_eq!(f.log(), "changed=<>\n");
+}
+
+#[test]
+fn several_recorded_full_forms_do_not_refuse_a_plain_command() {
+    let f = Fixture::new();
+    assert!(f.invoke(&[], &["{changed}", "-x"], false).status.success());
+    assert!(f.invoke(&[], &["-x", "{changed}"], false).status.success());
+    let out = f.invoke(&[], &["-x"], false);
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(err(&out).contains("matches 2 recorded hooks"), "{}", err(&out));
+    assert_eq!(f.log(), "arg=<-x>\nchanged=<UNSET>\n");
+}
+
+#[test]
+fn explain_never_launches_and_no_split_is_refused() {
+    let f = Fixture::new();
+    let out = f.invoke(&["--no-split"], &["--files", "{changed}"], true);
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert!(err(&out).contains("unknown option --no-split"), "{}", err(&out));
+    assert!(!f.root.join("log").exists());
+    let out = f
+        .command(false)
+        .args(["explain", "--"])
+        .arg(&f.runner)
+        .arg("{changed}")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", err(&out));
+    assert!(err(&out).contains("{changed}"), "{}", err(&out));
+    assert!(!f.root.join("log").exists());
+}
+
