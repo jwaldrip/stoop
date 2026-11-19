@@ -565,7 +565,13 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             };
         }
         if !o.quiet {
-            eprintln!("stoop: run {key}: no compatible tracer");
+            match &hook {
+                Some(h) => eprintln!(
+                    "stoop: run full {key} (no compatible tracer): removed {:?}",
+                    h.removed
+                ),
+                None => eprintln!("stoop: run {key}: no compatible tracer"),
+            }
             eprintln!(
                 "stoop: not traced ({}); running without a proof",
                 trace::UNAVAILABLE
