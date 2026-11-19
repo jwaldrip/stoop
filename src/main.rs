@@ -10,6 +10,7 @@ mod input;
 #[allow(dead_code)]
 mod job;
 mod journal;
+mod mcp;
 mod oid_attrs;
 mod pathutil;
 #[allow(dead_code)]
@@ -36,6 +37,7 @@ USAGE
   stoop ls [--store DIR]                        list recorded proofs
   stoop forget <key> [--store DIR]              drop a proof
   stoop plan [options]                          plan experimental job skips
+  stoop mcp [--allow-run] [--root DIR]          serve stoop to AI agents (stoop mcp --help)
   stoop pull | prune [--sync git[:remote]]       fetch or expire shared proofs
 
 OPTIONS
@@ -103,7 +105,9 @@ fn real_main(mut args: Vec<String>) -> i32 {
             println!("stoop {}", env!("CARGO_PKG_VERSION"));
             return 0;
         }
-        Some(c @ ("run" | "explain" | "sh" | "ls" | "forget" | "pull" | "prune" | "plan")) => {
+        Some(
+            c @ ("run" | "explain" | "sh" | "ls" | "forget" | "pull" | "prune" | "plan" | "mcp"),
+        ) => {
             let c = c.to_string();
             args.remove(0);
             c
@@ -112,6 +116,9 @@ fn real_main(mut args: Vec<String>) -> i32 {
     };
     if cmd == "plan" {
         return plan::cmd(&args);
+    }
+    if cmd == "mcp" {
+        return mcp::cmd(&args);
     }
     let (mut o, rest) = match parse(&args) {
         Ok(x) => x,

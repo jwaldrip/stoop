@@ -164,6 +164,16 @@ Build caches have to know what a task depends on. Most are told; stoop finds out
 
 Those tools do things stoop doesn't, like task graphs, restoring cached outputs and, in Bazel's case, remote execution. stoop is one binary around one command, and it works inside any of them.
 
+## Let an agent use it
+
+`stoop mcp` serves stoop to an MCP client such as Claude Code, Cursor or VS Code. An agent can ask what would run and why (`explain`), read the recorded proofs, drop one, and read the agent guide. It runs a command only if you start the server with `--allow-run`.
+
+```sh
+stoop mcp --print-config    # the config to paste into your client
+```
+
+The [MCP reference](https://stoop.build/docs/mcp.html) covers the tools, the scope, and what the server never does. The guide agents read first is at [stoop.build/AGENTS.md](https://stoop.build/AGENTS.md).
+
 ## Roadmap
 
 Not built yet. Today a skip needs byte-equal inputs; the plan loosens that only where it can be shown not to hide a change:
@@ -179,7 +189,7 @@ Not built yet. Today a skip needs byte-equal inputs; the plan loosens that only 
 
 ## Documentation
 
-The [field guide](https://stoop.build/docs/getting-started.html) covers [getting started](https://stoop.build/docs/getting-started.html), [how it works](https://stoop.build/docs/how-it-works.html), [CI recipes](https://stoop.build/docs/ci.html), [every flag](https://stoop.build/docs/cli.html), [`.stoopignore`](https://stoop.build/docs/stoopignore.html), [blind spots](https://stoop.build/docs/blind-spots.html) and the [FAQ](https://stoop.build/docs/faq.html). The site's source is in [`site/`](site/).
+The [field guide](https://stoop.build/docs/getting-started.html) covers [getting started](https://stoop.build/docs/getting-started.html), [how it works](https://stoop.build/docs/how-it-works.html), [CI recipes](https://stoop.build/docs/ci.html), [every flag](https://stoop.build/docs/cli.html), [the MCP server](https://stoop.build/docs/mcp.html), [`.stoopignore`](https://stoop.build/docs/stoopignore.html), [blind spots](https://stoop.build/docs/blind-spots.html) and the [FAQ](https://stoop.build/docs/faq.html). The site's source is in [`site/`](site/).
 
 ## Build
 
