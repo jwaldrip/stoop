@@ -711,4 +711,19 @@ mod tests {
         assert!(s.forget("k").unwrap());
         assert!(!s.forget("k").unwrap());
     }
+
+    #[test]
+    fn excluded_names_round_trip_and_older_files_load_without_them() {
+        let s = store("excluded");
+        let mut p = proof("f:1");
+        p.env_excluded = vec!["CI_COMMIT_SHA".into()];
+        s.save("k", p).unwrap();
+        assert_eq!(
+            s.load("k")[0].env_excluded,
+            vec!["CI_COMMIT_SHA".to_string()]
+        );
+        let older: Proof =
+            serde_json::from_str(r#"{"created":1,"argv":["x"],"env":{},"inputs":[]}"#).unwrap();
+        assert!(older.env_excluded.is_empty());
+    }
 }
