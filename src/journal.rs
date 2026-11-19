@@ -242,7 +242,7 @@ impl Journal {
             let timestamp = now().max(self.record.created.saturating_add(1));
             self.record.created = timestamp;
             self.record.attest = attest::mint(&self.key, &self.record);
-            if publish_proof && run::env_str(run::SALT_VAR).is_none() {
+            if publish_proof && run::env_salt().is_none() {
                 eprintln!("stoop: sync: publishing environment hashes without {}. In a public repository set it from a repository secret so low-entropy values cannot be guessed offline.", run::SALT_VAR);
             }
             let mut last_error = String::new();
