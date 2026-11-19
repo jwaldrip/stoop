@@ -826,6 +826,19 @@ fn evaluate(
                 format!("step {index}: {name} is both counted and excluded in its proof"),
             );
         }
+        // A learned name is excluded only while its value looks like an identifier now. The planner
+        // cannot see that value, so it cannot replay the exclusion.
+        if let Some(name) = proof.env_excluded.iter().find(|name| {
+            crate::volatile::curated_reason(name.as_str(), &crate::volatile::all_markers())
+                .is_none()
+        }) {
+            return decision(
+                Code::Unplannable,
+                format!(
+                    "step {index}: {name} was learned, so the planner cannot check its exclusion"
+                ),
+            );
+        }
         for (name, hash) in &proof.env {
             if known_github(name) {
                 let value = if name == "GITHUB_JOB" {

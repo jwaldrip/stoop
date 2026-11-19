@@ -138,7 +138,7 @@ Always single-quote the placeholder. Stoop refuses the shell-mangled forms befor
 |---|---|
 | Files read, executed, looked up or listed | Traced; every byte hashed, inside the repository and out |
 | A file that was absent and appears | Recorded as absent inside the repository |
-| The environment | Every variable, minus runner bookkeeping, a curated list of per-run and per-commit variables, and any variable learned to change on every run; `--ignore-env NAME` exempts one, `--env NAME` counts one back |
+| The environment | Every variable, minus runner bookkeeping, a curated list of per-run and per-commit variables, and any variable learned to change on every run while it holds an identifier; `--ignore-env NAME` exempts one, `--env NAME` counts one back |
 | External state you can check | `--probe CMD`: its output must match for a skip |
 | What the run wrote in the repository | Must still be in place for a skip; throwaway output goes in `.stoopignore` |
 

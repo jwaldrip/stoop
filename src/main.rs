@@ -92,8 +92,11 @@ BLIND SPOTS
   repository must still be in place for a skip; list throwaway output in
   .stoopignore.
   Variables that change on every run (a timestamp, a per-job id) are learned after four
-  runs and then ignored, unless the command text names them. A curated list covers the
-  common CI and terminal ones. A variable that really changes what a command does, and
+  runs and ignored while they hold an id, unless the command text names them. A curated
+  list covers the common CI and terminal ones; a provider's names count only where its
+  marker is set. The command text is the argv words and the `stoop sh` step body, not
+  the files a command runs, so a curated name read from a file is still ignored: pass
+  `--env NAME` to count it. A variable that really changes what a command does, and
   takes a new value on every run, would be ignored too. `stoop forget --volatile KEY`
   resets what was learned for a key; `--env NAME` counts a name again.
 ";

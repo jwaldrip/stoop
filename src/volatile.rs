@@ -3,20 +3,23 @@
 //! The environment counts as an input because a variable read never shows up in a file trace.
 //! Some variables are bookkeeping: they change on every run, every commit or every terminal, and
 //! say nothing about what a command produces. Two sources exclude them. The command text overrules
-//! both: a name the text mentions, and a name forced with `--env`, always count.
+//! both: a name the text mentions, and a name forced with `--env`, always count. The command text
+//! is the argv words and the `stoop sh` step body, never the files the command runs.
 //!
 //! - The curated table below. Each name is one a tool documents as per run, per session or per
 //!   commit, and each group cites the page or source it was read from. A name that could not be
-//!   sourced is not here.
+//!   sourced is not here. A group that names a provider counts only where that provider's marker
+//!   variable is set.
 //! - The learner. A name whose opaque value is new on each of the last few runs of the same proof
-//!   key is excluded for that key. A value that returns is evidence the name is not bookkeeping: it
-//!   is counted again, and never learned again for that key.
+//!   key is excluded for that key, and only while its value is still an identifier. A value that
+//!   returns is evidence the name is not bookkeeping: it is counted again, and never learned again
+//!   for that key. A learned name holding a plain value is counted again, and may be learned later.
 //!
 //! Every invocation that reaches the decision is an observation, skips included. A skipped run's
 //! value equals an earlier proof's value, so counting only recorded runs would miss a repeat.
 
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -35,6 +38,9 @@ pub struct Group {
     pub source: &'static str,
     pub names: &'static [&'static str],
     pub prefixes: &'static [&'static str],
+    /// Marker variables a provider sets. The group counts only where one of them is set. Empty
+    /// means the group always counts.
+    pub requires: &'static [&'static str],
 }
 
 pub const GROUPS: &[Group] = &[
@@ -43,33 +49,43 @@ pub const GROUPS: &[Group] = &[
         source: "bash: https://tiswww.case.edu/php/chet/bash/bashref.html (Bash Variables); zsh: https://zsh.sourceforge.io/Doc/Release/Parameters.html (RANDOM, SECONDS) and https://zsh.sourceforge.io/Doc/Release/Zsh-Modules.html (EPOCHSECONDS, EPOCHREALTIME)",
         names: &["RANDOM", "SRANDOM", "SECONDS", "EPOCHSECONDS", "EPOCHREALTIME"],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "shell process id",
         source: "bash: https://tiswww.case.edu/php/chet/bash/bashref.html (Bash Variables: BASHPID, PPID)",
         names: &["BASHPID", "PPID"],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "terminal size",
         source: "bash: https://tiswww.case.edu/php/chet/bash/bashref.html (COLUMNS, LINES); zsh: https://zsh.sourceforge.io/Doc/Release/Parameters.html (COLUMNS, LINES)",
         names: &["COLUMNS", "LINES"],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "terminal multiplexer or window id",
-        source: "tmux TMUX, TMUX_PANE: https://man.openbsd.org/tmux (ENVIRONMENT) ; GNU screen STY and WINDOW: http://www.gnu.org/software/screen/manual/screen.html ; xterm WINDOWID: https://invisible-island.net/xterm/manpage/xterm.html ; kitty KITTY_WINDOW_ID and KITTY_LISTEN_ON: https://sw.kovidgoyal.net/kitty/remote-control/ ; zellij ZELLIJ_SESSION_NAME: https://zellij.dev/documentation/integration",
+        source: "tmux TMUX, TMUX_PANE: https://man.openbsd.org/tmux (ENVIRONMENT) ; GNU screen STY: http://www.gnu.org/software/screen/manual/screen.html ; xterm WINDOWID: https://invisible-island.net/xterm/manpage/xterm.html ; kitty KITTY_WINDOW_ID and KITTY_LISTEN_ON: https://sw.kovidgoyal.net/kitty/remote-control/ ; zellij ZELLIJ_SESSION_NAME: https://zellij.dev/documentation/integration",
         names: &[
             "TMUX",
             "TMUX_PANE",
             "STY",
-            "WINDOW",
             "WINDOWID",
             "KITTY_WINDOW_ID",
             "KITTY_LISTEN_ON",
             "ZELLIJ_SESSION_NAME",
         ],
         prefixes: &[],
+        requires: &[],
+    },
+    Group {
+        why: "GNU screen window number",
+        source: "GNU screen: http://www.gnu.org/software/screen/manual/screen.html (environment variable WINDOW, set in each window)",
+        names: &["WINDOW"],
+        prefixes: &[],
+        requires: &["STY"],
     },
     Group {
         why: "terminal emulator instance or pane",
@@ -87,6 +103,7 @@ pub const GROUPS: &[Group] = &[
             "KONSOLE_DBUS_SESSION",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "login session or SSH connection",
@@ -101,12 +118,14 @@ pub const GROUPS: &[Group] = &[
             "SSH_AGENT_PID",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "editor window socket",
         source: "VS Code VSCODE_IPC_HOOK_CLI: https://github.com/microsoft/vscode/blob/main/src/vs/server/node/server.cli.ts ; VS Code VSCODE_GIT_IPC_HANDLE: https://github.com/microsoft/vscode/blob/main/extensions/git/src/ipc/ipcServer.ts",
         names: &["VSCODE_IPC_HOOK_CLI", "VSCODE_GIT_IPC_HANDLE"],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "GitLab per-job or per-pipeline value",
@@ -126,6 +145,7 @@ pub const GROUPS: &[Group] = &[
             "CI_RUNNER_ID",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "GitLab per-commit value",
@@ -150,6 +170,7 @@ pub const GROUPS: &[Group] = &[
             "CI_EXTERNAL_PULL_REQUEST_TARGET_BRANCH_SHA",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "Buildkite per-build, per-job or per-agent value",
@@ -173,6 +194,7 @@ pub const GROUPS: &[Group] = &[
             "BUILDKITE_AGENT_PID",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "Buildkite per-commit value",
@@ -185,6 +207,7 @@ pub const GROUPS: &[Group] = &[
             "BUILDKITE_MERGE_QUEUE_BASE_COMMIT",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "CircleCI per-job or per-workflow value",
@@ -198,12 +221,14 @@ pub const GROUPS: &[Group] = &[
             "CIRCLE_WORKFLOW_WORKSPACE_ID",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "CircleCI per-commit value",
         source: "https://circleci.com/docs/variables/",
         names: &["CIRCLE_SHA1", "CIRCLE_COMPARE_URL"],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "Travis per-build or per-job value",
@@ -217,6 +242,7 @@ pub const GROUPS: &[Group] = &[
             "TRAVIS_JOB_WEB_URL",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "Travis per-commit value",
@@ -228,6 +254,7 @@ pub const GROUPS: &[Group] = &[
             "TRAVIS_PULL_REQUEST_SHA",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "Jenkins or TeamCity per-build value",
@@ -240,24 +267,28 @@ pub const GROUPS: &[Group] = &[
             "TEAMCITY_BUILD_PROPERTIES_FILE",
         ],
         prefixes: &[],
+        requires: &["JENKINS_URL", "TEAMCITY_VERSION"],
     },
     Group {
         why: "Jenkins per-executor slot",
         source: "https://www.jenkins.io/doc/book/pipeline/jenkinsfile/ (EXECUTOR_NUMBER)",
         names: &["EXECUTOR_NUMBER"],
         prefixes: &[],
+        requires: &["JENKINS_URL"],
     },
     Group {
         why: "Jenkins per-commit value",
         source: "Git plugin: https://plugins.jenkins.io/git/ (GIT_COMMIT, GIT_PREVIOUS_COMMIT, GIT_PREVIOUS_SUCCESSFUL_COMMIT)",
         names: &["GIT_COMMIT", "GIT_PREVIOUS_COMMIT", "GIT_PREVIOUS_SUCCESSFUL_COMMIT"],
         prefixes: &[],
+        requires: &["JENKINS_URL"],
     },
     Group {
         why: "TeamCity per-commit value",
         source: "https://www.jetbrains.com/help/teamcity/predefined-build-parameters.html (env.BUILD_VCS_NUMBER_<VCS_root_ID>)",
         names: &[],
         prefixes: &["BUILD_VCS_NUMBER_"],
+        requires: &["TEAMCITY_VERSION"],
     },
     Group {
         why: "Azure Pipelines per-build, per-job or per-agent value",
@@ -269,6 +300,7 @@ pub const GROUPS: &[Group] = &[
             "AGENT_ID",
         ],
         prefixes: &[],
+        requires: &["TF_BUILD"],
     },
     Group {
         why: "Azure Pipelines per-commit value",
@@ -279,6 +311,7 @@ pub const GROUPS: &[Group] = &[
             "SYSTEM_PULLREQUEST_SOURCECOMMITID",
         ],
         prefixes: &[],
+        requires: &["TF_BUILD"],
     },
     Group {
         why: "Bitbucket per-run value",
@@ -293,12 +326,14 @@ pub const GROUPS: &[Group] = &[
             "BITBUCKET_MERGE_QUEUE_PR_IDS",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "Bitbucket per-commit value",
         source: "https://support.atlassian.com/bitbucket-cloud/docs/variables-and-secrets/",
         names: &["BITBUCKET_COMMIT", "BITBUCKET_PR_DESTINATION_COMMIT"],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "Drone per-build or per-stage value",
@@ -314,6 +349,7 @@ pub const GROUPS: &[Group] = &[
             "DRONE_STAGE_FINISHED",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "Drone per-commit value",
@@ -330,6 +366,7 @@ pub const GROUPS: &[Group] = &[
             "DRONE_COMMIT_MESSAGE",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "AWS CodeBuild per-build value",
@@ -340,10 +377,10 @@ pub const GROUPS: &[Group] = &[
             "CODEBUILD_BUILD_NUMBER",
             "CODEBUILD_BUILD_URL",
             "CODEBUILD_PUBLIC_BUILD_URL",
-            "CODEBUILD_BATCH_BUILD_IDENTIFIER",
             "CODEBUILD_START_TIME",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "AWS CodeBuild per-commit value",
@@ -354,6 +391,7 @@ pub const GROUPS: &[Group] = &[
             "CODEBUILD_WEBHOOK_PREV_COMMIT",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "Semaphore per-workflow, per-pipeline or per-job value",
@@ -365,6 +403,7 @@ pub const GROUPS: &[Group] = &[
             "SEMAPHORE_JOB_ID",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "Semaphore per-commit value",
@@ -377,6 +416,7 @@ pub const GROUPS: &[Group] = &[
             "SEMAPHORE_GIT_PR_SHA",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "AppVeyor per-build or per-job value",
@@ -389,6 +429,7 @@ pub const GROUPS: &[Group] = &[
             "APPVEYOR_JOB_NUMBER",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "AppVeyor per-commit value",
@@ -403,12 +444,14 @@ pub const GROUPS: &[Group] = &[
             "APPVEYOR_PULL_REQUEST_HEAD_COMMIT",
         ],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "GoCD per-pipeline or per-stage counter and label",
         source: "https://docs.gocd.org/current/faq/dev_use_current_revision_in_build.html",
         names: &["GO_PIPELINE_COUNTER", "GO_PIPELINE_LABEL", "GO_STAGE_COUNTER"],
         prefixes: &[],
+        requires: &[],
     },
     Group {
         why: "GoCD per-commit revision",
@@ -420,6 +463,7 @@ pub const GROUPS: &[Group] = &[
             "GO_TO_REVISION_",
             "GO_DEPENDENCY_LABEL_",
         ],
+        requires: &[],
     },
     Group {
         why: "rotating credential issued per job or per session",
@@ -436,16 +480,40 @@ pub const GROUPS: &[Group] = &[
             "AWS_SESSION_TOKEN",
         ],
         prefixes: &[],
+        requires: &[],
     },
 ];
 
-/// The curated reason a name is excluded, or `None` when it is not curated. Every curated name is
-/// ASCII, so a name that is not UTF-8 never matches.
-pub fn curated_reason(name: &str) -> Option<&'static str> {
+/// The marker variables the environment sets, out of every marker a group names.
+fn markers_set() -> BTreeSet<String> {
+    all_markers()
+        .into_iter()
+        .filter(|marker| std::env::var_os(marker).is_some())
+        .collect()
+}
+
+/// Every marker variable a group names in its `requires`.
+pub fn all_markers() -> BTreeSet<String> {
+    GROUPS
+        .iter()
+        .flat_map(|group| group.requires.iter())
+        .map(|marker| marker.to_string())
+        .collect()
+}
+
+/// The curated reason a name is excluded, or `None` when it is not curated. A group with `requires`
+/// counts only when one of those markers is in `markers`. Every curated name is ASCII, so a name
+/// that is not UTF-8 never matches.
+pub fn curated_reason(name: &str, markers: &BTreeSet<String>) -> Option<&'static str> {
     GROUPS
         .iter()
         .find(|group| {
-            group.names.contains(&name) || group.prefixes.iter().any(|p| name.starts_with(p))
+            (group.names.contains(&name) || group.prefixes.iter().any(|p| name.starts_with(p)))
+                && (group.requires.is_empty()
+                    || group
+                        .requires
+                        .iter()
+                        .any(|marker| markers.contains(*marker)))
         })
         .map(|group| group.why)
 }
@@ -507,6 +575,8 @@ pub fn never_learn(name: &str) -> bool {
         "https_proxy",
         "all_proxy",
         "no_proxy",
+        "SOURCE_DATE_EPOCH",
+        "IMAGE_TAG",
     ];
     const PREFIX: &[&str] = &[
         "LC_",
@@ -563,6 +633,10 @@ pub fn never_learn(name: &str) -> bool {
         "_ONLY",
         "_DISABLE",
         "_ENABLE",
+        "_TAG",
+        "_SHA",
+        "_DIGEST",
+        "_EPOCH",
     ];
     const CONTAINS: &[&str] = &[
         "DEBUG", "VERBOSE", "TRACE", "QUIET", "COLOR", "FORCE", "DRY_RUN",
@@ -656,21 +730,23 @@ pub struct Plan {
 
 /// Split candidate environment keys into counted and excluded names. A name the command text
 /// mentions and a name forced with `--env` always count. A curated name is excluded for its
-/// group's reason; a learned name for the learned reason.
+/// group's reason when one of the group's markers is in `markers`. A learned name is excluded only
+/// while it is in `active`: learned, and holding an identifier now.
 pub fn plan(
     candidates: &[String],
     mention: &str,
     forced: &[String],
-    learned: &BTreeMap<String, u32>,
+    active: &BTreeMap<String, u32>,
+    markers: &BTreeSet<String>,
 ) -> Plan {
     let mut out = Plan::default();
     for key in candidates {
         let name = crate::run::env_name(key);
         if forced.contains(key) || mentioned(&name.to_string_lossy(), mention) {
             out.counted.push(key.clone());
-        } else if let Some(why) = curated_reason(key) {
+        } else if let Some(why) = curated_reason(key, markers) {
             out.excluded.push((key.clone(), why.to_string()));
-        } else if let Some(runs) = learned.get(key) {
+        } else if let Some(runs) = active.get(key) {
             out.excluded.push((
                 key.clone(),
                 format!("changes on every run (learned after {runs} runs)"),
@@ -709,6 +785,8 @@ pub struct Request<'a> {
     pub mention: &'a str,
     /// Names forced to count with `--env`.
     pub forced: &'a [String],
+    /// Names the user exempted with `--ignore-env`. A learned name among them is not counted back in.
+    pub ignore: &'a [String],
     pub salt: Option<&'a [u8]>,
     /// False turns learning off: nothing is observed and no learned name is excluded.
     pub learn: bool,
@@ -733,23 +811,58 @@ pub fn decide(req: &Request) -> Outcome {
     let mut candidates: Vec<String> = req.candidates.iter().chain(req.forced).cloned().collect();
     candidates.sort();
     candidates.dedup();
+    let markers = markers_set();
     let mut outcome = Outcome::default();
-    let learned = if req.learn {
-        let observed = observations(&candidates, req.mention, req.forced, req.salt);
+    let mut universe = candidates.clone();
+    let mut active: BTreeMap<String, u32> = BTreeMap::new();
+    if req.learn {
+        let observed = observations(&candidates, req.mention, req.forced, req.salt, &markers);
+        let plain = plain_now(&candidates);
         let salt_id = salt_id(req.salt);
         let step = if req.persist {
-            persist(req.store, req.key, &salt_id, &observed, req.now)
+            persist(req.store, req.key, &salt_id, &observed, &plain, req.now)
         } else {
-            in_memory(req.store, req.key, &salt_id, &observed, req.now)
+            in_memory(req.store, req.key, &salt_id, &observed, &plain, req.now)
         };
         outcome.changes = step.changes;
         outcome.warning = step.warning;
-        step.learned
-    } else {
-        BTreeMap::new()
-    };
-    outcome.plan = plan(&candidates, req.mention, req.forced, &learned);
+        // A learned name joins the universe even when it is unset, so its absence is counted. An
+        // ignored name never comes back.
+        universe.extend(
+            step.learned
+                .keys()
+                .filter(|name| !req.ignore.contains(*name))
+                .cloned(),
+        );
+        // Excluded only while it holds an identifier now: the state records that it was learned,
+        // not what it holds.
+        active = step
+            .learned
+            .into_iter()
+            .filter(|(name, _)| observed.contains_key(name) && !never_learn(name))
+            .collect();
+    }
+    universe.sort();
+    universe.dedup();
+    outcome.plan = plan(&universe, req.mention, req.forced, &active, &markers);
     outcome
+}
+
+/// Candidate names that hold a value which is not an identifier now.
+fn plain_now(candidates: &[String]) -> BTreeSet<String> {
+    candidates
+        .iter()
+        .filter(|key| {
+            std::env::var_os(crate::run::env_name(key.as_str()))
+                .is_some_and(|value| !identifier(&value))
+        })
+        .cloned()
+        .collect()
+}
+
+/// Whether a value looks like an identifier: UTF-8 that `opaque` accepts, as `digest` requires.
+fn identifier(value: &std::ffi::OsStr) -> bool {
+    value.to_str().is_some_and(opaque)
 }
 
 /// The digest of each name this run could learn: present, opaque, and neither curated, never
@@ -759,10 +872,11 @@ fn observations(
     mention: &str,
     forced: &[String],
     salt: Option<&[u8]>,
+    markers: &BTreeSet<String>,
 ) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for key in candidates {
-        if forced.contains(key) || curated_reason(key).is_some() || never_learn(key) {
+        if forced.contains(key) || curated_reason(key, markers).is_some() || never_learn(key) {
             continue;
         }
         let name = crate::run::env_name(key);
@@ -832,6 +946,7 @@ struct NameState {
 enum Change {
     Learned(String),
     Revoked(String),
+    Stopped(String),
 }
 
 /// What one run of the policy produced: the learned names and what changed.
@@ -853,12 +968,29 @@ impl Step {
 
 /// Apply one invocation's observations to a key's state. A repeat resets the streak, and revokes a
 /// learned name for good. A new value extends the streak, and learns the name after `MIN_RUNS`.
-/// A name absent from `observed` breaks its streak but keeps what it has learned.
-fn advance(state: &mut KeyState, observed: &BTreeMap<String, String>, now: u64) -> Vec<Change> {
+/// A name absent from `observed` breaks its streak but keeps what it has learned. A learned name in
+/// `plain` loses its learning without being refused.
+fn advance(
+    state: &mut KeyState,
+    observed: &BTreeMap<String, String>,
+    plain: &BTreeSet<String>,
+    now: u64,
+) -> Vec<Change> {
     state.runs += 1;
     state.updated = now;
     let run = state.runs;
     let mut changes = Vec::new();
+    // A learned name holding a plain value is no longer excluded. Its learning goes, but it is not
+    // refused: if it holds identifiers again, it can be learned again.
+    for name in plain {
+        let Some(entry) = state.names.get_mut(name) else {
+            continue;
+        };
+        if entry.learned.take().is_some() {
+            entry.streak = 0;
+            changes.push(Change::Stopped(name.clone()));
+        }
+    }
     for (name, digest) in observed {
         let entry = state.names.entry(name.clone()).or_default();
         entry.last = run;
@@ -935,6 +1067,10 @@ fn render(change: &Change) -> String {
         ),
         Change::Revoked(name) => format!(
             "counting env {} again: it returned to an earlier value, so it is not ignored for this key any more",
+            safe(name)
+        ),
+        Change::Stopped(name) => format!(
+            "counting env {} again: its value is no longer an identifier, so it is not ignored for this key any more",
             safe(name)
         ),
     }
@@ -1087,6 +1223,7 @@ fn persist(
     key: &str,
     salt_id: &str,
     observed: &BTreeMap<String, String>,
+    plain: &BTreeSet<String>,
     now: u64,
 ) -> Step {
     let _guard = match lock(store) {
@@ -1114,7 +1251,7 @@ fn persist(
         }
     };
     let mut state = take_key(&mut catalog, key, salt_id);
-    let changes = advance(&mut state, observed, now);
+    let changes = advance(&mut state, observed, plain, now);
     let learned = learned_of(&state);
     catalog.keys.insert(key.to_string(), state);
     let bytes = match fit(&mut catalog, key) {
@@ -1139,6 +1276,7 @@ fn in_memory(
     key: &str,
     salt_id: &str,
     observed: &BTreeMap<String, String>,
+    plain: &BTreeSet<String>,
     now: u64,
 ) -> Step {
     let mut catalog = match read_catalog(store) {
@@ -1151,7 +1289,7 @@ fn in_memory(
         }
     };
     let mut state = take_key(&mut catalog, key, salt_id);
-    advance(&mut state, observed, now);
+    advance(&mut state, observed, plain, now);
     Step {
         learned: learned_of(&state),
         changes: Vec::new(),
@@ -1239,6 +1377,7 @@ mod tests {
             candidates: &names,
             mention: "",
             forced: &[],
+            ignore: &[],
             salt: None,
             learn: true,
             persist: true,
@@ -1361,7 +1500,10 @@ mod tests {
             "GO_DEPENDENCY_LABEL_pipeline",
             "AWS_SESSION_TOKEN",
         ] {
-            assert!(curated_reason(name).is_some(), "{name} should be curated");
+            assert!(
+                curated_reason(name, &all_markers()).is_some(),
+                "{name} should be curated"
+            );
         }
     }
 
@@ -1417,25 +1559,28 @@ mod tests {
             "BUILDKITE_BUILD_CHECKOUT_PATH",
             "SECURITYSESSIONID",
         ] {
-            assert!(curated_reason(name).is_none(), "{name} must stay counted");
+            assert!(
+                curated_reason(name, &all_markers()).is_none(),
+                "{name} must stay counted"
+            );
         }
     }
 
     #[test]
     fn prefixes_match_only_the_families_they_name() {
-        assert!(curated_reason("GO_REVISION_CODE").is_some());
-        assert!(curated_reason("GO_DEPENDENCY_LABEL_x").is_some());
-        assert!(curated_reason("BUILD_VCS_NUMBER_2").is_some());
-        assert!(curated_reason("GO_REVISIONS").is_none());
-        assert!(curated_reason("GO_REVISIO").is_none());
-        assert!(curated_reason("BUILD_VCS_NUMBER").is_none());
-        assert!(curated_reason("CI_").is_none());
+        assert!(curated_reason("GO_REVISION_CODE", &all_markers()).is_some());
+        assert!(curated_reason("GO_DEPENDENCY_LABEL_x", &all_markers()).is_some());
+        assert!(curated_reason("BUILD_VCS_NUMBER_2", &all_markers()).is_some());
+        assert!(curated_reason("GO_REVISIONS", &all_markers()).is_none());
+        assert!(curated_reason("GO_REVISIO", &all_markers()).is_none());
+        assert!(curated_reason("BUILD_VCS_NUMBER", &all_markers()).is_none());
+        assert!(curated_reason("CI_", &all_markers()).is_none());
     }
 
     #[test]
     fn a_name_that_is_not_utf8_is_never_curated() {
-        assert!(curated_reason("\u{0}ff").is_none());
-        assert!(curated_reason("\u{0}52414e444f4d").is_none());
+        assert!(curated_reason("\u{0}ff", &all_markers()).is_none());
+        assert!(curated_reason("\u{0}52414e444f4d", &all_markers()).is_none());
     }
 
     #[test]
@@ -1457,6 +1602,7 @@ mod tests {
             "echo $RANDOM",
             &["TMUX_PANE".to_string()],
             &learned,
+            &BTreeSet::new(),
         );
         assert_eq!(
             plan.counted,
@@ -1485,7 +1631,7 @@ mod tests {
     fn a_learned_name_that_the_command_mentions_still_counts() {
         let candidates = vec!["FOO".to_string()];
         let learned = BTreeMap::from([("FOO".to_string(), 4)]);
-        let plan = plan(&candidates, "echo FOO", &[], &learned);
+        let plan = plan(&candidates, "echo FOO", &[], &learned, &BTreeSet::new());
         assert_eq!(plan.counted, vec!["FOO".to_string()]);
         assert!(plan.excluded.is_empty());
     }
@@ -1722,6 +1868,7 @@ mod tests {
                 candidates: &names,
                 mention: "",
                 forced: &[],
+                ignore: &[],
                 salt: Some(salt),
                 learn: true,
                 persist: true,
@@ -1759,6 +1906,7 @@ mod tests {
             candidates: &names,
             mention: &format!("echo ${name}"),
             forced: &[],
+            ignore: &[],
             salt: None,
             learn: true,
             persist: true,
@@ -1785,6 +1933,7 @@ mod tests {
             candidates: &names,
             mention: "",
             forced: &forced,
+            ignore: &[],
             salt: None,
             learn: true,
             persist: true,
@@ -1810,6 +1959,7 @@ mod tests {
             candidates: &names,
             mention: "",
             forced: &[],
+            ignore: &[],
             salt: None,
             learn: false,
             persist: true,
@@ -1836,6 +1986,7 @@ mod tests {
             candidates: &names,
             mention: "",
             forced: &[],
+            ignore: &[],
             salt: None,
             learn: true,
             persist: false,
@@ -1908,6 +2059,7 @@ mod tests {
                             candidates: &[],
                             mention: "",
                             forced: &[],
+                            ignore: &[],
                             salt: None,
                             learn: true,
                             persist: true,
@@ -1963,6 +2115,7 @@ mod tests {
                 candidates: &[],
                 mention: "",
                 forced: &[],
+                ignore: &[],
                 salt: None,
                 learn: true,
                 persist: true,
@@ -1990,6 +2143,7 @@ mod tests {
             candidates: &names,
             mention: "",
             forced: &[],
+            ignore: &[],
             salt: None,
             learn: true,
             persist: true,
@@ -2018,6 +2172,7 @@ mod tests {
                 candidates: &names,
                 mention: "",
                 forced: &[],
+                ignore: &[],
                 salt: None,
                 learn: true,
                 persist: true,
@@ -2031,6 +2186,7 @@ mod tests {
             candidates: &names,
             mention: "",
             forced: &[],
+            ignore: &[],
             salt: None,
             learn: true,
             persist: true,
@@ -2042,10 +2198,10 @@ mod tests {
 }
 
 #[cfg(test)]
-mod red_tests {
-    //! Failing-first tests for the review of b6b33ad. They use the current API on purpose, so each
-    //! one fails on behaviour: a learned name whose value stops being an identifier, a learned name
-    //! that is unset, the CodeBuild batch identifier, the never-learn names, and provider gates.
+mod review_tests {
+    //! Tests for the review of b6b33ad: a learned name is excluded only while it holds an
+    //! identifier, an unset learned name counts, provider gates count only under their marker, the
+    //! CodeBuild batch identifier is not curated, and the reviewed behavioural names are never learned.
     use super::*;
 
     fn dir(name: &str) -> PathBuf {
@@ -2070,6 +2226,7 @@ mod red_tests {
             candidates: &names,
             mention: "",
             forced: &[],
+            ignore: &[],
             salt: None,
             learn: true,
             persist: true,
@@ -2114,7 +2271,7 @@ mod red_tests {
 
     #[test]
     fn codebuild_batch_build_identifier_is_not_curated() {
-        assert!(curated_reason("CODEBUILD_BATCH_BUILD_IDENTIFIER").is_none());
+        assert!(curated_reason("CODEBUILD_BATCH_BUILD_IDENTIFIER", &all_markers()).is_none());
     }
 
     #[test]
@@ -2134,10 +2291,57 @@ mod red_tests {
     #[test]
     fn jenkins_names_count_when_their_provider_marker_is_absent() {
         let names = vec!["BUILD_NUMBER".to_string()];
-        let plan = plan(&names, "", &[], &BTreeMap::new());
+        let plan = plan(&names, "", &[], &BTreeMap::new(), &BTreeSet::new());
         assert!(
             plan.counted.contains(&"BUILD_NUMBER".to_string()),
             "{plan:?}"
+        );
+    }
+
+    #[test]
+    fn a_provider_gated_name_is_curated_only_where_its_marker_is_set() {
+        let none = BTreeSet::new();
+        let jenkins = BTreeSet::from(["JENKINS_URL".to_string()]);
+        let azure = BTreeSet::from(["TF_BUILD".to_string()]);
+        let screen = BTreeSet::from(["STY".to_string()]);
+        assert!(curated_reason("BUILD_NUMBER", &none).is_none());
+        assert!(curated_reason("BUILD_NUMBER", &jenkins).is_some());
+        assert!(curated_reason("GIT_COMMIT", &none).is_none());
+        assert!(curated_reason("GIT_COMMIT", &jenkins).is_some());
+        assert!(curated_reason("AGENT_ID", &jenkins).is_none());
+        assert!(curated_reason("AGENT_ID", &azure).is_some());
+        assert!(curated_reason("WINDOW", &none).is_none());
+        assert!(curated_reason("WINDOW", &screen).is_some());
+        // Terminal size is curated everywhere: its one real effect is on help-text snapshots.
+        assert!(curated_reason("COLUMNS", &none).is_some());
+    }
+
+    #[test]
+    fn an_ignored_learned_name_stays_out_of_the_plan() {
+        let s = dir("ignored-learned");
+        let name = "VOLATILE_RED_IGNORED";
+        for value in V {
+            observe(&s, name, Some(value));
+        }
+        let ignore = vec![name.to_string()];
+        let out = decide(&Request {
+            store: &s,
+            key: "k",
+            candidates: &[],
+            mention: "",
+            forced: &[],
+            salt: None,
+            learn: true,
+            persist: true,
+            now: 1,
+            ignore: &ignore,
+        });
+        std::env::remove_var(name);
+        assert!(
+            out.plan.counted.iter().all(|key| key != name)
+                && out.plan.excluded.iter().all(|(key, _)| key != name),
+            "{:?}",
+            out.plan
         );
     }
 }

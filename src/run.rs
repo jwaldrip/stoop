@@ -907,6 +907,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         candidates: &candidates,
         mention: &mention,
         forced: &o.env,
+        ignore: &o.ignore_env,
         salt: salt.as_deref(),
         learn: learning_on(&o),
         // A run that does not write its record, or only explains, observes in memory: it must not
@@ -936,6 +937,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         .map(|(name, _)| name.clone())
         .collect();
     let env_now = env_hashes(&volatile.plan.counted, salt.as_deref());
+    let excluded_now: std::collections::BTreeSet<&String> = env_excluded.iter().collect();
 
     let remote = o
         .sync
@@ -976,6 +978,13 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 vec![("proof".to_string(), "expired")]
             } else if p.env != env_now {
                 vec![("env".to_string(), "changed")]
+            } else if p
+                .env_excluded
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                != excluded_now
+            {
+                vec![("env exclusions".to_string(), "changed")]
             } else {
                 let mut d: Vec<(String, &'static str)> = verify(&root, &p.inputs, explain)
                     .into_iter()

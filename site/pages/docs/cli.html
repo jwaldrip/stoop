@@ -50,9 +50,9 @@
   <dt id="opt-store">--store DIR</dt>
   <dd>Where proofs live. Defaults to <code>&lt;root&gt;/.stoop</code>, or <code>$STOOP_STORE</code>. An external store scopes automatic keys by Git origin, or by the physical root path if there is no origin. See <a href="how-it-works.html#keys">keys</a>.</dd>
   <dt id="opt-env">--env NAME</dt>
-  <dd>Count this variable too. The environment already counts, minus runner bookkeeping (<code>GITHUB_</code>, <code>RUNNER_</code>, <code>ACTIONS_</code>, <code>INPUT_</code>, <code>STOOP_</code>) and the curated per-run variables; use this to put one back. A name the command text mentions counts anyway. Repeatable.</dd>
+  <dd>Count this variable too. The environment already counts, minus runner bookkeeping (<code>GITHUB_</code>, <code>RUNNER_</code>, <code>ACTIONS_</code>, <code>INPUT_</code>, <code>STOOP_</code>) and the curated per-run variables; use this to put one back. A name the command text mentions counts anyway. The command text is the argv words and the <code>stoop sh</code> step body, not the files the command runs. Repeatable.</dd>
   <dt id="opt-ignore-env">--ignore-env NAME</dt>
-  <dd>Exempt a variable that changes without mattering, such as a per-run token. Repeatable.</dd>
+  <dd>Exempt a variable that changes without mattering, such as a per-run token. An exempt name is never counted, even when it was learned. Repeatable.</dd>
   <dt id="opt-no-learn-volatile">--no-learn-volatile</dt>
   <dd>Do not learn variables that change on every run. The curated list still applies. See <a href="blind-spots.html#volatile">variables that change on every run</a>.</dd>
   <dt id="opt-probe">--probe CMD</dt>
