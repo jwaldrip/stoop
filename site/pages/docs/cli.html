@@ -83,6 +83,7 @@
   <tbody>
     <tr><td><code>STOOP_FULL=1</code></td><td>Never skip; still record. For the nightly full run.</td></tr>
     <tr><td><code>STOOP_OFF=1</code></td><td>Don't trace or skip; run commands directly.</td></tr>
+    <tr><td><code>STOOP_DTRACE_DIAGNOSTIC=1</code></td><td>macOS only, with passwordless <code>sudo</code>: run the command once under DTrace and print a report. Never recorded. <code>list</code> adds the paths and the process tree; <code>raw</code> adds every line the tracer printed.</td></tr>
     <tr><td><code>STOOP_STORE=DIR</code></td><td>Default for <code>--store</code>.</td></tr>
     <tr><td><code>STOOP_SYNC=git[:REMOTE]</code></td><td>Default for <code>--sync</code>.</td></tr>
     <tr><td><code>STOOP_SYNC_WRITE=1</code></td><td>Same as <code>--sync-write</code>.</td></tr>

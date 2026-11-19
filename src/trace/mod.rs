@@ -132,6 +132,9 @@ mod linux;
 ))]
 pub use linux::run;
 
+#[cfg(target_os = "macos")]
+pub(crate) mod macos;
+
 #[cfg(not(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")

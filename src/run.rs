@@ -539,6 +539,32 @@ fn plain(argv: &[std::ffi::OsString], pass_env: &[&str]) -> i32 {
     }
 }
 
+/// The opt-in macOS diagnostic: run the command once under DTrace and report what it did. Nothing
+/// is recorded, and the command's own status is returned. `None` means the tracer could not be
+/// armed and the command has not run, so the caller runs it untraced as usual. The report prints
+/// even under `--quiet`, because the variable asked for it.
+#[cfg(target_os = "macos")]
+fn dtrace_diagnostic(o: &Opts, cwd: &Path, key: &str) -> Option<Outcome> {
+    let mode = env_str("STOOP_DTRACE_DIAGNOSTIC").unwrap_or_default();
+    let raw = mode == "raw";
+    let paths = raw || mode == "list";
+    let diagnostic = match trace::macos::diagnose(&o.argv, cwd, raw) {
+        Ok(diagnostic) => diagnostic,
+        Err(e) => {
+            eprintln!("stoop: DTrace diagnostic verdict: UNKNOWN ({e}); running untraced");
+            return None;
+        }
+    };
+    for line in trace::macos::report(&diagnostic, paths, raw) {
+        eprintln!("stoop: {line}");
+    }
+    Some(Outcome {
+        status: diagnostic.trace.status,
+        key: key.to_owned(),
+        how: diagnostic_how(diagnostic.trace.status),
+    })
+}
+
 pub enum How {
     Skipped { proof: String },
     Recorded { proof: String },
@@ -551,6 +577,18 @@ pub struct Outcome {
     pub status: i32,
     pub key: String,
     pub how: How,
+}
+
+/// How a diagnostic run is journaled. It is never a proof: a command that failed is a failed step,
+/// as it is when traced on Linux, and a command that passed is blocked, because nothing was
+/// recorded.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn diagnostic_how(status: i32) -> How {
+    if status == 0 {
+        How::Unrecorded("macOS DTrace diagnostic: never recorded".into())
+    } else {
+        How::Failed
+    }
 }
 
 pub fn run(o: Opts, explain: bool) -> i32 {
@@ -866,6 +904,12 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 key,
                 how: How::Untraced,
             };
+        }
+        #[cfg(target_os = "macos")]
+        if env_switch("STOOP_DTRACE_DIAGNOSTIC", false) {
+            if let Some(outcome) = dtrace_diagnostic(&o, &cwd, &key) {
+                return outcome;
+            }
         }
         if !o.quiet {
             match &hook {
@@ -2158,5 +2202,17 @@ mod hook_key_tests {
     #[test]
     fn a_hook_key_separates_non_utf8_words_by_their_exact_bytes() {
         assert_ne!(key(b"x\xfe"), key(b"x\xff"));
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_how_tests {
+    use super::*;
+
+    #[test]
+    fn a_passing_diagnostic_run_is_blocked_and_a_failing_one_is_a_failed_step() {
+        assert!(matches!(diagnostic_how(0), How::Unrecorded(_)));
+        assert!(matches!(diagnostic_how(3), How::Failed));
+        assert!(matches!(diagnostic_how(-1), How::Failed));
     }
 }

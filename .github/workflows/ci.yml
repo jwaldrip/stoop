@@ -80,6 +80,31 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  macos-dtrace:
+    name: DTrace diagnostic (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-latest, macos-15-intel]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: What this runner can trace
+        run: |
+          sw_vers
+          uname -m
+          csrutil status || true
+          sudo -n /usr/sbin/dtrace -V
+      - name: Parser, launcher and fail-closed rules
+        run: cargo test --bin stoop trace::macos
+      - name: A fixture run under real DTrace (known results, nothing recorded)
+        env:
+          STOOP_REQUIRE_DTRACE: "1"
+        run: cargo test --test macos_diagnostic -- --nocapture --test-threads=1
+
   windows:
     name: build and unit tests (Windows, untraced)
     runs-on: windows-latest
