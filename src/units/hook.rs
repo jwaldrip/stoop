@@ -511,7 +511,7 @@ pub(crate) fn expanded_matches(hook: &Hook, incoming: &[String]) -> bool {
 
 /// Argv text made safe to print on one line of stoop's output. Control characters become
 /// `\u{..}` text; then the plan CLI's escape neutralises `::` and `##[` (GitHub workflow
-/// commands) and `%`.
+/// commands), `%`, and bidirectional formatting characters.
 pub(crate) fn safe(text: &str) -> String {
     let mut shown = String::with_capacity(text.len());
     for ch in text.chars() {

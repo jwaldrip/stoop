@@ -2,12 +2,31 @@ use super::spec::Decision;
 use serde_json::{json, Value};
 use std::io::Write;
 
+/// Bidirectional formatting characters reorder the text after them on screen, so a line can read
+/// differently from its bytes. They print as `\u{..}` text.
+fn bidi(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 pub fn escape(s: &str) -> String {
-    s.replace('%', "%25")
+    let escaped = s
+        .replace('%', "%25")
         .replace('\r', "%0D")
         .replace('\n', "%0A")
         .replace("##[", "#%23[")
-        .replace("::", "%3A%3A")
+        .replace("::", "%3A%3A");
+    let mut out = String::with_capacity(escaped.len());
+    for ch in escaped.chars() {
+        if bidi(ch) {
+            out.push_str(&format!("\\u{{{:x}}}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 pub fn job(id: &str, gated: bool, decision: &Decision, key: Option<&str>) -> Value {

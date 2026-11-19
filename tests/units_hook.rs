@@ -679,7 +679,11 @@ fn two_recorded_forms_with_one_full_command_still_expand_to_it() {
     let out = f.invoke(&[], &["--files", ""], false);
     assert!(out.status.success(), "{}", err(&out));
     assert!(err(&out).contains("the shell expanded"), "{}", err(&out));
-    assert!(!err(&out).contains("matches 2 recorded hooks"), "{}", err(&out));
+    assert!(
+        !err(&out).contains("matches 2 recorded hooks"),
+        "{}",
+        err(&out)
+    );
     assert_eq!(f.log(), "changed=<>\n");
 }
 
