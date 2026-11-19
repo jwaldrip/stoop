@@ -643,3 +643,28 @@ fn ping_returns_an_empty_result_in_both_eras() {
     );
     m.finish();
 }
+
+#[test]
+fn a_hostile_argument_echoed_by_run_stays_inert_in_text_content() {
+    // The command prints its argument. The argument carries workflow-command forms: the text
+    // content must not carry them, while the structured output keeps the exact bytes.
+    let dir = temp_dir("proto-hostile-argv");
+    let mut m = Mcp::spawn(&["--allow-run"], &dir);
+    let hostile = "x\n::error::pwned ##[add-mask]";
+    let r = m.call(
+        json!(2),
+        "tools/call",
+        modern(tool_call(
+            "run",
+            json!({"argv": ["sh", "-c", "printf '%s\\n' \"$1\"", "sh", hostile]}),
+        )),
+    );
+    let res = result(&r);
+    let text = text_of(res);
+    assert!(!text.contains('\n'), "a raw newline reached text content");
+    assert!(!text.contains("::error"), "{text}");
+    assert!(!text.contains("##["), "{text}");
+    let out = res["structuredContent"]["stdout"]["text"].as_str().unwrap();
+    assert!(out.contains("::error::pwned ##[add-mask]"), "{out}");
+    m.finish();
+}
