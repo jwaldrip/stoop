@@ -679,6 +679,16 @@ fn sed_in_place_is_an_uncertain_owner_change() {
 }
 
 #[test]
+fn special_node_creation_makes_every_oid_of_its_run_unknown() {
+    let w = Ws::new("oid-mknod");
+    w.init_git();
+    w.commit_all();
+    let p = recorded(&w, "cat in.txt >/dev/null && mkfifo pipe.node");
+    assert_unknown_oid_basis(entry(&p, "inputs", "in.txt"));
+    w.clean();
+}
+
+#[test]
 fn root_without_git_records_no_blob_ids() {
     let w = Ws::new("oid-no-git");
     assert!(!w.root.join(".git").exists());
