@@ -3586,6 +3586,49 @@ mod tests {
         assert_eq!((o.counts.by_oid, o.counts.hashed), (0, 1));
         assert_eq!(o.counts.declined.get("object-format"), Some(&1));
     }
+    #[test]
+    fn explain_notes_name_each_blob_id_match_and_decline() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        let record = f.jobs.load("job-test").remove(0);
+        let mut evidence = Evidence::new(&record);
+        let mut notes = Vec::new();
+        let compared = |id: &str, content, declined| Answer::compared(id.into(), content, declined);
+        count(
+            &mut evidence,
+            &mut notes,
+            true,
+            2,
+            "dir/a",
+            &compared("f:x", Content::Oid, None),
+        );
+        count(
+            &mut evidence,
+            &mut notes,
+            true,
+            2,
+            "dir/b",
+            &compared("f:y", Content::Hashed, Some("mode")),
+        );
+        count(
+            &mut evidence,
+            &mut notes,
+            true,
+            2,
+            "dir/c",
+            &compared("f:z", Content::Hashed, Some("oid-unavailable")),
+        );
+        assert_eq!(
+            notes,
+            vec![
+                "step 2: dir/a: matched by blob id".to_string(),
+                "step 2: dir/b: blob id not used: mode".to_string(),
+            ]
+        );
+        assert_eq!((evidence.by_oid, evidence.hashed), (1, 2));
+        assert_eq!(evidence.declined.get("mode"), Some(&1));
+        assert_eq!(evidence.declined.get("oid-unavailable"), Some(&1));
+    }
     fn commit_index(root: &Path, message: &str) {
         git(
             root,
