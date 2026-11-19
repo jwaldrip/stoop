@@ -292,7 +292,13 @@ fn a_non_utf8_stoop_full_still_forces_a_run() {
 fn plan_with(dir: &Path, env: &[(&str, OsString)]) -> Output {
     let mut command = stoop(
         dir,
-        &["plan", "--workflow", ".github/workflows/ci.yml", "--format", "json"],
+        &[
+            "plan",
+            "--workflow",
+            ".github/workflows/ci.yml",
+            "--format",
+            "json",
+        ],
     );
     command.env("GITHUB_JOB", "stoop-plan");
     for (name, value) in env {
@@ -331,8 +337,7 @@ fn a_non_utf8_stoop_off_forces_the_planner_to_run_every_job() {
     let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(plan["skip"], serde_json::json!([]), "{plan}");
     assert_eq!(
-        plan["jobs"][0]["detail"],
-        "STOOP_FULL or STOOP_OFF enabled",
+        plan["jobs"][0]["detail"], "STOOP_FULL or STOOP_OFF enabled",
         "{plan}"
     );
 }
@@ -375,11 +380,15 @@ fn a_non_utf8_github_actions_keeps_the_planner_guards() {
     .output()
     .unwrap();
     assert_no_panic(&output);
-    assert!(!output.status.success(), "{}", text(&output));
+    assert!(output.status.success(), "{}", text(&output));
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["jobs"][0]["decision"], "run", "{plan}");
+    assert_eq!(plan["jobs"][0]["code"], "error", "{plan}");
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("plan job differs from GITHUB_JOB"),
-        "{}",
-        text(&output)
+        plan["jobs"][0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("differs from GITHUB_")),
+        "{plan}"
     );
 }
 
@@ -423,11 +432,20 @@ fn a_non_utf8_variable_name_does_not_stop_plan_run_or_sh() {
         &[(".github/workflows/ci.yml", WORKFLOW), ("a.txt", "a\n")],
     );
     let name = raw(b"\xffNAME");
-    let plan = stoop(dir.path(), &["plan", "--workflow", ".github/workflows/ci.yml", "--format", "json"])
-        .env("GITHUB_JOB", "stoop-plan")
-        .env(&name, "1")
-        .output()
-        .unwrap();
+    let plan = stoop(
+        dir.path(),
+        &[
+            "plan",
+            "--workflow",
+            ".github/workflows/ci.yml",
+            "--format",
+            "json",
+        ],
+    )
+    .env("GITHUB_JOB", "stoop-plan")
+    .env(&name, "1")
+    .output()
+    .unwrap();
     assert_no_panic(&plan);
     assert!(plan.status.success(), "{}", text(&plan));
     let run = stoop(dir.path(), &["run", "--", "true"])
@@ -501,7 +519,7 @@ fn a_non_utf8_salt_keys_every_recorded_environment_hash() {
 #[cfg(target_os = "linux")]
 #[test]
 fn a_recorded_plan_reports_a_non_utf8_github_sha_unavailable() {
-    const SHA_WORKFLOW: &str = "name: fixture\non: push\ndefaults:\n  run:\n    shell: stoop sh {0}\njobs:\n  stoop-plan:\n    runs-on: ubuntu-latest\n    steps: []\n  a:\n    needs: [stoop-plan]\n    if: ${{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',a,') }}\n    runs-on: ubuntu-latest\n    steps:\n      - run: cat a.txt > /dev/null; echo \"$GITHUB_SHA\" > /dev/null\n";
+    const SHA_WORKFLOW: &str = "name: fixture\non: push\ndefaults:\n  run:\n    shell: stoop sh {0}\njobs:\n  stoop-plan:\n    runs-on: ubuntu-latest\n    steps: []\n  a:\n    needs: [stoop-plan]\n    if: ${{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',a,') }}\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@1111111111111111111111111111111111111111\n      - run: cat a.txt > /dev/null; echo \"$GITHUB_SHA\" > /dev/null\n";
     let dir = Dir::new("sha-sentinel");
     repo(
         dir.path(),
@@ -516,7 +534,11 @@ fn a_recorded_plan_reports_a_non_utf8_github_sha_unavailable() {
     let temp = dir.path().join("runner");
     fs::create_dir_all(&temp).unwrap();
     let script = temp.join("step.sh");
-    fs::write(&script, "cat a.txt > /dev/null; echo \"$GITHUB_SHA\" > /dev/null").unwrap();
+    fs::write(
+        &script,
+        "cat a.txt > /dev/null; echo \"$GITHUB_SHA\" > /dev/null",
+    )
+    .unwrap();
     let event = temp.join("event.json");
     fs::write(&event, "{}").unwrap();
     let recorded = stoop(dir.path(), &["sh", script.to_str().unwrap()])

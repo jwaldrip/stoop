@@ -30,7 +30,7 @@ pub struct PlanCtx<'a> {
     pub max_age: u64,
     /// Raw values of known GitHub variables, not their recorded hashes.
     pub github_vars: BTreeMap<String, String>,
-    pub salt: Option<String>,
+    pub salt: Option<Vec<u8>>,
     pub event_path: Option<String>,
     /// Identity of the current run's event payload, if readable.
     pub event: Option<String>,
@@ -1795,7 +1795,7 @@ mod tests {
         let mut p = proof(vec![input("/tmp/plan-event", &file_id(b"event"))]);
         p.env.insert(
             "GITHUB_REF".into(),
-            crate::run::env_hash("GITHUB_REF", "", Some("salt")),
+            crate::run::env_hash("GITHUB_REF", "", Some(&b"salt"[..])),
         );
         f.install(vec![p]);
         let mut ctx = PlanCtx {
@@ -1806,7 +1806,7 @@ mod tests {
             now: 100,
             max_age: 50,
             github_vars: BTreeMap::new(),
-            salt: Some("salt".into()),
+            salt: Some(b"salt".to_vec()),
             event_path: Some("/tmp/plan-event".into()),
             event: Some(file_id(b"bad")),
             explain: false,

@@ -84,7 +84,7 @@ fn parse(args: &[String]) -> Result<Option<Options>, String> {
     }
     if !o.allowed.is_empty()
         && (std::env::var_os("GITHUB_OUTPUT").is_some()
-            || (o.format == "github" && run::env_flag("GITHUB_ACTIONS")))
+            || (o.format == "github" && run::env_switch("GITHUB_ACTIONS", true)))
     {
         return Err("--allow-uses is only available for local dry runs".into());
     }
@@ -372,17 +372,17 @@ fn build<S: attest::KeySource>(
     let mut global_error = plan_override(&workflow, &o.plan_job)
         .and_then(|()| gha::workflow::validate_plan_environment(&workflow, &o.plan_job))
         .err();
-    if run::env_flag("GITHUB_ACTIONS")
+    if run::env_switch("GITHUB_ACTIONS", true)
         && std::env::var("GITHUB_JOB").ok().as_deref() != Some(o.plan_job.as_str())
     {
         global_error = Some("plan job differs from GITHUB_JOB".into());
     }
-    if run::env_flag("GITHUB_ACTIONS")
+    if run::env_switch("GITHUB_ACTIONS", true)
         && std::env::var("GITHUB_SHA").ok().as_deref() != Some(tree.commit())
     {
         global_error = Some("planned revision differs from GITHUB_SHA".into());
     }
-    if run::env_flag("GITHUB_ACTIONS") {
+    if run::env_switch("GITHUB_ACTIONS", true) {
         if run::env_str("STOOP_JOB_WORKFLOW_REF") != run::env_str("GITHUB_WORKFLOW_REF")
             || run::env_str("STOOP_JOB_WORKFLOW_REF").is_none()
         {
@@ -511,7 +511,7 @@ fn build<S: attest::KeySource>(
         now,
         max_age: ceiling,
         github_vars: cx.verified_vars(&o.plan_job),
-        salt: run::env_str("STOOP_ENV_SALT"),
+        salt: run::env_salt(),
         event_path,
         event,
         explain: o.explain,
