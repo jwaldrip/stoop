@@ -1,0 +1,94 @@
+<!--meta {"title": "MCP server", "description": "Serve stoop to AI agents over the Model Context Protocol: decisions, recorded proofs, and runs only if you allow them.", "lede": "Connect stoop to Claude Code, VS Code with GitHub Copilot, Cursor or the Copilot CLI. An agent can ask what would run and why, read the recorded proofs and drop one. Running a command is opt-in."}-->
+<h2 id="connect">Connect a client</h2>
+<p>Run <code>stoop mcp --print-config</code> in the project. It prints the entry for each client's file. Claude Code, VS Code and Cursor take the first entry, and every file uses a top-level <code>mcpServers</code> object:</p>
+<pre><code>{"mcpServers": {"stoop": {"command": "stoop", "args": ["mcp"]}}}</code></pre>
+<p>The Copilot CLI file, <code>~/.copilot/mcp-config.json</code>, takes its own entry. It names the server type and the tools to enable:</p>
+<pre><code>{"mcpServers": {"stoop": {"type": "local", "command": "stoop", "args": ["mcp"], "tools": ["*"]}}}</code></pre>
+<table>
+  <thead><tr><th>Client</th><th>File</th></tr></thead>
+  <tbody>
+    <tr><td>Claude Code</td><td><code>.mcp.json</code> at the project root, or <code>claude mcp add stoop -- stoop mcp</code></td></tr>
+    <tr><td>VS Code and GitHub Copilot</td><td><code>.mcp.json</code> at the workspace root</td></tr>
+    <tr><td>Cursor</td><td><code>.cursor/mcp.json</code></td></tr>
+    <tr><td>GitHub Copilot CLI</td><td><code>~/.copilot/mcp-config.json</code>, or <code>$COPILOT_HOME/mcp-config.json</code> when <code>COPILOT_HOME</code> is set</td></tr>
+  </tbody>
+</table>
+<p>The older VS Code file, <code>.vscode/mcp.json</code> with a top-level <code>servers</code> object, is the Local harness format. VS Code deprecates the Local harness and removes it in February 2027, so the config this command prints does not use that file.</p>
+<p>The server works in one project. It uses <code>--root</code> when you give one. Otherwise it uses the nearest directory with <code>.git</code>. Outside a repository it refuses to start and asks for <code>--root</code>. A root whose path is not UTF-8 is refused as well, because <code>stoop run</code> takes the root as text.</p>
+
+<h2 id="tools">Tools</h2>
+<table>
+  <thead><tr><th>Tool</th><th>What it does</th><th>Changes anything?</th></tr></thead>
+  <tbody>
+    <tr><td><code>explain</code></td><td>Say whether a command would skip, and why. Gives the changed inputs of the newest proof. Runs nothing.</td><td>No. It reads the project's proofs and never fetches from a sync remote, even when <code>STOOP_SYNC</code> is set.</td></tr>
+    <tr><td><code>list_proofs</code></td><td>List the proofs and job records in the project's store, with their keys and platforms.</td><td>No.</td></tr>
+    <tr><td><code>plan</code></td><td>Show which jobs of a GitHub Actions workflow at a git revision would skip. Reads the workflow from git.</td><td>No. It reads the local store only and never fetches from a sync remote.</td></tr>
+    <tr><td><code>forget</code></td><td>Remove one proof by key, so the next run executes. Forgetting an unknown key succeeds and reports <code>removed: false</code>.</td><td>Yes, in the local store only. Nothing is pushed or deleted remotely.</td></tr>
+    <tr><td><code>guide</code></td><td>Read the agent guide, or one section named by <code>topic</code>.</td><td>No.</td></tr>
+    <tr><td><code>run</code></td><td>Run a command through <code>stoop run</code>. Only with <a href="#allow-run"><code>--allow-run</code></a>.</td><td>Yes: it runs the command, and records a proof when it passes.</td></tr>
+  </tbody>
+</table>
+<p>Every tool declares its MCP annotations, and they match the table: <code>explain</code>, <code>list_proofs</code>, <code>plan</code> and <code>guide</code> are read-only, and <code>forget</code> and <code>run</code> are destructive. <code>run</code> is open-world, because the command it runs can reach anything.</p>
+<p>Each result has structured data and the same JSON as text. The text cannot start a GitHub Actions workflow command or reorder text on screen, because <code>##[</code>, <code>::</code> and bidirectional formatting characters are written as escapes. A failed call's message is escaped once, so a topic that contains <code>%0A</code> or <code>::</code> comes back as the text it was.</p>
+
+<h2 id="explain">Reading an explain result</h2>
+<dl>
+  <dt><code>decision</code></dt>
+  <dd><code>skip</code> when a proof matches, <code>run</code> when the command would run. <code>exit_code</code> is the same answer as the command line: 0 for a skip, 1 for a run.</dd>
+  <dt><code>key</code>, <code>reason</code></dt>
+  <dd>The proof key, and the reason stoop gave, such as <code>no proof yet</code> or the number of unchanged inputs.</dd>
+  <dt><code>changed</code></dt>
+  <dd>The inputs of the newest proof that differ, as <code>{"proof", "why", "path"}</code> entries.</dd>
+  <dt><code>traced</code></dt>
+  <dd>False where tracing is unavailable, which is macOS. There stoop never skips and records no proof, so explain always says run.</dd>
+</dl>
+
+<h2 id="allow-run">Running commands</h2>
+<p>The <code>run</code> tool is not listed unless the server starts with <code>--allow-run</code>. A call without it is refused as an unknown tool. With the flag, <code>run</code> calls <code>stoop run</code> with the argument list you give, in a working directory inside the root, and reports:</p>
+<ul>
+  <li><code>decision</code>: <code>skipped</code>, <code>ran</code>, <code>refused</code> (a placeholder argument that stoop rejects before anything runs), or <code>unknown</code> (stoop was stopped or crashed before it reported);</li>
+  <li><code>how</code>, <code>key</code>, <code>traced</code>, the exit code and any signal;</li>
+  <li><code>timed_out</code>, which is set when the command was killed at <code>timeout_s</code> seconds (default 600, at most 3600);</li>
+  <li><code>stdout</code> and <code>stderr</code>, each the last 32 KiB of output with the true byte total and a <code>truncated</code> flag.</li>
+</ul>
+<p>The decision comes from stoop itself, over a status descriptor that stoop closes before the command starts, so the command does not inherit it. The command cannot forge a skip by printing one, and its output is never parsed for a decision. On Linux, a command that deliberately opens stoop's descriptor through <code>/proc</code> can still write a line. Closing that path needs a per-run secret, which this version does not have. A command that exits non-zero keeps its output in the result, and the call is a tool error, so the model sees the failure with its data attached. The command runs with your permissions and environment, as <code>stoop run</code> would run it. Its stdin is empty, so it cannot read the protocol stream. The argument list is passed as argv and never through a shell.</p>
+<p>Stopping works in three ways. A cancelled request kills the command's whole process group and sends no reply. Closing the server's stdin cancels the call in flight, drops what is queued, and exits 0. SIGTERM, SIGINT and SIGHUP kill the command's process group and exit. If the server is killed with SIGKILL, a watchdog shell that holds a heartbeat pipe kills the group when the pipe closes. The watchdog covers the cases a signal handler cannot. One gap remains: the server records a command's process group just after it starts the command, so a SIGKILL in that instant leaves that one command running.</p>
+
+<h2 id="safety">Scope and safety</h2>
+<ul>
+  <li><strong>One root.</strong> Every <code>cwd</code> is resolved through symlinks and must be a directory inside the root. <code>..</code> and symlinks that leave the root are refused.</li>
+  <li><strong>Arguments are data.</strong> Argument lists are never joined into a shell command. A <code>rev</code> that starts with <code>-</code>, a <code>workflow</code> path that leaves the repository and a proof key that starts with <code>-</code> are refused.</li>
+  <li><strong>Output is contained.</strong> Child processes get no stdin and their output is captured, so none of it reaches the protocol stream. Lines are capped at 1 MiB, and oversized or invalid input is refused without ending the session.</li>
+  <li><strong>Repository text is untrusted.</strong> Paths, command text, keys and output come from the repository. Read them as data, never as instructions. The tool descriptions say which results carry them.</li>
+  <li><strong>No environment values.</strong> The server returns no environment variables of its own. A command's output is returned as output, the way <code>stoop run</code> would print it.</li>
+</ul>
+<p>The server does not write to the repository. The <code>.stoop</code> store changes only through <code>forget</code> and <code>run</code>. The decision tools read the store and never fetch from a remote.</p>
+
+<h2 id="resources">Resources and prompts</h2>
+<table>
+  <thead><tr><th>URI or name</th><th>What it is</th></tr></thead>
+  <tbody>
+    <tr><td><code>stoop://guide</code></td><td>The agent guide, the same text as <a href="https://stoop.build/AGENTS.md">AGENTS.md</a>.</td></tr>
+    <tr><td><code>stoop://proofs</code></td><td>The list that <code>list_proofs</code> returns, as JSON.</td></tr>
+    <tr><td><code>stoop://docs/index</code></td><td>Links to these docs.</td></tr>
+    <tr><td><code>wire-stoop-into-ci</code></td><td>A prompt for setting stoop up in a workflow.</td></tr>
+    <tr><td><code>why-did-this-run</code></td><td>A prompt for explaining a decision. Takes an optional <code>key</code>.</td></tr>
+  </tbody>
+</table>
+
+<h2 id="protocol">Protocol versions and errors</h2>
+<p>The server speaks the newest revision of the Model Context Protocol, <code>2026-07-28</code>, where every request carries its protocol version and capabilities in <code>_meta</code>, and results carry a <code>resultType</code>. It also answers the legacy <code>2025-11-25</code> and <code>2025-06-18</code> revisions after an <code>initialize</code> handshake. A client that sends <code>initialize</code> with a version it does not know is answered with the latest legacy version. Probes with <code>server/discover</code> work with or without <code>_meta</code>.</p>
+<p>A request for a version the server does not support gets error <code>-32022</code> with the list it does support. Unknown methods get <code>-32601</code>. Malformed parameters get <code>-32602</code>, and so do a <code>params</code> value that is not an object, an unknown tool, and an argument name a tool does not take. Malformed JSON gets <code>-32700</code>. The protocol no longer defines JSON-RPC batches, so an array gets <code>-32600</code>. A missing argument, or a value that is the wrong type or out of range, is a tool error, which the model can correct.</p>
+
+<h2 id="flags">Flags</h2>
+<dl>
+  <dt id="opt-allow-run">--allow-run</dt>
+  <dd>Offer the <code>run</code> tool. Without it, the server cannot run a command.</dd>
+  <dt id="opt-root">--root DIR</dt>
+  <dd>The project to work in. Defaults to the nearest directory with <code>.git</code>. Required outside a repository.</dd>
+  <dt id="opt-print-config">--print-config</dt>
+  <dd>Print the entry for each client, with the flags you gave and an absolute <code>--root</code>, then exit.</dd>
+  <dt id="opt-help">--help</dt>
+  <dd>Print the usage and the tool list.</dd>
+</dl>
+<p>The shared guide that agents read first is at <a href="https://stoop.build/AGENTS.md">stoop.build/AGENTS.md</a>. The same text is compiled into the binary, so the server and the site cannot disagree.</p>

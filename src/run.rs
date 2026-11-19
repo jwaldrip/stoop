@@ -2,6 +2,7 @@
 
 #[path = "units/mod.rs"]
 mod units;
+pub(crate) use units::hook::safe;
 
 use crate::ignore::Ignore;
 use crate::input::{identify, identify_recorded, par_map, verify, Input};
@@ -48,10 +49,12 @@ pub struct Opts {
     /// Seconds a proof stays valid; 0 means forever. Default: 7 days.
     pub max_age: Option<u64>,
     pub defer_push: bool,
-    pub argv: Vec<String>,
+    pub argv: Vec<std::ffi::OsString>,
     /// Explicitly passed OIDC request variables; such a run is never recorded.
     pub pass_env: Vec<&'static str>,
     pub allow_id_token: bool,
+    /// The descriptor `stoop run` reports its decision on, set only by the MCP server.
+    pub status_fd: Option<i32>,
 }
 
 pub const ID_TOKEN_VARS: [&str; 2] = [
@@ -215,10 +218,19 @@ pub(crate) fn shared_scope(root: &Path, store: &Path) -> Option<String> {
     Some(h.finalize().to_hex().to_string())
 }
 
-fn default_key(argv: &[String], rel_cwd: &str, scope: Option<&str>) -> String {
+/// The words a hook record can hold: a record stores text, so only an argv of UTF-8 words is
+/// recordable. The hook template is never recorded, so a shell-erased form of it is not recognised.
+fn recordable_argv(words: &[std::ffi::OsString]) -> Option<Vec<String>> {
+    words
+        .iter()
+        .map(|word| word.to_str().map(str::to_owned))
+        .collect()
+}
+
+fn default_key(argv: &[std::ffi::OsString], rel_cwd: &str, scope: Option<&str>) -> String {
     let mut h = blake3::Hasher::new();
     for a in argv {
-        h.update(a.as_bytes());
+        h.update(a.as_encoded_bytes());
         h.update(&[0]);
     }
     h.update(rel_cwd.as_bytes());
@@ -244,8 +256,9 @@ fn hook_key(
     for words in [&hook.original, &hook.argv] {
         hash.update(&(words.len() as u64).to_le_bytes());
         for word in words {
-            hash.update(&(word.len() as u64).to_le_bytes());
-            hash.update(word.as_bytes());
+            let bytes = word.as_encoded_bytes();
+            hash.update(&(bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
         }
     }
     for value in [cwd, scope.unwrap_or(""), label.unwrap_or("")] {
@@ -282,17 +295,58 @@ pub fn ambient_env(mention: &str, ignore: &[String]) -> Vec<String> {
         "SSH_AUTH_SOCK",
         "XDG_RUNTIME_DIR",
     ];
+    // A name that is not UTF-8 is fingerprinted by its exact bytes (see `env_key`), so a change to
+    // its value invalidates a proof like any other name. The ignore list and the skip list are
+    // text, so they match by key and by the name's bytes.
     let mut names: Vec<String> = std::env::vars_os()
-        .filter_map(|(k, _)| k.into_string().ok())
-        .filter(|k| {
-            if ALWAYS_SKIP.contains(&k.as_str()) || ignore.contains(k) {
-                return false;
+        .filter_map(|(name, _)| {
+            let key = env_key(&name);
+            let bytes = name.as_encoded_bytes();
+            if ALWAYS_SKIP.iter().any(|skip| bytes == skip.as_bytes()) || ignore.contains(&key) {
+                return None;
             }
-            !NOISY_PREFIX.iter().any(|p| k.starts_with(p)) || mention.contains(k.as_str())
+            let noisy = NOISY_PREFIX.iter().any(|p| bytes.starts_with(p.as_bytes()));
+            // The command text is text, so a name that is not UTF-8 is matched in lossy form.
+            (!noisy || mention.contains(name.to_string_lossy().as_ref())).then_some(key)
         })
         .collect();
     names.sort();
     names
+}
+
+/// The fingerprint key of an environment name. A UTF-8 name is its own key. A name that is not
+/// UTF-8 is a NUL followed by its bytes in hex. An environment name cannot hold NUL, so no UTF-8
+/// name collides with such a key, and `env_name` reverses it exactly.
+pub fn env_key(name: &std::ffi::OsStr) -> String {
+    match name.to_str() {
+        Some(text) => text.to_string(),
+        None => {
+            let mut key = String::from("\u{0}");
+            for byte in name.as_encoded_bytes() {
+                key.push_str(&format!("{byte:02x}"));
+            }
+            key
+        }
+    }
+}
+
+/// The environment name a fingerprint key stands for: the exact inverse of `env_key`.
+pub fn env_name(key: &str) -> std::ffi::OsString {
+    use std::os::unix::ffi::OsStringExt;
+    let Some(hex) = key.strip_prefix('\u{0}') else {
+        return std::ffi::OsString::from(key);
+    };
+    let bytes: Option<Vec<u8>> = (0..hex.len())
+        .step_by(2)
+        .map(|i| {
+            hex.get(i..i + 2)
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+        })
+        .collect();
+    match bytes {
+        Some(bytes) => std::ffi::OsString::from_vec(bytes),
+        None => std::ffi::OsString::from(key),
+    }
 }
 
 /// Run each probe and hash what it prints. `None` if any fails: an external fact that
@@ -336,28 +390,31 @@ pub fn run_probes(probes: &[String], cwd: &Path, quiet: bool) -> Option<BTreeMap
 /// cannot match and the command runs. The salt itself is never hashed in.
 pub const SALT_VAR: &str = "STOOP_ENV_SALT";
 
-pub fn env_hash(name: &str, value: &str, salt: Option<&str>) -> String {
+pub fn env_hash(name: &str, value: &str, salt: Option<&[u8]>) -> String {
+    env_hash_bytes(name, value.as_bytes(), salt)
+}
+
+/// `env_hash` for a value that may not be UTF-8: the exact bytes are hashed.
+pub fn env_hash_bytes(name: &str, value: &[u8], salt: Option<&[u8]>) -> String {
     match salt {
         Some(salt) => {
-            let key = blake3::derive_key("stoop env hash v1", salt.as_bytes());
+            let key = blake3::derive_key("stoop env hash v1", salt);
             let mut h = blake3::Hasher::new_keyed(&key);
             h.update(name.as_bytes());
             h.update(&[0]);
-            h.update(value.as_bytes());
+            h.update(value);
             format!("s:{}", h.finalize().to_hex())
         }
-        None => blake3::hash(value.as_bytes()).to_hex().to_string(),
+        None => blake3::hash(value).to_hex().to_string(),
     }
 }
 
-fn env_hashes(names: &[String], salt: Option<&str>) -> BTreeMap<String, String> {
+fn env_hashes(names: &[String], salt: Option<&[u8]>) -> BTreeMap<String, String> {
     names
         .iter()
         .map(|n| {
-            (
-                n.clone(),
-                env_hash(n, &std::env::var(n).unwrap_or_default(), salt),
-            )
+            let value = std::env::var_os(env_name(n)).unwrap_or_default();
+            (n.clone(), env_hash_bytes(n, value.as_encoded_bytes(), salt))
         })
         .collect()
 }
@@ -380,9 +437,32 @@ pub fn env_flag(name: &str) -> bool {
     }
 }
 
+/// An on/off switch stoop must not misread. A value that is not UTF-8 is not a switch it
+/// recognises, so `unreadable_on` decides: `true` for a switch whose "on" only makes stoop
+/// run more and skip less, `false` for a switch whose "on" publishes or stores more.
+pub fn env_switch(name: &str, unreadable_on: bool) -> bool {
+    match std::env::var_os(name) {
+        Some(value) if value.to_str().is_none() => unreadable_on,
+        _ => env_flag(name),
+    }
+}
+
 /// A string environment variable; empty counts as unset.
 pub fn env_str(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
+}
+
+/// The proof salt: the exact bytes of `STOOP_ENV_SALT`. A salt that is not UTF-8 still keys every
+/// hash, so it can never fall back to the unsalted hashes a remote would publish. An empty or
+/// blank salt is unset, as before.
+pub fn env_salt() -> Option<Vec<u8>> {
+    salt_from(SALT_VAR)
+}
+
+fn salt_from(name: &str) -> Option<Vec<u8>> {
+    let value = std::env::var_os(name)?;
+    let blank = value.to_str().is_some_and(|text| text.trim().is_empty());
+    (!blank).then(|| value.into_encoded_bytes())
 }
 
 /// "90s", "30m", "12h", "7d", or a bare number of seconds. "0" means never expire.
@@ -401,6 +481,20 @@ pub fn parse_age(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("cannot read {s:?} as a duration (try 90s, 30m, 12h, 7d)"))
 }
 
+/// A path or probe name as explain prints it. Control characters become `\u{..}`, so a name cannot
+/// start a line of its own on stderr, where the MCP server reads explain's lines.
+fn shown_text(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() {
+            shown.push_str(&format!("\\u{{{:x}}}", ch as u32));
+        } else {
+            shown.push(ch);
+        }
+    }
+    shown
+}
+
 fn ago(created: u64) -> String {
     let s = now().saturating_sub(created);
     match s {
@@ -411,7 +505,7 @@ fn ago(created: u64) -> String {
     }
 }
 
-fn plain(argv: &[String], pass_env: &[&str]) -> i32 {
+fn plain(argv: &[std::ffi::OsString], pass_env: &[&str]) -> i32 {
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]);
     for name in pass_env {
@@ -425,7 +519,10 @@ fn plain(argv: &[String], pass_env: &[&str]) -> i32 {
             s.code().unwrap_or_else(|| 128 + s.signal().unwrap_or(0))
         }
         Err(e) => {
-            eprintln!("stoop: cannot run {}: {e}", argv[0]);
+            eprintln!(
+                "stoop: cannot run {}: {e}",
+                safe(&argv[0].to_string_lossy())
+            );
             127
         }
     }
@@ -451,6 +548,16 @@ pub fn run(o: Opts, explain: bool) -> i32 {
 
 pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
     run_internal(o, explain, false)
+}
+
+/// `stoop run` as the MCP server starts it: the same decision as `run`, with the outcome returned.
+pub fn run_observed(o: Opts) -> Outcome {
+    run_internal(o, false, true)
+}
+
+/// The error that stops a placeholder argv before anything runs, if there is one.
+pub fn hook_refusal(argv: &[OsString]) -> Option<String> {
+    units::hook::prepare(argv).err()
 }
 
 /// The variables that carry a placeholder's value (spec section 4.7). Stoop owns them for each run.
@@ -567,7 +674,13 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             .into_iter()
             .filter(|r| r.cwd == rel_cwd && r.scope == scope && r.label == o.key)
         {
-            if let Ok(Some(candidate)) = units::hook::prepare(&record.argv) {
+            let words: Vec<std::ffi::OsString> = record
+                .argv
+                .iter()
+                .cloned()
+                .map(std::ffi::OsString::from)
+                .collect();
+            if let Ok(Some(candidate)) = units::hook::prepare(&words) {
                 if units::hook::expanded_matches(&candidate, &o.argv)
                     && !found.iter().any(|known| known.argv == candidate.argv)
                 {
@@ -633,23 +746,37 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     }
     if let Some(h) = &hook {
         if !expanded && !explain && !o.no_record {
-            let record = units::hook_store::Record {
-                key: key.clone(),
-                argv: h.original.clone(),
-                cwd: rel_cwd.clone(),
-                scope: scope.clone(),
-                label: o.key.clone(),
-                created: now(),
-            };
-            if let Err(warning) = units::hook_store::record(&store_path, record) {
-                if !o.quiet {
-                    eprintln!("{warning}");
+            // A record holds text. A hook template with an argument that is not UTF-8 is not
+            // recorded, so a shell-erased form of this hook is not recognised. The whole-command
+            // proof is keyed by the exact bytes and is still recorded.
+            let words = recordable_argv(&h.original);
+            match words {
+                Some(argv) => {
+                    let record = units::hook_store::Record {
+                        key: key.clone(),
+                        argv,
+                        cwd: rel_cwd.clone(),
+                        scope: scope.clone(),
+                        label: o.key.clone(),
+                        created: now(),
+                    };
+                    if let Err(warning) = units::hook_store::record(&store_path, record) {
+                        if !o.quiet {
+                            eprintln!("{warning}");
+                        }
+                    }
                 }
+                None if !o.quiet => {
+                    eprintln!(
+                        "stoop: the hook template is not recorded, so a shell-erased form of this hook will not be recognised"
+                    );
+                }
+                None => {}
             }
         }
     }
     // STOOP_OFF runs a hook's first-run form without tracing, and its hints still print above.
-    if env_flag("STOOP_OFF") && !explain {
+    if env_switch("STOOP_OFF", true) && !explain {
         return Outcome {
             status: plain(&o.argv, &[]),
             key: initial_key,
@@ -700,7 +827,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             how: How::Untraced,
         };
     }
-    let full = env_flag("STOOP_FULL");
+    let full = env_switch("STOOP_FULL", true);
     let max_age = o
         .max_age
         .or_else(|| {
@@ -710,13 +837,23 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         })
         .unwrap_or(DEFAULT_MAX_AGE);
     let mut env_names = ambient_env(
-        &format!("{} {}", o.argv.join(" "), o.mention),
+        &format!(
+            "{} {}",
+            // Only the names of variables the command mentions are read from this text, and
+            // those are ASCII, so lossy text finds the same names as the exact bytes.
+            o.argv
+                .iter()
+                .map(|word| word.to_string_lossy())
+                .collect::<Vec<_>>()
+                .join(" "),
+            o.mention
+        ),
         &o.ignore_env,
     );
     env_names.extend(o.env.iter().cloned());
     env_names.sort();
     env_names.dedup();
-    let salt = env_str(SALT_VAR);
+    let salt = env_salt();
     let env_now = env_hashes(&env_names, salt.as_deref());
 
     let remote = o
@@ -806,12 +943,12 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 } else {
                     String::new()
                 };
-                why = format!("{} {}{}", first.0, first.1, more);
+                why = format!("{} {}{}", shown_text(&first.0), first.1, more);
             }
             if explain {
                 eprintln!("proof {} ({}):", i + 1, ago(p.created));
                 for (path, w) in diffs.iter().take(20) {
-                    eprintln!("  {w}: {path}");
+                    eprintln!("  {w}: {}", shown_text(path));
                 }
             }
         }
@@ -968,7 +1105,11 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             let (outputs, removed, write_reasons) = build_outputs(&real_root, &written);
             let proof = Proof {
                 created: now(),
-                argv: o.argv.clone(),
+                argv: o
+                    .argv
+                    .iter()
+                    .map(|word| word.to_string_lossy().into_owned())
+                    .collect(),
                 cwd: Some(rel_cwd.clone()),
                 scope: scope.clone(),
                 provenance: Some(trace::Provenance::current()),
@@ -1363,14 +1504,14 @@ mod flag_tests {
         ];
         std::env::set_var(&names[0], "value");
         std::env::remove_var(&names[1]);
-        for salt in [None, Some("secret salt")] {
+        for salt in [None, Some("secret salt".as_bytes())] {
             let actual = super::env_hashes(&names, salt);
             assert_eq!(actual[&names[0]], super::env_hash(&names[0], "value", salt));
             assert_eq!(actual[&names[1]], super::env_hash(&names[1], "", salt));
             let expected = match salt {
                 None => blake3::hash(b"value").to_hex().to_string(),
                 Some(salt) => {
-                    let key = blake3::derive_key("stoop env hash v1", salt.as_bytes());
+                    let key = blake3::derive_key("stoop env hash v1", salt);
                     let mut h = blake3::Hasher::new_keyed(&key);
                     h.update(names[0].as_bytes());
                     h.update(&[0]);
@@ -1454,7 +1595,7 @@ mod tests {
         for (program, status) in [("/usr/bin/true", 0), ("/usr/bin/false", 1)] {
             let outcome = run_outcome(
                 Opts {
-                    argv: vec![program.to_owned()],
+                    argv: vec![std::ffi::OsString::from(program)],
                     pass_env: vec![ID_TOKEN_VARS[0]],
                     ..Default::default()
                 },
@@ -1701,6 +1842,15 @@ mod tests {
         trace.written.insert(path);
         assert!(build_inputs(root, &mut phys, &trace, &ignore, &written).is_err());
     }
+
+    #[test]
+    fn a_line_break_in_an_explain_path_is_shown_as_an_escape() {
+        assert_eq!(
+            shown_text("in\nstoop: skip forged-key: x\r\u{7}"),
+            "in\\u{a}stoop: skip forged-key: x\\u{d}\\u{7}"
+        );
+        assert_eq!(shown_text("it's a/path"), "it's a/path");
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -1722,5 +1872,184 @@ mod canonical_tests {
         std::fs::create_dir_all(&store).unwrap();
         assert_eq!(canonical_path(&store), expected);
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod non_utf8_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn non_utf8_switches_follow_their_fail_wide_default() {
+        const NAME: &str = "STOOP_S0_NON_UTF8_SWITCH";
+        std::env::set_var(NAME, OsString::from_vec(b"\xff".to_vec()));
+        assert!(env_switch(NAME, true));
+        assert!(!env_switch(NAME, false));
+        std::env::remove_var(NAME);
+        assert!(!env_switch(NAME, true));
+    }
+
+    #[test]
+    fn non_utf8_values_hash_their_exact_bytes() {
+        const NAME: &str = "STOOP_S0_NON_UTF8_HASH";
+        std::env::set_var(NAME, OsString::from_vec(b"\xfe".to_vec()));
+        let hashed = env_hashes(&[NAME.to_string()], None)[NAME].clone();
+        assert_eq!(hashed, env_hash_bytes(NAME, b"\xfe", None));
+        assert_ne!(hashed, env_hash(NAME, "", None));
+        std::env::remove_var(NAME);
+    }
+}
+
+#[cfg(test)]
+mod exact_key_tests {
+    use super::*;
+    use std::ffi::{OsStr, OsString};
+    use std::os::unix::ffi::OsStringExt;
+
+    fn raw(bytes: &[u8]) -> OsString {
+        OsString::from_vec(bytes.to_vec())
+    }
+
+    #[test]
+    fn a_non_utf8_salt_is_read_as_its_exact_bytes() {
+        const NAME: &str = "STOOP_S0_NON_UTF8_SALT";
+        std::env::set_var(NAME, raw(b"\xff\xfe"));
+        assert_eq!(salt_from(NAME), Some(vec![0xff, 0xfe]));
+        std::env::set_var(NAME, "  ");
+        assert_eq!(salt_from(NAME), None);
+        std::env::set_var(NAME, "");
+        assert_eq!(salt_from(NAME), None);
+        std::env::remove_var(NAME);
+        assert_eq!(salt_from(NAME), None);
+    }
+
+    #[test]
+    fn a_non_utf8_salt_keys_the_hashes_exactly() {
+        let salt: &[u8] = b"\xff";
+        let exact = env_hash_bytes("NAME", b"\xfe", Some(salt));
+        assert!(exact.starts_with("s:"));
+        assert_ne!(exact, env_hash_bytes("NAME", b"\xfe", None));
+        // A lossy salt or a lossy value would hash to something else.
+        assert_ne!(
+            exact,
+            env_hash_bytes("NAME", b"\xfe", Some("\u{fffd}".as_bytes()))
+        );
+        assert_ne!(
+            exact,
+            env_hash_bytes("NAME", "\u{fffd}".as_bytes(), Some(salt))
+        );
+    }
+
+    #[test]
+    fn env_hashes_read_a_non_utf8_value_under_a_salt_exactly() {
+        const NAME: &str = "S0_NON_UTF8_VALUE";
+        std::env::set_var(NAME, raw(b"\xfe"));
+        let salt: &[u8] = b"\xff";
+        let got = env_hashes(&[NAME.to_string()], Some(salt));
+        assert_eq!(got[NAME], env_hash_bytes(NAME, b"\xfe", Some(salt)));
+        std::env::remove_var(NAME);
+    }
+
+    #[test]
+    fn a_non_utf8_name_has_an_exact_key_no_utf8_name_shares() {
+        let name = raw(b"S0_\xffNAME");
+        let key = env_key(&name);
+        assert!(key.contains('\u{0}'));
+        assert_eq!(env_name(&key), name);
+        assert_ne!(env_key(&raw(b"S0_\xfeNAME")), key);
+        assert_eq!(env_name("PATH"), OsString::from("PATH"));
+        assert_eq!(env_key(OsStr::new("PATH")), "PATH");
+    }
+
+    #[test]
+    fn ambient_env_fingerprints_a_non_utf8_name_by_its_exact_bytes() {
+        let name = raw(b"S0_AMBIENT_\xff");
+        std::env::set_var(&name, "1");
+        let key = env_key(&name);
+        assert!(ambient_env("", &[]).contains(&key));
+        assert!(!ambient_env("", std::slice::from_ref(&key)).contains(&key));
+        std::env::remove_var(&name);
+    }
+}
+
+#[cfg(test)]
+mod argv_bytes_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    fn raw(bytes: &[u8]) -> OsString {
+        OsString::from_vec(bytes.to_vec())
+    }
+
+    #[test]
+    fn utf8_argv_keys_keep_their_existing_bytes() {
+        // The key hashes each word's bytes then a NUL, as it always has.
+        let mut h = blake3::Hasher::new();
+        h.update(b"echo");
+        h.update(&[0]);
+        h.update(b"hi");
+        h.update(&[0]);
+        let expected = format!("echo-{}", &h.finalize().to_hex()[..16]);
+        let argv = [OsString::from("echo"), OsString::from("hi")];
+        assert_eq!(default_key(&argv, "", None), expected);
+    }
+
+    #[test]
+    fn non_utf8_argv_words_are_hashed_by_their_exact_bytes() {
+        let fe = default_key(&[raw(b"x\xfe")], "", None);
+        assert_ne!(fe, default_key(&[raw(b"x\xff")], "", None));
+        // A lossy form of the word would collide with the replacement character.
+        assert_ne!(fe, default_key(&[OsString::from("x\u{fffd}")], "", None));
+    }
+
+    #[test]
+    fn only_a_utf8_argv_is_recordable() {
+        assert_eq!(recordable_argv(&[raw(b"x\xfe")]), None);
+        assert_eq!(
+            recordable_argv(&[OsString::from("x")]),
+            Some(vec!["x".to_string()])
+        );
+    }
+}
+
+#[cfg(test)]
+mod env_hash_name_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn env_hashes_read_a_non_utf8_name_by_its_exact_bytes() {
+        let name = OsString::from_vec(b"S0_N3_\xfe".to_vec());
+        std::env::set_var(&name, "v");
+        let key = env_key(&name);
+        let got = env_hashes(std::slice::from_ref(&key), None);
+        assert_eq!(got[&key], env_hash_bytes(&key, b"v", None));
+        std::env::remove_var(&name);
+    }
+}
+
+#[cfg(test)]
+mod hook_key_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    fn key(word: &[u8]) -> String {
+        let words = [
+            OsString::from("./t"),
+            OsString::from("{changed}"),
+            OsString::from_vec(word.to_vec()),
+        ];
+        let hook = units::hook::prepare(&words).unwrap().unwrap();
+        hook_key(&hook, None, "", None)
+    }
+
+    #[test]
+    fn a_hook_key_separates_non_utf8_words_by_their_exact_bytes() {
+        assert_ne!(key(b"x\xfe"), key(b"x\xff"));
     }
 }

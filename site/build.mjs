@@ -56,6 +56,7 @@ const DOCS = [
   ["how-it-works", "How it works"],
   ["ci", "CI recipes"],
   ["cli", "CLI reference"],
+  ["mcp", "MCP server"],
   ["stoopignore", ".stoopignore"],
   ["blind-spots", "Blind spots"],
   ["faq", "FAQ"],

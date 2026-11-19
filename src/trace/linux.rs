@@ -548,7 +548,7 @@ struct Tracer<'a> {
 }
 
 pub fn run<'a>(
-    argv: &[String],
+    argv: &[std::ffi::OsString],
     cwd: &Path,
     allow_network: bool,
     scope: Option<&Scope<'a>>,
@@ -570,7 +570,8 @@ pub fn run<'a>(
     let cargs: Vec<CString> = argv
         .iter()
         .map(|a| {
-            CString::new(a.as_bytes()).map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
+            CString::new(a.as_encoded_bytes())
+                .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))
         })
         .collect::<io::Result<_>>()?;
     let mut ptrs: Vec<*const libc::c_char> = cargs.iter().map(|c| c.as_ptr()).collect();
