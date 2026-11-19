@@ -8,8 +8,8 @@
 //!
 //! - The curated table below. Each name is one a tool documents as per run, per session or per
 //!   commit, and each group cites the page or source it was read from. A name that could not be
-//!   sourced is not here. A group that names a provider counts only where that provider's marker
-//!   variable is set.
+//!   sourced is not here. A group that names a provider is ignored only where that provider's
+//!   marker variable is set.
 //! - The learner. A name whose opaque value is new on each of the last few runs of the same proof
 //!   key is excluded for that key, and only while its value is still an identifier. A value that
 //!   returns is evidence the name is not bookkeeping: it is counted again, and never learned again
@@ -38,8 +38,8 @@ pub struct Group {
     pub source: &'static str,
     pub names: &'static [&'static str],
     pub prefixes: &'static [&'static str],
-    /// Marker variables a provider sets. The group counts only where one of them is set. Empty
-    /// means the group always counts.
+    /// Marker variables a provider sets. The group is ignored only where one of them is set.
+    /// Empty means the group is ignored everywhere.
     pub requires: &'static [&'static str],
 }
 
@@ -258,7 +258,7 @@ pub const GROUPS: &[Group] = &[
     },
     Group {
         why: "Jenkins or TeamCity per-build value",
-        source: "Jenkins: https://www.jenkins.io/doc/book/pipeline/jenkinsfile/ (BUILD_ID, BUILD_NUMBER, BUILD_TAG, BUILD_URL) ; TeamCity: https://www.jetbrains.com/help/teamcity/predefined-build-parameters.html (env.BUILD_NUMBER, env.BUILD_URL, env.TEAMCITY_BUILD_PROPERTIES_FILE)",
+        source: "Jenkins: https://www.jenkins.io/doc/book/pipeline/jenkinsfile/ (BUILD_ID, BUILD_NUMBER, BUILD_TAG, BUILD_URL) ; TeamCity: https://www.jetbrains.com/help/teamcity/predefined-build-parameters.html (env.BUILD_NUMBER, env.BUILD_URL, env.TEAMCITY_BUILD_PROPERTIES_FILE) ; JENKINS_HOME and JENKINS_URL, the markers of the three Jenkins groups: https://github.com/jenkinsci/jenkins/blob/master/core/src/main/java/jenkins/model/CoreEnvironmentContributor.java",
         names: &[
             "BUILD_ID",
             "BUILD_NUMBER",
@@ -267,21 +267,21 @@ pub const GROUPS: &[Group] = &[
             "TEAMCITY_BUILD_PROPERTIES_FILE",
         ],
         prefixes: &[],
-        requires: &["JENKINS_URL", "TEAMCITY_VERSION"],
+        requires: &["JENKINS_URL", "JENKINS_HOME", "TEAMCITY_VERSION"],
     },
     Group {
         why: "Jenkins per-executor slot",
         source: "https://www.jenkins.io/doc/book/pipeline/jenkinsfile/ (EXECUTOR_NUMBER)",
         names: &["EXECUTOR_NUMBER"],
         prefixes: &[],
-        requires: &["JENKINS_URL"],
+        requires: &["JENKINS_URL", "JENKINS_HOME"],
     },
     Group {
         why: "Jenkins per-commit value",
         source: "Git plugin: https://plugins.jenkins.io/git/ (GIT_COMMIT, GIT_PREVIOUS_COMMIT, GIT_PREVIOUS_SUCCESSFUL_COMMIT)",
         names: &["GIT_COMMIT", "GIT_PREVIOUS_COMMIT", "GIT_PREVIOUS_SUCCESSFUL_COMMIT"],
         prefixes: &[],
-        requires: &["JENKINS_URL"],
+        requires: &["JENKINS_URL", "JENKINS_HOME"],
     },
     Group {
         why: "TeamCity per-commit value",
@@ -501,9 +501,9 @@ pub fn all_markers() -> BTreeSet<String> {
         .collect()
 }
 
-/// The curated reason a name is excluded, or `None` when it is not curated. A group with `requires`
-/// counts only when one of those markers is in `markers`. Every curated name is ASCII, so a name
-/// that is not UTF-8 never matches.
+/// The curated reason a name is excluded, or `None` when it is not curated. A group with
+/// `requires` excludes its names only when one of those markers is in `markers`. Every curated
+/// name is ASCII, so a name that is not UTF-8 never matches.
 pub fn curated_reason(name: &str, markers: &BTreeSet<String>) -> Option<&'static str> {
     GROUPS
         .iter()
@@ -637,6 +637,11 @@ pub fn never_learn(name: &str) -> bool {
         "_SHA",
         "_DIGEST",
         "_EPOCH",
+        "_SHA1",
+        "_SHA256",
+        "_SHA512",
+        "_HASH",
+        "_CHECKSUM",
     ];
     const CONTAINS: &[&str] = &[
         "DEBUG", "VERBOSE", "TRACE", "QUIET", "COLOR", "FORCE", "DRY_RUN",
@@ -987,7 +992,6 @@ fn advance(
             continue;
         };
         if entry.learned.take().is_some() {
-            entry.streak = 0;
             changes.push(Change::Stopped(name.clone()));
         }
     }
@@ -1070,7 +1074,7 @@ fn render(change: &Change) -> String {
             safe(name)
         ),
         Change::Stopped(name) => format!(
-            "counting env {} again: its value is no longer an identifier, so it is not ignored for this key any more",
+            "counting env {} again: its value is not an identifier now, so it is not ignored while it holds this value",
             safe(name)
         ),
     }
@@ -2199,9 +2203,10 @@ mod tests {
 
 #[cfg(test)]
 mod review_tests {
-    //! Tests for the review of b6b33ad: a learned name is excluded only while it holds an
-    //! identifier, an unset learned name counts, provider gates count only under their marker, the
-    //! CodeBuild batch identifier is not curated, and the reviewed behavioural names are never learned.
+    //! Tests for the review of b6b33ad and its follow-up: a learned name is excluded only while it
+    //! holds an identifier, an unset learned name counts, provider names are ignored only under
+    //! their marker, the CodeBuild batch identifier is not curated, the reviewed behavioural names
+    //! are never learned, and a learned name relearns after a plain value.
     use super::*;
 
     fn dir(name: &str) -> PathBuf {
