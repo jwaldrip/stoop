@@ -1157,7 +1157,7 @@ impl TokenApi {
                             }
                         }
                         let audience = target.strip_prefix("/token?audience=").map(decode_query);
-                        let body = if bearer && audience.is_some() {
+                        let body = if let (true, Some(audience)) = (bearer, audience) {
                             seen.fetch_add(1, Ordering::Relaxed);
                             let now = std::time::SystemTime::now()
                                 .duration_since(std::time::UNIX_EPOCH)
@@ -1165,7 +1165,7 @@ impl TokenApi {
                                 .as_secs();
                             let claims = serde_json::json!({
                                 "iss": "https://token.actions.githubusercontent.com",
-                                "aud": audience.unwrap(),
+                                "aud": audience,
                                 "repository": "owner/repo",
                                 "repository_id": "12345",
                                 "repository_owner_id": "6789",
