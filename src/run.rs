@@ -1271,3 +1271,25 @@ mod tests {
         assert!(build_inputs(root, &mut phys, &trace, &ignore, &written).is_err());
     }
 }
+
+#[cfg(all(test, unix))]
+mod canonical_tests {
+    use super::canonical_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn a_store_that_does_not_exist_yet_resolves_through_its_symlinked_parent() {
+        let base = std::env::temp_dir().join(format!("stoop-canonical-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let store = link.join(".stoop");
+        let expected: PathBuf = std::fs::canonicalize(&real).unwrap().join(".stoop");
+        assert_eq!(canonical_path(&store), expected);
+        std::fs::create_dir_all(&store).unwrap();
+        assert_eq!(canonical_path(&store), expected);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

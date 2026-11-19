@@ -658,3 +658,13 @@ fn an_ambiguous_plain_command_never_skips_on_a_stored_proof() {
     assert!(second.status.success(), "{}", err(&second));
     assert!(!err(&second).contains("stoop: skip"), "{}", err(&second));
 }
+
+#[test]
+fn a_removed_word_cannot_carry_a_raw_control_character() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--files", "{changed:\u{1b}x}"], false);
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(!err(&out).contains('\u{1b}'), "{:?}", err(&out));
+    assert!(err(&out).contains("\\u{1b}"), "{}", err(&out));
+    assert_eq!(f.log(), "changed=<>\n");
+}
