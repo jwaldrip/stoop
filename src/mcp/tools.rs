@@ -440,8 +440,9 @@ fn stream_json(stream: &exec::Stream) -> Value {
     json!({"text": stream.text, "bytes": stream.bytes, "truncated": stream.truncated})
 }
 
-/// `explain`: stoop's own decision for `argv`. The command is never executed, so every line on
-/// stderr is stoop's.
+/// `explain`: stoop's own decision for `argv`. The command is never executed. The decision is the
+/// exit status. The key and reasons come from stoop's lines on stderr, where repository text is
+/// escaped, so a file name cannot start a line of its own.
 fn explain(root: &Path, args: &Args, cancelled: &mut dyn FnMut() -> bool) -> Step {
     let argv = argv_arg(args)?;
     let cwd = cwd_arg(root, args)?;
@@ -517,7 +518,7 @@ fn explain(root: &Path, args: &Args, cancelled: &mut dyn FnMut() -> bool) -> Ste
             "exit_code": finished.code,
             "key": key,
             "reason": reason,
-            "traced": !text.contains("not traced"),
+            "traced": crate::trace::supported(),
             "changed": changed,
             "lines": lines,
             "lines_truncated": truncated

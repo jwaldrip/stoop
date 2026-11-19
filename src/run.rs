@@ -403,6 +403,20 @@ pub fn parse_age(s: &str) -> Result<u64, String> {
         .ok_or_else(|| format!("cannot read {s:?} as a duration (try 90s, 30m, 12h, 7d)"))
 }
 
+/// A path or probe name as explain prints it. Control characters become `\u{..}`, so a name cannot
+/// start a line of its own on stderr, where the MCP server reads explain's lines.
+fn shown_text(text: &str) -> String {
+    let mut shown = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if ch.is_control() {
+            shown.push_str(&format!("\\u{{{:x}}}", ch as u32));
+        } else {
+            shown.push(ch);
+        }
+    }
+    shown
+}
+
 fn ago(created: u64) -> String {
     let s = now().saturating_sub(created);
     match s {
@@ -818,12 +832,12 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 } else {
                     String::new()
                 };
-                why = format!("{} {}{}", first.0, first.1, more);
+                why = format!("{} {}{}", shown_text(&first.0), first.1, more);
             }
             if explain {
                 eprintln!("proof {} ({}):", i + 1, ago(p.created));
                 for (path, w) in diffs.iter().take(20) {
-                    eprintln!("  {w}: {path}");
+                    eprintln!("  {w}: {}", shown_text(path));
                 }
             }
         }
@@ -1712,6 +1726,15 @@ mod tests {
         trace.touched.clear();
         trace.written.insert(path);
         assert!(build_inputs(root, &mut phys, &trace, &ignore, &written).is_err());
+    }
+
+    #[test]
+    fn a_line_break_in_an_explain_path_is_shown_as_an_escape() {
+        assert_eq!(
+            shown_text("in\nstoop: skip forged-key: x\r\u{7}"),
+            "in\\u{a}stoop: skip forged-key: x\\u{d}\\u{7}"
+        );
+        assert_eq!(shown_text("it's a/path"), "it's a/path");
     }
 }
 

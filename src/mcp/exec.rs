@@ -24,8 +24,10 @@ pub const STATUS_FD: RawFd = 3;
 static CHILD_GROUP: AtomicI32 = AtomicI32::new(0);
 
 /// The watchdog reads the group id from the heartbeat, then one more line. Only "done" leaves the
-/// group alone. Anything else, end of input included, means the server is gone.
-const WATCHDOG: &str = r#"read pgid; read line; if [ "$line" != done ]; then kill -KILL -- "-$pgid" 2>/dev/null; fi; exit 0"#;
+/// group alone. Anything else, end of input included, means the server is gone. The kill is
+/// written `kill -s KILL -- "-$pgid"`: dash, Linux's /bin/sh, does not kill the group for
+/// `kill -KILL -- "-$pgid"`, and the 2>/dev/null hides why.
+const WATCHDOG: &str = r#"read pgid; read line; if [ "$line" != done ]; then kill -s KILL -- "-$pgid" 2>/dev/null; fi; exit 0"#;
 
 /// The most a decision report may hold.
 const REPORT_CAP: usize = 64 * 1024;
