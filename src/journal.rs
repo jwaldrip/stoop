@@ -333,6 +333,7 @@ mod tests {
         assert_eq!(fake.calls(), 0);
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_action_recording_requires_matching_workspace_copy() {
         const CHILD: &str = "STOOP_LOCAL_RECORD_TEST_CHILD";
@@ -463,7 +464,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod strict_tests {
     use super::strict_actions;
     use std::ffi::OsString;

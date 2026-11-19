@@ -11,6 +11,7 @@
 use crate::job::JobStore;
 use crate::proof::{now, Store};
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -34,12 +35,13 @@ pub fn ref_name(key: &str) -> String {
 
 fn legacy_exit(op: &str, status: std::process::ExitStatus) -> String {
     if let Some(code) = status.code() {
-        format!("git {op} failed with exit status {code}")
-    } else if let Some(signal) = status.signal() {
-        format!("git {op} ended by signal {signal}")
-    } else {
-        format!("unexpected output from git {op}")
+        return format!("git {op} failed with exit status {code}");
     }
+    #[cfg(unix)]
+    if let Some(signal) = status.signal() {
+        return format!("git {op} ended by signal {signal}");
+    }
+    format!("unexpected output from git {op}")
 }
 
 impl Remote {

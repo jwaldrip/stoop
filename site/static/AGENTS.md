@@ -60,7 +60,7 @@ Each decision is one line on stderr:
 
 A run that fails records no proof, so the next run runs the command again.
 
-On macOS stoop does not trace, so it never skips and never records. It prints `stoop: not traced` and runs the command. Tracing needs Linux on x86-64 or arm64.
+On macOS and Windows stoop does not trace, so it never skips and never records. It prints `stoop: not traced` and runs the command. Tracing needs Linux on x86-64 or arm64.
 
 To see the decision without running anything, use `explain`. It exits 0 for a skip and 1 for a run.
 

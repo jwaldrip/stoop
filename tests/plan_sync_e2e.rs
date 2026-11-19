@@ -1,3 +1,4 @@
+#![cfg(unix)]
 #[path = "../src/trace/version.rs"]
 mod tracer_version;
 

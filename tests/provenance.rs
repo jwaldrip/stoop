@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Proof portability must never cross incompatible tracing platforms.
 
 use std::fs;

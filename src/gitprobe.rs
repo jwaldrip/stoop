@@ -6,12 +6,17 @@
 //! returned only when Git exits zero, so every failure looks the same to the
 //! caller and leaks nothing.
 
-use std::io::{self, Read, Write};
+#[cfg(unix)]
+use std::io;
+use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::process::ExitStatus;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const DEADLINE: Duration = Duration::from_secs(3);
@@ -58,7 +63,15 @@ pub fn output(root: &Path, args: &[&str], input: &[u8], max_bytes: usize) -> Opt
     let root = root.canonicalize().ok()?;
     let mut command = Command::new("git");
     for (key, _) in std::env::vars_os() {
-        if key.as_os_str().as_bytes().starts_with(b"GIT_") {
+        // Windows names its variables without regard to case, so `git_dir` is `GIT_DIR` there.
+        let is_git = if cfg!(windows) {
+            key.to_string_lossy()
+                .to_ascii_uppercase()
+                .starts_with("GIT_")
+        } else {
+            key.as_encoded_bytes().starts_with(b"GIT_")
+        };
+        if is_git {
             command.env_remove(key);
         }
     }
@@ -91,12 +104,14 @@ pub fn output(root: &Path, args: &[&str], input: &[u8], max_bytes: usize) -> Opt
     run(command, input, max_bytes, DEADLINE)
 }
 
+#[cfg(unix)]
 fn run(mut command: Command, input: &[u8], max_bytes: usize, timeout: Duration) -> Option<Vec<u8>> {
     let deadline = Instant::now().checked_add(timeout)?;
     let child = spawn(&mut command).ok()?;
     collect(child, input, max_bytes, deadline)
 }
 
+#[cfg(unix)]
 fn spawn(command: &mut Command) -> io::Result<Child> {
     command
         .stdin(Stdio::piped())
@@ -108,11 +123,13 @@ fn spawn(command: &mut Command) -> io::Result<Child> {
 
 // Owns the leader until it is reaped. Its PID doubles as its process-group ID,
 // and that ID cannot be reused while the leader is unreaped.
+#[cfg(unix)]
 struct Leader {
     child: Child,
     reaped: bool,
 }
 
+#[cfg(unix)]
 impl Leader {
     fn signal_group(&self) {
         unsafe { libc::kill(-(self.child.id() as libc::pid_t), libc::SIGKILL) };
@@ -149,6 +166,7 @@ impl Leader {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Leader {
     fn drop(&mut self) {
         if !self.reaped {
@@ -159,6 +177,7 @@ impl Drop for Leader {
     }
 }
 
+#[cfg(unix)]
 fn nonblocking(fd: RawFd) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
@@ -167,6 +186,7 @@ fn nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn retryable(err: &io::Error) -> bool {
     matches!(
         err.kind(),
@@ -175,6 +195,7 @@ fn retryable(err: &io::Error) -> bool {
 }
 
 // Grows `out` for `extra` bytes that were just read, never past `max_bytes`.
+#[cfg(unix)]
 fn reserve(out: &mut Vec<u8>, extra: usize, max_bytes: usize) -> Option<()> {
     let needed = out.len().checked_add(extra)?;
     if needed > max_bytes {
@@ -187,6 +208,7 @@ fn reserve(out: &mut Vec<u8>, extra: usize, max_bytes: usize) -> Option<()> {
     Some(())
 }
 
+#[cfg(unix)]
 fn collect(child: Child, input: &[u8], max_bytes: usize, deadline: Instant) -> Option<Vec<u8>> {
     let mut leader = Leader {
         child,
@@ -310,7 +332,80 @@ fn collect(child: Child, input: &[u8], max_bytes: usize, deadline: Instant) -> O
     }
 }
 
-#[cfg(test)]
+// Windows has no poll on pipes, so one thread feeds stdin and one collects stdout under the same
+// cap. The caller waits on the output and then on the exit, both against the one deadline.
+#[cfg(windows)]
+fn run(mut command: Command, input: &[u8], max_bytes: usize, timeout: Duration) -> Option<Vec<u8>> {
+    use std::os::windows::process::CommandExt;
+    use std::sync::mpsc;
+    use std::thread;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    fn kill(child: &mut Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let deadline = Instant::now().checked_add(timeout)?;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+    let mut child = command.spawn().ok()?;
+    let stdin = child.stdin.take();
+    let Some(mut stdout) = child.stdout.take() else {
+        kill(&mut child);
+        return None;
+    };
+    let payload = input.to_vec();
+    thread::spawn(move || {
+        if let Some(mut pipe) = stdin {
+            if !payload.is_empty() {
+                let _ = pipe.write_all(&payload);
+            }
+            // Dropping the pipe closes stdin, so Git sees the end of input.
+        }
+    });
+    let (done, collected) = mpsc::channel();
+    thread::spawn(move || {
+        let mut out: Vec<u8> = Vec::new();
+        let mut chunk = vec![0u8; CHUNK];
+        let result = loop {
+            match stdout.read(&mut chunk) {
+                Ok(0) => break Some(out),
+                Ok(n) if out.len().saturating_add(n) > max_bytes => break None,
+                Ok(n) => out.extend_from_slice(&chunk[..n]),
+                Err(_) => break None,
+            }
+        };
+        let _ = done.send(result);
+    });
+    let out = match collected.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Some(out)) => out,
+        _ => {
+            kill(&mut child);
+            return None;
+        }
+    };
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success().then_some(out),
+            Ok(None) => {}
+            Err(_) => {
+                kill(&mut child);
+                return None;
+            }
+        }
+        if Instant::now() >= deadline {
+            kill(&mut child);
+            return None;
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use std::fs;
@@ -370,7 +465,7 @@ mod tests {
     fn git(dir: &Path, args: &[&str]) {
         let mut command = Command::new("git");
         for (key, _) in std::env::vars_os() {
-            if key.as_os_str().as_bytes().starts_with(b"GIT_") {
+            if key.as_encoded_bytes().starts_with(b"GIT_") {
                 command.env_remove(key);
             }
         }
@@ -592,5 +687,57 @@ mod tests {
             output(&missing, &["ls-files", "--stage", "-z"], &[], 16),
             None
         );
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    fn cmd(script: &str) -> Command {
+        let mut command = Command::new("cmd");
+        command.args(["/c", script]);
+        command
+    }
+
+    const WAIT: Duration = Duration::from_secs(20);
+
+    #[test]
+    fn zero_exit_returns_the_output() {
+        let out = run(cmd("echo abc"), b"", 100, WAIT).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out).trim(), "abc");
+    }
+
+    #[test]
+    fn input_reaches_the_command_and_is_closed() {
+        let mut findstr = Command::new("findstr");
+        findstr.arg("x");
+        let out = run(findstr, b"x1\r\ny\r\nx2\r\n", 100, WAIT).unwrap();
+        assert_eq!(String::from_utf8_lossy(&out).replace("\r\n", "|"), "x1|x2|");
+    }
+
+    #[test]
+    fn a_nonzero_exit_returns_nothing() {
+        assert_eq!(run(cmd("echo abc & exit 1"), b"", 100, WAIT), None);
+    }
+
+    #[test]
+    fn output_over_the_cap_returns_nothing_and_exactly_the_cap_is_allowed() {
+        // "abc" and the line ending are five bytes.
+        assert_eq!(run(cmd("echo abc"), b"", 4, WAIT), None);
+        assert_eq!(run(cmd("echo abc"), b"", 5, WAIT).unwrap().len(), 5);
+    }
+
+    #[test]
+    fn the_deadline_stops_a_command_that_does_not_finish() {
+        let start = Instant::now();
+        let out = run(
+            cmd("ping -n 20 127.0.0.1 >nul"),
+            b"",
+            100,
+            Duration::from_millis(400),
+        );
+        assert_eq!(out, None);
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
 }

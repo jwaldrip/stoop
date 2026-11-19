@@ -907,6 +907,7 @@ fn curl_command_disables_configuration_and_does_not_put_credentials_in_arguments
         .any(|arg| arg.contains("Authorization") || arg.contains("bearer")));
 }
 
+#[cfg(unix)]
 #[test]
 fn curl_sends_bearer_on_stdin_not_argv() {
     use std::os::unix::fs::PermissionsExt;
