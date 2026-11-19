@@ -11,8 +11,8 @@
 use crate::pathutil::from_key;
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::io;
-use std::os::unix::fs::MetadataExt;
+use std::io::{self, Read};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -20,6 +20,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 pub struct Input {
     pub path: String,
     pub id: String,
+    #[serde(default)]
+    pub oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oid_basis: Option<crate::oid_attrs::OidBasis>,
 }
 
 /// Identity of a regular file: a hash of its bytes, and whether any execute bit is set.
@@ -37,38 +41,57 @@ pub struct Mismatch {
 /// Current id for `path`, or `None` when the path is not worth recording
 /// (outside the root and absent, or a device, socket or pipe).
 pub fn identify(path: &Path, inside: bool, listed: bool) -> Option<String> {
+    identify_recorded(path, inside, listed, false).map(|(id, _)| id)
+}
+
+/// Record a Git blob id only for regular files inside a Git worktree.
+pub fn identify_recorded(
+    path: &Path,
+    inside: bool,
+    listed: bool,
+    oids: bool,
+) -> Option<(String, Option<String>)> {
     match fs::symlink_metadata(path) {
-        Err(e) => match e.kind() {
-            io::ErrorKind::NotFound => inside.then(|| "a".to_string()),
-            _ => {
-                if e.raw_os_error() == Some(libc::ENOTDIR) {
-                    inside.then(|| "a".to_string())
-                } else {
-                    inside.then(|| "u".to_string())
-                }
-            }
-        },
+        Err(e) => {
+            let id = match e.kind() {
+                io::ErrorKind::NotFound => "a",
+                _ if e.raw_os_error() == Some(libc::ENOTDIR) => "a",
+                _ => "u",
+            };
+            inside.then(|| (id.to_owned(), None))
+        }
         Ok(m) => {
             let ft = m.file_type();
             if ft.is_symlink() {
                 let t = fs::read_link(path).ok()?;
-                Some(format!("l:{}", t.to_string_lossy()))
+                Some((format!("l:{}", t.to_string_lossy()), None))
             } else if ft.is_dir() {
-                if listed {
-                    Some(format!("dl:{}", list_hash(path)?))
+                let id = if listed {
+                    format!("dl:{}", list_hash(path)?)
                 } else {
-                    Some("d".to_string())
-                }
+                    "d".to_owned()
+                };
+                Some((id, None))
             } else if ft.is_file() {
-                match hash_file(path) {
-                    Ok(h) => Some(file_id(m.mode() & 0o111 != 0, &h)),
-                    Err(_) => inside.then(|| "u".to_string()),
+                let hash = if inside && oids {
+                    hash_file_with_oid(path)
+                } else {
+                    hash_file(path).map(|hash| (hash, None))
+                };
+                match hash {
+                    Ok((hash, oid)) => Some((file_id(m.mode() & 0o111 != 0, &hash), oid)),
+                    Err(_) => inside.then(|| ("u".to_owned(), None)),
                 }
             } else {
                 None
             }
         }
     }
+}
+
+#[cfg(test)]
+pub fn records_oids(root: &Path) -> bool {
+    crate::oid_attrs::snapshot(root).is_some()
 }
 
 fn list_hash(dir: &Path) -> Option<String> {
@@ -88,10 +111,93 @@ fn list_hash(dir: &Path) -> Option<String> {
 
 /// Every byte counts, whatever the file is: source, binary, archive, model weights.
 pub fn hash_file(path: &Path) -> io::Result<String> {
-    let mut f = fs::File::open(path)?;
+    let (mut f, _) = open_regular_file(path)?;
     let mut h = blake3::Hasher::new();
     h.update_reader(&mut f)?;
     Ok(h.finalize().to_hex().to_string())
+}
+
+// Do not block if a regular file is replaced with a FIFO between lstat and
+// open, or follow a newly substituted symlink. Hash the opened regular file.
+fn open_regular_file(path: &Path) -> io::Result<(fs::File, fs::Metadata)> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    Ok((file, metadata))
+}
+
+fn digest_hex(prefix: &str, digest: ring::digest::Digest) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut text = String::with_capacity(prefix.len() + digest.as_ref().len() * 2);
+    text.push_str(prefix);
+    for &byte in digest.as_ref() {
+        text.push(HEX[(byte >> 4) as usize] as char);
+        text.push(HEX[(byte & 15) as usize] as char);
+    }
+    text
+}
+
+fn blob_header(digest: &mut ring::digest::Context, mut len: u64) {
+    let mut digits = [0u8; 20];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (len % 10) as u8;
+        len /= 10;
+        if len == 0 {
+            break;
+        }
+    }
+    digest.update(b"blob ");
+    digest.update(&digits[start..]);
+    digest.update(b"\0");
+}
+
+/// Return the Git object id of these bytes using the selected object format.
+#[allow(dead_code)]
+pub fn blob_oid(bytes: &[u8], sha256: bool) -> String {
+    let algorithm = if sha256 {
+        &ring::digest::SHA256
+    } else {
+        &ring::digest::SHA1_FOR_LEGACY_USE_ONLY
+    };
+    let mut digest = ring::digest::Context::new(algorithm);
+    blob_header(&mut digest, bytes.len() as u64);
+    digest.update(bytes);
+    digest_hex("", digest.finish())
+}
+
+fn hash_reader_with_oid(mut reader: impl Read, len: u64) -> io::Result<(String, Option<String>)> {
+    let mut blake = blake3::Hasher::new();
+    let mut git = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+    blob_header(&mut git, len);
+    let mut buffer = [0u8; 64 * 1024];
+    let mut read = 0u64;
+    loop {
+        let n = reader.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        read = read.saturating_add(n as u64);
+        blake.update(&buffer[..n]);
+        git.update(&buffer[..n]);
+    }
+    let oid = (read == len).then(|| digest_hex("sha1:", git.finish()));
+    Ok((blake.finalize().to_hex().to_string(), oid))
+}
+
+pub fn hash_file_with_oid(path: &Path) -> io::Result<(String, Option<String>)> {
+    let (file, metadata) = open_regular_file(path)?;
+    let len = metadata.len();
+    hash_reader_with_oid(file, len)
 }
 
 /// Run `f` over `items` on all cores, preserving order.
@@ -164,11 +270,225 @@ pub fn verify(root: &Path, inputs: &[Input], all: bool) -> Vec<Mismatch> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn unavailable_oid_serializes_as_null_without_a_basis() {
+        let input = Input {
+            path: "file".into(),
+            id: "f:hash".into(),
+            oid: None,
+            oid_basis: None,
+        };
+        let value = serde_json::to_value(&input).unwrap();
+        assert_eq!(value.get("oid"), Some(&serde_json::Value::Null));
+        assert!(value.get("oid_basis").is_none());
+        let legacy: Input = serde_json::from_str(r#"{"path":"file","id":"f:hash"}"#).unwrap();
+        assert_eq!(legacy, input);
+    }
+
     fn tmp(name: &str) -> std::path::PathBuf {
         let d = std::env::temp_dir().join(format!("stoop-input-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_TEMPLATE_DIR")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    fn pseudo_random_bytes(len: usize) -> Vec<u8> {
+        let mut state = 0x1234_5678_9abc_def0u64;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state as u8
+            })
+            .collect()
+    }
+
+    #[test]
+    fn blob_ids_match_git() {
+        let d = tmp("blob-sha1");
+        git(&d, &["init", "--object-format=sha1", "-q"]);
+        let file = d.join("sample.bin");
+        for size in [0, 1, 65_537, 9 * 1024 * 1024] {
+            let bytes = pseudo_random_bytes(size);
+            fs::write(&file, &bytes).unwrap();
+            let expected = git(&d, &["hash-object", "--no-filters", "sample.bin"]);
+            let (hash, oid) = hash_file_with_oid(&file).unwrap();
+            assert_eq!(oid, Some(format!("sha1:{expected}")), "size {size}");
+            assert_eq!(blob_oid(&bytes, false), expected, "size {size}");
+            assert_eq!(hash, hash_file(&file).unwrap(), "size {size}");
+            assert_eq!(
+                hash,
+                blake3::hash(&bytes).to_hex().to_string(),
+                "size {size}"
+            );
+        }
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn blob_id_dropped_when_length_differs() {
+        let bytes = b"\x00\xffreader contents";
+        let expected_hash = blake3::hash(bytes).to_hex().to_string();
+        for len in [bytes.len() - 1, bytes.len() + 1] {
+            let (hash, oid) = hash_reader_with_oid(bytes.as_slice(), len as u64).unwrap();
+            assert_eq!(hash, expected_hash, "declared length {len}");
+            assert_eq!(oid, None, "declared length {len}");
+        }
+        let (hash, oid) = hash_reader_with_oid(bytes.as_slice(), bytes.len() as u64).unwrap();
+        assert_eq!(hash, expected_hash);
+        assert_eq!(oid, Some(format!("sha1:{}", blob_oid(bytes, false))));
+    }
+
+    #[test]
+    fn blob_oid_sha256_matches_git() {
+        let d = tmp("blob-sha256");
+        git(&d, &["init", "--object-format=sha256", "-q"]);
+        let file = d.join("sample.bin");
+        for size in [0, 1, 65_537, 9 * 1024 * 1024] {
+            let bytes = pseudo_random_bytes(size);
+            fs::write(&file, &bytes).unwrap();
+            let expected = git(&d, &["hash-object", "--no-filters", "sample.bin"]);
+            assert_eq!(blob_oid(&bytes, true), expected, "size {size}");
+            let (hash, oid) = hash_file_with_oid(&file).unwrap();
+            assert_eq!(hash, hash_file(&file).unwrap(), "size {size}");
+            assert_eq!(oid, Some(format!("sha1:{}", blob_oid(&bytes, false))));
+        }
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn sha256_worktree_never_advertises_sha1_oids() {
+        let d = tmp("sha256-ineligible");
+        git(&d, &["init", "--object-format=sha256", "-q"]);
+        assert!(!records_oids(&d));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn records_oids_requires_a_safe_sha1_worktree() {
+        let d = tmp("git-entry");
+        assert!(!records_oids(&d));
+        fs::write(d.join(".git"), "gitdir: elsewhere\n").unwrap();
+        assert!(!records_oids(&d));
+        fs::remove_file(d.join(".git")).unwrap();
+        fs::create_dir(d.join(".git")).unwrap();
+        assert!(!records_oids(&d));
+        fs::remove_dir(d.join(".git")).unwrap();
+        git(&d, &["init", "--object-format=sha1", "-q"]);
+        assert!(records_oids(&d));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn records_oids_rejects_a_real_separate_gitdir() {
+        let d = tmp("separate-gitdir");
+        let admin = d.join("admin");
+        git(
+            &d,
+            &["init", "--separate-git-dir", admin.to_str().unwrap(), "-q"],
+        );
+        assert!(d.join(".git").is_file());
+        assert!(!records_oids(&d));
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn recorded_oids_only_cover_in_root_regular_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let d = tmp("recorded-oids");
+        let file = d.join("data");
+        fs::write(&file, b"file contents").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let (plain, oid) = identify_recorded(&file, true, false, true).unwrap();
+        assert_eq!(plain, file_id(false, &hash_file(&file).unwrap()));
+        assert_eq!(
+            oid,
+            Some(format!("sha1:{}", blob_oid(b"file contents", false)))
+        );
+        assert_eq!(
+            identify_recorded(&file, true, false, false),
+            Some((plain.clone(), None))
+        );
+        assert_eq!(
+            identify_recorded(&file, false, false, true),
+            Some((plain.clone(), None))
+        );
+
+        let input = Input {
+            path: "data".into(),
+            id: plain,
+            oid: Some("sha1:0000000000000000000000000000000000000000".into()),
+            oid_basis: Some(crate::oid_attrs::OidBasis {
+                text: "unspecified".into(),
+                eol: "unspecified".into(),
+                crlf: "unspecified".into(),
+                filter: "unspecified".into(),
+                ident: "unspecified".into(),
+                working_tree_encoding: "unspecified".into(),
+                export_subst: "unspecified".into(),
+                autocrlf: "unset".into(),
+            }),
+        };
+        assert!(verify(&d, &[input], true).is_empty());
+
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+        let (executable, executable_oid) = identify_recorded(&file, true, false, true).unwrap();
+        assert_eq!(executable, file_id(true, &hash_file(&file).unwrap()));
+        assert_eq!(executable_oid, oid);
+
+        let link = d.join("link");
+        symlink("data", &link).unwrap();
+        assert_eq!(
+            identify_recorded(&link, true, false, true),
+            Some(("l:data".into(), None))
+        );
+        assert_eq!(
+            identify_recorded(&d, true, false, true),
+            Some(("d".into(), None))
+        );
+        let (listing, listing_oid) = identify_recorded(&d, true, true, true).unwrap();
+        assert!(listing.starts_with("dl:"));
+        assert_eq!(listing_oid, None);
+        assert_eq!(
+            identify_recorded(&d.join("missing"), true, false, true),
+            Some(("a".into(), None))
+        );
+        assert_eq!(
+            identify_recorded(&d.join("missing"), false, false, true),
+            None
+        );
+        let socket = d.join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        assert_eq!(identify_recorded(&socket, true, false, true), None);
+        drop(listener);
+        fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
@@ -208,10 +528,14 @@ mod tests {
             Input {
                 path: "a".into(),
                 id: identify(&d.join("a"), true, false).unwrap(),
+                oid: None,
+                oid_basis: None,
             },
             Input {
                 path: "gone".into(),
                 id: "a".into(),
+                oid: None,
+                oid_basis: None,
             },
         ];
         assert!(verify(&d, &inputs, true).is_empty());
@@ -272,5 +596,42 @@ mod tests {
         assert_eq!(&plain[2..], &executable[2..]);
         assert_ne!(plain, executable);
         fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn fifo_never_gets_an_oid() {
+        use std::os::unix::ffi::OsStrExt;
+        let d = tmp("oid-fifo");
+        let path = d.join("fifo");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert_eq!(identify_recorded(&path, true, false, true), None);
+        assert!(hash_file_with_oid(&path).is_err());
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn socket_never_gets_an_oid() {
+        let d = tmp("oid-socket");
+        let path = d.join("socket");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert_eq!(identify_recorded(&path, true, false, true), None);
+        drop(listener);
+        fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn device_never_gets_an_oid() {
+        assert_eq!(
+            identify_recorded(Path::new("/dev/null"), false, false, true),
+            None
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn proc_file_never_gets_an_oid() {
+        let result = identify_recorded(Path::new("/proc/self/status"), false, false, true);
+        assert!(matches!(result, Some((_, None))));
     }
 }

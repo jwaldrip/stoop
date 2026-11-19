@@ -11,15 +11,16 @@
 
 use super::{ExecEvent, Scope, Trace};
 use crate::ignore::Ignore;
-use crate::input::{file_id, hash_file};
+use crate::input::{file_id, hash_file, hash_file_with_oid};
 use crate::pathutil::{absolutize, to_key, without_dots, Physical};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsString};
 use std::fs;
 use std::io;
-use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::ffi::{OsStrExt, OsStringExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(target_arch = "x86_64")]
@@ -119,6 +120,8 @@ enum Op {
     Fchmod {
         fd: usize,
     },
+    /// The operation may change attribute sources without a known pathname.
+    UncertainOidState,
     /// Something this tracer cannot see through.
     Unsound(&'static str),
     /// clone-family calls are unsound only when they create a namespace.
@@ -254,6 +257,12 @@ fn table() -> Vec<(i64, Vec<Op>)> {
             ],
         ),
         (s(libc::SYS_truncate), vec![Truncate { path: 0 }]),
+        (s(libc::SYS_recvmsg), vec![UncertainOidState]),
+        (s(libc::SYS_recvmmsg), vec![UncertainOidState]),
+        (s(libc::SYS_pidfd_getfd), vec![UncertainOidState]),
+        (s(libc::SYS_fchown), vec![UncertainOidState]),
+        (s(libc::SYS_fchownat), vec![UncertainOidState]),
+        (s(libc::SYS_mknodat), vec![UncertainOidState]),
         (s(libc::SYS_connect), vec![Connect]),
         (s(libc::SYS_clone), vec![Clone { modern: false }]),
         (s(libc::SYS_clone3), vec![Clone { modern: true }]),
@@ -329,6 +338,9 @@ fn table() -> Vec<(i64, Vec<Op>)> {
     ];
     #[cfg(target_arch = "x86_64")]
     t.extend([
+        (s(libc::SYS_chown), vec![UncertainOidState]),
+        (s(libc::SYS_lchown), vec![UncertainOidState]),
+        (s(libc::SYS_mknod), vec![UncertainOidState]),
         (
             s(libc::SYS_open),
             vec![Open {
@@ -514,6 +526,9 @@ struct Rec<'a> {
     /// The root as the user spelled it; keys in reasons are relative to it.
     root: PathBuf,
     hashed: u64,
+    oid_epoch: Option<Arc<crate::oid_attrs::Epoch>>,
+    /// Default Git configuration sources may resolve into the repository.
+    cautious_git_config: bool,
     link_walks: BTreeMap<PathBuf, Vec<PathBuf>>,
     redirected_reads: HashSet<String>,
 }
@@ -545,6 +560,8 @@ pub fn run<'a>(
     let tbl = table();
     let nrs: Vec<i64> = tbl.iter().map(|(n, _)| *n).collect();
     let filter = bpf_filter(&nrs, &denied());
+    let cautious_git_config =
+        scope.is_some_and(|s| s.oid_epoch.is_some() && cautious_git_config(s.root, &s.real_root));
     let prog = libc::sock_fprog {
         len: filter.len() as u16,
         filter: filter.as_ptr() as *mut libc::sock_filter,
@@ -598,12 +615,17 @@ pub fn run<'a>(
             phys: Physical::new(s.root, &s.real_root),
             ignore: s.ignore,
             root: s.root.to_path_buf(),
+            oid_epoch: s.oid_epoch.clone(),
+            cautious_git_config,
             hashed: 0,
             link_walks: BTreeMap::new(),
             redirected_reads: HashSet::new(),
         }),
         t: Trace {
             status: 1,
+            oid_epoch: scope.and_then(|s| s.oid_epoch.clone()),
+            #[cfg(test)]
+            oid_epoch_captured: scope.is_some(),
             ..Trace::default()
         },
     };
@@ -625,6 +647,7 @@ pub fn run<'a>(
         // The child died before exec (seccomp refused, for instance).
         return Err(io::Error::other("could not start the traced command"));
     }
+    tr.inspect_inherited_fds(pid);
     let opts = libc::PTRACE_O_TRACESECCOMP
         | libc::PTRACE_O_TRACEFORK
         | libc::PTRACE_O_TRACEVFORK
@@ -1182,6 +1205,40 @@ fn is_dir(p: &Path) -> bool {
     fs::symlink_metadata(p).is_ok_and(|m| m.is_dir())
 }
 
+/// If default Git configuration sources can be inside the repository, any
+/// ordinary write may change the configuration observed by the snapshot.
+fn cautious_git_config(root: &Path, real_root: &Path) -> bool {
+    let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+        return true;
+    };
+    let xdg = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(".config"));
+    let mut phys = Physical::new(root, real_root);
+    for path in [
+        home.clone(),
+        home.join(".gitconfig"),
+        xdg.clone(),
+        xdg.join("git/config"),
+        xdg.join("git/attributes"),
+        PathBuf::from("/etc/gitconfig"),
+        PathBuf::from("/etc/gitattributes"),
+    ] {
+        if !path.is_absolute() || path.starts_with(root) {
+            return true;
+        }
+        let resolved = match fs::canonicalize(&path) {
+            Ok(path) => Some(path),
+            Err(error) if is_absent(&error) => phys.locate(&path).map(|location| location.path),
+            Err(_) => None,
+        };
+        if resolved.is_none_or(|path| path.starts_with(real_root)) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Read an ELF PT_INTERP pathname without loading the executable into memory.
 fn elf_interpreter(file: &mut fs::File, header: &[u8]) -> io::Result<Option<PathBuf>> {
     use std::io::{Read, Seek, SeekFrom};
@@ -1305,6 +1362,63 @@ fn push_reason(t: &mut Trace, why: String) {
 }
 
 impl Rec<'_> {
+    /// Attribute files can be ignored by the proof but still affect every Git OID.
+    /// Unknown locations and ordinary writes outside the root are conservative:
+    /// Git can read config and attribute files at arbitrary external paths.
+    fn invalidates_oids(&mut self, raw: &Path, follows: bool) -> bool {
+        let link_meta = fs::symlink_metadata(raw);
+        let metadata = if follows {
+            fs::metadata(raw)
+        } else {
+            fs::symlink_metadata(raw)
+        };
+        if metadata.as_ref().is_err_and(|e| !is_absent(e)) {
+            return true;
+        }
+        if raw.file_name().is_some_and(|name| name == ".gitattributes")
+            || raw
+                .components()
+                .any(|component| component.as_os_str() == ".git")
+        {
+            return true;
+        }
+        if metadata.as_ref().is_ok_and(|m| {
+            let kind = m.file_type();
+            kind.is_char_device() || kind.is_block_device() || kind.is_fifo() || kind.is_socket()
+        }) {
+            return false;
+        }
+        let physical = if follows && link_meta.as_ref().is_ok_and(|m| m.file_type().is_symlink()) {
+            fs::canonicalize(raw).ok()
+        } else {
+            self.phys.locate(raw).map(|location| location.path)
+        };
+        let Some(physical) = physical else {
+            return true;
+        };
+        if !physical.starts_with(self.phys.real()) {
+            return true;
+        }
+        if self.cautious_git_config
+            || self.oid_epoch.as_ref().is_some_and(|epoch| {
+                physical.starts_with(&epoch.git_dir) || physical.starts_with(&epoch.common_dir)
+            })
+            || physical.file_name().is_some_and(|name| {
+                matches!(
+                    name.to_str(),
+                    Some(".gitattributes" | ".gitconfig" | "gitattributes" | "gitconfig")
+                )
+            })
+            || physical
+                .components()
+                .any(|component| component.as_os_str() == ".git")
+        {
+            return true;
+        }
+        // An attribute file or a config file may share an inode with another name.
+        metadata.is_ok_and(|m| m.is_file() && m.nlink() > 1)
+    }
+
     fn key_text(&self, lex: &Path) -> String {
         to_key(&self.root, lex)
     }
@@ -1517,8 +1631,27 @@ impl Rec<'_> {
             // Once replay is already impossible, avoid hashing more content.
             return None;
         }
-        match hash_file(phys) {
-            Ok(h) => {
+        let basis = (!t.oid_attrs_changed)
+            .then(|| {
+                self.oid_epoch
+                    .as_ref()
+                    .and_then(|epoch| epoch.basis.get(key))
+            })
+            .flatten()
+            .cloned();
+        let hash = if basis.as_ref().is_some_and(|basis| basis.allows_oid()) {
+            hash_file_with_oid(phys)
+        } else {
+            hash_file(phys).map(|hash| (hash, None))
+        };
+        match hash {
+            Ok((h, oid)) => {
+                if let Some(basis) = basis {
+                    if let Some(oid) = oid {
+                        t.prior_oids.insert(key.to_owned(), oid);
+                    }
+                    t.prior_oid_bases.insert(key.to_owned(), basis);
+                }
                 self.hashed += size;
                 Some(file_id(exec, &h))
             }
@@ -1531,6 +1664,54 @@ impl Rec<'_> {
 }
 
 impl Tracer<'_> {
+    /// A tracee can write through an inherited descriptor without opening a path
+    /// under ptrace. Inspect writable regular descriptors before its first exec.
+    fn inspect_inherited_fds(&mut self, pid: i32) {
+        let Some(rec) = self.rec.as_mut().filter(|rec| rec.oid_epoch.is_some()) else {
+            return;
+        };
+        let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+            self.t.oid_attrs_changed = true;
+            return;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                self.t.oid_attrs_changed = true;
+                return;
+            };
+            let Ok(metadata) = fs::metadata(entry.path()) else {
+                self.t.oid_attrs_changed = true;
+                return;
+            };
+            if !metadata.is_file() {
+                continue;
+            }
+            let info = PathBuf::from(format!("/proc/{pid}/fdinfo")).join(entry.file_name());
+            let flags = fs::read_to_string(info).ok().and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix("flags:"))
+                    .and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
+            });
+            let Some(flags) = flags else {
+                self.t.oid_attrs_changed = true;
+                return;
+            };
+            if flags & libc::O_ACCMODE as u32 == libc::O_RDONLY as u32
+                || flags & libc::O_CLOEXEC as u32 != 0
+            {
+                continue;
+            }
+            let Ok(path) = fs::read_link(entry.path()) else {
+                self.t.oid_attrs_changed = true;
+                return;
+            };
+            if !path.is_absolute() || metadata.nlink() > 1 || rec.invalidates_oids(&path, true) {
+                self.t.oid_attrs_changed = true;
+                return;
+            }
+        }
+    }
+
     fn flag(&mut self, why: &str) {
         if self.t.unsound.len() < 16 && !self.t.unsound.iter().any(|u| u == why) {
             self.t.unsound.push(why.to_string());
@@ -1616,6 +1797,9 @@ impl Tracer<'_> {
             if special
                 && (!target.is_absolute() || target.as_os_str().as_bytes().ends_with(b" (deleted)"))
             {
+                if self.rec.is_some() {
+                    self.t.oid_attrs_changed = true;
+                }
                 if matches!(self.syscall, libc::SYS_execve | libc::SYS_execveat) {
                     self.flag("it executed an unkeyable file descriptor");
                 } else if self.syscall == libc::SYS_linkat
@@ -1802,6 +1986,14 @@ impl Tracer<'_> {
     /// Record a write, and what the path held before the first one. Returns the key when in scope.
     fn write(&mut self, raw: &Path, follows: bool) -> Option<String> {
         self.rec.as_ref()?;
+        if !self.t.oid_attrs_changed
+            && self
+                .rec
+                .as_mut()
+                .is_some_and(|rec| rec.oid_epoch.is_some() && rec.invalidates_oids(raw, follows))
+        {
+            self.t.oid_attrs_changed = true;
+        }
         // A write through a link changes what the link points to, not the link itself.
         let through_link =
             follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink());
@@ -1937,6 +2129,10 @@ impl Tracer<'_> {
             }
         }
         if !dir {
+            // A new symlink or hard link can change how an attribute source is reached.
+            if self.rec.is_some() {
+                self.t.oid_attrs_changed = true;
+            }
             self.topology_changed(pid);
         }
         self.write(&p, false);
@@ -1960,8 +2156,17 @@ impl Tracer<'_> {
             return;
         };
         let removes_dir = dir || flags.is_some_and(|i| args[i] as i32 & AT_REMOVEDIR != 0);
-        if fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir() || m.file_type().is_symlink()) {
-            self.topology_changed(pid);
+        if removes_dir && self.rec.is_some() && crate::oid_attrs::directory_removal_invalidates(&p)
+        {
+            self.t.oid_attrs_changed = true;
+        }
+        if let Ok(metadata) = fs::symlink_metadata(&p) {
+            if metadata.file_type().is_symlink() && self.rec.is_some() {
+                self.t.oid_attrs_changed = true;
+            }
+            if metadata.is_dir() || metadata.file_type().is_symlink() {
+                self.topology_changed(pid);
+            }
         }
         // Read the directory's contents before the call, while they are still there.
         let key = self.write(&p, false);
@@ -1992,10 +2197,19 @@ impl Tracer<'_> {
             return;
         };
         let exchange = flags.is_some_and(|i| args[i] as u32 & RENAME_EXCHANGE != 0);
-        let directory = is_dir(&a) || (exchange && is_dir(&b));
-        if [&a, &b].iter().any(|p| {
-            fs::symlink_metadata(p).is_ok_and(|m| m.is_dir() || m.file_type().is_symlink())
-        }) {
+        let a_meta = fs::symlink_metadata(&a).ok();
+        let b_meta = fs::symlink_metadata(&b).ok();
+        let a_dir = a_meta.as_ref().is_some_and(|m| m.is_dir());
+        let b_dir = b_meta.as_ref().is_some_and(|m| m.is_dir());
+        let symlink = a_meta.as_ref().is_some_and(|m| m.file_type().is_symlink())
+            || b_meta.as_ref().is_some_and(|m| m.file_type().is_symlink());
+        let directory = a_dir || (exchange && b_dir);
+        // A moved directory may contain attribute sources. A symlink changes
+        // their resolution, even when neither endpoint names an attribute file.
+        if (directory || symlink) && self.rec.is_some() {
+            self.t.oid_attrs_changed = true;
+        }
+        if a_dir || b_dir || symlink {
             self.topology_changed(pid);
         }
         let ka = self.write(&a, false);
@@ -2016,14 +2230,44 @@ impl Tracer<'_> {
     /// The bytes survive a mode change, so the content is recorded too.
     fn chmod(&mut self, raw: &Path, follows: bool) {
         if !raw.is_absolute() {
+            if self.rec.is_some() {
+                self.t.oid_attrs_changed = true;
+            }
             return;
         }
         match fs::symlink_metadata(raw) {
-            Ok(m) if m.is_dir() => self.touch(raw.to_path_buf(), false),
+            Ok(m) if m.is_dir() => {
+                // Directory permissions can change which attribute files Git can read.
+                if self.rec.is_some() {
+                    self.t.oid_attrs_changed = true;
+                }
+                self.touch(raw.to_path_buf(), false);
+            }
             Ok(_) => {
                 self.write(raw, follows);
             }
+            Err(error) if !is_absent(&error) && self.rec.is_some() => {
+                self.t.oid_attrs_changed = true;
+            }
             Err(_) => {}
+        }
+    }
+
+    /// Resolve descriptor-only chmods, including fchmodat2 with AT_EMPTY_PATH.
+    fn chmod_fd(&mut self, pid: i32, fd: i32) {
+        let path = if fd == AT_FDCWD {
+            self.cwd(pid)
+        } else {
+            fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok()
+        };
+        match path {
+            Some(path)
+                if path.is_absolute() && !path.as_os_str().as_bytes().ends_with(b" (deleted)") =>
+            {
+                self.chmod(&path, false);
+            }
+            _ if self.rec.is_some() => self.t.oid_attrs_changed = true,
+            _ => {}
         }
     }
 
@@ -2117,15 +2361,18 @@ impl Tracer<'_> {
                         let nofollow =
                             flags.is_some_and(|i| args[i] as i32 & AT_SYMLINK_NOFOLLOW != 0);
                         self.chmod(&p, !nofollow);
+                    } else if flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0) {
+                        if let Some(fd) = dirfd {
+                            self.chmod_fd(pid, args[fd] as i32);
+                        } else if self.rec.is_some() {
+                            self.t.oid_attrs_changed = true;
+                        }
                     }
                 }
-                Op::Fchmod { fd } => {
-                    // The fd was opened by name; its path is the file's physical location.
-                    if let Ok(p) = std::fs::read_link(format!("/proc/{pid}/fd/{}", args[fd] as i32))
-                    {
-                        if !p.to_string_lossy().ends_with(" (deleted)") {
-                            self.chmod(&p, false);
-                        }
+                Op::Fchmod { fd } => self.chmod_fd(pid, args[fd] as i32),
+                Op::UncertainOidState => {
+                    if self.rec.is_some() {
+                        self.t.oid_attrs_changed = true;
                     }
                 }
                 Op::Unsound(why) => self.flag(why),
@@ -2156,6 +2403,64 @@ impl Tracer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oid_attribute_mutation_detection_is_conservative() {
+        let dir = std::env::temp_dir().join(format!(
+            "stoop-oid-write-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let root = fs::canonicalize(&dir).unwrap();
+        let ignore = Ignore::new(&[], None, &[]);
+        let mut rec = Rec {
+            phys: Physical::new(&root, &root),
+            ignore: &ignore,
+            root: root.clone(),
+            hashed: 0,
+            oid_epoch: Some(Arc::new(crate::oid_attrs::Epoch {
+                basis: HashMap::new(),
+                git_dir: root.join(".git-storage"),
+                common_dir: root.join(".git-common"),
+            })),
+            cautious_git_config: false,
+            link_walks: BTreeMap::new(),
+            redirected_reads: HashSet::new(),
+        };
+        let ordinary = root.join("ordinary");
+        fs::write(&ordinary, b"ordinary").unwrap();
+        assert!(!rec.invalidates_oids(&ordinary, true));
+        assert!(rec.invalidates_oids(&root.join("nested/.gitattributes"), false));
+        assert!(rec.invalidates_oids(&root.join(".git/config"), true));
+        for dir in [".git-storage", ".git-common"] {
+            fs::create_dir(root.join(dir)).unwrap();
+            let metadata = root.join(dir).join("config");
+            fs::write(&metadata, b"config").unwrap();
+            assert!(rec.invalidates_oids(&metadata, true));
+        }
+        let git_alias = root.join("metadata-alias");
+        std::os::unix::fs::symlink(root.join(".git-storage"), &git_alias).unwrap();
+        assert!(rec.invalidates_oids(&git_alias.join("config"), true));
+        assert!(rec.invalidates_oids(&root.parent().unwrap().join("outside"), true));
+        assert!(!rec.invalidates_oids(Path::new("/dev/null"), true));
+
+        let attrs = root.join(".gitattributes");
+        fs::write(&attrs, b"* -text\n").unwrap();
+        let link = root.join("attribute-symlink");
+        std::os::unix::fs::symlink(&attrs, &link).unwrap();
+        assert!(rec.invalidates_oids(&link, true));
+        let alias = root.join("linked-attributes");
+        fs::hard_link(attrs, &alias).unwrap();
+        assert!(rec.invalidates_oids(&alias, true));
+
+        rec.cautious_git_config = true;
+        assert!(rec.invalidates_oids(&ordinary, true));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn topology_cache_is_cleared_again_on_the_changing_process_stop() {

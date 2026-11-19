@@ -2,12 +2,31 @@ use super::spec::Decision;
 use serde_json::{json, Value};
 use std::io::Write;
 
+/// Bidirectional formatting characters reorder the text after them on screen, so a line can read
+/// differently from its bytes. They print as `\u{..}` text.
+fn bidi(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 pub fn escape(s: &str) -> String {
-    s.replace('%', "%25")
+    let escaped = s
+        .replace('%', "%25")
         .replace('\r', "%0D")
         .replace('\n', "%0A")
         .replace("##[", "#%23[")
-        .replace("::", "%3A%3A")
+        .replace("::", "%3A%3A");
+    let mut out = String::with_capacity(escaped.len());
+    for ch in escaped.chars() {
+        if bidi(ch) {
+            out.push_str(&format!("\\u{{{:x}}}", ch as u32));
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 pub fn job(id: &str, gated: bool, decision: &Decision, key: Option<&str>) -> Value {
@@ -142,4 +161,20 @@ fn append(path: &str, text: &str) -> Result<(), String> {
         .open(path)
         .and_then(|mut f| f.write_all(text.as_bytes()))
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::escape;
+
+    #[test]
+    fn escape_writes_bidi_formatting_characters_as_text() {
+        let escaped = escape("a\u{202E}b\u{2066}c\u{200F}d\u{061C}e");
+        assert_eq!(escaped, "a\\u{202e}b\\u{2066}c\\u{200f}d\\u{61c}e");
+    }
+
+    #[test]
+    fn escape_keeps_the_workflow_command_escapes() {
+        assert_eq!(escape("##[error]x::y\n"), "#%23[error]x%3A%3Ay%0A");
+    }
 }

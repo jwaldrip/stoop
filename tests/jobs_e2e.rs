@@ -22,6 +22,18 @@ struct RecordedProvenance {
     version: u32,
 }
 
+#[derive(serde::Deserialize, serde::Serialize)]
+struct RecordedOidBasis {
+    text: String,
+    eol: String,
+    filter: String,
+    ident: String,
+    working_tree_encoding: String,
+    export_subst: String,
+    crlf: String,
+    autocrlf: String,
+}
+
 struct ActionApi {
     url: String,
     stop: Arc<AtomicBool>,
@@ -201,6 +213,11 @@ impl Ws {
         let path = self.temp.join("script.sh");
         fs::write(&path, script).unwrap();
         let mut command = Command::new(env!("CARGO_BIN_EXE_stoop"));
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("GIT_") {
+                command.env_remove(key);
+            }
+        }
         command
             .arg("sh")
             .args(options)
@@ -241,6 +258,21 @@ impl Ws {
             .env_remove("STOOP_OFF")
             .env_remove("STOOP_MATRIX")
             .env_remove("STOOP_STORE")
+            .env("HOME", self.root.parent().unwrap().join("home"))
+            .env("XDG_CONFIG_HOME", self.root.parent().unwrap().join("xdg"))
+            .env_remove("GIT_CONFIG")
+            .env_remove("GIT_CONFIG_GLOBAL")
+            .env_remove("GIT_CONFIG_SYSTEM")
+            .env_remove("GIT_CONFIG_NOSYSTEM")
+            .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_ATTR_SOURCE")
+            .env_remove("GIT_CONFIG_PARAMETERS")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_OBJECT_DIRECTORY")
+            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
             .env_remove("STOOP_ENV_SALT");
         for name in [
             "HTTP_PROXY",
@@ -301,6 +333,12 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .current_dir(dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
         .output()
         .unwrap();
     assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
@@ -803,6 +841,10 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
     struct Input {
         path: String,
         id: String,
+        #[serde(default)]
+        oid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oid_basis: Option<RecordedOidBasis>,
     }
     #[derive(serde::Deserialize)]
     struct Proof {
@@ -835,6 +877,18 @@ fn recorded_step_keys_and_digests_resolve_on_remote() {
         );
         let file: Value = serde_json::from_str(&raw).unwrap();
         let proofs: Vec<Proof> = serde_json::from_value(file["proofs"].clone()).unwrap();
+        if script == scripts[0] {
+            let input = proofs
+                .iter()
+                .flat_map(|proof| &proof.inputs)
+                .find(|input| input.path == "in.txt")
+                .expect("the proof records in.txt");
+            assert!(input
+                .oid
+                .as_deref()
+                .is_some_and(|oid| oid.starts_with("sha1:")));
+            assert!(input.oid_basis.is_some());
+        }
         assert!(proofs.iter().any(|p| {
             let bytes = serde_json::to_vec(&(
                 &p.inputs,
@@ -872,6 +926,10 @@ fn concurrent_proof_race(proof_only: bool) {
     struct Input {
         path: String,
         id: String,
+        #[serde(default)]
+        oid: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        oid_basis: Option<RecordedOidBasis>,
     }
     #[derive(serde::Deserialize)]
     struct Proof {

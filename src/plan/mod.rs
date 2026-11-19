@@ -1,6 +1,6 @@
 pub mod eval;
 mod graph;
-mod output;
+pub(crate) mod output;
 #[cfg(test)]
 mod probes;
 pub mod spec;
@@ -690,6 +690,8 @@ mod tests {
                     "f:{}",
                     blake3::hash(include_bytes!("../../tests/fixtures/plan/a.txt")).to_hex()
                 ),
+                oid: None,
+                oid_basis: None,
             }],
             outputs: vec![],
             removed: vec![],

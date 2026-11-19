@@ -185,7 +185,7 @@ impl Fixture {
                 put_ref(
                     &self.remote,
                     &key,
-                    &json!({"v":2,"key":key,"proofs":[proof]}),
+                    &json!({"v":4,"key":key,"proofs":[proof]}),
                 );
                 selected.push(format!("refs/stoop/{key}"));
                 steps.push(json!({"key":key,"proof":digest,"how":"ran"}));

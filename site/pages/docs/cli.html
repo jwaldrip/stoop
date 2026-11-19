@@ -17,6 +17,28 @@
 <p>On a traced <code>stoop run</code>, recognized test, lint and build launches can produce one diagnostic line, for example <code>stoop: observed jest via npm (diagnostic only)</code>. The original command still runs unchanged; the observation is not saved in its proof. Warm skips, <code>--quiet</code>, <code>--no-record</code>, <code>stoop sh</code> and <code>stoop explain</code> omit the line.</p>
 <p>Observation stops at 1,024 captured execs, 1,024 tracked tasks or 1,024 pending child stops, or if an exec has more than 128 arguments or 16 KiB of arguments. Runners observed before a limit can still be reported; the command continues unchanged.</p>
 
+<h2 id="changed-hook">Changed-unit hook</h2>
+<p>Write <code>'{changed}'</code> where a test command takes test files, and say which files are tests: <code>stoop run -- npx jest '{changed:*.test.ts}'</code>. The filter is a list of patterns separated by <code>|</code>, with <code>!</code> to exclude. Always single-quote the placeholder. Unquoted, bash and zsh expand commas and wildcards before stoop sees them, and fish refuses the wildcard.</p>
+<p>In this release a placeholder runs the <strong>full command</strong>: the placeholder and the option in front of it are removed, so the command runs everything. Stoop does not yet run a subset of tests, so an unchanged tree skips only through the whole-command proof. When the full command runs, stoop prints the words it removed.</p>
+<p>The placeholder assumes two things about the command: each test file passes alone exactly as it does in the full suite, and running the command with no test files does nothing beyond running them all. Stoop cannot check either premise.</p>
+<p>Stoop detects the common quoting mistakes and exits 2 before anything runs: a comma inside braces, a <code>|</code> or <code>;</code> outside quotes, a placeholder cut off by <code>|</code>, <code>;</code> or a space, a brace-expanded word such as <code>changed:*.t</code>, and a placeholder in shell code or in the <code>$0</code> of a shell command. Stoop refuses an option that takes several values, such as <code>--files a b '{changed}'</code>, because it cannot tell where the values end. Use <code>--files='{changed}'</code>, or put the placeholder right after the option or after <code>--</code>. Option declarations arrive with the configuration slice.</p>
+<p>On the first run of a placeholder argv, stoop records that argv before running it, whatever the result. The record is not a proof and never causes a skip. If a later invocation has the placeholder removed or emptied, as a shell does with an unquoted <code>$STOOP_CHANGED</code>, stoop runs the full command and names the expansion. The exit status is the command's own.</p>
+<h3 id="quoting">Quoting</h3>
+<p>Each row is what the shell does before stoop starts. Stoop's Linux CI covers every row.</p>
+<table>
+  <thead>
+    <tr><th>Shell or context</th><th>Write</th><th>What stoop receives</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>bash, dash, zsh, fish</td><td><code>'{changed:*.t}'</code></td><td>The placeholder, unchanged.</td></tr>
+    <tr><td>bash, dash, zsh, fish</td><td><code>'$STOOP_CHANGED'</code></td><td>The environment spelling, unchanged, with the same filters.</td></tr>
+    <tr><td>zsh, fish</td><td><code>{changed:*.t}</code>, unquoted</td><td>Nothing: the shell refuses the wildcard before stoop starts.</td></tr>
+    <tr><td>bash</td><td><code>{changed:*.t,*.u}</code>, unquoted</td><td>Brace expansion splits it into words without braces; stoop refuses that shape before it launches anything.</td></tr>
+    <tr><td>dash</td><td><code>{changed:*.t|*.u}</code>, unquoted</td><td>The pipe splits the command; stoop receives a cut-off word and refuses it.</td></tr>
+    <tr><td>Makefile recipe</td><td><code>'$$STOOP_CHANGED'</code></td><td>The environment spelling as <code>'$STOOP_CHANGED'</code>, because make turns <code>$$</code> into <code>$</code>.</td></tr>
+    <tr><td>GitHub Actions <code>run:</code></td><td><code>'{changed:*.t}'</code> or <code>'$STOOP_CHANGED'</code></td><td>The placeholder or environment spelling, unchanged, under the step's bash.</td></tr>
+  </tbody>
+</table>
 <h2 id="options">Options</h2>
 <p>Options go before <code>--</code>. Everything after it is the command.</p>
 <dl>
@@ -42,6 +64,8 @@
   <dd>Check and skip as usual, but never write a proof. For jobs you don't trust.</dd>
   <dt id="opt-allow-id-token">--allow-id-token</dt>
   <dd>Permit the OIDC request variable names listed in <code>STOOP_PASS_ENV</code> to reach this command. Such a command runs untraced, without running probes or using or writing proofs; in shell mode it blocks job attestation.</dd>
+  <dt id="opt-literal">--literal</dt>
+  <dd>Treat a <code>{changed}</code> placeholder as ordinary text. Turns off every hook rule for this invocation, including the empty-value hint. Use it when a literal brace argument is what you mean.</dd>
   <dt id="opt-sync">--sync git[:REMOTE]</dt>
   <dd>On a miss, fetch this key's proofs from <code>refs/stoop/&lt;key&gt;</code> on the git remote (default <code>origin</code>) and check again. See <a href="ci.html#sync">git sync</a>.</dd>
   <dt id="opt-sync-write">--sync-write</dt>

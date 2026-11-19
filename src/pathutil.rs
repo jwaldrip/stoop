@@ -259,6 +259,13 @@ mod tests {
         assert_eq!(from_key(root, "/usr/lib/x"), PathBuf::from("/usr/lib/x"));
     }
 
+    #[test]
+    fn proc_paths_never_get_a_physical_repository_key() {
+        let root = scratch("proc-exclusion");
+        let mut physical = Physical::new(&root, &root);
+        assert!(physical.locate(Path::new("/proc/self/status")).is_none());
+    }
+
     struct Scratch(PathBuf);
     impl std::ops::Deref for Scratch {
         type Target = Path;

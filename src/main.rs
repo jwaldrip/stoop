@@ -2,12 +2,15 @@ mod attest;
 #[allow(dead_code)]
 mod gha;
 #[allow(dead_code)]
+mod gitprobe;
+#[allow(dead_code)]
 mod gittree;
 mod ignore;
 mod input;
 #[allow(dead_code)]
 mod job;
 mod journal;
+mod oid_attrs;
 mod pathutil;
 #[allow(dead_code)]
 mod plan;
@@ -50,6 +53,7 @@ OPTIONS
   --ignore PATTERN  paths whose reads do not count (also .stoopignore)
   --no-record       check and run, but never write a proof (untrusted jobs)
   --allow-id-token  allow names in STOOP_PASS_ENV; runs untraced and unrecorded
+  --literal         treat placeholders as ordinary text (no changed-unit hooks)
   --quiet           print nothing about the decision
 
 ENVIRONMENT
@@ -159,6 +163,10 @@ fn real_main(mut args: Vec<String>) -> i32 {
                 eprintln!("stoop: forget needs a key");
                 return 2;
             };
+            let hook = run::forget_hook_records(&o, &proof::sanitize(key));
+            if let Err(warning) = &hook {
+                eprintln!("{warning}");
+            }
             let result = if key.starts_with("job-") {
                 jobs_for(&o).forget(&proof::sanitize(key))
             } else {
@@ -166,6 +174,7 @@ fn real_main(mut args: Vec<String>) -> i32 {
             };
             match result {
                 Ok(true) => 0,
+                Ok(false) if matches!(hook, Ok(true)) => 0,
                 Ok(false) => {
                     eprintln!("stoop: no proof named {key}");
                     1
@@ -278,6 +287,7 @@ fn parse(args: &[String]) -> Result<(Opts, Vec<String>), String> {
             "--ignore" => o.ignore.push(val("--ignore")?),
             "--no-record" => o.no_record = true,
             "--allow-id-token" => o.allow_id_token = true,
+            "--literal" => o.literal = true,
             "--allow-network" => o.allow_network = true,
             "--ignore-env" => o.ignore_env.push(val("--ignore-env")?),
             "--max-age" => o.max_age = Some(run::parse_age(&val("--max-age")?)?),

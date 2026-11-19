@@ -4,6 +4,7 @@ use crate::ignore::Ignore;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Where the tracer records what the run's writes replace: repository paths under `root`.
 /// Keys are relative to `real_root`, the canonical path of `root`.
@@ -12,6 +13,8 @@ pub struct Scope<'a> {
     pub root: &'a Path,
     pub real_root: PathBuf,
     pub ignore: &'a Ignore,
+    /// Attribute evidence observed once before the traced command starts.
+    pub oid_epoch: Option<Arc<crate::oid_attrs::Epoch>>,
 }
 
 /// What the run did with a path it looked at.
@@ -95,6 +98,17 @@ pub struct Trace {
     pub keys: HashMap<PathBuf, String>,
     /// State of each in-scope key before the run first wrote it.
     pub priors: BTreeMap<String, String>,
+    /// Blob ids captured in the same read as each content prior.
+    pub prior_oids: BTreeMap<String, String>,
+    /// Attribute state under which each content prior's blob id was calculated.
+    pub prior_oid_bases: BTreeMap<String, crate::oid_attrs::OidBasis>,
+    /// The shared pre-run attribute snapshot, absent when Git evidence is unsafe.
+    pub oid_epoch: Option<Arc<crate::oid_attrs::Epoch>>,
+    /// Unit tests can construct synthetic traces without ever starting a command.
+    #[cfg(test)]
+    pub(crate) oid_epoch_captured: bool,
+    /// Git attributes or repository metadata may have changed during the run.
+    pub oid_attrs_changed: bool,
     /// Reasons the planner cannot replay this run (at most 16, deduplicated). Not fatal.
     pub unplannable: Vec<String>,
     /// Successful execs, present only for an ordinary, traced `stoop run`.

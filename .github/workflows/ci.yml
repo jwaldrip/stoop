@@ -22,9 +22,40 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install the shells the hook tests run under
+        run: sudo apt-get update && sudo apt-get install -y zsh fish dash
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - name: Compare recorder performance with base
+        env:
+          BASE_REF: ${{ github.base_ref || 'main' }}
+        run: |
+          head=$(git rev-parse HEAD)
+          git fetch --no-tags --depth=1 origin "$BASE_REF"
+          base=$(git rev-parse FETCH_HEAD)
+          echo "base=$base head=$head"
+          git switch --detach "$base"
+          cargo build --release --target-dir "$RUNNER_TEMP/stoop-base"
+          git switch --detach "$head"
+          STOOP_BENCH_BASE_BIN="$RUNNER_TEMP/stoop-base/release/stoop" STOOP_DEBUG=1 cargo test --release --test record_e2e recorder_base_vs_head_timing_fixture -- --nocapture
       - run: cargo test
+      - name: Verify blob IDs above 2 GiB
+        run: cargo test --release --test record_e2e sparse_input_over_two_gib_keeps_its_blob_oid -- --ignored --nocapture
+      - name: Changed-unit hook in a run step (brace and environment spellings)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --quiet
+          stoop="$GITHUB_WORKSPACE/target/debug/stoop"
+          work="$(mktemp -d)"
+          cd "$work"
+          printf 'changed\n' > a.t
+          "$stoop" run --root . -- /bin/sh -c 'printf "[%s]\n" "$@"' sh '{changed:*.t}' > out.txt 2> err.txt
+          test "$(cat out.txt)" = "[]" || { echo 'the brace placeholder did not run the full command'; cat out.txt; exit 1; }
+          grep -F 'removed ["{changed:*.t}"]' err.txt || { echo 'the brace placeholder did not reach stoop intact'; cat err.txt; exit 1; }
+          "$stoop" run --root . -- /bin/sh -c 'printf "[%s]\n" "$@"' sh --files '$STOOP_CHANGED' > out2.txt 2> err2.txt
+          test "$(cat out2.txt)" = "[]" || { echo 'the environment spelling did not run the full command'; cat out2.txt; exit 1; }
+          grep -F 'removed ["--files", "$STOOP_CHANGED"]' err2.txt || { echo 'the environment spelling did not reach stoop intact'; cat err2.txt; exit 1; }
 
   linux-arm:
     name: tests (Linux arm64)
@@ -33,6 +64,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Install the shells the hook tests run under
+        run: sudo apt-get update && sudo apt-get install -y zsh fish dash
       - run: cargo test
 
   macos:
