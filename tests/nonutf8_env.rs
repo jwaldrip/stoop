@@ -50,7 +50,14 @@ fn git(dir: &Path, args: &[&str]) {
         .env("HOME", dir)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
         .env("GIT_CONFIG_NOSYSTEM", "1")
-        .args(["-c", "user.name=t", "-c", "user.email=t@example.org", "-c", "commit.gpgsign=false"])
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.org",
+            "-c",
+            "commit.gpgsign=false",
+        ])
         .args(args)
         .status()
         .unwrap()
@@ -103,10 +110,19 @@ fn assert_no_panic(output: &Output) {
 #[test]
 fn plan_survives_an_unrelated_non_utf8_variable() {
     let dir = Dir::new("plan");
-    repo(dir.path(), &[(".github/workflows/ci.yml", WORKFLOW), ("a.txt", "a\n")]);
+    repo(
+        dir.path(),
+        &[(".github/workflows/ci.yml", WORKFLOW), ("a.txt", "a\n")],
+    );
     let output = stoop(
         dir.path(),
-        &["plan", "--workflow", ".github/workflows/ci.yml", "--format", "json"],
+        &[
+            "plan",
+            "--workflow",
+            ".github/workflows/ci.yml",
+            "--format",
+            "json",
+        ],
     )
     .env("GITHUB_JOB", "stoop-plan")
     .env("NONUTF8_TEST", raw(b"raw-\xff"))
@@ -121,10 +137,19 @@ fn plan_survives_an_unrelated_non_utf8_variable() {
 #[test]
 fn a_non_utf8_needed_variable_makes_planning_fail_wide() {
     let dir = Dir::new("plan-sha");
-    repo(dir.path(), &[(".github/workflows/ci.yml", WORKFLOW), ("a.txt", "a\n")]);
+    repo(
+        dir.path(),
+        &[(".github/workflows/ci.yml", WORKFLOW), ("a.txt", "a\n")],
+    );
     let output = stoop(
         dir.path(),
-        &["plan", "--workflow", ".github/workflows/ci.yml", "--format", "json"],
+        &[
+            "plan",
+            "--workflow",
+            ".github/workflows/ci.yml",
+            "--format",
+            "json",
+        ],
     )
     .env("GITHUB_JOB", "stoop-plan")
     .env("GITHUB_ACTIONS", "true")
@@ -140,14 +165,20 @@ fn a_non_utf8_needed_variable_makes_planning_fail_wide() {
 #[test]
 fn shell_mode_survives_an_unrelated_non_utf8_variable() {
     let dir = Dir::new("sh");
-    repo(dir.path(), &[(".github/workflows/ci.yml", WORKFLOW), ("a.txt", "a\n")]);
+    repo(
+        dir.path(),
+        &[(".github/workflows/ci.yml", WORKFLOW), ("a.txt", "a\n")],
+    );
     let runner = dir.path().join("runner");
     fs::create_dir_all(&runner).unwrap();
     fs::write(dir.path().join("step.sh"), "echo ok\n").unwrap();
     let output = stoop(dir.path(), &["sh", "step.sh"])
         .env("GITHUB_ACTIONS", "true")
         .env("GITHUB_REPOSITORY", "owner/repo")
-        .env("GITHUB_WORKFLOW_REF", "owner/repo/.github/workflows/ci.yml@refs/heads/main")
+        .env(
+            "GITHUB_WORKFLOW_REF",
+            "owner/repo/.github/workflows/ci.yml@refs/heads/main",
+        )
         .env("GITHUB_WORKFLOW", "fixture")
         .env("GITHUB_JOB", "a")
         .env("GITHUB_SHA", "1111111111111111111111111111111111111111")
@@ -159,7 +190,11 @@ fn shell_mode_survives_an_unrelated_non_utf8_variable() {
         .unwrap();
     assert_no_panic(&output);
     assert!(output.status.success(), "{}", text(&output));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("ok"), "{}", text(&output));
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}",
+        text(&output)
+    );
 }
 
 #[test]
@@ -167,8 +202,14 @@ fn pull_and_ls_survive_an_unrelated_non_utf8_variable() {
     let dir = Dir::new("pull-ls");
     repo(dir.path(), &[("in.txt", "one\n")]);
     let remote = dir.path().join("remote.git");
-    git(dir.path(), &["init", "-q", "--bare", remote.to_str().unwrap()]);
-    git(dir.path(), &["remote", "add", "origin", remote.to_str().unwrap()]);
+    git(
+        dir.path(),
+        &["init", "-q", "--bare", remote.to_str().unwrap()],
+    );
+    git(
+        dir.path(),
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
     let ls = stoop(dir.path(), &["ls"])
         .env("NONUTF8_TEST", raw(b"raw-\xff"))
         .output()
@@ -201,7 +242,10 @@ fn a_changed_non_utf8_variable_invalidates_a_proof() {
     assert_no_panic(&second);
     assert!(second.status.success(), "{}", text(&second));
     let stderr = String::from_utf8_lossy(&second.stderr);
-    assert!(!stderr.contains("stoop: skip"), "a changed non-UTF-8 value must not skip:\n{stderr}");
+    assert!(
+        !stderr.contains("stoop: skip"),
+        "a changed non-UTF-8 value must not skip:\n{stderr}"
+    );
 }
 
 #[cfg(target_os = "linux")]
@@ -227,7 +271,9 @@ fn explain_reports_a_changed_non_utf8_variable_as_a_run() {
 fn a_non_utf8_stoop_full_still_forces_a_run() {
     let dir = Dir::new("full-non-utf8");
     repo(dir.path(), &[("in.txt", "one\n")]);
-    let first = stoop(dir.path(), &["run", "--", "cat", "in.txt"]).output().unwrap();
+    let first = stoop(dir.path(), &["run", "--", "cat", "in.txt"])
+        .output()
+        .unwrap();
     assert!(first.status.success(), "{}", text(&first));
     let second = stoop(dir.path(), &["run", "--", "cat", "in.txt"])
         .env("STOOP_FULL", raw(b"\xff"))
@@ -236,5 +282,8 @@ fn a_non_utf8_stoop_full_still_forces_a_run() {
     assert_no_panic(&second);
     assert!(second.status.success(), "{}", text(&second));
     let stderr = String::from_utf8_lossy(&second.stderr);
-    assert!(!stderr.contains("stoop: skip"), "an unreadable STOOP_FULL must never skip:\n{stderr}");
+    assert!(
+        !stderr.contains("stoop: skip"),
+        "an unreadable STOOP_FULL must never skip:\n{stderr}"
+    );
 }
