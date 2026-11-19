@@ -3,7 +3,7 @@
 // dropped silently. The only elements removed are the chrome selected by isChrome():
 // navigation, skip links, the theme toggle, the logo lockup, the maker mark and the
 // progress bar. Their text is interface, not content, and the build's text check
-// (tokens.mjs) compares the twin with the same scope, so a dropped sentence fails it.
+// (text.mjs) compares the twin with the same scope, so a dropped sentence fails it.
 import { classesOf, findAll, hasClass, textOf } from "./html.mjs";
 
 export class TwinError extends Error {}
