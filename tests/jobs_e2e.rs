@@ -1559,15 +1559,29 @@ fn a_clean_step_records_blob_ids_the_planner_matches() {
     assert_eq!(job["legs"][0]["checked"]["blob_reads"], 0, "{result}");
 }
 
-/// P2's tracer drops every blob id in a run when a step writes an ordinary file outside the
-/// repository, because Git can read configuration and attribute files at paths the tracer cannot
-/// enumerate. This pins that rule as it stands. The step is still proved, by hashing, so nothing is
-/// decided by blob id. Narrowing the rule is a deliberate change, and this is the test to update.
+/// Writes outside the repository keep every blob id. Git reads configuration and attributes from
+/// fixed paths, and the recorder watches those paths. A temporary file or a tool cache is not one
+/// of them, so the step is decided by blob id, not by hashing.
 #[test]
-fn a_write_outside_the_repository_drops_every_blob_id_in_the_run() {
+fn a_write_outside_the_repository_keeps_blob_ids() {
     let result = plan_recorded_step(
         "outside-blob-ids",
-        "cat a.txt; printf x > \"$RUNNER_TEMP/outside\"\n",
+        "cat a.txt; printf x > \"$RUNNER_TEMP/outside\"; mkdir -p \"$RUNNER_TEMP/cache\" && printf x > \"$RUNNER_TEMP/cache/x\"\n",
+        &[("a.txt", "a\n")],
+    );
+    let job = &result["jobs"][0];
+    assert_eq!(job["code"], "proved", "{result}");
+    assert_eq!(job["legs"][0]["checked"]["by_oid"], 1, "{result}");
+    assert_eq!(job["legs"][0]["checked"]["hashed"], 0, "{result}");
+}
+
+/// The same step also creates `.git/info/attributes`, a file Git reads for attributes. That write
+/// drops every blob id in the run, and the step is still proved, by hashing.
+#[test]
+fn a_write_to_a_git_attribute_file_drops_blob_ids() {
+    let result = plan_recorded_step(
+        "watched-blob-ids",
+        "cat a.txt; printf x > \"$RUNNER_TEMP/outside\"; printf '# x\\n' >> .git/info/attributes\n",
         &[("a.txt", "a\n")],
     );
     let job = &result["jobs"][0];
