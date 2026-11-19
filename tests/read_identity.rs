@@ -153,12 +153,6 @@ fn assert_recorded(out: &Output, case: &Case, key: &str) {
     assert!(case.proof(key).exists(), "no proof written:\n{err}");
 }
 
-/// The next run has no proof to reuse, so it runs and says so.
-fn assert_next_run_runs(case: &Case, key: &str, script: &str) {
-    let out = run(case, key, script, &[]);
-    assert!(stderr(&out).contains("stoop: run "), "{}", stderr(&out));
-}
-
 fn touch_ahead(path: &Path) {
     let status = Command::new("touch")
         .args(["-d", "+60 seconds"])

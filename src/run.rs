@@ -1645,6 +1645,10 @@ pub fn build_inputs(
         if trace.magic_links.contains(lex) {
             continue;
         }
+        // A link the run wrote is its own output, so what it resolves to is not an input.
+        if trace.is_output(lex) {
+            continue;
+        }
         let first = trace.seen.as_ref().map(|seen| seen.get(lex));
         if !std::fs::symlink_metadata(lex).is_ok_and(|m| m.file_type().is_symlink()) {
             // The run followed a link at its first look; no candidate checks what it resolved to now.
@@ -1673,6 +1677,13 @@ pub fn build_inputs(
                     "{} has no read-time identity",
                     to_key(root, lex)
                 )));
+                continue;
+            }
+            Some(Some(Seen::Symlink { resolved: None, .. }))
+                if now.as_deref().is_some_and(|target| trace.is_output(target)) =>
+            {
+                // Dangling when the run first looked, and now it resolves to a path the run wrote.
+                // Nothing was read through the link, so there is nothing to refuse.
                 continue;
             }
             Some(Some(Seen::Symlink { resolved, .. })) if *resolved == now => {}
@@ -1728,6 +1739,9 @@ pub fn build_inputs(
                     .is_none()
                 {
                     return Err("a symlink target is not valid UTF-8".into());
+                }
+                if trace.is_output(&target) {
+                    continue;
                 }
                 let tk = to_key(root, &target);
                 if ignore.is_ignored(&link_key) || ignore.is_ignored(&tk) {
