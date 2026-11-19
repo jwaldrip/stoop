@@ -444,10 +444,12 @@ fn shell_mode(o: &mut Opts, script: &OsStr, rest: &[OsString]) -> i32 {
     o.transient
         .push(pathutil::to_key(&root, std::path::Path::new(script)));
     o.mention = String::from_utf8_lossy(&body).into_owned();
-    let mut argv: Vec<OsString> = ["bash", "--noprofile", "--norc", "-eo", "pipefail"]
-        .into_iter()
-        .map(OsString::from)
-        .collect();
+    let mut argv: Vec<OsString> = vec![sys::bash()];
+    argv.extend(
+        ["--noprofile", "--norc", "-eo", "pipefail"]
+            .into_iter()
+            .map(OsString::from),
+    );
     argv.push(script.to_os_string());
     argv.extend(rest.iter().cloned());
     o.argv = argv;
