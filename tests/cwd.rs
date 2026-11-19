@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Command identity and root discovery, exercised through the real binary.
 
 use std::fs;

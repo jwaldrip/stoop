@@ -1051,7 +1051,7 @@ fn evaluate(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::input::Input;
@@ -1697,6 +1697,7 @@ mod tests {
         );
         assert_eq!(d.code, Code::InputChanged);
     }
+    #[cfg(unix)]
     #[test]
     fn symlink_ancestor_is_not_assumed_absent() {
         use std::os::unix::fs::symlink;
@@ -2102,6 +2103,7 @@ mod tests {
         ctx.salt = None;
         assert_eq!(decide(&f.spec, &mut ctx).code, Code::EnvChanged);
     }
+    #[cfg(unix)]
     #[test]
     fn exec_bit_is_part_of_the_id() {
         use std::os::unix::fs::PermissionsExt;
@@ -2248,6 +2250,7 @@ mod tests {
         fs::remove_file(f.root.join(".git/objects").join(&oid[..2]).join(&oid[2..])).unwrap();
         assert_eq!(f.decide(BTreeMap::new()).code, Code::Error);
     }
+    #[cfg(unix)]
     #[test]
     fn prior_mismatch_words() {
         use std::os::unix::fs::symlink;
@@ -2428,6 +2431,7 @@ mod tests {
         f.install(vec![a, b]);
         assert_eq!(f.decide(BTreeMap::new()).code, Code::PriorChanged);
     }
+    #[cfg(unix)]
     #[test]
     fn k_n26_non_utf8_below_removed_dir() {
         use std::os::unix::ffi::OsStringExt;
@@ -2479,6 +2483,7 @@ mod tests {
         f.install(vec![p]);
         assert_eq!(f.decide(BTreeMap::new()).code, Code::Unplannable);
     }
+    #[cfg(unix)]
     #[test]
     fn k_n30_kind_only_prior_keeps_the_exec_bit() {
         use std::os::unix::fs::PermissionsExt;
@@ -2690,6 +2695,7 @@ mod tests {
         fs::remove_file(f.root.join(".git/objects").join(&oid[..2]).join(&oid[2..])).unwrap();
         assert_eq!(f.decide(BTreeMap::new()).code, Code::Error);
     }
+    #[cfg(unix)]
     #[test]
     fn nonregular_attributes_are_unplannable() {
         use std::os::unix::fs::symlink;
@@ -3320,6 +3326,7 @@ mod tests {
             assert_eq!(o.counts.declined.get("conversion"), Some(&1), "{name}");
         }
     }
+    #[cfg(unix)]
     #[test]
     fn exec_bit_mismatch_with_equal_blob_id_is_changed() {
         use std::os::unix::fs::PermissionsExt;
@@ -3352,6 +3359,7 @@ mod tests {
             assert_eq!(o.counts.declined.get("mode"), Some(&1), "{path}");
         }
     }
+    #[cfg(unix)]
     #[test]
     fn symlink_blob_id_is_derived_from_the_recorded_target() {
         let mut f = Fixture::new();
@@ -3366,6 +3374,7 @@ mod tests {
             (1, 0, 0)
         );
     }
+    #[cfg(unix)]
     #[test]
     fn symlink_with_another_target_is_changed_without_reading() {
         let mut f = Fixture::new();
@@ -3377,6 +3386,7 @@ mod tests {
         assert_eq!(o.decision.code, Code::InputChanged, "{}", o.decision.detail);
         assert_eq!((o.counts.by_oid, o.counts.blob_reads), (1, 0));
     }
+    #[cfg(unix)]
     #[test]
     fn symlink_target_with_replacement_character_reads_the_blob() {
         use std::os::unix::ffi::OsStrExt;
@@ -3619,6 +3629,7 @@ mod tests {
         );
         assert!(o.counts.declined.is_empty());
     }
+    #[cfg(unix)]
     #[test]
     fn recorded_file_id_against_a_tree_link_takes_the_existing_path() {
         let mut f = Fixture::new();
@@ -3635,6 +3646,7 @@ mod tests {
         assert_eq!(o.decision.code, Code::InputChanged, "{}", o.decision.detail);
         assert_eq!((o.counts.by_oid, o.counts.hashed), (0, 0));
     }
+    #[cfg(unix)]
     #[test]
     fn sha256_repository_never_derives_link_blob_ids() {
         let mut f = Fixture::new_with(&["init", "-q", "--object-format=sha256"]);
@@ -3812,8 +3824,10 @@ mod tests {
             ],
         );
     }
+    #[cfg(unix)]
     /// A xorshift generator, so a corpus run reproduces from its seed.
     struct Rng(u64);
+    #[cfg(unix)]
     impl Rng {
         fn next(&mut self) -> u64 {
             let mut x = self.0;
@@ -3827,6 +3841,7 @@ mod tests {
             (self.next() % n as u64) as usize
         }
     }
+    #[cfg(unix)]
     /// The repository shapes the corpus draws records from.
     #[derive(Clone, Copy, Debug)]
     enum Corpus {
@@ -3835,6 +3850,7 @@ mod tests {
         Attributes,
         Gitlink,
     }
+    #[cfg(unix)]
     fn corpus_fixture(kind: Corpus) -> Fixture {
         use std::os::unix::ffi::OsStrExt;
         use std::os::unix::fs::PermissionsExt;
@@ -3876,6 +3892,7 @@ mod tests {
         f.tree = GitTree::load(&root, "HEAD").unwrap();
         f
     }
+    #[cfg(unix)]
     fn corpus_paths(f: &Fixture) -> Vec<String> {
         let mut paths = f.tree.below("");
         paths.extend(
@@ -3927,6 +3944,7 @@ mod tests {
         input.oid_basis = Some(clean_basis());
     }
     /// One input drawn from the categories the planner must handle. `exact` keeps it exact.
+    #[cfg(unix)]
     fn random_input(rng: &mut Rng, f: &Fixture, paths: &[String], exact: bool) -> Input {
         let path = paths[rng.below(paths.len())].clone();
         let mut input = exact_input(f, &path);
@@ -3979,6 +3997,7 @@ mod tests {
         input
     }
     /// Proofs for one record: one to three steps, with outputs and priors on some of them.
+    #[cfg(unix)]
     fn random_record(rng: &mut Rng, f: &Fixture, paths: &[String]) -> Vec<Proof> {
         let exact = rng.below(2) == 0;
         let mut proofs = Vec::new();
@@ -4083,6 +4102,7 @@ mod tests {
     /// with blob ids as with hashing, Check agrees with both, and the counters account for every
     /// content comparison once. The seed prints on failure, and `STOOP_EQUIV_CASES` raises the
     /// count. Half the records are exact, so the corpus reaches proved decisions too.
+    #[cfg(unix)]
     #[test]
     fn equivalence_corpus() {
         let cases: usize = std::env::var("STOOP_EQUIV_CASES")

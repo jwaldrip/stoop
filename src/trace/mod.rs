@@ -148,3 +148,26 @@ pub fn run(
         UNAVAILABLE,
     ))
 }
+
+#[cfg(all(
+    test,
+    not(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))
+))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_linux_proof_is_never_current_where_tracing_is_unavailable() {
+        let linux = Provenance {
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            tracer: TRACER.into(),
+            version: TRACER_VERSION,
+        };
+        assert!(!linux.is_current());
+        assert!(!Provenance::current().is_current());
+    }
+}

@@ -783,6 +783,7 @@ mod partial_tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn load_reads_a_blobless_clone() {
         let f = Fixture::new();

@@ -1,10 +1,9 @@
 //! Durable templates identify shell-erased hooks; they never confer a proof hit.
 
+use crate::sys::Private;
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -82,7 +81,7 @@ fn lock(store: &Path) -> io::Result<File> {
     match OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        .private()
         .open(store.join(".gitignore"))
     {
         Ok(mut file) => file.write_all(b"*\n")?,
@@ -94,11 +93,9 @@ fn lock(store: &Path) -> io::Result<File> {
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
+        .private()
         .open(store.join("hooks-v1.lock"))?;
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
+    file.lock()?;
     Ok(file)
 }
 
@@ -123,7 +120,7 @@ fn write_bytes(store: &Path, bytes: &[u8]) -> io::Result<()> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
-            .mode(0o600)
+            .private()
             .open(&temp)?;
         file.write_all(bytes)?;
         file.sync_all()?;
@@ -255,6 +252,7 @@ pub(crate) fn forget(store: &Path, key: &str) -> Result<bool, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
     fn store(name: &str) -> PathBuf {
@@ -276,6 +274,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_read_only_store_warns_that_the_full_command_runs() {
         let path = store("read-only");
