@@ -44,7 +44,7 @@ pub enum Inbound {
     Eof,
 }
 
-/// Read stdin one line at a time until it ends, then send `Eof`.
+/// Read stdin one line at a time until it ends, then send `Eof` once.
 pub fn read_lines<R: BufRead>(mut input: R, tx: Sender<Inbound>) {
     loop {
         match read_one(&mut input) {
@@ -108,6 +108,7 @@ pub enum Parsed {
     Request {
         id: Value,
         method: String,
+        /// Always a JSON object: anything else is refused before dispatch.
         params: Value,
     },
     Notification {
@@ -163,6 +164,9 @@ pub fn parse(line: &[u8]) -> Parsed {
     };
     match (method, id) {
         (Some(Value::String(method)), Some(id)) if valid_id(&id) => {
+            if !params.is_object() {
+                return invalid(id, INVALID_PARAMS, "params must be an object");
+            }
             Parsed::Request { id, method, params }
         }
         (Some(Value::String(_)), Some(_)) => invalid(
@@ -209,9 +213,9 @@ pub fn write_message<W: Write>(out: &mut W, message: &Value) -> io::Result<()> {
     out.flush()
 }
 
-/// Text content for a structured result. It is the same JSON, with the sequences that GitHub
-/// workflow commands act on written as JSON escapes, so the text cannot start one. The plan
-/// command's JSON output does the same.
+/// Text content for a structured result. The JSON is written so that the sequences GitHub
+/// workflow commands act on cannot appear: `##[` and `::` become JSON escapes, and bidirectional
+/// formatting characters become escapes too, as `plan::output::escape` does for plan's output.
 pub fn json_text(value: &Value) -> String {
     let json = serde_json::to_string(value).unwrap_or_else(|_| "null".into());
     let json = json
@@ -244,6 +248,7 @@ mod tests {
     fn json_text_never_contains_a_workflow_command_sequence() {
         let text = json_text(&json!({"a": "x\n::error::y##[add-mask]\u{202e}"}));
         assert!(!text.contains('\n') && !text.contains("::") && !text.contains("##["));
+        assert!(!text.contains('\u{202e}'));
         let back: Value = serde_json::from_str(&text).expect("still JSON");
         assert_eq!(back["a"], "x\n::error::y##[add-mask]\u{202e}");
     }

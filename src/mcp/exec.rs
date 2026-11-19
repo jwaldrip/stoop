@@ -1,18 +1,35 @@
-//! Run the stoop binary as a child: bounded output, a deadline, and cancellation.
+//! Run the stoop binary as a child: bounded output, a deadline, cancellation, and a watchdog.
 //!
-//! The child's stdin is closed (it must never read the protocol stream) and its output is
-//! captured, so none of it reaches stdout. The child leads its own process group, so a timeout
-//! or a cancellation takes its whole tree with it.
+//! Each child leads its own process group, so a timeout, a cancellation or a signal takes the
+//! whole tree with it. A watchdog shell holds a heartbeat pipe: when the server exits without
+//! finishing (SIGKILL included), the pipe closes and the watchdog kills the group. The decision
+//! of `stoop run` comes back on a pipe the wrapped command never holds (see `STATUS_FD`).
 
-use std::io::{self, Read};
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// How much of one output stream to keep, and which end of it.
+/// The descriptor `stoop run --status-fd` reports on. `stoop run` makes it close-on-exec before
+/// it starts the command, so the command never holds it and cannot write a decision.
+pub const STATUS_FD: RawFd = 3;
+
+/// The group of the child in flight, read by the signal handler. 0 when no child runs.
+static CHILD_GROUP: AtomicI32 = AtomicI32::new(0);
+
+/// The watchdog reads the group id from the heartbeat, then one more line. Only "done" leaves the
+/// group alone. Anything else, end of input included, means the server is gone.
+const WATCHDOG: &str = r#"read pgid; read line; if [ "$line" != done ]; then kill -KILL -- "-$pgid" 2>/dev/null; fi; exit 0"#;
+
+/// The most a decision report may hold.
+const REPORT_CAP: usize = 64 * 1024;
+
 pub struct Keep {
     pub cap: usize,
     /// Keep the last `cap` bytes (a run's output) rather than the first (a plan's JSON).
@@ -23,6 +40,10 @@ pub struct Limits {
     pub timeout: Duration,
     pub stdout: Keep,
     pub stderr: Keep,
+    /// Variables the child must not inherit: the sync settings, for the read-only tools.
+    pub drop_env: &'static [&'static str],
+    /// Whether `stoop run` reports its decision on `STATUS_FD`.
+    pub report: bool,
 }
 
 /// Bytes kept from one stream, and the true total they came from.
@@ -40,6 +61,8 @@ pub struct Finished {
     pub stderr: Stream,
     pub timed_out: bool,
     pub cancelled: bool,
+    /// The one-line decision `stoop run` reported, if it reported one.
+    pub report: Option<String>,
 }
 
 struct Tail {
@@ -99,12 +122,105 @@ fn spawn_reader<R: Read + Send + 'static>(mut source: R, sink: Arc<Mutex<Tail>>,
     });
 }
 
+fn set_flag(fd: RawFd, command: libc::c_int, value: libc::c_int) -> io::Result<()> {
+    // SAFETY: fcntl on a descriptor this process owns.
+    if unsafe { libc::fcntl(fd, command, value) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// A pipe whose two ends are close-on-exec, so no child started later inherits them.
+fn pipe() -> io::Result<(File, File)> {
+    let mut fds = [0 as RawFd; 2];
+    // SAFETY: pipe writes two new descriptors into the array it is given.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: both descriptors are new and owned by nothing else.
+    let read = unsafe { File::from_raw_fd(fds[0]) };
+    // SAFETY: as above.
+    let write = unsafe { File::from_raw_fd(fds[1]) };
+    set_flag(read.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC)?;
+    set_flag(write.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC)?;
+    Ok((read, write))
+}
+
+/// A shell that kills the group named on its first line, unless its heartbeat ends with "done".
+/// It keeps its own group, so that kill does not reach it.
+fn start_watchdog() -> io::Result<(Child, File)> {
+    let (read, write) = pipe()?;
+    let child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(WATCHDOG)
+        .arg("stoop-watchdog")
+        .stdin(Stdio::from(read))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()?;
+    Ok((child, write))
+}
+
+/// Runs in the child between fork and exec: the report pipe becomes `STATUS_FD` there.
+fn place_status_fd(fd: RawFd) -> io::Result<()> {
+    if fd == STATUS_FD {
+        return set_flag(fd, libc::F_SETFD, 0);
+    }
+    // SAFETY: dup2 is async-signal-safe and runs only in the child.
+    if unsafe { libc::dup2(fd, STATUS_FD) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The one line `stoop run` wrote, if it wrote one. Every writer has exited by now, so this
+/// reads what is there and never waits.
+fn read_report(mut file: File) -> Option<String> {
+    set_flag(file.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK).ok()?;
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while bytes.len() < REPORT_CAP {
+        match file.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&chunk[..n]),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    let text = String::from_utf8(bytes).ok()?;
+    text.lines().next().map(str::to_string)
+}
+
 /// SIGKILL the child's process group. Only called while the child is still unreaped, so its
 /// process group id cannot have been reused.
 fn kill_group(pid: i32) {
     // SAFETY: killpg only sends a signal; a failure (the group is already gone) is harmless.
     unsafe {
         libc::killpg(pid, libc::SIGKILL);
+    }
+}
+
+extern "C" fn stop_on_signal(signal: libc::c_int) {
+    let group = CHILD_GROUP.load(Ordering::SeqCst);
+    if group > 0 {
+        // SAFETY: killpg and _exit are async-signal-safe.
+        unsafe {
+            libc::killpg(group, libc::SIGKILL);
+        }
+    }
+    // SAFETY: as above.
+    unsafe { libc::_exit(128 + signal) }
+}
+
+/// SIGTERM, SIGINT and SIGHUP kill the child in flight and exit, so no run outlives the server.
+/// SIGKILL cannot be caught; the watchdog covers it.
+pub fn install_signal_handlers() {
+    for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+        // SAFETY: the handler makes only async-signal-safe calls.
+        unsafe {
+            libc::signal(signal, stop_on_signal as *const () as libc::sighandler_t);
+        }
     }
 }
 
@@ -116,6 +232,13 @@ pub fn run(
     limits: Limits,
     cancelled: &mut dyn FnMut() -> bool,
 ) -> io::Result<Finished> {
+    let (mut watchdog, mut heartbeat) = start_watchdog()?;
+    let (report_read, report_write) = if limits.report {
+        let (read, write) = pipe()?;
+        (Some(read), Some(write))
+    } else {
+        (None, None)
+    };
     let mut command = Command::new(exe);
     command
         .args(args)
@@ -124,8 +247,31 @@ pub fn run(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
-    let mut child = command.spawn()?;
+    for name in limits.drop_env {
+        command.env_remove(name);
+    }
+    if let Some(write) = &report_write {
+        let fd = write.as_raw_fd();
+        // SAFETY: runs in the child after fork and before exec, with only async-signal-safe calls.
+        unsafe {
+            command.pre_exec(move || place_status_fd(fd));
+        }
+    }
+    let spawned = command.spawn();
+    drop(report_write);
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(error) => {
+            let _ = heartbeat.write_all(b"done\n");
+            let _ = watchdog.wait();
+            return Err(error);
+        }
+    };
     let pid = child.id() as i32;
+    // The watchdog learns the group now. Its heartbeat must end with "done" on a normal finish.
+    let _ = writeln!(heartbeat, "{pid}");
+    CHILD_GROUP.store(pid, Ordering::SeqCst);
+
     let out = Arc::new(Mutex::new(Tail::new(limits.stdout)));
     let err = Arc::new(Mutex::new(Tail::new(limits.stderr)));
     let (done_tx, done_rx) = channel();
@@ -159,6 +305,13 @@ pub fn run(
         }
         std::thread::sleep(Duration::from_millis(10));
     };
+    CHILD_GROUP.store(0, Ordering::SeqCst);
+    let report = report_read.and_then(read_report);
+    // A normal finish leaves the group alone: a background process the command started may
+    // outlive it. A timeout or cancellation already killed the group above.
+    let _ = heartbeat.write_all(b"done\n");
+    let _ = watchdog.wait();
+
     // A grandchild may hold a pipe open. Wait briefly for the readers, then take what is there.
     let deadline = Instant::now() + Duration::from_millis(500);
     for _ in 0..2 {
@@ -176,5 +329,6 @@ pub fn run(
         stderr,
         timed_out,
         cancelled: was_cancelled,
+        report,
     })
 }

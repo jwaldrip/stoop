@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::temp_dir;
+use common::repo;
 use std::path::Path;
 use std::process::Command;
 
@@ -20,7 +20,8 @@ fn an_independent_client_passes_its_checks() {
         return;
     }
     let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/mcp_client.py");
-    let dir = temp_dir("interop");
+    // The server refuses to start outside a repository without --root, so the client runs in one.
+    let dir = repo("interop", &[("in.txt", "one\n")]);
     let out = Command::new("python3")
         .arg(&script)
         .arg(env!("CARGO_BIN_EXE_stoop"))

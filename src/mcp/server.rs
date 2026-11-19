@@ -1,5 +1,6 @@
-//! The server: one request at a time, while stdin is still read, so a ping or a cancellation
-//! is seen during a long tool call.
+//! The server: one request at a time, while stdin is still read, so a ping or a cancellation is
+//! seen during a long tool call. End of input cancels the call in flight, drops what is queued,
+//! and ends the session. SIGTERM, SIGINT and SIGHUP stop the child in flight and exit.
 //!
 //! Two eras are served. The newest revision (2026-07-28) is stateless: each request names its
 //! protocol version and capabilities in `_meta`, and its results carry `resultType`. The legacy
@@ -7,6 +8,7 @@
 //! no `resultType`. Both are answered by the same code.
 
 use super::content;
+use super::exec;
 use super::tools::{self, Outcome};
 use super::wire::{self, Inbound, Parsed, RpcError, INVALID_PARAMS, METHOD_NOT_FOUND};
 use crate::plan;
@@ -24,6 +26,7 @@ pub const SUPPORTED: [&str; 3] = [MODERN, "2025-11-25", "2025-06-18"];
 const LEGACY: [&str; 2] = ["2025-11-25", "2025-06-18"];
 const VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 const CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+const SERVER_INFO_KEY: &str = "io.modelcontextprotocol/serverInfo";
 const INSTRUCTIONS: &str = "stoop skips a command whose recorded inputs have not changed. Read the guide first (the guide tool or stoop://guide). Use explain before run: it reports what would run and never executes anything.";
 const METHODS: [&str; 9] = [
     "initialize",
@@ -54,6 +57,8 @@ pub struct Io<W: Write> {
     out: W,
     inbox: Receiver<Inbound>,
     deferred: VecDeque<Inbound>,
+    /// Set once stdin has ended. The call in flight is cancelled and nothing else is answered.
+    closed: bool,
     /// The first write failure. The server stops when it sees one.
     failed: Option<io::Error>,
 }
@@ -63,53 +68,65 @@ impl<W: Write> Io<W> {
         wire::write_message(&mut self.out, message)
     }
 
-    /// The next message to handle, from the held-back queue first, else stdin. `None` at the end.
+    /// The next message to handle: held-back requests first, then stdin. `None` once it has ended.
     fn next(&mut self) -> Option<Inbound> {
-        self.deferred.pop_front().or_else(|| self.inbox.recv().ok())
+        if self.closed {
+            return None;
+        }
+        if let Some(item) = self.deferred.pop_front() {
+            return Some(item);
+        }
+        match self.inbox.recv() {
+            Ok(Inbound::Eof) | Err(_) => {
+                self.closed = true;
+                None
+            }
+            Ok(item) => Some(item),
+        }
     }
 
-    /// Called while a tool call runs. Answers pings now, drops queued requests that were
-    /// cancelled, holds everything else back. Returns true when `call` itself was cancelled,
-    /// or when a write failed (the work stops, and `run` reports the failure).
+    /// Called while a tool call runs. Answers pings, drops queued requests that were cancelled, and
+    /// holds everything else back. Returns true when the call must stop: it was cancelled, stdin
+    /// ended, or a write failed.
     pub fn poll_cancelled(&mut self, call: &Value) -> bool {
-        let mut cancelled = self.failed.is_some();
+        if self.closed || self.failed.is_some() {
+            return true;
+        }
         loop {
-            let item = match self.inbox.try_recv() {
-                Ok(item) => item,
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    self.deferred.push_back(Inbound::Eof);
-                    break;
+            let bytes = match self.inbox.try_recv() {
+                Ok(Inbound::Eof) | Err(TryRecvError::Disconnected) => {
+                    self.closed = true;
+                    return true;
                 }
-            };
-            let parsed = match &item {
-                Inbound::Line(bytes) => wire::parse(bytes),
-                _ => {
-                    self.deferred.push_back(item);
+                Ok(Inbound::Line(bytes)) => bytes,
+                Ok(other) => {
+                    self.deferred.push_back(other);
                     continue;
                 }
+                Err(TryRecvError::Empty) => return false,
             };
-            match parsed {
+            match wire::parse(&bytes) {
                 Parsed::Request { id, method, params } if method == "ping" => {
                     let answer = wire::result_response(id, shape(era_hint(&params), json!({})));
-                    if let Err(e) = self.send(&answer) {
-                        self.failed = Some(e);
-                        cancelled = true;
+                    if let Err(error) = self.send(&answer) {
+                        self.failed = Some(error);
+                        return true;
                     }
                 }
                 Parsed::Notification { method, params } if method == "notifications/cancelled" => {
                     match params.get("requestId") {
-                        Some(target) if target == call => cancelled = true,
-                        Some(target) => self
-                            .deferred
-                            .retain(|queued| !is_request_with_id(queued, target)),
+                        Some(target) if target == call => return true,
+                        Some(target) => {
+                            let target = target.clone();
+                            self.deferred
+                                .retain(|queued| !is_request_with_id(queued, &target));
+                        }
                         None => {}
                     }
                 }
-                _ => self.deferred.push_back(item),
+                _ => self.deferred.push_back(Inbound::Line(bytes)),
             }
         }
-        cancelled
     }
 }
 
@@ -135,6 +152,7 @@ where
     R: Read + Send + 'static,
     W: Write,
 {
+    exec::install_signal_handlers();
     let (tx, rx) = channel();
     std::thread::spawn(move || wire::read_lines(BufReader::new(input), tx));
     let mut server = Server {
@@ -143,6 +161,7 @@ where
             out: output,
             inbox: rx,
             deferred: VecDeque::new(),
+            closed: false,
             failed: None,
         },
         negotiated: None,
@@ -203,7 +222,7 @@ impl<W: Write> Server<W> {
         }
     }
 
-    /// Answer one request. `None` means no reply: the call was cancelled.
+    /// Answer one request. `None` means no reply: the call was cancelled or stdin ended.
     fn request(&mut self, id: &Value, method: &str, params: &Value) -> io::Result<Option<Value>> {
         if !METHODS.contains(&method) {
             return Ok(Some(fail(
@@ -346,7 +365,7 @@ fn negotiate(params: &Value, bare_ok: bool, initialized: bool) -> Result<Era, Rp
     }
 }
 
-/// The era a bare ping's `_meta` names, for shaping its answer. Nothing is refused here.
+/// The era a ping's `_meta` names, for shaping its answer. Nothing is refused here.
 fn era_hint(params: &Value) -> Era {
     match params
         .get("_meta")
@@ -366,7 +385,7 @@ fn discover() -> Value {
     json!({
         "supportedVersions": SUPPORTED,
         "capabilities": {"tools": {}, "resources": {}, "prompts": {}},
-        "_meta": {"io.modelcontextprotocol/serverInfo": server_info()},
+        "_meta": {SERVER_INFO_KEY: server_info()},
         "instructions": INSTRUCTIONS
     })
 }
@@ -377,7 +396,7 @@ fn shape(era: Era, mut body: Value) -> Value {
         if let Some(map) = body.as_object_mut() {
             map.entry("resultType").or_insert(json!("complete"));
             map.entry("_meta")
-                .or_insert_with(|| json!({"io.modelcontextprotocol/serverInfo": server_info()}));
+                .or_insert_with(|| json!({SERVER_INFO_KEY: server_info()}));
         }
     }
     body
@@ -421,9 +440,6 @@ mod tests {
         );
         let modern = shape(Era::Modern, json!({"a": 1}));
         assert_eq!(modern["resultType"], "complete");
-        assert_eq!(
-            modern["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
-            "stoop"
-        );
+        assert_eq!(modern["_meta"][SERVER_INFO_KEY]["name"], "stoop");
     }
 }

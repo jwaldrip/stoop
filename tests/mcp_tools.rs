@@ -370,9 +370,9 @@ fn every_tool_declares_its_annotations_explicitly_and_truthfully() {
     let r = m.call(json!(1), "tools/list", modern(json!({})));
     // name: readOnly, destructive, idempotent, openWorld
     let expected = [
-        ("explain", true, false, true, true),
+        ("explain", true, false, true, false),
         ("list_proofs", true, false, true, false),
-        ("plan", true, false, true, true),
+        ("plan", true, false, true, false),
         ("forget", false, true, true, false),
         ("guide", true, false, true, false),
         ("run", false, true, false, true),

@@ -1,5 +1,5 @@
-//! Helpers for the MCP tests: drive the real `stoop mcp` over stdio, and build throwaway
-//! repositories. Each test file includes this module with `mod common;`.
+//! Helpers for the MCP tests: drive the real `stoop mcp` over stdio, build throwaway
+//! repositories, and inspect processes. Each test file includes this module with `mod common;`.
 #![allow(dead_code)]
 
 use serde_json::{json, Value};
@@ -60,6 +60,18 @@ pub fn git(dir: &Path, args: &[&str]) {
         .status()
         .expect("git runs");
     assert!(status.success(), "git {args:?} failed in {}", dir.display());
+}
+
+/// The standard output of a git command in `dir`.
+pub fn git_output(dir: &Path, args: &[&str]) -> String {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .expect("git runs");
+    assert!(out.status.success(), "git {args:?} failed");
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 /// A git repository whose first commit holds `files` (relative path, body).
@@ -129,6 +141,71 @@ pub fn text_of(tool_result: &Value) -> String {
         .to_string()
 }
 
+/// Whether `dir` or one of its ancestors is a repository.
+pub fn has_git_ancestor(dir: &Path) -> bool {
+    dir.ancestors().any(|d| d.join(".git").exists())
+}
+
+/// The state letters `ps` reports for a process, or None when it does not exist.
+pub fn process_state(pid: u32) -> Option<String> {
+    let out = Command::new("ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if state.is_empty() {
+        None
+    } else {
+        Some(state)
+    }
+}
+
+/// True once a process is gone or a zombie: nothing runs for it any more.
+pub fn process_gone(pid: u32) -> bool {
+    match process_state(pid) {
+        None => true,
+        Some(state) => state.starts_with('Z'),
+    }
+}
+
+/// Wait up to `within` for a process to stop running. Returns whether it did.
+pub fn wait_gone(pid: u32, within: Duration) -> bool {
+    let deadline = Instant::now() + within;
+    loop {
+        if process_gone(pid) {
+            return true;
+        }
+        if Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Wait up to `within` for a file to appear, and return its text.
+pub fn wait_for_file(path: &Path, within: Duration) -> Option<String> {
+    let deadline = Instant::now() + within;
+    loop {
+        if let Ok(text) = fs::read_to_string(path) {
+            if !text.trim().is_empty() {
+                return Some(text);
+            }
+        }
+        if Instant::now() > deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Send a signal to a process.
+pub fn signal(pid: u32, sig: i32) {
+    // SAFETY: kill only sends a signal to a process the test started.
+    unsafe {
+        libc::kill(pid as i32, sig);
+    }
+}
+
 /// A running `stoop mcp` with its stdio attached.
 pub struct Mcp {
     child: Child,
@@ -141,16 +218,41 @@ pub struct Mcp {
 }
 
 impl Mcp {
-    /// Start `stoop mcp <args>` with `dir` as its working directory.
+    /// Start `stoop mcp <args>` in `dir`. When `dir` has no repository above it and no `--root`
+    /// is given, `--root dir` is added, so a plain temp folder can still be used.
     pub fn spawn(args: &[&str], dir: &Path) -> Mcp {
+        Self::spawn_env(args, dir, &[])
+    }
+
+    /// As `spawn`, with extra environment variables for the server.
+    pub fn spawn_env(args: &[&str], dir: &Path, env: &[(&str, &str)]) -> Mcp {
+        let mut all: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        if !all.iter().any(|a| a == "--root") && !has_git_ancestor(dir) {
+            all.push("--root".into());
+            all.push(dir.display().to_string());
+        }
+        Self::start(&all, dir, env)
+    }
+
+    /// Start with exactly `args`: the server's own rules apply, including refusing to start
+    /// outside a repository without `--root`.
+    pub fn spawn_raw(args: &[&str], dir: &Path) -> Mcp {
+        let all: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        Self::start(&all, dir, &[])
+    }
+
+    fn start(all: &[String], dir: &Path, env: &[(&str, &str)]) -> Mcp {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_stoop"));
         cmd.arg("mcp")
-            .args(args)
+            .args(all)
             .current_dir(dir)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         clear_env(&mut cmd);
+        for (name, value) in env {
+            cmd.env(name, value);
+        }
         let mut child = cmd.spawn().expect("stoop mcp starts");
         let stdout = child.stdout.take().unwrap();
         let (tx, lines) = channel();
@@ -179,6 +281,10 @@ impl Mcp {
             seen: Vec::new(),
             queued: VecDeque::new(),
         }
+    }
+
+    pub fn pid(&self) -> u32 {
+        self.child.id()
     }
 
     pub fn stderr(&self) -> String {

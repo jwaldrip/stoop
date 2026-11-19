@@ -52,6 +52,8 @@ pub struct Opts {
     /// Explicitly passed OIDC request variables; such a run is never recorded.
     pub pass_env: Vec<&'static str>,
     pub allow_id_token: bool,
+    /// The descriptor `stoop run` reports its decision on, set only by the MCP server.
+    pub status_fd: Option<i32>,
 }
 
 pub const ID_TOKEN_VARS: [&str; 2] = [
@@ -451,6 +453,16 @@ pub fn run(o: Opts, explain: bool) -> i32 {
 
 pub fn run_outcome(o: Opts, explain: bool) -> Outcome {
     run_internal(o, explain, false)
+}
+
+/// `stoop run` as the MCP server starts it: the same decision as `run`, with the outcome returned.
+pub fn run_observed(o: Opts) -> Outcome {
+    run_internal(o, false, true)
+}
+
+/// The error that stops a placeholder argv before anything runs, if there is one.
+pub fn hook_refusal(argv: &[String]) -> Option<String> {
+    units::hook::prepare(argv).err()
 }
 
 /// The variables that carry a placeholder's value (spec section 4.7). Stoop owns them for each run.

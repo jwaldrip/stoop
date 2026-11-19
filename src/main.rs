@@ -239,7 +239,10 @@ fn real_main(mut args: Vec<String>) -> i32 {
         }
         c => {
             o.argv = rest;
-            run::run(o, c == "explain")
+            match o.status_fd.take() {
+                Some(fd) if c == "run" => report_run(o, fd),
+                _ => run::run(o, c == "explain"),
+            }
         }
     }
 }
@@ -302,6 +305,13 @@ fn parse(args: &[String]) -> Result<(Opts, Vec<String>), String> {
             "--sync" => o.sync = Some(val("--sync")?),
             "--sync-write" => o.sync_write = true,
             "--quiet" => o.quiet = true,
+            "--status-fd" => {
+                o.status_fd = Some(
+                    val("--status-fd")?
+                        .parse()
+                        .map_err(|_| "--status-fd needs a descriptor number".to_string())?,
+                )
+            }
             _ => return Err(format!("unknown option {a}")),
         }
         i += 1;
@@ -410,4 +420,50 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
         }
     }
     outcome.status
+}
+
+/// Keeps the MCP server's status descriptor from every child: close-on-exec, set before any
+/// child exists in this process.
+fn take_status_fd(fd: i32) {
+    // SAFETY: fcntl on a descriptor the MCP server gave this process.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+}
+
+/// `stoop run` for the MCP server. The decision goes to the status descriptor as one JSON line.
+/// The command's stdout and stderr stay its own, and nothing parses them for a decision.
+fn report_run(o: Opts, fd: i32) -> i32 {
+    take_status_fd(fd);
+    if let Some(error) = run::hook_refusal(&o.argv) {
+        eprintln!("stoop: {error}");
+        emit_decision(
+            fd,
+            serde_json::json!({"decision": "refused", "how": "refused", "key": null, "traced": null, "exit": 2}),
+        );
+        return 2;
+    }
+    let outcome = run::run_observed(o);
+    let (decision, how, traced) = match &outcome.how {
+        run::How::Skipped { .. } => ("skipped", "skipped", true),
+        run::How::Recorded { .. } => ("ran", "recorded", true),
+        run::How::Unrecorded(_) => ("ran", "unrecorded", true),
+        run::How::Failed => ("ran", "failed", true),
+        run::How::Untraced => ("ran", "untraced", false),
+    };
+    emit_decision(
+        fd,
+        serde_json::json!({"decision": decision, "how": how, "key": outcome.key, "traced": traced, "exit": outcome.status}),
+    );
+    outcome.status
+}
+
+/// Writes the decision line and closes the descriptor, which ends the server's read.
+fn emit_decision(fd: i32, value: serde_json::Value) {
+    use std::io::Write;
+    use std::os::unix::io::FromRawFd;
+    // SAFETY: the MCP server handed this descriptor over for the decision alone. The file takes
+    // ownership and closes it.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let _ = writeln!(file, "{value}");
 }

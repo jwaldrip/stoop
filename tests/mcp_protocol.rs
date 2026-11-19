@@ -567,7 +567,7 @@ fn tool_arguments_that_violate_the_schema_are_tool_errors_not_protocol_errors() 
     let extra = m.call(
         json!(2),
         "tools/call",
-        modern(tool_call("guide", json!({"topik": "run"}))),
+        modern(tool_call("guide", json!({"topic": 5}))),
     );
     assert_eq!(result(&extra)["isError"], true, "{extra}");
     m.finish();

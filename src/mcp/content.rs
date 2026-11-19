@@ -105,7 +105,7 @@ pub fn select(topic: Option<&str>) -> Result<Vec<Section>, String> {
         let ids: Vec<String> = sections().into_iter().map(|s| s.id).collect();
         return Err(format!(
             "no guide section named {}; the sections are: {}",
-            plan::output::escape(topic),
+            topic,
             ids.join(", ")
         ));
     }
