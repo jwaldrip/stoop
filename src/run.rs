@@ -1822,7 +1822,7 @@ mod tests {
             .unwrap();
         assert!(input.oid.is_none());
         assert_eq!(
-            input.oid_basis.as_ref().map(|basis| basis.eol.as_str()),
+            input.oid_basis.as_ref().map(|basis| &*basis.eol),
             Some("crlf")
         );
         let converted = input.oid_basis.clone().unwrap();

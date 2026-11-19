@@ -1144,7 +1144,6 @@ fn changes_to_git_sources_drop_every_blob_id_in_the_run() {
         ("home-symlink-to-config", &[("H:.gitconfig", Some("[user]\n"))], "ln -s \"$HOME/.gitconfig\" \"$HOME/alias\""),
         ("write-through-new-symlink", &[("X:git/config", Some("[user]\n"))], "ln -s \"$XDG_CONFIG_HOME/git/config\" \"$HOME/alias\" && printf 'x = 1\\n' >> \"$HOME/alias\""),
         ("hard-link-to-config", &[("H:.gitconfig", Some("[user]\n"))], "ln \"$HOME/.gitconfig\" \"$HOME/alias\" && printf 'x = 1\\n' >> \"$HOME/alias\""),
-        ("symlink-to-git-info", &[("H:", None)], "ln -s \"$PWD/.git/info\" \"$HOME/link\" && printf '# x\\n' >> \"$HOME/link/attributes\""),
         ("repo-info-attributes-created", &[], "printf '# x\\n' > .git/info/attributes"),
         ("repo-info-attributes-renamed", &[("R:.git/info/attributes", Some("# x\n"))], "./syscall-probe rename .git/info/attributes .git/info/attributes.old"),
         ("repo-config-appended", &[], "printf '\\n[x]\\n' >> .git/config"),
@@ -1164,6 +1163,20 @@ fn changes_to_git_sources_drop_every_blob_id_in_the_run() {
         assert_eq!(oid, control_oid, "{name}");
         assert_blob_oid(&control, "inputs", "in.txt", &control_oid);
     }
+}
+
+/// A symbolic link made into the git directory is a read of `.git` through another name. The run
+/// is refused as not recorded, so no proof can skip it and no blob id is claimed.
+#[test]
+fn a_symlink_into_git_is_not_recorded() {
+    let (w, _oid) = committed_input("oid-symlink-into-git");
+    seed(&w, &[]);
+    let (code, err) = w.sh(
+        "cat in.txt >/dev/null && ln -s \"$PWD/.git/info\" \"$HOME/link\" && printf '# x\\n' >> \"$HOME/link/attributes\"",
+    );
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("not recorded: it reads .git"), "{err}");
+    w.clean();
 }
 
 /// A descriptor the run inherits, open for writing on a watched file, drops every blob id in the

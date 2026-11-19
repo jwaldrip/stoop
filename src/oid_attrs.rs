@@ -1,5 +1,6 @@
 //! Evidence that hashing raw working-tree bytes is safe for Git object IDs.
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
@@ -8,14 +9,14 @@ use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OidBasis {
-    pub text: String,
-    pub eol: String,
-    pub filter: String,
-    pub ident: String,
-    pub working_tree_encoding: String,
-    pub export_subst: String,
-    pub crlf: String,
-    pub autocrlf: String,
+    pub text: Cow<'static, str>,
+    pub eol: Cow<'static, str>,
+    pub filter: Cow<'static, str>,
+    pub ident: Cow<'static, str>,
+    pub working_tree_encoding: Cow<'static, str>,
+    pub export_subst: Cow<'static, str>,
+    pub crlf: Cow<'static, str>,
+    pub autocrlf: Cow<'static, str>,
 }
 
 impl OidBasis {
@@ -31,7 +32,7 @@ impl OidBasis {
             &self.crlf,
         ]
         .iter()
-        .all(|value| value.as_str() == "unspecified")
+        .all(|value| value.as_ref() == "unspecified")
             && (self.autocrlf == "unset"
                 || self.autocrlf.eq_ignore_ascii_case("false")
                 || self.autocrlf.eq_ignore_ascii_case("no")
@@ -187,11 +188,13 @@ fn repo_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
 // Git's human-readable states collide with literal attribute values. --all
 // reports only present attributes, so escape these spellings and the escape
 // prefix. No caller can confuse a present value with an absent attribute.
-fn present_value(value: &str) -> String {
-    if matches!(value, "set" | "unset" | "unspecified") || value.starts_with("present:") {
-        format!("present:{value}")
-    } else {
-        value.to_owned()
+fn present_value(value: &str) -> Cow<'static, str> {
+    match value {
+        "set" => Cow::Borrowed("present:set"),
+        "unset" => Cow::Borrowed("present:unset"),
+        "unspecified" => Cow::Borrowed("present:unspecified"),
+        _ if value.starts_with("present:") => Cow::Owned(format!("present:{value}")),
+        _ => Cow::Owned(value.to_owned()),
     }
 }
 
@@ -244,7 +247,7 @@ fn config(root: &Path) -> Option<String> {
         }
         if key == "core.autocrlf" {
             let value = std::str::from_utf8(value).ok()?;
-            autocrlf = present_value(value);
+            autocrlf = present_value(value).into_owned();
         }
     }
     Some(autocrlf)
@@ -387,7 +390,11 @@ fn empty_basis(autocrlf: &str) -> OidBasis {
         working_tree_encoding: "unspecified".into(),
         export_subst: "unspecified".into(),
         crlf: "unspecified".into(),
-        autocrlf: autocrlf.to_owned(),
+        autocrlf: if autocrlf == "unset" {
+            Cow::Borrowed("unset")
+        } else {
+            Cow::Owned(autocrlf.to_owned())
+        },
     }
 }
 
