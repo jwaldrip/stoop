@@ -582,3 +582,18 @@ mod forget_name_tests {
         assert_eq!(proof_name(OsStr::from_bytes(b"\xff")), None);
     }
 }
+
+#[cfg(test)]
+mod help_tests {
+    use super::HELP;
+
+    #[test]
+    fn the_help_says_a_providers_names_are_ignored_only_where_its_marker_is_set() {
+        let text = HELP.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            text.contains("a provider's names are ignored only where its marker variable is set."),
+            "{text}"
+        );
+        assert!(!text.contains("count only where"), "{text}");
+    }
+}

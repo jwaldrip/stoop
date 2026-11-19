@@ -47,9 +47,11 @@ impl Ws {
             .env_remove("STOOP_SYNC_WRITE")
             .env_remove("STOOP_ENV_SALT")
             .env_remove("CI_COMMIT_SHA")
+            .env_remove("CI_JOB_ID")
             .env_remove("NODE_ENV")
             .env_remove("SESSION_MARK_LEARN")
             .env_remove("JENKINS_URL")
+            .env_remove("JENKINS_HOME")
             .env_remove("TEAMCITY_VERSION")
             .env_remove("TF_BUILD")
             .env_remove("STY")
@@ -391,4 +393,64 @@ fn build_number_is_excluded_under_jenkins() {
         ("JENKINS_URL", "https://ci.example/"),
     ]);
     assert!(skipped(&second), "{second}");
+}
+
+#[test]
+fn a_curated_name_that_appears_between_runs_stops_the_skip_until_it_is_recorded() {
+    let w = Ws::new("curated-appears");
+    w.run(&[]);
+    let appears = w.run(&[("CI_JOB_ID", "1001")]);
+    assert!(!skipped(&appears), "{appears}");
+    let recorded = w.run(&[("CI_JOB_ID", "1002")]);
+    assert!(skipped(&recorded), "{recorded}");
+}
+
+#[test]
+fn a_curated_name_that_disappears_between_runs_stops_the_skip_until_it_is_recorded() {
+    let w = Ws::new("curated-disappears");
+    w.run(&[("CI_JOB_ID", "1001")]);
+    let gone = w.run(&[]);
+    assert!(!skipped(&gone), "{gone}");
+    let recorded = w.run(&[]);
+    assert!(skipped(&recorded), "{recorded}");
+}
+
+#[test]
+fn build_number_is_excluded_under_jenkins_home_without_a_root_url() {
+    let w = Ws::new("build-number-jenkins-home");
+    w.run(&[
+        ("BUILD_NUMBER", "101"),
+        ("JENKINS_HOME", "/var/lib/jenkins"),
+    ]);
+    let second = w.run(&[
+        ("BUILD_NUMBER", "102"),
+        ("JENKINS_HOME", "/var/lib/jenkins"),
+    ]);
+    assert!(skipped(&second), "{second}");
+}
+
+#[test]
+fn a_learned_name_that_holds_a_plain_value_is_learned_again_after_four_fresh_values() {
+    let w = Ws::new("relearn-after-plain");
+    for i in 0..4 {
+        w.run(&[("SESSION_MARK_LEARN", &opaque(i))]);
+    }
+    let plain = w.run(&[("SESSION_MARK_LEARN", "production")]);
+    assert!(
+        plain.contains("counting env SESSION_MARK_LEARN again"),
+        "{plain}"
+    );
+    for i in 4..7 {
+        let stderr = w.run(&[("SESSION_MARK_LEARN", &opaque(i))]);
+        assert!(
+            !stderr.contains("ignoring env SESSION_MARK_LEARN"),
+            "run {}: {stderr}",
+            i + 1
+        );
+    }
+    let learned = w.run(&[("SESSION_MARK_LEARN", &opaque(7))]);
+    assert!(
+        learned.contains("ignoring env SESSION_MARK_LEARN"),
+        "{learned}"
+    );
 }

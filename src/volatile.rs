@@ -2359,4 +2359,95 @@ mod review_tests {
             out.plan
         );
     }
+
+    #[test]
+    fn jenkins_home_marks_a_jenkins_build_without_a_root_url() {
+        let home = BTreeSet::from(["JENKINS_HOME".to_string()]);
+        assert!(curated_reason("BUILD_NUMBER", &home).is_some());
+        assert!(curated_reason("GIT_COMMIT", &home).is_some());
+        assert!(curated_reason("EXECUTOR_NUMBER", &home).is_some());
+        assert!(all_markers().contains("JENKINS_HOME"));
+    }
+
+    #[test]
+    fn release_digests_are_never_learned() {
+        for name in [
+            "RELEASE_SHA1",
+            "RELEASE_SHA256",
+            "RELEASE_SHA512",
+            "RELEASE_HASH",
+            "RELEASE_CHECKSUM",
+        ] {
+            assert!(never_learn(name), "{name} must not be learned");
+        }
+    }
+
+    #[test]
+    fn a_release_digest_is_never_excluded_however_often_it_changes() {
+        let s = dir("release-digest");
+        let name = "VOLATILE_RED_RELEASE_SHA256";
+        for value in [
+            "3f9a2c1d", "7b20e4a8", "c5d61f09", "0a8e77b2", "9b1d4e7a", "2c8f0a6d",
+        ] {
+            let out = observe(&s, name, Some(value));
+            assert!(out.plan.excluded.is_empty(), "{:?}", out.plan);
+        }
+        std::env::remove_var(name);
+    }
+
+    #[test]
+    fn every_curated_name_that_is_never_learned_stays_curated() {
+        let mut checked = 0;
+        for group in GROUPS {
+            for name in group.names {
+                if never_learn(name) {
+                    checked += 1;
+                    assert!(
+                        curated_reason(name, &all_markers()).is_some(),
+                        "{name} must stay curated"
+                    );
+                }
+            }
+        }
+        assert!(
+            checked >= 18,
+            "only {checked} curated names are never learned"
+        );
+        assert!(curated_reason("CIRCLE_SHA1", &all_markers()).is_some());
+    }
+
+    #[test]
+    fn a_learned_name_that_holds_a_plain_value_is_learned_again_after_four_fresh_values() {
+        let s = dir("relearn-after-plain");
+        let name = "VOLATILE_RED_RELEARN";
+        for value in V {
+            observe(&s, name, Some(value));
+        }
+        let plain = observe(&s, name, Some("production"));
+        assert!(
+            plain.plan.counted.contains(&name.to_string()),
+            "{:?}",
+            plain.plan
+        );
+        assert!(
+            plain
+                .changes
+                .iter()
+                .any(|line| line.starts_with("counting env VOLATILE_RED_RELEARN again")),
+            "{:?}",
+            plain.changes
+        );
+        let fresh = ["9b1d4e7a", "2c8f0a6d", "e4a13b95", "71d0c2f8"];
+        for &value in &fresh[..3] {
+            let out = observe(&s, name, Some(value));
+            assert!(out.plan.excluded.is_empty(), "{:?}", out.plan);
+        }
+        let learned = observe(&s, name, Some(fresh[3]));
+        assert!(
+            learned.plan.excluded.iter().any(|(key, _)| key == name),
+            "{:?}",
+            learned.plan
+        );
+        std::env::remove_var(name);
+    }
 }
