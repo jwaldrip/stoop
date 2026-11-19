@@ -86,6 +86,14 @@ impl Ws {
         ]);
     }
 
+    /// Makes paths tracked without hashing their content, so no clean filter runs. Untracked
+    /// inputs carry no blob id, so a test that expects one tracks its inputs first.
+    fn track(&self, paths: &[&str]) {
+        let mut args = vec!["add", "--intent-to-add", "--"];
+        args.extend_from_slice(paths);
+        self.git(&args);
+    }
+
     fn clean(&self) {
         fs::remove_dir_all(&self.root).unwrap();
         fs::remove_dir_all(self.store()).unwrap();
@@ -793,6 +801,12 @@ fn git_conversion_attributes_omit_input_and_prior_oids_without_running_filters()
     symlink("input-plain", w.root.join("alias-to-plain")).unwrap();
     attributes.push_str("input-plain !text\nprior-plain !text\nalias-to-plain filter=poison\n");
     w.write(".gitattributes", &attributes);
+    let tracked: Vec<String> = cases
+        .iter()
+        .flat_map(|(name, _, _)| [format!("input-{name}"), format!("prior-{name}")])
+        .chain(["input-plain".to_owned(), "prior-plain".to_owned()])
+        .collect();
+    w.track(&tracked.iter().map(String::as_str).collect::<Vec<_>>());
     script.push_str(
         "cat input-plain alias-to-text alias-to-plain >/dev/null; printf 'new\\n' > prior-plain",
     );
@@ -888,11 +902,12 @@ fn core_autocrlf_only_allows_unset_or_false_for_inputs_and_priors() {
     ] {
         let w = Ws::new(&format!("oid-autocrlf-{name}"));
         w.init_git();
+        w.write("input.txt", "one\r\ntwo\r\n");
+        w.write("prior.txt", "one\r\ntwo\r\n");
+        w.track(&["input.txt", "prior.txt"]);
         if let Some(setting) = setting {
             w.git(&["config", "--local", "core.autocrlf", setting]);
         }
-        w.write("input.txt", "one\r\ntwo\r\n");
-        w.write("prior.txt", "one\r\ntwo\r\n");
         let p = recorded(&w, "cat input.txt >/dev/null; printf 'new\\n' > prior.txt");
         let id = format!("f:{}", hash(b"one\r\ntwo\r\n"));
         for (field, path) in [("inputs", "input.txt"), ("priors", "prior.txt")] {
@@ -929,6 +944,7 @@ fn symlink_targets_use_physical_path_attributes() {
             ));
             w.init_git();
             w.write("real/content.txt", "one\r\ntwo\r\n");
+            w.track(&["real/content.txt"]);
             if kind == "file" {
                 symlink("real/content.txt", w.root.join("alias.txt")).unwrap();
             } else {
@@ -1121,7 +1137,7 @@ fn changes_to_git_sources_drop_every_blob_id_in_the_run() {
         ("xdg-config-append", &[("X:git/config", Some("[user]\n"))], "printf 'x = 1\\n' >> \"$XDG_CONFIG_HOME/git/config\""),
         ("xdg-attributes-create", &[("X:git", None)], "printf '* -text\\n' > \"$XDG_CONFIG_HOME/git/attributes\""),
         ("xdg-directory-replaced", &[("X:git/config", Some("[user]\n"))], "mv \"$XDG_CONFIG_HOME/git\" \"$XDG_CONFIG_HOME/git-old\" && mkdir \"$XDG_CONFIG_HOME/git\" && printf '[x]\\n' > \"$XDG_CONFIG_HOME/git/config\""),
-        ("xdg-directory-symlinked", &[("X:git/config", Some("[user]\n"))], "mv \"$XDG_CONFIG_HOME/git\" \"$HOME/moved\" && ln -s \"$HOME/moved\" \"$XDG_CONFIG_HOME/git\""),
+        ("xdg-directory-symlinked", &[("X:git/config", Some("[user]\n")), ("H:", None)], "mv \"$XDG_CONFIG_HOME/git\" \"$HOME/moved\" && ln -s \"$HOME/moved\" \"$XDG_CONFIG_HOME/git\""),
         ("home-symlink-to-config", &[("H:.gitconfig", Some("[user]\n"))], "ln -s \"$HOME/.gitconfig\" \"$HOME/alias\""),
         ("write-through-new-symlink", &[("X:git/config", Some("[user]\n"))], "ln -s \"$XDG_CONFIG_HOME/git/config\" \"$HOME/alias\" && printf 'x = 1\\n' >> \"$HOME/alias\""),
         ("hard-link-to-config", &[("H:.gitconfig", Some("[user]\n"))], "ln \"$HOME/.gitconfig\" \"$HOME/alias\" && printf 'x = 1\\n' >> \"$HOME/alias\""),
@@ -1290,6 +1306,7 @@ fn git_root_does_not_record_special_files_as_inputs() {
 
     let w = Ws::new("oid-special-files");
     w.init_git();
+    w.track(&["in.txt"]);
     let fifo = CString::new(w.root.join("fifo").as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
     let listener = UnixListener::bind(w.root.join("socket")).unwrap();
