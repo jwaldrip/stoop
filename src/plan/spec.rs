@@ -1,4 +1,5 @@
 use crate::job::JobRecord;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug)]
 pub struct JobSpec {
@@ -82,7 +83,12 @@ pub struct Evidence {
     pub inputs: usize,
     pub priors: usize,
     pub hashed: usize,
-    pub by_diff: usize,
+    /// Content comparisons decided by recorded and tree blob ids, with no blob read.
+    pub by_oid: usize,
+    /// Blob reads made while evaluating this record.
+    pub blob_reads: usize,
+    /// Comparisons that fell back to hashing, by stable reason.
+    pub declined: BTreeMap<&'static str, usize>,
     pub overlay: usize,
     pub assumed_outside: usize,
     pub assumed_env: Vec<String>,
@@ -100,5 +106,28 @@ impl RecordCheck for Unverified {
             Code::Unattested,
             "no attestation verifier is configured".into(),
         ))
+    }
+}
+
+impl Evidence {
+    /// Zeroed counters for one record.
+    pub fn new(record: &JobRecord) -> Self {
+        Self {
+            run: record.run.clone(),
+            created: record.created,
+            commit: record.commit.clone(),
+            record_digest: None,
+            proofs: Vec::new(),
+            steps: 0,
+            inputs: 0,
+            priors: 0,
+            hashed: 0,
+            by_oid: 0,
+            blob_reads: 0,
+            declined: BTreeMap::new(),
+            overlay: 0,
+            assumed_outside: 0,
+            assumed_env: Vec::new(),
+        }
     }
 }

@@ -1,6 +1,7 @@
 //! Symbolically evaluate step proofs without executing repository code.
 use super::spec::{Code, Decision, Evidence, JobSpec, RecordCheck, StepSpec};
 use crate::gittree::{Entry, GitTree};
+use crate::input::Input;
 use crate::job::{JobRecord, JobStore, RecordStatus};
 use crate::proof::{Proof, Store};
 use std::collections::{BTreeMap, BTreeSet};
@@ -21,6 +22,16 @@ pub(crate) fn steps_match<'a>(
     expected.next().is_none()
 }
 
+/// Whether recorded git blob ids may decide a content comparison (`stoop plan --prefilter`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Prefilter {
+    /// Let a recorded blob id decide when every check passes; hash the rest.
+    On,
+    /// Hash every content comparison.
+    Off,
+    /// Evaluate each record both ways; any difference runs the job with an error.
+    Check,
+}
 pub struct PlanCtx<'a> {
     pub tree: &'a mut GitTree,
     pub proofs: &'a Store,
@@ -35,6 +46,8 @@ pub struct PlanCtx<'a> {
     /// Identity of the current run's event payload, if readable.
     pub event: Option<String>,
     pub explain: bool,
+    /// Whether recorded git blob ids may decide content comparisons.
+    pub prefilter: Prefilter,
 }
 
 fn decision(code: Code, detail: String) -> Decision {
@@ -170,14 +183,21 @@ impl VirtualTree<'_> {
         }
         Ok(state)
     }
-    fn id(&mut self, p: &str, expected: &str) -> Result<String, String> {
+    /// The id of `input.path` at rev, for comparison with the recorded `input.id`. A content
+    /// comparison decides from git blob ids when `shortcut` is set and every check passes, and
+    /// otherwise reads or hashes the blob, as before blob ids existed.
+    fn compare(&mut self, input: &Input, shortcut: bool) -> Result<Answer, String> {
+        let p = input.path.as_str();
+        let expected = input.id.as_str();
         if p.split('/').any(|part| part == ".git") {
             return Err("git metadata is not represented by the commit tree".into());
         }
         let state = self.state(p)?;
-        match state {
-            State::Absent => Ok("a".into()),
-            State::File(Identity::Recorded(id)) | State::Link(Identity::Recorded(id)) => Ok(id),
+        Ok(match state {
+            State::Absent => Answer::plain("a".into()),
+            State::File(Identity::Recorded(id)) | State::Link(Identity::Recorded(id)) => {
+                Answer::plain(id)
+            }
             State::File(Identity::Object(oid, exec))
                 if expected.starts_with("f:") || expected.starts_with("x:") =>
             {
@@ -188,17 +208,43 @@ impl VirtualTree<'_> {
                 {
                     return Err(format!("conversion: checkout converts {p} ({reason})"));
                 }
-                self.tree
-                    .file_id(&oid, exec)
-                    .map_err(|e| format!("git: {}", e.0))
+                match shortcut.then(|| file_by_oid(input, &oid, exec)) {
+                    Some(Ok(id)) => Answer::compared(id, Content::Oid, None),
+                    attempt => {
+                        let id = self
+                            .tree
+                            .file_id(&oid, exec)
+                            .map_err(|e| format!("git: {}", e.0))?;
+                        Answer::compared(id, Content::Hashed, attempt.and_then(Result::err))
+                    }
+                }
             }
-            State::File(Identity::Object(_, exec)) => Ok(if exec { "xk" } else { "fk" }.into()),
-            State::Link(Identity::Object(oid, _)) => Ok(format!(
-                "l:{}",
-                self.tree
+            State::File(Identity::Object(_, exec)) => {
+                Answer::plain(if exec { "xk" } else { "fk" }.into())
+            }
+            State::Link(Identity::Object(oid, _)) if expected.starts_with("l:") => {
+                match shortcut.then(|| link_by_oid(expected, &oid)) {
+                    Some(Ok(id)) => Answer::compared(id, Content::Oid, None),
+                    attempt => {
+                        let target = self
+                            .tree
+                            .link_target(&oid)
+                            .map_err(|e| format!("git: {}", e.0))?;
+                        Answer::compared(
+                            format!("l:{target}"),
+                            Content::Hashed,
+                            attempt.and_then(Result::err),
+                        )
+                    }
+                }
+            }
+            State::Link(Identity::Object(oid, _)) => {
+                let target = self
+                    .tree
                     .link_target(&oid)
-                    .map_err(|e| format!("git: {}", e.0))?
-            )),
+                    .map_err(|e| format!("git: {}", e.0))?;
+                Answer::plain(format!("l:{target}"))
+            }
             State::Dir if expected.starts_with("dl:") => {
                 let prefix = if p == "." {
                     Vec::new()
@@ -234,9 +280,126 @@ impl VirtualTree<'_> {
                         hash.update(&name);
                     }
                 }
-                Ok(format!("dl:{}", hash.finalize().to_hex()))
+                Answer::plain(format!("dl:{}", hash.finalize().to_hex()))
             }
-            State::Dir => Ok("d".into()),
+            State::Dir => Answer::plain("d".into()),
+        })
+    }
+}
+
+/// Whether `s` is exactly `len` lowercase hexadecimal digits.
+fn lower_hex(s: &str, len: usize) -> bool {
+    s.len() == len
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Decide a file comparison from git blob ids, or name the reason the blob must be read. The
+/// recorded `oid` and the tree's blob id describe the same bytes: the recorder took both from one
+/// read of the file, and the tree's blob is what checkout writes once no conversion applies at
+/// either end. Equal ids therefore mean the step would read the same bytes at rev.
+fn file_by_oid(input: &Input, tree_oid: &str, exec: bool) -> Result<String, &'static str> {
+    let oid = input.oid.as_deref().ok_or("oid-unavailable")?;
+    let basis = input.oid_basis.as_ref().ok_or("oid-unavailable")?;
+    if !basis.allows_oid() {
+        return Err("conversion");
+    }
+    let recorded = oid
+        .strip_prefix("sha1:")
+        .filter(|hex| lower_hex(hex, 40))
+        .filter(|_| lower_hex(tree_oid, 40));
+    let Some(recorded) = recorded else {
+        return Err("object-format");
+    };
+    let hash = input.id.get(2..).unwrap_or("");
+    if !lower_hex(hash, 64) {
+        return Err("id-malformed");
+    }
+    if input.id.starts_with("x:") != exec {
+        return Err("mode");
+    }
+    if recorded == tree_oid {
+        Ok(crate::input::file_id(exec, hash))
+    } else {
+        Ok(format!("{}:git-{tree_oid}", if exec { "x" } else { "f" }))
+    }
+}
+
+/// Decide a symbolic link from its recorded target. A link's blob is its target's bytes, and
+/// checkout applies no conversion to links, so the blob id follows from the target. Text that
+/// the recorder decoded lossily (U+FFFD) is not those bytes, so the blob is read instead.
+fn link_by_oid(recorded: &str, tree_oid: &str) -> Result<String, &'static str> {
+    if !lower_hex(tree_oid, 40) {
+        return Err("object-format");
+    }
+    let target = &recorded["l:".len()..];
+    if target.contains('\u{fffd}') {
+        return Err("oid-unavailable");
+    }
+    if crate::input::blob_oid(target.as_bytes(), false) == tree_oid {
+        Ok(recorded.to_owned())
+    } else {
+        Ok(format!("l:\0{tree_oid}"))
+    }
+}
+
+/// Count one comparison, and under `--explain` say how blob ids decided it.
+fn count(
+    evidence: &mut Evidence,
+    notes: &mut Vec<String>,
+    explain: bool,
+    step: usize,
+    path: &str,
+    answer: &Answer,
+) {
+    match answer.content {
+        Some(Content::Oid) => {
+            evidence.by_oid += 1;
+            if explain {
+                notes.push(format!("step {step}: {path}: matched by blob id"));
+            }
+        }
+        Some(Content::Hashed) => evidence.hashed += 1,
+        None => {}
+    }
+    if let Some(reason) = answer.declined {
+        *evidence.declined.entry(reason).or_default() += 1;
+        if explain && reason != "oid-unavailable" {
+            notes.push(format!("step {step}: {path}: blob id not used: {reason}"));
+        }
+    }
+}
+
+/// How a content comparison was decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Content {
+    /// From recorded and tree blob ids, with no blob read.
+    Oid,
+    /// From the blob's content hash, read or cached.
+    Hashed,
+}
+
+/// One compared path's id at rev, its comparison route when it compared content, and the stable
+/// reason blob ids were not used, when they were a candidate.
+struct Answer {
+    id: String,
+    content: Option<Content>,
+    declined: Option<&'static str>,
+}
+
+impl Answer {
+    fn plain(id: String) -> Self {
+        Self {
+            id,
+            content: None,
+            declined: None,
+        }
+    }
+    fn compared(id: String, content: Content, declined: Option<&'static str>) -> Self {
+        Self {
+            id,
+            content: Some(content),
+            declined,
         }
     }
 }
@@ -355,7 +518,11 @@ pub fn decide(spec: &JobSpec, ctx: &mut PlanCtx<'_>) -> Decision {
                 );
             }
             Some(RecordStatus::Passed) => {
-                let result = evaluate(spec, ctx, record);
+                let outcome = evaluate_record(spec, ctx, record);
+                if ctx.explain {
+                    explain_counts(record, &outcome);
+                }
+                let result = outcome.decision;
                 if result.skip {
                     match ctx.check.check(spec, record) {
                         Ok(()) => result,
@@ -396,7 +563,106 @@ pub fn decide(spec: &JobSpec, ctx: &mut PlanCtx<'_>) -> Decision {
     newest.expect("nonempty records")
 }
 
-fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decision {
+/// One record's evaluation: its decision, the counters behind it, and its `--explain` lines.
+struct Outcome {
+    decision: Decision,
+    counts: Evidence,
+    notes: Vec<String>,
+}
+
+/// Evaluate one record in the mode the context selects. `check` evaluates both ways and fails
+/// the record when the two disagree.
+fn evaluate_record(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Outcome {
+    match ctx.prefilter {
+        Prefilter::On => run(spec, ctx, record, true),
+        Prefilter::Off => run(spec, ctx, record, false),
+        Prefilter::Check => {
+            let on = run(spec, ctx, record, true);
+            let off = run(spec, ctx, record, false);
+            let (a, b) = (&on.decision, &off.decision);
+            if a.skip != b.skip
+                || a.code != b.code
+                || a.detail != b.detail
+                || a.mismatches != b.mismatches
+            {
+                let detail = format!(
+                    "object-id shortcut disagrees with hashing on record {}: {} vs {}",
+                    record.run.as_deref().unwrap_or("unknown"),
+                    code_name(&a.code),
+                    code_name(&b.code)
+                );
+                return Outcome {
+                    decision: decision(Code::Error, detail),
+                    ..on
+                };
+            }
+            on
+        }
+    }
+}
+
+/// Evaluate one record once, with or without blob ids, and count what it read.
+fn run(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord, shortcut: bool) -> Outcome {
+    let mut counts = Evidence::new(record);
+    let mut notes = Vec::new();
+    let before = ctx.tree.blob_reads();
+    let mut result = evaluate(spec, ctx, record, shortcut, &mut counts, &mut notes);
+    counts.blob_reads = ctx.tree.blob_reads() - before;
+    if result.skip {
+        counts.record_digest = spec
+            .key
+            .as_deref()
+            .and_then(|key| crate::attest::digest(key, record).ok());
+        counts.proofs = record.steps.iter().map(|step| step.proof.clone()).collect();
+        result.evidence = Some(counts.clone());
+    }
+    Outcome {
+        decision: result,
+        counts,
+        notes,
+    }
+}
+
+fn code_name(code: &Code) -> String {
+    serde_json::to_value(code)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+/// The `--explain` lines for one evaluated record: its counters, why blob ids were not used,
+/// and each comparison they decided.
+fn explain_counts(record: &JobRecord, outcome: &Outcome) {
+    let c = &outcome.counts;
+    let run = super::output::escape(record.run.as_deref().unwrap_or("unknown"));
+    eprintln!(
+        "stoop: record {run}: {} inputs, {} priors: {} by object id, {} hashed ({} blob reads), {} from earlier steps",
+        c.inputs, c.priors, c.by_oid, c.hashed, c.blob_reads, c.overlay
+    );
+    if !c.declined.is_empty() {
+        let reasons: Vec<String> = c
+            .declined
+            .iter()
+            .map(|(reason, n)| format!("{reason} {n}"))
+            .collect();
+        eprintln!(
+            "stoop: record {run}: blob ids not used: {}",
+            reasons.join(", ")
+        );
+    }
+    for note in &outcome.notes {
+        eprintln!("stoop: {}", super::output::escape(note));
+    }
+}
+
+fn evaluate(
+    spec: &JobSpec,
+    ctx: &mut PlanCtx<'_>,
+    record: &JobRecord,
+    shortcut: bool,
+    evidence: &mut Evidence,
+    notes: &mut Vec<String>,
+) -> Decision {
     if record
         .event_path
         .as_deref()
@@ -468,22 +734,9 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
         }
         proofs.push(proof);
     }
-    let mut evidence = Evidence {
-        run: record.run.clone(),
-        created: record.created,
-        commit: record.commit.clone(),
-        record_digest: None,
-        proofs: Vec::new(),
-        steps: steps.len(),
-        inputs: 0,
-        priors: 0,
-        hashed: 0,
-        by_diff: 0,
-        overlay: 0,
-        assumed_outside: 0,
-        assumed_env: Vec::new(),
-    };
+    evidence.steps = steps.len();
     let mut assumed_env = BTreeSet::new();
+    let explain = ctx.explain;
     let mut tree = VirtualTree {
         tree: ctx.tree,
         overlay: BTreeMap::new(),
@@ -521,8 +774,8 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
                 }
                 continue;
             }
-            let actual = match tree.id(&input.path, &input.id) {
-                Ok(id) => id,
+            let answer = match tree.compare(input, shortcut) {
+                Ok(answer) => answer,
                 Err(err) => {
                     return decision(
                         if err.starts_with("git:") {
@@ -536,9 +789,10 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
             };
             if tree.overlay_affects(&input.path) {
                 evidence.overlay += 1;
-            } else if input.id.starts_with("f:") || input.id.starts_with("x:") {
-                evidence.hashed += 1;
+            } else {
+                count(evidence, notes, explain, *index, &input.path, &answer);
             }
+            let actual = answer.id;
             if actual != input.id {
                 let why = if actual == "a" {
                     "removed"
@@ -654,8 +908,8 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
                     }
                 }
                 evidence.priors += 1;
-                let actual = match tree.id(&prior.path, &prior.id) {
-                    Ok(id) => id,
+                let answer = match tree.compare(prior, shortcut) {
+                    Ok(answer) => answer,
                     Err(err) => {
                         return decision(
                             if err.starts_with("git:") {
@@ -667,6 +921,8 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
                         )
                     }
                 };
+                count(evidence, notes, explain, *index, &prior.path, &answer);
+                let actual = answer.id;
                 let expected = prior.id.as_str();
                 let actual_kind = if actual == "a" {
                     "absent"
@@ -761,16 +1017,11 @@ fn evaluate(spec: &JobSpec, ctx: &mut PlanCtx<'_>, record: &JobRecord) -> Decisi
         }
     }
     evidence.assumed_env = assumed_env.into_iter().collect();
-    evidence.record_digest = spec
-        .key
-        .as_deref()
-        .and_then(|key| crate::attest::digest(key, record).ok());
-    evidence.proofs = record.steps.iter().map(|step| step.proof.clone()).collect();
     Decision {
         skip: true,
         code: Code::Proved,
         detail: "repository inputs match; outside inputs and environment are assumed".into(),
-        evidence: Some(evidence),
+        evidence: None,
         mismatches: Vec::new(),
     }
 }
@@ -832,6 +1083,9 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::new_with(&["init", "-q"])
+        }
+        fn new_with(init: &[&str]) -> Self {
             let root = std::env::temp_dir().join(format!(
                 "stoop-plan-test-{}-{}",
                 std::process::id(),
@@ -840,7 +1094,7 @@ mod tests {
             fs::create_dir_all(root.join("dir")).unwrap();
             fs::write(root.join("dir/a"), b"tracked").unwrap();
             for args in [
-                &["init", "-q"][..],
+                init,
                 &["add", "."][..],
                 &[
                     "-c",
@@ -991,6 +1245,7 @@ mod tests {
                     event_path: None,
                     event: None,
                     explain: false,
+                    prefilter: Prefilter::On,
                 },
             )
         }
@@ -1408,6 +1663,7 @@ mod tests {
                 github_vars: BTreeMap::new(),
                 event: Some(file_id(b"new")),
                 explain: false,
+                prefilter: Prefilter::On,
                 check: &Accept,
                 salt: None,
                 event_path: None,
@@ -1537,6 +1793,7 @@ mod tests {
                 github_vars: BTreeMap::new(),
                 event: Some(file_id(b"event")),
                 explain: false,
+                prefilter: Prefilter::On,
                 check: &Accept,
                 salt: None,
                 event_path: None,
@@ -1564,6 +1821,7 @@ mod tests {
             github_vars: BTreeMap::new(),
             event: None,
             explain: false,
+            prefilter: Prefilter::On,
             check: &super::super::spec::Unverified,
             salt: None,
             event_path: None,
@@ -1810,6 +2068,7 @@ mod tests {
             event_path: Some("/tmp/plan-event".into()),
             event: Some(file_id(b"bad")),
             explain: false,
+            prefilter: Prefilter::On,
         };
         assert_eq!(decide(&f.spec, &mut ctx).code, Code::InputChanged);
         ctx.event = Some(file_id(b"event"));
@@ -2318,6 +2577,7 @@ mod tests {
             event_path: None,
             event: None,
             explain: false,
+            prefilter: Prefilter::On,
         };
         let d = decide(&f.spec, &mut ctx);
         assert_eq!(d.code, Code::Unattested);
@@ -2676,6 +2936,7 @@ mod tests {
                     event_path: None,
                     event: None,
                     explain: false,
+                    prefilter: Prefilter::On,
                 },
             )
         };
@@ -2751,5 +3012,953 @@ mod tests {
             a::KEY_1,
         ));
         assert_eq!(evaluate(&mut f, &record, &resolver).code, Code::Stale);
+    }
+    fn clean_basis() -> crate::oid_attrs::OidBasis {
+        crate::oid_attrs::OidBasis {
+            text: "unspecified".into(),
+            eol: "unspecified".into(),
+            filter: "unspecified".into(),
+            ident: "unspecified".into(),
+            working_tree_encoding: "unspecified".into(),
+            export_subst: "unspecified".into(),
+            crlf: "unspecified".into(),
+            autocrlf: "unset".into(),
+        }
+    }
+    /// An input the recorder would write for a regular file it read once.
+    fn with_oid(path: &str, id: &str, oid: &str) -> Input {
+        Input {
+            path: path.into(),
+            id: id.into(),
+            oid: Some(oid.into()),
+            oid_basis: Some(clean_basis()),
+        }
+    }
+    fn git_stdout(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(root)
+            .env("HOME", root)
+            .env("XDG_CONFIG_HOME", root.join(".git/stoop-test-home"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim_end()
+            .to_owned()
+    }
+    /// The `sha1:` blob id git gives `bytes`, as the recorder writes it.
+    fn blob_oid_of(root: &Path, bytes: &[u8]) -> String {
+        use std::io::Write;
+        let mut child = Command::new("git")
+            .current_dir(root)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(["hash-object", "--no-filters", "--stdin"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(bytes).unwrap();
+        let output = child.wait_with_output().unwrap();
+        format!("sha1:{}", String::from_utf8(output.stdout).unwrap().trim())
+    }
+    /// The `sha1:` blob id of `path` at HEAD, as git's tree names it.
+    fn tree_oid(root: &Path, path: &str) -> String {
+        let hex = git_stdout(root, &["rev-parse", &format!("HEAD:{path}")]);
+        format!("sha1:{hex}")
+    }
+    fn commit_all(root: &Path, message: &str) {
+        git(root, &["add", "-A"]);
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                message,
+            ],
+        );
+    }
+    /// Delete a loose blob, so that reading it would need a fetch.
+    fn drop_loose_blob(root: &Path, oid: &str) {
+        let hex = oid.trim_start_matches("sha1:");
+        let (dir, file) = hex.split_at(2);
+        fs::remove_file(root.join(".git/objects").join(dir).join(file)).unwrap();
+    }
+    fn outcome(f: &mut Fixture, prefilter: Prefilter) -> Outcome {
+        let record = f.jobs.load("job-test").remove(0);
+        evaluate_record(
+            &f.spec,
+            &mut PlanCtx {
+                tree: &mut f.tree,
+                proofs: &f.proofs,
+                jobs: &f.jobs,
+                now: 100,
+                max_age: 50,
+                github_vars: BTreeMap::new(),
+                check: &Accept,
+                salt: None,
+                event_path: None,
+                event: None,
+                explain: false,
+                prefilter,
+            },
+            &record,
+        )
+    }
+
+    #[test]
+    fn blob_id_match_proves_without_reading_blobs() {
+        let mut f = Fixture::new();
+        let oid = tree_oid(&f.root, "dir/a");
+        f.install(vec![proof(vec![with_oid(
+            "dir/a",
+            &file_id(b"tracked"),
+            &oid,
+        )])]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::Proved, "{}", o.decision.detail);
+        assert_eq!(
+            (o.counts.by_oid, o.counts.hashed, o.counts.blob_reads),
+            (1, 0, 0)
+        );
+    }
+    #[test]
+    fn blob_id_match_needs_no_blob_in_a_blobless_clone() {
+        let mut f = Fixture::new();
+        let oid = tree_oid(&f.root, "dir/a");
+        drop_loose_blob(&f.root, &oid);
+        git(&f.root, &["config", "remote.origin.promisor", "true"]);
+        f.install(vec![proof(vec![with_oid(
+            "dir/a",
+            &file_id(b"tracked"),
+            &oid,
+        )])]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::Proved, "{}", o.decision.detail);
+        assert_eq!(o.counts.by_oid, 1);
+        assert_eq!(f.tree.blob_reads(), 0);
+        assert_eq!(f.tree.fetched_objects(), 0);
+    }
+    #[test]
+    fn blob_id_mismatch_is_changed_without_reading_blobs_in_either_mode() {
+        let mut f = Fixture::new();
+        let old = blob_oid_of(&f.root, b"old");
+        f.install(vec![proof(vec![with_oid("dir/a", &file_id(b"old"), &old)])]);
+        let on = outcome(&mut f, Prefilter::On);
+        assert_eq!(on.decision.code, Code::InputChanged);
+        assert_eq!(
+            on.decision.mismatches,
+            vec![(1, "dir/a".to_string(), "changed".to_string())]
+        );
+        assert_eq!((on.counts.by_oid, on.counts.blob_reads), (1, 0));
+        let off = outcome(&mut f, Prefilter::Off);
+        assert_eq!(off.decision.code, Code::InputChanged);
+        assert_eq!(off.counts.by_oid, 0);
+    }
+    #[test]
+    fn null_oid_falls_back_to_hashing() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![input("dir/a", &file_id(b"tracked"))])]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::Proved, "{}", o.decision.detail);
+        assert_eq!(
+            (o.counts.by_oid, o.counts.hashed, o.counts.blob_reads),
+            (0, 1, 1)
+        );
+        assert_eq!(o.counts.declined.get("oid-unavailable"), Some(&1));
+    }
+    #[test]
+    fn oid_without_basis_and_basis_without_oid_fall_back() {
+        for (with_oid_value, with_basis) in [(true, false), (false, true)] {
+            let mut f = Fixture::new();
+            let oid = tree_oid(&f.root, "dir/a");
+            let recorded = Input {
+                path: "dir/a".into(),
+                id: file_id(b"tracked"),
+                oid: with_oid_value.then(|| oid.clone()),
+                oid_basis: with_basis.then(clean_basis),
+            };
+            f.install(vec![proof(vec![recorded])]);
+            let o = outcome(&mut f, Prefilter::On);
+            assert_eq!(o.decision.code, Code::Proved, "{}", o.decision.detail);
+            assert_eq!((o.counts.by_oid, o.counts.hashed), (0, 1));
+            assert_eq!(o.counts.declined.get("oid-unavailable"), Some(&1));
+        }
+    }
+    #[test]
+    fn conversion_at_rev_is_unplannable_before_blob_ids() {
+        let mut f = Fixture::new();
+        fs::write(f.root.join(".gitattributes"), "dir/a text eol=crlf\n").unwrap();
+        commit_all(&f.root, "attributes");
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        let oid = tree_oid(&f.root, "dir/a");
+        f.install(vec![proof(vec![with_oid(
+            "dir/a",
+            &file_id(b"tracked"),
+            &oid,
+        )])]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::Unplannable, "{}", o.decision.detail);
+        assert!(
+            o.decision.detail.contains("eol=crlf"),
+            "{}",
+            o.decision.detail
+        );
+        assert_eq!(o.counts.by_oid, 0);
+    }
+    #[test]
+    fn recorded_conversion_or_autocrlf_falls_back_to_hashing() {
+        type BasisEdit = fn(&mut crate::oid_attrs::OidBasis);
+        let cases: [(&str, BasisEdit); 5] = [
+            ("eol", |b| b.eol = "crlf".into()),
+            ("text", |b| b.text = "set".into()),
+            ("filter", |b| b.filter = "lfs".into()),
+            ("autocrlf input", |b| b.autocrlf = "input".into()),
+            ("autocrlf true", |b| b.autocrlf = "true".into()),
+        ];
+        for (name, change) in cases {
+            let mut f = Fixture::new();
+            let oid = tree_oid(&f.root, "dir/a");
+            let mut basis = clean_basis();
+            change(&mut basis);
+            let recorded = Input {
+                path: "dir/a".into(),
+                id: file_id(b"tracked"),
+                oid: Some(oid),
+                oid_basis: Some(basis),
+            };
+            f.install(vec![proof(vec![recorded])]);
+            let o = outcome(&mut f, Prefilter::On);
+            assert_eq!(
+                o.decision.code,
+                Code::Proved,
+                "{name}: {}",
+                o.decision.detail
+            );
+            assert_eq!((o.counts.by_oid, o.counts.hashed), (0, 1), "{name}");
+            assert_eq!(o.counts.declined.get("conversion"), Some(&1), "{name}");
+        }
+    }
+    #[test]
+    fn exec_bit_mismatch_with_equal_blob_id_is_changed() {
+        use std::os::unix::fs::PermissionsExt;
+        let cases = [("dir/a", "x:"), ("dir/run", "f:")];
+        for (path, prefix) in cases {
+            let mut f = Fixture::new();
+            fs::write(f.root.join("dir/run"), b"tracked").unwrap();
+            fs::set_permissions(f.root.join("dir/run"), fs::Permissions::from_mode(0o755)).unwrap();
+            commit_all(&f.root, "exec");
+            f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+            let oid = tree_oid(&f.root, path);
+            let hash = &file_id(b"tracked")[2..];
+            f.install(vec![proof(vec![with_oid(
+                path,
+                &format!("{prefix}{hash}"),
+                &oid,
+            )])]);
+            let o = outcome(&mut f, Prefilter::On);
+            assert_eq!(o.decision.code, Code::InputChanged, "{path}");
+            assert_eq!(
+                o.decision.mismatches,
+                vec![(1, path.to_string(), "changed".to_string())],
+                "{path}"
+            );
+            assert_eq!(
+                (o.counts.by_oid, o.counts.hashed, o.counts.blob_reads),
+                (0, 1, 1),
+                "{path}"
+            );
+            assert_eq!(o.counts.declined.get("mode"), Some(&1), "{path}");
+        }
+    }
+    #[test]
+    fn symlink_blob_id_is_derived_from_the_recorded_target() {
+        let mut f = Fixture::new();
+        std::os::unix::fs::symlink("dir/a", f.root.join("link")).unwrap();
+        commit_all(&f.root, "link");
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        f.install(vec![proof(vec![input("link", "l:dir/a")])]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::Proved, "{}", o.decision.detail);
+        assert_eq!(
+            (o.counts.by_oid, o.counts.hashed, o.counts.blob_reads),
+            (1, 0, 0)
+        );
+    }
+    #[test]
+    fn symlink_with_another_target_is_changed_without_reading() {
+        let mut f = Fixture::new();
+        std::os::unix::fs::symlink("dir/a", f.root.join("link")).unwrap();
+        commit_all(&f.root, "link");
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        f.install(vec![proof(vec![input("link", "l:dir/other")])]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::InputChanged, "{}", o.decision.detail);
+        assert_eq!((o.counts.by_oid, o.counts.blob_reads), (1, 0));
+    }
+    #[test]
+    fn symlink_target_with_replacement_character_reads_the_blob() {
+        use std::os::unix::ffi::OsStrExt;
+        let mut f = Fixture::new();
+        let target = std::ffi::OsStr::from_bytes(b"d\xffr");
+        std::os::unix::fs::symlink(target, f.root.join("link")).unwrap();
+        commit_all(&f.root, "lossy link");
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        f.install(vec![proof(vec![input("link", "l:d\u{fffd}r")])]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::Proved, "{}", o.decision.detail);
+        assert_eq!(
+            (o.counts.by_oid, o.counts.hashed, o.counts.blob_reads),
+            (0, 1, 1)
+        );
+        assert_eq!(o.counts.declined.get("oid-unavailable"), Some(&1));
+    }
+    #[test]
+    fn gitlink_entry_is_never_compared_by_blob_id() {
+        let mut f = Fixture::new();
+        let oid = tree_oid(&f.root, "dir/a");
+        let hex = oid.trim_start_matches("sha1:").to_owned();
+        let cacheinfo = format!("160000,{hex},sub");
+        git(
+            &f.root,
+            &["update-index", "--add", "--cacheinfo", cacheinfo.as_str()],
+        );
+        git(
+            &f.root,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "gitlink",
+            ],
+        );
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        f.install(vec![proof(vec![with_oid(
+            "sub",
+            &file_id(b"tracked"),
+            &oid,
+        )])]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::InputChanged, "{}", o.decision.detail);
+        assert_eq!(
+            (o.counts.by_oid, o.counts.hashed, o.counts.blob_reads),
+            (0, 0, 0)
+        );
+    }
+    #[test]
+    fn sha256_repository_never_uses_blob_ids() {
+        let mut f = Fixture::new_with(&["init", "-q", "--object-format=sha256"]);
+        let sha1 = format!("sha1:{}", "0123456789abcdef0123456789abcdef01234567");
+        f.install(vec![proof(vec![with_oid(
+            "dir/a",
+            &file_id(b"tracked"),
+            &sha1,
+        )])]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::Proved, "{}", o.decision.detail);
+        assert_eq!(
+            (o.counts.by_oid, o.counts.hashed, o.counts.blob_reads),
+            (0, 1, 1)
+        );
+        assert_eq!(o.counts.declined.get("object-format"), Some(&1));
+    }
+    #[test]
+    fn missing_entry_and_renamed_path_are_removed_without_reading() {
+        let mut f = Fixture::new();
+        let oid = tree_oid(&f.root, "dir/a");
+        f.install(vec![proof(vec![with_oid(
+            "gone/file",
+            &file_id(b"tracked"),
+            &oid,
+        )])]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::InputChanged);
+        assert_eq!(
+            o.decision.mismatches[0],
+            (1, "gone/file".to_string(), "removed".to_string())
+        );
+        assert_eq!(
+            (o.counts.by_oid, o.counts.hashed, o.counts.blob_reads),
+            (0, 0, 0)
+        );
+        let mut g = Fixture::new();
+        git(&g.root, &["mv", "dir/a", "dir/b"]);
+        commit_all(&g.root, "rename");
+        g.tree = GitTree::load(&g.root, "HEAD").unwrap();
+        let moved = tree_oid(&g.root, "dir/b");
+        g.install(vec![proof(vec![with_oid(
+            "dir/a",
+            &file_id(b"tracked"),
+            &moved,
+        )])]);
+        let r = outcome(&mut g, Prefilter::On);
+        assert_eq!(r.decision.code, Code::InputChanged);
+        assert_eq!(r.decision.mismatches[0].2, "removed");
+        assert_eq!((r.counts.by_oid, r.counts.blob_reads), (0, 0));
+    }
+    #[test]
+    fn foreign_or_malformed_recorded_oids_fall_back_to_hashing() {
+        let hex = "0123456789abcdef0123456789abcdef01234567";
+        let cases = [
+            ("sha256 tag", format!("sha256:{}", "0".repeat(64))),
+            ("uppercase", format!("sha1:{}", hex.to_uppercase())),
+            ("truncated", format!("sha1:{}", &hex[..38])),
+            ("bare hex", hex.to_owned()),
+        ];
+        for (name, oid) in cases {
+            let mut f = Fixture::new();
+            f.install(vec![proof(vec![with_oid(
+                "dir/a",
+                &file_id(b"tracked"),
+                &oid,
+            )])]);
+            let o = outcome(&mut f, Prefilter::On);
+            assert_eq!(
+                o.decision.code,
+                Code::Proved,
+                "{name}: {}",
+                o.decision.detail
+            );
+            assert_eq!((o.counts.by_oid, o.counts.hashed), (0, 1), "{name}");
+            assert_eq!(o.counts.declined.get("object-format"), Some(&1), "{name}");
+        }
+    }
+    #[test]
+    fn malformed_content_id_is_not_shortcut() {
+        let mut f = Fixture::new();
+        let oid = tree_oid(&f.root, "dir/a");
+        f.install(vec![proof(vec![with_oid("dir/a", "f:not-hex", &oid)])]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::InputChanged);
+        assert_eq!((o.counts.by_oid, o.counts.hashed), (0, 1));
+        assert_eq!(o.counts.declined.get("id-malformed"), Some(&1));
+    }
+    #[test]
+    fn prior_blob_ids_are_compared_without_reads() {
+        let mut f = Fixture::new();
+        let oid = tree_oid(&f.root, "dir/a");
+        let mut p = proof(vec![]);
+        p.outputs = vec![input("dir/a", &file_id(b"new"))];
+        p.priors = Some(vec![with_oid("dir/a", &file_id(b"tracked"), &oid)]);
+        f.install(vec![p]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::Proved, "{}", o.decision.detail);
+        assert_eq!(
+            (
+                o.counts.priors,
+                o.counts.by_oid,
+                o.counts.hashed,
+                o.counts.blob_reads
+            ),
+            (1, 1, 0, 0)
+        );
+    }
+    #[test]
+    fn changed_prior_blob_id_is_prior_changed_without_reads() {
+        let mut f = Fixture::new();
+        let old = blob_oid_of(&f.root, b"old");
+        let mut p = proof(vec![]);
+        p.outputs = vec![input("dir/a", &file_id(b"new"))];
+        p.priors = Some(vec![with_oid("dir/a", &file_id(b"old"), &old)]);
+        f.install(vec![p]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::PriorChanged, "{}", o.decision.detail);
+        assert!(
+            o.decision.detail.contains("prior content changed"),
+            "{}",
+            o.decision.detail
+        );
+        assert_eq!((o.counts.by_oid, o.counts.blob_reads), (1, 0));
+    }
+    #[test]
+    fn overlay_paths_ignore_blob_ids() {
+        let mut f = Fixture::new();
+        let mut first = proof(vec![]);
+        first.outputs.push(input("dir/a", &file_id(b"generated")));
+        let wrong = blob_oid_of(&f.root, b"other");
+        f.install(vec![
+            first,
+            proof(vec![with_oid("dir/a", &file_id(b"generated"), &wrong)]),
+        ]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::Proved, "{}", o.decision.detail);
+        assert_eq!(
+            (o.counts.overlay, o.counts.by_oid, o.counts.hashed),
+            (1, 0, 0)
+        );
+    }
+    #[test]
+    fn inconsistent_pair_is_outside_the_domain_and_check_flags_it() {
+        let mut f = Fixture::new();
+        let oid = tree_oid(&f.root, "dir/a");
+        f.install(vec![proof(vec![with_oid(
+            "dir/a",
+            &file_id(b"other"),
+            &oid,
+        )])]);
+        assert_eq!(outcome(&mut f, Prefilter::On).decision.code, Code::Proved);
+        assert_eq!(
+            outcome(&mut f, Prefilter::Off).decision.code,
+            Code::InputChanged
+        );
+        let check = outcome(&mut f, Prefilter::Check).decision;
+        assert_eq!(check.code, Code::Error, "{}", check.detail);
+        assert!(check.detail.contains("disagrees"), "{}", check.detail);
+    }
+    #[test]
+    fn check_mode_accepts_a_consistent_record() {
+        let mut f = Fixture::new();
+        let oid = tree_oid(&f.root, "dir/a");
+        f.install(vec![proof(vec![with_oid(
+            "dir/a",
+            &file_id(b"tracked"),
+            &oid,
+        )])]);
+        let o = outcome(&mut f, Prefilter::Check);
+        assert_eq!(o.decision.code, Code::Proved, "{}", o.decision.detail);
+        assert_eq!(o.counts.by_oid, 1);
+    }
+    #[test]
+    fn off_mode_hashes_every_comparison() {
+        let mut f = Fixture::new();
+        let oid = tree_oid(&f.root, "dir/a");
+        f.install(vec![proof(vec![with_oid(
+            "dir/a",
+            &file_id(b"tracked"),
+            &oid,
+        )])]);
+        let o = outcome(&mut f, Prefilter::Off);
+        assert_eq!(o.decision.code, Code::Proved, "{}", o.decision.detail);
+        assert_eq!(
+            (o.counts.by_oid, o.counts.hashed, o.counts.blob_reads),
+            (0, 1, 1)
+        );
+        assert!(o.counts.declined.is_empty());
+    }
+    #[test]
+    fn recorded_file_id_against_a_tree_link_takes_the_existing_path() {
+        let mut f = Fixture::new();
+        std::os::unix::fs::symlink("dir/a", f.root.join("link")).unwrap();
+        commit_all(&f.root, "link");
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        let oid = tree_oid(&f.root, "dir/a");
+        f.install(vec![proof(vec![with_oid(
+            "link",
+            &file_id(b"tracked"),
+            &oid,
+        )])]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::InputChanged, "{}", o.decision.detail);
+        assert_eq!((o.counts.by_oid, o.counts.hashed), (0, 0));
+    }
+    #[test]
+    fn sha256_repository_never_derives_link_blob_ids() {
+        let mut f = Fixture::new_with(&["init", "-q", "--object-format=sha256"]);
+        std::os::unix::fs::symlink("dir/a", f.root.join("link")).unwrap();
+        commit_all(&f.root, "link");
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        f.install(vec![proof(vec![input("link", "l:dir/a")])]);
+        let o = outcome(&mut f, Prefilter::On);
+        assert_eq!(o.decision.code, Code::Proved, "{}", o.decision.detail);
+        assert_eq!((o.counts.by_oid, o.counts.hashed), (0, 1));
+        assert_eq!(o.counts.declined.get("object-format"), Some(&1));
+    }
+    #[test]
+    fn explain_notes_name_each_blob_id_match_and_decline() {
+        let mut f = Fixture::new();
+        f.install(vec![proof(vec![])]);
+        let record = f.jobs.load("job-test").remove(0);
+        let mut evidence = Evidence::new(&record);
+        let mut notes = Vec::new();
+        let compared = |id: &str, content, declined| Answer::compared(id.into(), content, declined);
+        count(
+            &mut evidence,
+            &mut notes,
+            true,
+            2,
+            "dir/a",
+            &compared("f:x", Content::Oid, None),
+        );
+        count(
+            &mut evidence,
+            &mut notes,
+            true,
+            2,
+            "dir/b",
+            &compared("f:y", Content::Hashed, Some("mode")),
+        );
+        count(
+            &mut evidence,
+            &mut notes,
+            true,
+            2,
+            "dir/c",
+            &compared("f:z", Content::Hashed, Some("oid-unavailable")),
+        );
+        assert_eq!(
+            notes,
+            vec![
+                "step 2: dir/a: matched by blob id".to_string(),
+                "step 2: dir/b: blob id not used: mode".to_string(),
+            ]
+        );
+        assert_eq!((evidence.by_oid, evidence.hashed), (1, 2));
+        assert_eq!(evidence.declined.get("mode"), Some(&1));
+        assert_eq!(evidence.declined.get("oid-unavailable"), Some(&1));
+    }
+    fn commit_index(root: &Path, message: &str) {
+        git(
+            root,
+            &[
+                "-c",
+                "user.name=test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                message,
+            ],
+        );
+    }
+    /// A xorshift generator, so a corpus run reproduces from its seed.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+    /// The repository shapes the corpus draws records from.
+    #[derive(Clone, Copy, Debug)]
+    enum Corpus {
+        Plain,
+        Links,
+        Attributes,
+        Gitlink,
+    }
+    fn corpus_fixture(kind: Corpus) -> Fixture {
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::PermissionsExt;
+        let mut f = Fixture::new();
+        let root = f.root.clone();
+        fs::write(root.join("dir/b"), b"run").unwrap();
+        fs::set_permissions(root.join("dir/b"), fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(root.join("top.txt"), b"top\n").unwrap();
+        match kind {
+            Corpus::Plain | Corpus::Gitlink => {}
+            Corpus::Links => {
+                std::os::unix::fs::symlink("dir/a", root.join("link")).unwrap();
+                std::os::unix::fs::symlink("dir", root.join("dirlink")).unwrap();
+                let lossy = std::ffi::OsStr::from_bytes(b"d\xffr");
+                std::os::unix::fs::symlink(lossy, root.join("weird")).unwrap();
+            }
+            Corpus::Attributes => {
+                fs::write(
+                    root.join(".gitattributes"),
+                    "conv.txt eol=crlf\n*.m conv\n[attr]conv eol=crlf\n",
+                )
+                .unwrap();
+                fs::write(root.join("conv.txt"), b"conv\n").unwrap();
+                fs::write(root.join("m1.m"), b"m\n").unwrap();
+            }
+        }
+        if matches!(kind, Corpus::Gitlink) {
+            git(&root, &["add", "dir", "top.txt"]);
+            let sha = git_stdout(&root, &["rev-parse", "HEAD:dir/a"]);
+            let info = format!("160000,{sha},sub");
+            git(
+                &root,
+                &["update-index", "--add", "--cacheinfo", info.as_str()],
+            );
+            commit_index(&root, "corpus");
+        } else {
+            commit_all(&root, "corpus");
+        }
+        f.tree = GitTree::load(&root, "HEAD").unwrap();
+        f
+    }
+    fn corpus_paths(f: &Fixture) -> Vec<String> {
+        let mut paths = f.tree.below("");
+        paths.extend(
+            [
+                "missing/x",
+                "top.txt/x",
+                "dir/a/x",
+                "sub/inside",
+                "dirlink/a",
+                "nope",
+                "new/file",
+            ]
+            .map(str::to_owned),
+        );
+        paths
+    }
+    /// The input a recorder would write for the path as it stands at HEAD.
+    fn exact_input(f: &Fixture, path: &str) -> Input {
+        let plain = |id: String| Input {
+            path: path.into(),
+            id,
+            oid: None,
+            oid_basis: None,
+        };
+        match f.tree.entry(path).cloned() {
+            Some(Entry::Blob { oid, exec }) => {
+                let bytes = fs::read(f.root.join(path)).unwrap();
+                let hash = blake3::hash(&bytes).to_hex().to_string();
+                Input {
+                    path: path.into(),
+                    id: crate::input::file_id(exec, &hash),
+                    oid: Some(format!("sha1:{oid}")),
+                    oid_basis: Some(clean_basis()),
+                }
+            }
+            Some(Entry::Link { .. }) => {
+                let target = fs::read_link(f.root.join(path)).unwrap();
+                plain(format!("l:{}", target.to_string_lossy()))
+            }
+            Some(Entry::Tree | Entry::Gitlink) => plain("d".into()),
+            None => plain("a".into()),
+        }
+    }
+    /// Make `input` the record of `bytes` as the recorder would write them.
+    fn set_content(input: &mut Input, bytes: &[u8]) {
+        let exec = input.id.starts_with("x:");
+        input.id = crate::input::file_id(exec, &blake3::hash(bytes).to_hex());
+        input.oid = Some(format!("sha1:{}", crate::input::blob_oid(bytes, false)));
+        input.oid_basis = Some(clean_basis());
+    }
+    /// One input drawn from the categories the planner must handle. `exact` keeps it exact.
+    fn random_input(rng: &mut Rng, f: &Fixture, paths: &[String], exact: bool) -> Input {
+        let path = paths[rng.below(paths.len())].clone();
+        let mut input = exact_input(f, &path);
+        let content = input.id.starts_with("f:") || input.id.starts_with("x:");
+        let category = if exact { 0 } else { rng.below(12) };
+        match category {
+            1 if content => {
+                let mut bytes = fs::read(f.root.join(&path)).unwrap();
+                bytes.push(b'!');
+                set_content(&mut input, &bytes);
+            }
+            2 if content => {
+                let mut bytes = fs::read(f.root.join(&path)).unwrap();
+                if let Some(first) = bytes.first_mut() {
+                    *first ^= 1;
+                }
+                set_content(&mut input, &bytes);
+            }
+            3 if content => {
+                input.id = if input.id.starts_with("x:") {
+                    format!("f:{}", &input.id[2..])
+                } else {
+                    format!("x:{}", &input.id[2..])
+                };
+            }
+            4 => {
+                input.oid = None;
+                input.oid_basis = None;
+            }
+            5 => input.oid_basis = None,
+            6 => {
+                input.oid = input
+                    .oid
+                    .take()
+                    .map(|o| o.trim_start_matches("sha1:").into())
+            }
+            7 if content => input.id = "f:zz".into(),
+            8 => input.id = "a".into(),
+            9 => input.id = "d".into(),
+            10 => {
+                if let Some(id) = crate::input::identify(&f.root.join(&path), true, true) {
+                    input.id = id;
+                    input.oid = None;
+                    input.oid_basis = None;
+                }
+            }
+            11 if input.id.starts_with("l:") => input.id = "l:other".into(),
+            _ => {}
+        }
+        input
+    }
+    /// Proofs for one record: one to three steps, with outputs and priors on some of them.
+    fn random_record(rng: &mut Rng, f: &Fixture, paths: &[String]) -> Vec<Proof> {
+        let exact = rng.below(2) == 0;
+        let mut proofs = Vec::new();
+        for _ in 0..1 + rng.below(3) {
+            let count = 5 + rng.below(36);
+            let mut inputs = Vec::with_capacity(count);
+            for _ in 0..count {
+                inputs.push(random_input(rng, f, paths, exact));
+            }
+            let mut step = proof(inputs);
+            let mut priors = Vec::new();
+            if rng.below(4) == 0 {
+                let out: &str = ["top.txt", "dir/b", "new/file"][rng.below(3)];
+                step.outputs.push(Input {
+                    path: out.into(),
+                    id: file_id(b"generated"),
+                    oid: None,
+                    oid_basis: None,
+                });
+                priors.push(exact_input(f, out));
+            }
+            for _ in 0..rng.below(3) {
+                priors.push(random_input(rng, f, paths, exact));
+            }
+            step.priors = Some(priors);
+            proofs.push(step);
+        }
+        proofs
+    }
+    /// Save `proofs` as one record of `job`, one uniquely keyed step per proof, and return the
+    /// traced steps that plan it.
+    fn save_record(f: &Fixture, job: &str, proofs: Vec<Proof>) -> Vec<StepSpec> {
+        let mut steps = Vec::new();
+        let mut records = Vec::new();
+        for (index, proof) in proofs.into_iter().enumerate() {
+            let key = format!("{job}-{index}");
+            steps.push(StepSpec::Traced {
+                index: index + 1,
+                key: key.clone(),
+                max_age: None,
+            });
+            records.push(StepRecord {
+                key: key.clone(),
+                proof: proof.digest(),
+                how: StepHow::Ran,
+            });
+            f.proofs.save(&key, proof).unwrap();
+        }
+        f.jobs
+            .save(
+                job,
+                JobRecord {
+                    created: 100,
+                    started: 100,
+                    status: Some(RecordStatus::Passed),
+                    failed: None,
+                    actions: BTreeMap::new(),
+                    commit: None,
+                    host: BTreeMap::new(),
+                    event_path: Some("/tmp/event.json".into()),
+                    run: Some("1/1".into()),
+                    steps: records,
+                    attest: None,
+                    workflow_ref: None,
+                    job_workflow_ref: None,
+                },
+            )
+            .unwrap();
+        steps
+    }
+    /// The fields that decide what a plan says. Evidence counters are compared separately.
+    fn plan_key(d: &Decision) -> (bool, Code, String, Vec<(usize, String, String)>) {
+        (
+            d.skip,
+            d.code.clone(),
+            d.detail.clone(),
+            d.mismatches.clone(),
+        )
+    }
+    /// Plan `spec` in `prefilter` mode on a freshly loaded tree.
+    fn plan(f: &Fixture, spec: &JobSpec, prefilter: Prefilter) -> Decision {
+        let mut tree = GitTree::load(&f.root, "HEAD").unwrap();
+        decide(
+            spec,
+            &mut PlanCtx {
+                tree: &mut tree,
+                proofs: &f.proofs,
+                jobs: &f.jobs,
+                check: &Accept,
+                now: 100,
+                max_age: 50,
+                github_vars: BTreeMap::new(),
+                salt: None,
+                event_path: None,
+                event: None,
+                explain: false,
+                prefilter,
+            },
+        )
+    }
+    /// The equivalence property (spec 3.4) over generated records. Each record plans the same
+    /// with blob ids as with hashing, Check agrees with both, and the counters account for every
+    /// content comparison once. The seed prints on failure, and `STOOP_EQUIV_CASES` raises the
+    /// count. Half the records are exact, so the corpus reaches proved decisions too.
+    #[test]
+    fn equivalence_corpus() {
+        let cases: usize = std::env::var("STOOP_EQUIV_CASES")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(400)
+            .max(4);
+        let seed: u64 = 0x5EED_1234_ABCD_0001;
+        let mut rng = Rng(seed);
+        let mut proved = 0;
+        for kind in [
+            Corpus::Plain,
+            Corpus::Links,
+            Corpus::Attributes,
+            Corpus::Gitlink,
+        ] {
+            let f = corpus_fixture(kind);
+            let paths = corpus_paths(&f);
+            for case in 0..cases / 4 {
+                let job = format!("job-corpus-{}-{case}", format!("{kind:?}").to_lowercase());
+                let proofs = random_record(&mut rng, &f, &paths);
+                let steps = save_record(&f, &job, proofs);
+                let spec = JobSpec {
+                    key: Some(job.clone()),
+                    steps,
+                    ..f.spec.clone()
+                };
+                let why = format!("seed {seed:#x}, {kind:?}, case {case}");
+                let on = plan(&f, &spec, Prefilter::On);
+                let off = plan(&f, &spec, Prefilter::Off);
+                let check = plan(&f, &spec, Prefilter::Check);
+                assert_eq!(plan_key(&on), plan_key(&off), "{why}");
+                assert_eq!(plan_key(&check), plan_key(&on), "{why}");
+                if let (Some(a), Some(b)) = (&on.evidence, &off.evidence) {
+                    proved += 1;
+                    assert_eq!(a.hashed + a.by_oid, b.hashed, "{why}");
+                    assert_eq!(b.by_oid, 0, "{why}");
+                    assert_eq!(
+                        (a.steps, a.inputs, a.priors, a.overlay, a.assumed_outside),
+                        (b.steps, b.inputs, b.priors, b.overlay, b.assumed_outside),
+                        "{why}"
+                    );
+                    assert_eq!(
+                        (&a.assumed_env, &a.record_digest, &a.proofs),
+                        (&b.assumed_env, &b.record_digest, &b.proofs),
+                        "{why}"
+                    );
+                }
+            }
+        }
+        assert!(
+            proved >= cases / 8,
+            "seed {seed:#x}: only {proved} proved records in {cases}"
+        );
     }
 }
