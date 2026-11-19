@@ -92,8 +92,17 @@ fn the_tree_its_lookups_and_its_status_are_observed_and_never_recorded() {
     assert_eq!(out.status.code(), Some(3), "{stderr}");
     assert_eq!(fs::read_to_string(w.dir.join("runs.log")).unwrap(), "run");
     assert!(stderr.contains("stoop: DTrace diagnostic:"), "{stderr}");
-    assert!(!stderr.contains("incomplete"), "{stderr}");
     assert!(stderr.contains("not recorded"), "{stderr}");
+    // DTrace cannot always read a path, and it cannot place a path relative to a descriptor
+    // here, so a run may be reported incomplete. It must never be incomplete for a structural
+    // reason: the tracer armed, saw the command exit, stopped cleanly, and every pid it saw
+    // belongs to the tree.
+    for line in stderr.lines().filter(|l| l.contains("is incomplete")) {
+        assert!(
+            line.contains("directory descriptor") || line.contains("loss or error"),
+            "structural reason: {line}\n{stderr}"
+        );
+    }
 
     let read = listed(&stderr, "read");
     for name in ["in.txt", "nested.txt"] {
@@ -103,7 +112,13 @@ fn the_tree_its_lookups_and_its_status_are_observed_and_never_recorded() {
         .iter()
         .filter(|path| path.starts_with(&w.path("missing/")))
         .count();
-    assert_eq!(missing, 2000, "failed lookups seen: {missing}");
+    // A failed lookup is never lost silently: either all 2000 were seen, or the tracer said it
+    // could not read some path.
+    assert!(
+        missing == 2000 || stderr.contains("loss or error"),
+        "failed lookups seen: {missing}\n{stderr}"
+    );
+    assert!(missing >= 1900, "failed lookups seen: {missing}");
     assert!(
         listed(&stderr, "wrote").contains(&w.path("built.txt")),
         "{stderr}"

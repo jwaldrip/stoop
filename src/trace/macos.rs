@@ -132,16 +132,10 @@ syscall::faccessat:entry, syscall::fstatat:entry, syscall::fstatat64:entry
 	printf("EV\t%d\tstat\t%d\t-\t%s\n", pid, (int)arg0, copyinstr(arg1));
 }
 
-syscall::execve:entry
+proc:::exec
 /tree[pid]/
 {
-	printf("EV\t%d\texec\t-\t-\t%s\n", pid, copyinstr(arg0));
-}
-
-syscall::posix_spawn:entry
-/tree[pid]/
-{
-	printf("EV\t%d\texec\t-\t-\t%s\n", pid, copyinstr(arg1));
+	printf("EV\t%d\texec\t-\t-\t%s\n", pid, stringof(args[0]));
 }
 
 syscall::mkdir:entry, syscall::rmdir:entry, syscall::unlink:entry
@@ -371,7 +365,7 @@ impl Observer {
         if path.is_empty() {
             return;
         }
-        let Some(resolved) = self.resolve(pid, dirfd, path) else {
+        let Some(resolved) = self.resolve(pid, op, dirfd, path) else {
             return;
         };
         match op {
@@ -406,12 +400,15 @@ impl Observer {
         self.trace.touched.entry(path).or_default().read = true;
     }
 
-    fn resolve(&mut self, pid: u32, dirfd: Option<i32>, path: &str) -> Option<PathBuf> {
+    fn resolve(&mut self, pid: u32, op: &str, dirfd: Option<i32>, path: &str) -> Option<PathBuf> {
         if path.starts_with('/') {
             return Some(lexical(Path::new("/"), path));
         }
-        if !matches!(dirfd, None | Some(AT_FDCWD)) {
-            self.flag("a path relative to a directory descriptor cannot be placed");
+        if let Some(fd) = dirfd.filter(|fd| *fd != AT_FDCWD) {
+            let shown: String = path.chars().filter(|c| !c.is_control()).take(80).collect();
+            self.flag(format!(
+                "a path relative to directory descriptor {fd} cannot be placed ({op} by pid {pid}: {shown})"
+            ));
             return None;
         }
         match self.members.get(&pid).and_then(|m| m.cwd.clone()) {
