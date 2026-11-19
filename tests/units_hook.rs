@@ -668,3 +668,39 @@ fn a_removed_word_cannot_carry_a_raw_control_character() {
     assert!(err(&out).contains("\\u{1b}"), "{}", err(&out));
     assert_eq!(f.log(), "changed=<>\n");
 }
+
+#[test]
+fn two_recorded_forms_with_one_full_command_still_expand_to_it() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--files", "{changed}"], false);
+    assert!(out.status.success(), "{}", err(&out));
+    let out = f.invoke(&[], &["--files", "{changed:*.t}"], false);
+    assert!(out.status.success(), "{}", err(&out));
+    let out = f.invoke(&[], &["--files", ""], false);
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(err(&out).contains("the shell expanded"), "{}", err(&out));
+    assert!(!err(&out).contains("matches 2 recorded hooks"), "{}", err(&out));
+    assert_eq!(f.log(), "changed=<>\n");
+}
+
+#[test]
+fn three_identical_hook_runs_leave_one_record() {
+    let f = Fixture::new();
+    for _ in 0..3 {
+        let out = f.invoke(&[], &["--files", "{changed}"], false);
+        assert!(out.status.success(), "{}", err(&out));
+    }
+    let catalog: serde_json::Value =
+        serde_json::from_slice(&fs::read(f.root.join(".stoop/hooks-v1.json")).unwrap()).unwrap();
+    assert_eq!(catalog["records"].as_array().unwrap().len(), 1, "{catalog}");
+}
+
+#[test]
+fn a_removed_word_with_bidi_formatting_prints_as_text() {
+    let f = Fixture::new();
+    let out = f.invoke(&[], &["--files", "{changed:\u{202e}x}"], false);
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(!err(&out).contains('\u{202e}'), "{:?}", err(&out));
+    assert!(err(&out).contains("\\u{202e}"), "{}", err(&out));
+    assert_eq!(f.log(), "changed=<>\n");
+}

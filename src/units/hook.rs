@@ -635,3 +635,15 @@ pub(crate) fn empty_value_line(argv: &[String], explain: bool) -> Option<String>
         format!("stoop: {label} has an empty value; if a shell expanded a placeholder there, quote it: '{{changed}}'")
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::safe;
+
+    #[test]
+    fn safe_neutralises_control_bidi_and_workflow_text() {
+        assert_eq!(safe("a\nb\u{1b}c"), "a\\u{a}b\\u{1b}c");
+        assert_eq!(safe("x\u{202E}y"), "x\\u{202e}y");
+        assert_eq!(safe("##[error]z::w"), "#%23[error]z%3A%3Aw");
+    }
+}

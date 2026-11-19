@@ -143,3 +143,19 @@ fn append(path: &str, text: &str) -> Result<(), String> {
         .and_then(|mut f| f.write_all(text.as_bytes()))
         .map_err(|e| e.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::escape;
+
+    #[test]
+    fn escape_writes_bidi_formatting_characters_as_text() {
+        let escaped = escape("a\u{202E}b\u{2066}c\u{200F}d\u{061C}e");
+        assert_eq!(escaped, "a\\u{202e}b\\u{2066}c\\u{200f}d\\u{61c}e");
+    }
+
+    #[test]
+    fn escape_keeps_the_workflow_command_escapes() {
+        assert_eq!(escape("##[error]x::y\n"), "#%23[error]x%3A%3Ay%0A");
+    }
+}
