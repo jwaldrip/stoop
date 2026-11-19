@@ -261,7 +261,12 @@ fn probe_child() {
         return;
     };
     let root = PathBuf::from(root);
-    let args: Vec<String> = serde_json::from_str(&std::env::var("PROBE_ARGS").unwrap()).unwrap();
+    let args: Vec<std::ffi::OsString> =
+        serde_json::from_str::<Vec<String>>(&std::env::var("PROBE_ARGS").unwrap())
+            .unwrap()
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect();
     let o = match parse(&args) {
         Ok(Some(o)) => o,
         Ok(None) => panic!("help"),
