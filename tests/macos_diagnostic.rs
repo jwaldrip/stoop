@@ -1,10 +1,10 @@
 //! The macOS DTrace diagnostic, end to end. It needs passwordless `sudo` and DTrace, which
-//! hosted macOS runners have. Elsewhere each test says why it skipped, unless
+//! hosted macOS runners have. Where they are missing, each test says why it skipped, unless
 //! `STOOP_REQUIRE_DTRACE` is set, which makes a missing tracer a failure.
 #![cfg(target_os = "macos")]
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 fn tracer_usable() -> bool {
@@ -14,6 +14,7 @@ fn tracer_usable() -> bool {
         .is_ok_and(|out| out.status.success())
 }
 
+/// True when the test should be skipped. It never skips on a runner that has the tracer.
 fn skip(test: &str) -> bool {
     if tracer_usable() {
         return false;
@@ -43,14 +44,14 @@ impl Work {
         Self { dir }
     }
 
-    fn stoop(&self, script: &str) -> Output {
+    fn stoop(&self, script: &str, mode: &str) -> Output {
         Command::new(env!("CARGO_BIN_EXE_stoop"))
             .args([
                 "run", "--root", ".", "--key", "t", "--", "/bin/sh", "-c", script,
             ])
             .current_dir(&self.dir)
             .env("STOOP_STORE", self.dir.join("store"))
-            .env("STOOP_DTRACE_DIAGNOSTIC", "list")
+            .env("STOOP_DTRACE_DIAGNOSTIC", mode)
             .env_remove("STOOP_OFF")
             .env_remove("STOOP_FULL")
             .output()
@@ -60,6 +61,15 @@ impl Work {
     fn path(&self, name: &str) -> String {
         self.dir.join(name).display().to_string()
     }
+
+    /// Stoop wrote no proof: its store holds no proof files.
+    fn no_proof_written(&self) {
+        let store = self.dir.join("store");
+        let proofs = fs::read_dir(&store)
+            .map(|entries| entries.count())
+            .unwrap_or(0);
+        assert_eq!(proofs, 0, "a diagnostic run wrote into {}", store.display());
+    }
 }
 
 impl Drop for Work {
@@ -68,6 +78,7 @@ impl Drop for Work {
     }
 }
 
+/// The report lines of one kind: `stoop: dtrace <verb> <rest>` gives `<rest>`.
 fn listed(stderr: &str, verb: &str) -> Vec<String> {
     let prefix = format!("stoop: dtrace {verb} ");
     stderr
@@ -78,68 +89,113 @@ fn listed(stderr: &str, verb: &str) -> Vec<String> {
 }
 
 #[test]
-fn the_tree_its_lookups_and_its_status_are_observed_and_never_recorded() {
-    if skip("the_tree_its_lookups_and_its_status_are_observed_and_never_recorded") {
+fn a_fixture_with_a_tree_and_failed_lookups_is_observed_in_full_and_never_recorded() {
+    let name = "a_fixture_with_a_tree_and_failed_lookups_is_observed_in_full_and_never_recorded";
+    if skip(name) {
         return;
     }
-    let w = Work::new("tree");
+    let w = Work::new("fixture");
+    // 2000 lookups that fail, 1000 that succeed, 300 processes spawned and exec'd (so pids are
+    // reused), a grandchild, and writes into the repository.
     let script = "cat in.txt >/dev/null; \
         i=0; while [ $i -lt 2000 ]; do test -e \"missing/$i\"; i=$((i+1)); done; \
+        i=0; while [ $i -lt 1000 ]; do test -e in.txt; i=$((i+1)); done; \
+        i=0; while [ $i -lt 300 ]; do /usr/bin/true; i=$((i+1)); done; \
         /bin/sh -c 'cat nested.txt >/dev/null; printf built > built.txt'; \
-        printf run >> runs.log; exit 3";
-    let out = w.stoop(script);
+        mkdir out; printf run >> runs.log; exit 3";
+    let out = w.stoop(script, "list");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(3), "{stderr}");
     assert_eq!(fs::read_to_string(w.dir.join("runs.log")).unwrap(), "run");
-    assert!(stderr.contains("stoop: DTrace diagnostic:"), "{stderr}");
+    assert!(stderr.contains("stoop: DTrace diagnostic: "), "{stderr}");
     assert!(stderr.contains("not recorded"), "{stderr}");
-    // DTrace cannot always read a path, and it cannot place a path relative to a descriptor
-    // here, so a run may be reported incomplete. It must never be incomplete for a structural
-    // reason: the tracer armed, saw the command exit, stopped cleanly, and every pid it saw
-    // belongs to the tree.
-    for line in stderr.lines().filter(|l| l.contains("is incomplete")) {
-        assert!(
-            line.contains("directory descriptor") || line.contains("loss or error"),
-            "structural reason: {line}\n{stderr}"
-        );
-    }
+    // The known result: DTrace saw the whole fixture and reported no loss or error.
+    assert!(
+        stderr.contains("DTrace diagnostic verdict: no loss seen"),
+        "{stderr}"
+    );
+    w.no_proof_written();
 
     let read = listed(&stderr, "read");
-    for name in ["in.txt", "nested.txt"] {
-        assert!(read.contains(&w.path(name)), "{name} missing from {read:?}");
-    }
-    let missing = read
+    let failed = listed(&stderr, "failed");
+    let wrote = listed(&stderr, "wrote");
+    let spawned = listed(&stderr, "spawn");
+    let execed = listed(&stderr, "exec");
+
+    assert!(read.contains(&w.path("in.txt")), "{read:?}");
+    assert!(read.contains(&w.path("nested.txt")), "{read:?}");
+    let missing = failed
         .iter()
         .filter(|path| path.starts_with(&w.path("missing/")))
         .count();
-    // A failed lookup is never lost silently: either all 2000 were seen, or the tracer said it
-    // could not read some path.
+    assert_eq!(missing, 2000, "failed lookups seen: {failed:?}");
     assert!(
-        missing == 2000 || stderr.contains("loss or error"),
-        "failed lookups seen: {missing}\n{stderr}"
+        !read
+            .iter()
+            .any(|path| path.starts_with(&w.path("missing/"))),
+        "a failed lookup was also listed as read"
     );
-    assert!(missing >= 1900, "failed lookups seen: {missing}");
+    assert!(wrote.contains(&w.path("built.txt")), "{wrote:?}");
+    assert!(wrote.contains(&w.path("runs.log")), "{wrote:?}");
+    assert!(wrote.contains(&w.path("out")), "{wrote:?}");
+
+    let trues = execed
+        .iter()
+        .filter(|line| line.ends_with(" /usr/bin/true"))
+        .count();
+    assert_eq!(trues, 300, "exec attempts seen: {execed:?}");
     assert!(
-        listed(&stderr, "wrote").contains(&w.path("built.txt")),
-        "{stderr}"
+        execed.iter().any(|line| line.ends_with(" /bin/sh")),
+        "{execed:?}"
     );
-    assert!(!Path::new(&w.path("store")).join("proofs").exists());
+    assert!(
+        execed.iter().any(|line| line.ends_with(" /bin/cat")),
+        "{execed:?}"
+    );
+    assert!(spawned.len() >= 300, "spawn edges seen: {}", spawned.len());
 }
 
 #[test]
-fn a_tracer_killed_mid_run_returns_the_status_and_says_the_trace_is_incomplete() {
-    if skip("a_tracer_killed_mid_run_returns_the_status_and_says_the_trace_is_incomplete") {
+fn a_tracer_killed_mid_run_returns_the_status_and_says_the_report_is_unsound() {
+    let name = "a_tracer_killed_mid_run_returns_the_status_and_says_the_report_is_unsound";
+    if skip(name) {
         return;
     }
     let w = Work::new("killed");
-    let out = w.stoop("cat in.txt >/dev/null; sudo -n pkill -INT -x dtrace; sleep 2; printf run >> runs.log; exit 5");
+    // The command is a child of stoop, and so is the tracer's `sudo`. Only that tracer is
+    // signalled, never another process with the same name.
+    let out = w.stoop(
+        "cat in.txt >/dev/null; \
+         tracer=$(pgrep -P $PPID -x sudo); sudo -n kill -INT $tracer; sleep 2; \
+         printf run >> runs.log; exit 5",
+        "1",
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_eq!(out.status.code(), Some(5), "{stderr}");
     assert_eq!(fs::read_to_string(w.dir.join("runs.log")).unwrap(), "run");
     assert!(
-        stderr.contains("DTrace diagnostic is incomplete"),
+        stderr.contains("DTrace diagnostic verdict: UNSOUND"),
         "{stderr}"
     );
+    w.no_proof_written();
+}
+
+#[test]
+fn an_opt_in_without_passwordless_sudo_says_unknown_and_runs_the_command_once() {
+    if tracer_usable() {
+        eprintln!("skipped: `sudo -n dtrace` works here, so the no-sudo path cannot run");
+        return;
+    }
+    let w = Work::new("nosudo");
+    let out = w.stoop("printf run >> runs.log; exit 4", "1");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(4), "{stderr}");
+    assert_eq!(fs::read_to_string(w.dir.join("runs.log")).unwrap(), "run");
+    assert!(
+        stderr.contains("DTrace diagnostic verdict: UNKNOWN"),
+        "{stderr}"
+    );
+    w.no_proof_written();
 }
 
 #[test]

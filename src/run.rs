@@ -533,59 +533,29 @@ fn plain(argv: &[std::ffi::OsString], pass_env: &[&str]) -> i32 {
     }
 }
 
-/// The opt-in macOS diagnostic: run the command once under DTrace and say what it did. Nothing
-/// is recorded. `None` means the tracer could not arm and the command has not run, so the caller
-/// runs it untraced as usual.
+/// The opt-in macOS diagnostic: run the command once under DTrace and report what it did. Nothing
+/// is recorded, and the command's own status is returned. `None` means the tracer could not be
+/// armed and the command has not run, so the caller runs it untraced as usual. The report prints
+/// even under `--quiet`, because the variable asked for it.
 #[cfg(target_os = "macos")]
 fn dtrace_diagnostic(o: &Opts, cwd: &Path, key: &str) -> Option<Outcome> {
-    let diagnostic = match trace::macos::diagnose(&o.argv, cwd) {
+    let mode = env_str("STOOP_DTRACE_DIAGNOSTIC").unwrap_or_default();
+    let raw = mode == "raw";
+    let paths = raw || mode == "list";
+    let diagnostic = match trace::macos::diagnose(&o.argv, cwd, raw) {
         Ok(diagnostic) => diagnostic,
         Err(e) => {
-            if !o.quiet {
-                eprintln!("stoop: DTrace diagnostic unavailable ({e}); running untraced");
-            }
+            eprintln!("stoop: DTrace diagnostic verdict: UNKNOWN ({e}); running untraced");
             return None;
         }
     };
-    let trace = &diagnostic.trace;
-    if !o.quiet {
-        eprintln!(
-            "stoop: DTrace diagnostic: {} process(es), {} path event(s), {} path(s) looked at, {} written; not recorded",
-            diagnostic.processes,
-            diagnostic.events,
-            trace.touched.len(),
-            trace.written.len()
-        );
-        for reason in trace
-            .unsound
-            .iter()
-            .filter(|reason| reason.as_str() != trace::macos::DIAGNOSTIC_ONLY)
-        {
-            eprintln!(
-                "stoop: DTrace diagnostic is incomplete: {}",
-                shown_text(reason)
-            );
-        }
-        if env_str("STOOP_DTRACE_DIAGNOSTIC").is_some_and(|v| v == "list") {
-            let mut read: Vec<_> = trace.touched.keys().collect();
-            read.sort();
-            for path in read {
-                eprintln!("stoop: dtrace read {}", shown_text(&path.to_string_lossy()));
-            }
-            let mut wrote: Vec<_> = trace.written.iter().chain(&trace.created_dirs).collect();
-            wrote.sort();
-            for path in wrote {
-                eprintln!(
-                    "stoop: dtrace wrote {}",
-                    shown_text(&path.to_string_lossy())
-                );
-            }
-        }
+    for line in trace::macos::report(&diagnostic, paths, raw) {
+        eprintln!("stoop: {line}");
     }
     Some(Outcome {
-        status: trace.status,
+        status: diagnostic.trace.status,
         key: key.to_owned(),
-        how: How::Unrecorded("macOS diagnostic trace".into()),
+        how: How::Unrecorded("macOS DTrace diagnostic: never recorded".into()),
     })
 }
 

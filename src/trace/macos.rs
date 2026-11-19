@@ -1,25 +1,27 @@
 //! A diagnostic macOS tracer: DTrace under passwordless `sudo`.
 //!
-//! Diagnostic only. The observations are returned with a standing `unsound` reason, so no
-//! caller can record a proof from them. The privileged spike found DTrace the only tool that
-//! saw every category it can observe on hosted runners, and it still lacks symlink targets,
-//! errno and exact directory listings, so a recorded proof waits on those gaps.
+//! Diagnostic only. Every observation carries a standing `unsound` reason, so no caller can
+//! record a proof from it. The privileged spike found DTrace the only tool that saw every
+//! category it can observe on hosted runners. It still lacks symlink targets, errno and exact
+//! directory listings, and a relative path through a descriptor cannot be placed, so a recorded
+//! proof waits on those gaps.
 //!
 //! How a run goes:
 //! 1. The command is started inside a wrapper that blocks on a pipe, so its pid is known
 //!    before it can do anything.
 //! 2. DTrace is armed for that pid's process tree. The command is released only after the
 //!    script prints `READY`, so a tracer that never arms never lets the command run.
-//! 3. DTrace stops itself shortly after the root process exits. Every loss or error it can
-//!    report, every line this parser cannot read and every missing marker makes the
-//!    observation unsound.
+//! 3. DTrace stops itself shortly after the root process exits. Every line DTrace prints about
+//!    itself is a loss or an error, and every line this parser cannot read, every path it
+//!    cannot place and every missing marker makes the observation unsound.
 //!
-//! A failure before the command starts is an `Err` and the caller runs the command untraced.
-//! A failure after it starts is never an `Err`: the command's status comes back with
-//! `unsound` set, because an `Err` would make the caller run the command a second time.
+//! A failure before the command starts is an `Err`, and the caller runs the command untraced
+//! with an UNKNOWN verdict. A failure after it starts is never an `Err`: the command's status
+//! comes back with `unsound` set, because an `Err` would make the caller run the command a
+//! second time.
 
 use super::Trace;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -46,9 +48,12 @@ const MAX_REASONS: usize = 16;
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Tree membership starts at the command's pid (`$1`) and grows through `proc:::create`.
-/// A path-taking probe reports only for members. The tracer stops itself half a second after
-/// the root exits, which flushes every buffer first.
+/// Tree membership starts at the command's pid (`$1`) and grows through `proc:::create`, and a
+/// pid leaves it at `proc:::exit`, so a reused pid is not counted. A path-taking probe reports
+/// only for members. A NULL path pointer is never copied: the kernel fails such a call with
+/// EFAULT before any lookup, so there is nothing to report. A call that returns -1 also prints
+/// `FAIL`, with the path it was given. The tracer stops itself half a second after the root
+/// exits, which flushes every buffer first.
 const SCRIPT: &str = r#"#pragma D option quiet
 #pragma D option zdefs
 #pragma D option dynvarsize=128m
@@ -65,10 +70,16 @@ BEGIN
 }
 
 proc:::create
-/tree[pid]/
+/tree[pid] && arg0 != 0/
 {
 	tree[args[0]->pr_pid] = 1;
 	printf("SPAWN\t%d\t%d\n", pid, args[0]->pr_pid);
+}
+
+proc:::exec
+/tree[pid] && arg0 != 0/
+{
+	printf("EV\t%d\texec\t-\t-\t%s\n", pid, stringof(args[0]));
 }
 
 proc:::exec-success
@@ -81,6 +92,7 @@ proc:::exit
 /tree[pid]/
 {
 	printf("EXIT\t%d\n", pid);
+	tree[pid] = 0;
 }
 
 proc:::exit
@@ -97,62 +109,152 @@ tick-50ms
 }
 
 syscall::open:entry, syscall::open_nocancel:entry
-/tree[pid]/
+/tree[pid] && arg0 != 0/
 {
-	printf("EV\t%d\topen\t-\t%d\t%s\n", pid, (int)arg1, copyinstr(arg0));
+	self->lookup = 1;
+	self->fd = -2;
+	self->path = copyinstr(arg0);
+	printf("EV\t%d\topen\t-\t%d\t%s\n", pid, (int)arg1, self->path);
 }
 
 syscall::openat:entry, syscall::openat_nocancel:entry
-/tree[pid]/
+/tree[pid] && arg1 != 0/
 {
-	printf("EV\t%d\topenat\t%d\t%d\t%s\n", pid, (int)arg0, (int)arg2, copyinstr(arg1));
+	self->lookup = 1;
+	self->fd = (int)arg0;
+	self->path = copyinstr(arg1);
+	printf("EV\t%d\topenat\t%d\t%d\t%s\n", pid, (int)arg0, (int)arg2, self->path);
 }
 
 syscall::stat:entry, syscall::stat64:entry
-/tree[pid]/
+/tree[pid] && arg0 != 0/
 {
-	printf("EV\t%d\tstat\t-\t-\t%s\n", pid, copyinstr(arg0));
+	self->lookup = 1;
+	self->fd = -2;
+	self->path = copyinstr(arg0);
+	printf("EV\t%d\tstat\t-\t-\t%s\n", pid, self->path);
 }
 
 syscall::lstat:entry, syscall::lstat64:entry
-/tree[pid]/
+/tree[pid] && arg0 != 0/
 {
-	printf("EV\t%d\tlstat\t-\t-\t%s\n", pid, copyinstr(arg0));
+	self->lookup = 1;
+	self->fd = -2;
+	self->path = copyinstr(arg0);
+	printf("EV\t%d\tlstat\t-\t-\t%s\n", pid, self->path);
 }
 
-syscall::access:entry, syscall::getattrlist:entry, syscall::readlink:entry
-/tree[pid]/
+syscall::fstatat:entry, syscall::fstatat64:entry
+/tree[pid] && arg1 != 0/
 {
-	printf("EV\t%d\t%s\t-\t-\t%s\n", pid, probefunc, copyinstr(arg0));
+	self->lookup = 1;
+	self->fd = (int)arg0;
+	self->path = copyinstr(arg1);
+	printf("EV\t%d\tstat\t%d\t-\t%s\n", pid, (int)arg0, self->path);
 }
 
-syscall::faccessat:entry, syscall::fstatat:entry, syscall::fstatat64:entry
-/tree[pid]/
+syscall::access:entry
+/tree[pid] && arg0 != 0/
 {
-	printf("EV\t%d\tstat\t%d\t-\t%s\n", pid, (int)arg0, copyinstr(arg1));
+	self->lookup = 1;
+	self->fd = -2;
+	self->path = copyinstr(arg0);
+	printf("EV\t%d\taccess\t-\t-\t%s\n", pid, self->path);
 }
 
-proc:::exec
-/tree[pid]/
+syscall::faccessat:entry
+/tree[pid] && arg1 != 0/
 {
-	printf("EV\t%d\texec\t-\t-\t%s\n", pid, stringof(args[0]));
+	self->lookup = 1;
+	self->fd = (int)arg0;
+	self->path = copyinstr(arg1);
+	printf("EV\t%d\taccess\t%d\t-\t%s\n", pid, (int)arg0, self->path);
 }
 
-syscall::mkdir:entry, syscall::rmdir:entry, syscall::unlink:entry
-/tree[pid]/
+syscall::getattrlist:entry
+/tree[pid] && arg0 != 0/
 {
-	printf("EV\t%d\t%s\t-\t-\t%s\n", pid, probefunc, copyinstr(arg0));
+	self->lookup = 1;
+	self->fd = -2;
+	self->path = copyinstr(arg0);
+	printf("EV\t%d\tgetattrlist\t-\t-\t%s\n", pid, self->path);
+}
+
+syscall::readlink:entry
+/tree[pid] && arg0 != 0/
+{
+	self->lookup = 1;
+	self->fd = -2;
+	self->path = copyinstr(arg0);
+	printf("EV\t%d\treadlink\t-\t-\t%s\n", pid, self->path);
+}
+
+syscall::mkdir:entry
+/tree[pid] && arg0 != 0/
+{
+	self->lookup = 1;
+	self->fd = -2;
+	self->path = copyinstr(arg0);
+	printf("EV\t%d\tmkdir\t-\t-\t%s\n", pid, self->path);
+}
+
+syscall::rmdir:entry
+/tree[pid] && arg0 != 0/
+{
+	self->lookup = 1;
+	self->fd = -2;
+	self->path = copyinstr(arg0);
+	printf("EV\t%d\trmdir\t-\t-\t%s\n", pid, self->path);
+}
+
+syscall::unlink:entry
+/tree[pid] && arg0 != 0/
+{
+	self->lookup = 1;
+	self->fd = -2;
+	self->path = copyinstr(arg0);
+	printf("EV\t%d\tunlink\t-\t-\t%s\n", pid, self->path);
 }
 
 syscall::rename:entry
-/tree[pid]/
+/tree[pid] && arg0 != 0 && arg1 != 0/
 {
-	printf("EV\t%d\trenamefrom\t-\t-\t%s\n", pid, copyinstr(arg0));
-	printf("EV\t%d\trenameto\t-\t-\t%s\n", pid, copyinstr(arg1));
+	self->lookup = 1;
+	self->fd = -2;
+	self->path = copyinstr(arg0);
+	self->path2 = copyinstr(arg1);
+	printf("EV\t%d\trenamefrom\t-\t-\t%s\n", pid, self->path);
+	printf("EV\t%d\trenameto\t-\t-\t%s\n", pid, self->path2);
+}
+
+syscall::open:return, syscall::open_nocancel:return,
+syscall::openat:return, syscall::openat_nocancel:return,
+syscall::stat:return, syscall::stat64:return,
+syscall::lstat:return, syscall::lstat64:return,
+syscall::fstatat:return, syscall::fstatat64:return,
+syscall::access:return, syscall::faccessat:return,
+syscall::getattrlist:return, syscall::readlink:return,
+syscall::mkdir:return, syscall::rmdir:return, syscall::unlink:return
+/self->lookup/
+{
+	if ((int)arg0 == -1) {
+		printf("FAIL\t%d\t%d\t%s\n", pid, self->fd, self->path);
+	}
+	self->lookup = 0;
+}
+
+syscall::rename:return
+/self->lookup/
+{
+	if ((int)arg0 == -1) {
+		printf("FAIL\t%d\t-2\t%s\n", pid, self->path);
+		printf("FAIL\t%d\t-2\t%s\n", pid, self->path2);
+	}
+	self->lookup = 0;
 }
 
 syscall::chdir:entry
-/tree[pid]/
+/tree[pid] && arg0 != 0/
 {
 	self->cdset = 1;
 	self->cd = copyinstr(arg0);
@@ -161,9 +263,8 @@ syscall::chdir:entry
 syscall::chdir:return
 /self->cdset/
 {
-	printf("EV\t%d\tchdir\t-\t%d\t%s\n", pid, (int)arg1, self->cd);
+	printf("EV\t%d\tchdir\t-\t%d\t%s\n", pid, (int)arg0, self->cd);
 	self->cdset = 0;
-	self->cd = 0;
 }
 
 syscall::fchdir:entry
@@ -180,6 +281,17 @@ pub struct Diagnostic {
     pub processes: usize,
     /// Path events read from the tracer.
     pub events: usize,
+    /// Lookups that returned an error (`-1`). DTrace gives no errno, so a missing file and any
+    /// other failure look the same here.
+    pub failed: BTreeSet<PathBuf>,
+    /// Lines DTrace printed about its own losses or errors.
+    pub losses: usize,
+    /// Every line the tracer printed, kept only when asked (`STOOP_DTRACE_DIAGNOSTIC=raw`).
+    pub raw: Vec<String>,
+    /// Parent and child pid of each process the tree started.
+    pub spawns: Vec<(u32, u32)>,
+    /// Pid and path of each exec attempt made inside the tree.
+    pub execs: Vec<(u32, PathBuf)>,
 }
 
 enum Event {
@@ -192,6 +304,11 @@ enum Event {
         op: String,
         dirfd: Option<i32>,
         value: Option<i32>,
+        path: String,
+    },
+    /// A lookup that returned an error: the path as passed, relative to `dirfd` when given.
+    Fail {
+        dirfd: Option<i32>,
         path: String,
     },
 }
@@ -212,6 +329,11 @@ pub struct Observer {
     events: usize,
     saw_root_exit: bool,
     saw_stop: bool,
+    failed: BTreeSet<PathBuf>,
+    losses: usize,
+    raw: Vec<String>,
+    spawns: Vec<(u32, u32)>,
+    execs: Vec<(u32, PathBuf)>,
 }
 
 impl Observer {
@@ -232,6 +354,11 @@ impl Observer {
             events: 0,
             saw_root_exit: false,
             saw_stop: false,
+            failed: BTreeSet::new(),
+            losses: 0,
+            raw: Vec::new(),
+            spawns: Vec::new(),
+            execs: Vec::new(),
         };
         observer.flag(DIAGNOSTIC_ONLY);
         observer
@@ -256,9 +383,8 @@ impl Observer {
             return;
         }
         if line.starts_with("dtrace:") {
-            if let Some(reason) = tracer_message(line) {
-                self.flag(reason);
-            }
+            self.losses += 1;
+            self.flag(tracer_message(line));
             return;
         }
         let mut parts = line.splitn(6, '\t');
@@ -292,6 +418,16 @@ impl Observer {
                     _ => None,
                 }
             }
+            ("FAIL", [pid, dirfd, path]) => match (pid.parse(), dirfd.parse()) {
+                (Ok(pid), Ok(dirfd)) => Some((
+                    pid,
+                    Event::Fail {
+                        dirfd: Some(dirfd),
+                        path: (*path).to_owned(),
+                    },
+                )),
+                _ => None,
+            },
             _ => None,
         };
         match parsed {
@@ -319,6 +455,7 @@ impl Observer {
                     self.flag("a pid was reused before its exit was seen");
                 }
                 self.members.insert(child, Member { cwd, exited: false });
+                self.spawns.push((pid, child));
                 if let Some(held) = self.pending.remove(&child) {
                     for event in held {
                         self.apply(child, event);
@@ -340,6 +477,7 @@ impl Observer {
                 value,
                 path,
             } => self.path_event(pid, &op, dirfd, value, &path),
+            Event::Fail { dirfd, path } => self.failed_lookup(pid, dirfd, &path),
         }
     }
 
@@ -365,11 +503,15 @@ impl Observer {
         if path.is_empty() {
             return;
         }
-        let Some(resolved) = self.resolve(pid, op, dirfd, path) else {
+        let Some(resolved) = self.resolve(pid, dirfd, path) else {
             return;
         };
         match op {
-            "stat" | "lstat" | "access" | "getattrlist" | "readlink" | "exec" => {
+            "stat" | "lstat" | "access" | "getattrlist" | "readlink" => {
+                self.read(resolved);
+            }
+            "exec" => {
+                self.execs.push((pid, resolved.clone()));
                 self.read(resolved);
             }
             "open" | "openat" => {
@@ -382,7 +524,9 @@ impl Observer {
             }
             "chdir" => {
                 self.read(resolved.clone());
-                if value == Some(0) {
+                if value == Some(-1) {
+                    self.failed.insert(resolved);
+                } else if value == Some(0) {
                     if let Some(member) = self.members.get_mut(&pid) {
                         member.cwd = Some(resolved);
                     }
@@ -396,18 +540,29 @@ impl Observer {
         }
     }
 
+    /// A lookup that returned -1, placed the way its lookup was placed. A path that cannot be
+    /// placed makes the run unsound, with the same reason its lookup gave.
+    fn failed_lookup(&mut self, pid: u32, dirfd: Option<i32>, path: &str) {
+        if path.is_empty() || path.len() >= STRSIZE - 1 {
+            return;
+        }
+        if let Some(resolved) = self.resolve(pid, dirfd, path) {
+            self.failed.insert(resolved);
+        }
+    }
+
     fn read(&mut self, path: PathBuf) {
         self.trace.touched.entry(path).or_default().read = true;
     }
 
-    fn resolve(&mut self, pid: u32, op: &str, dirfd: Option<i32>, path: &str) -> Option<PathBuf> {
+    fn resolve(&mut self, pid: u32, dirfd: Option<i32>, path: &str) -> Option<PathBuf> {
         if path.starts_with('/') {
             return Some(lexical(Path::new("/"), path));
         }
         if let Some(fd) = dirfd.filter(|fd| *fd != AT_FDCWD) {
             let shown: String = path.chars().filter(|c| !c.is_control()).take(80).collect();
             self.flag(format!(
-                "a path relative to directory descriptor {fd} cannot be placed ({op} by pid {pid}: {shown})"
+                "a path relative to directory descriptor {fd} cannot be placed (pid {pid}: {shown})"
             ));
             return None;
         }
@@ -442,19 +597,20 @@ impl Observer {
             processes: self.members.len(),
             events: self.events,
             trace: self.trace,
+            failed: self.failed,
+            losses: self.losses,
+            raw: self.raw,
+            spawns: self.spawns,
+            execs: self.execs,
         }
     }
 }
 
-/// A line DTrace printed about itself. Returns the reason it makes the observation unsound,
-/// or `None` when it is harmless. A NULL pointer on a probe with no path is harmless; this
-/// script has no such probe that dereferences one, so only `proc` probes qualify.
-fn tracer_message(line: &str) -> Option<String> {
-    if line.contains("invalid address (0x0)") && line.contains("proc:") {
-        return None;
-    }
+/// A line DTrace printed about itself. Every one is a loss or an error, so every one makes the
+/// observation unsound. The script never copies a NULL pointer, so none is expected.
+fn tracer_message(line: &str) -> String {
     let shown: String = line.chars().filter(|c| !c.is_control()).take(160).collect();
-    Some(format!("the tracer reported a loss or error: {shown}"))
+    format!("the tracer reported a loss or error: {shown}")
 }
 
 /// `path` joined to `base` with `.` and `..` resolved by name only.
@@ -522,7 +678,7 @@ fn dtrace_command() -> Command {
 
 /// Runs `argv` once under DTrace and returns what was observed. `Err` means the command was
 /// not run and the caller should run it untraced.
-pub fn diagnose(argv: &[OsString], cwd: &Path) -> io::Result<Diagnostic> {
+pub fn diagnose(argv: &[OsString], cwd: &Path, raw: bool) -> io::Result<Diagnostic> {
     if !sudo_usable() {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
@@ -536,6 +692,7 @@ pub fn diagnose(argv: &[OsString], cwd: &Path) -> io::Result<Diagnostic> {
         cwd,
         READY_TIMEOUT,
         STOP_TIMEOUT,
+        raw,
     )
 }
 
@@ -547,12 +704,13 @@ pub(crate) fn run_with(
     cwd: &Path,
     ready_timeout: Duration,
     stop_timeout: Duration,
+    keep_raw: bool,
 ) -> io::Result<Diagnostic> {
     let (release_read, release_write) = make_pipe()?;
     let mut wrapper = Command::new("/bin/sh");
     wrapper
         .arg("-c")
-        .arg("read -r _ <&3; exec 3<&-; exec \"$@\"")
+        .arg("read -r _ <&3 || exit 125; exec 3<&-; exec \"$@\"")
         .arg("stoop")
         .args(argv)
         .current_dir(cwd);
@@ -631,6 +789,9 @@ pub(crate) fn run_with(
                         let _ = tx.send(());
                     }
                 }
+                if keep_raw {
+                    observer.raw.push(text.clone());
+                }
                 observer.feed(&text);
             }
         }
@@ -647,14 +808,29 @@ pub(crate) fn run_with(
             "the tracer did not report READY, so the command was not run",
         ));
     }
-    // Armed: release the command, which now runs exactly once.
+    // Armed: release the command, which now runs exactly once. The wrapper exits without running
+    // the command if the release never arrives.
     let mut release = std::fs::File::from(release_write);
     let released = release.write_all(b"\n").is_ok();
     drop(release);
-    let status = command.wait()?;
-    let code = status
-        .code()
-        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0));
+    if !released {
+        let _ = command.wait();
+        unsafe { libc::kill(tracer_pid as i32, libc::SIGINT) };
+        let _ = tracing.wait();
+        return Err(io::Error::other(
+            "the command could not be released, so it was not run",
+        ));
+    }
+    // The command has started from here on. A failure is reported as unsound, never as `Err`:
+    // the caller would run the command a second time.
+    let code = match command.wait() {
+        Ok(status) => Some(
+            status
+                .code()
+                .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+        ),
+        Err(_) => None,
+    };
 
     let mut observer = match done_rx.recv_timeout(stop_timeout) {
         Ok(observer) => observer,
@@ -673,16 +849,190 @@ pub(crate) fn run_with(
             }
         }
     };
-    if !released {
-        observer.flag("the command's release could not be confirmed");
+    if code.is_none() {
+        observer.flag("the command's exit status could not be read");
     }
     let _ = tracing.wait();
-    Ok(observer.finish(code))
+    Ok(observer.finish(code.unwrap_or(1)))
+}
+
+/// The lines `stoop run` prints for a diagnostic run, without the `stoop: ` prefix. `paths`
+/// adds what each path was (read, failed, written) and the tree; `raw` adds every tracer line.
+/// The verdict is UNSOUND for any reason, and otherwise says that no loss was seen, which is not
+/// a claim that the observation is complete.
+pub(crate) fn report(d: &Diagnostic, paths: bool, raw: bool) -> Vec<String> {
+    let t = &d.trace;
+    let read: BTreeSet<&PathBuf> = t
+        .touched
+        .keys()
+        .filter(|p| !d.failed.contains(*p))
+        .collect();
+    let written: BTreeSet<PathBuf> = t.written.iter().chain(&t.created_dirs).cloned().collect();
+    let mut out = vec![format!(
+        "DTrace diagnostic: {} process(es), {} path event(s), {} read, {} failed, {} written; not recorded",
+        d.processes,
+        d.events,
+        read.len(),
+        d.failed.len(),
+        written.len()
+    )];
+    let reasons: Vec<&String> = t
+        .unsound
+        .iter()
+        .filter(|reason| reason.as_str() != DIAGNOSTIC_ONLY)
+        .collect();
+    if reasons.is_empty() {
+        out.push(
+            "DTrace diagnostic verdict: no loss seen; completeness is not proven; not recorded"
+                .into(),
+        );
+    } else {
+        out.push(format!(
+            "DTrace diagnostic verdict: UNSOUND ({} reason(s), {} tracer loss or error line(s)); not recorded",
+            reasons.len(),
+            d.losses
+        ));
+        for reason in reasons {
+            out.push(format!(
+                "DTrace diagnostic UNSOUND: {}",
+                crate::run::safe(reason)
+            ));
+        }
+    }
+    if paths {
+        for path in &read {
+            out.push(format!("dtrace read {}", shown_path(path)));
+        }
+        for path in &d.failed {
+            out.push(format!("dtrace failed {}", shown_path(path)));
+        }
+        for path in &written {
+            out.push(format!("dtrace wrote {}", shown_path(path)));
+        }
+        for (parent, child) in &d.spawns {
+            out.push(format!("dtrace spawn {parent} {child}"));
+        }
+        for (pid, path) in &d.execs {
+            out.push(format!("dtrace exec {pid} {}", shown_path(path)));
+        }
+    }
+    if raw {
+        for line in &d.raw {
+            out.push(format!("dtrace raw {}", crate::run::safe(line)));
+        }
+    }
+    out
+}
+
+fn shown_path(path: &Path) -> String {
+    crate::run::safe(&path.to_string_lossy())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clean_run_reports_no_loss_and_never_claims_completeness() {
+        let mut o = observer();
+        feed(&mut o, &["EV\t100\tstat\t-\t-\tin.txt"]);
+        clean_end(&mut o);
+        let lines = report(&o.finish(0), false, false);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("no loss seen") && l.contains("not proven")),
+            "{lines:?}"
+        );
+        assert!(!lines.iter().any(|l| l.contains("UNSOUND")), "{lines:?}");
+    }
+
+    #[test]
+    fn a_loss_is_reported_as_unsound_with_its_text() {
+        let mut o = observer();
+        feed(&mut o, &["dtrace: 3 drops on CPU 1"]);
+        clean_end(&mut o);
+        let lines = report(&o.finish(0), false, false);
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("DTrace diagnostic verdict: UNSOUND")),
+            "{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("DTrace diagnostic UNSOUND: ")
+                    && l.contains("3 drops on CPU 1")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn listings_separate_reads_failed_lookups_writes_and_the_tree() {
+        let mut o = observer();
+        feed(
+            &mut o,
+            &[
+                "EV\t100\tstat\t-\t-\tin.txt",
+                "EV\t100\tstat\t-\t-\tmissing",
+                "FAIL\t100\t-2\tmissing",
+                "EV\t100\topen\t-\t1537\tout.txt",
+                "SPAWN\t100\t200",
+                "EV\t200\texec\t-\t-\t/usr/bin/true",
+                "EXIT\t200",
+            ],
+        );
+        clean_end(&mut o);
+        let lines = report(&o.finish(0), true, false);
+        for expected in [
+            "dtrace read /work/in.txt",
+            "dtrace failed /work/missing",
+            "dtrace wrote /work/out.txt",
+            "dtrace spawn 100 200",
+            "dtrace exec 200 /usr/bin/true",
+        ] {
+            assert!(lines.iter().any(|l| l == expected), "{expected}: {lines:?}");
+        }
+        assert!(
+            !lines.iter().any(|l| l == "dtrace read /work/missing"),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn raw_lines_are_printed_only_in_raw_mode_and_paths_only_when_asked() {
+        let mut o = observer();
+        feed(&mut o, &["EV\t100\tstat\t-\t-\tin.txt"]);
+        o.raw.push("EV\t100\tstat\t-\t-\tin.txt".into());
+        clean_end(&mut o);
+        let d = o.finish(0);
+        let summary_only = report(&d, false, false);
+        assert!(
+            !summary_only.iter().any(|l| l.starts_with("dtrace ")),
+            "{summary_only:?}"
+        );
+        let with_paths = report(&d, true, false);
+        assert!(with_paths.iter().any(|l| l == "dtrace read /work/in.txt"));
+        assert!(!with_paths.iter().any(|l| l.starts_with("dtrace raw")));
+        let with_raw = report(&d, true, true);
+        assert!(
+            with_raw.iter().any(|l| l.starts_with("dtrace raw EV")),
+            "{with_raw:?}"
+        );
+    }
+
+    #[test]
+    fn control_characters_in_paths_are_escaped_on_the_report() {
+        let mut o = observer();
+        feed(&mut o, &["EV\t100\tstat\t-\t-\ta\u{1b}b"]);
+        clean_end(&mut o);
+        let lines = report(&o.finish(0), true, false);
+        assert!(
+            lines.iter().any(|l| l == "dtrace read /work/a\\u{1b}b"),
+            "{lines:?}"
+        );
+    }
 
     fn observer() -> Observer {
         Observer::new(100, Path::new("/work"))
@@ -825,11 +1175,108 @@ mod tests {
     }
 
     #[test]
-    fn a_null_pointer_on_a_probe_with_no_path_is_harmless() {
+    fn a_null_pointer_error_is_unsound_on_every_probe() {
+        for line in [
+            "dtrace: error on enabled probe ID 7 (ID 12: proc:::create): invalid address (0x0) in action #1",
+            "dtrace: error on enabled probe ID 8 (ID 13: syscall::fstatat64:entry): invalid address (0x0) in action #2",
+        ] {
+            let mut o = observer();
+            o.feed(line);
+            clean_end(&mut o);
+            let d = o.finish(0);
+            assert!(
+                reasons(&d).iter().any(|r| r.contains("loss or error")),
+                "{line}: {:?}",
+                reasons(&d)
+            );
+        }
+    }
+
+    #[test]
+    fn failed_lookups_are_listed_as_failed_and_still_touched() {
         let mut o = observer();
-        o.feed("dtrace: error on enabled probe ID 7 (ID 12: proc:::create): invalid address (0x0) in action #1");
+        feed(
+            &mut o,
+            &[
+                "EV\t100\tstat\t-\t-\tmissing/x",
+                "FAIL\t100\t-2\tmissing/x",
+                "EV\t100\tstat\t-\t-\tin.txt",
+            ],
+        );
         clean_end(&mut o);
-        assert_eq!(reasons(&o.finish(0)), [DIAGNOSTIC_ONLY]);
+        let d = o.finish(0);
+        assert!(d.failed.contains(Path::new("/work/missing/x")));
+        assert!(!d.failed.contains(Path::new("/work/in.txt")));
+        assert!(d.trace.touched.contains_key(Path::new("/work/missing/x")));
+        assert_eq!(reasons(&d), [DIAGNOSTIC_ONLY]);
+    }
+
+    #[test]
+    fn a_failed_chdir_is_a_failed_lookup() {
+        let mut o = observer();
+        feed(&mut o, &["EV\t100\tchdir\t-\t-1\tmissing"]);
+        assert!(o.failed.contains(Path::new("/work/missing")));
+    }
+
+    #[test]
+    fn a_failed_lookup_relative_to_a_descriptor_is_unsound_and_not_placed() {
+        let mut o = observer();
+        feed(&mut o, &["FAIL\t100\t7\trel.txt"]);
+        clean_end(&mut o);
+        let d = o.finish(0);
+        assert!(d.failed.is_empty());
+        assert!(reasons(&d).iter().any(|r| r.contains("descriptor")));
+    }
+
+    #[test]
+    fn tracer_losses_are_counted() {
+        let mut o = observer();
+        feed(
+            &mut o,
+            &[
+                "dtrace: 3 drops on CPU 1",
+                "dtrace: 9 dynamic variable drops with non-empty dirty list",
+            ],
+        );
+        clean_end(&mut o);
+        assert_eq!(o.finish(0).losses, 2);
+    }
+
+    #[test]
+    fn the_recorder_refuses_a_diagnostic_trace() {
+        let mut o = observer();
+        feed(&mut o, &["EV\t100\tstat\t-\t-\tin.txt"]);
+        clean_end(&mut o);
+        let d = o.finish(0);
+        let root = Path::new("/work");
+        let mut phys = crate::pathutil::Physical::new(root, root);
+        let ignore = crate::ignore::Ignore::new(&[], None, &[]);
+        match crate::run::build_inputs(
+            root,
+            &mut phys,
+            &d.trace,
+            &ignore,
+            &std::collections::BTreeSet::new(),
+        ) {
+            Err(reason) => assert!(reason.contains("diagnostic backend"), "{reason}"),
+            Ok(_) => panic!("the recorder accepted a diagnostic trace"),
+        }
+    }
+
+    #[test]
+    fn raw_mode_keeps_every_line_the_tracer_printed() {
+        let argv = [OsString::from("/usr/bin/true")];
+        let d = run_with(
+            fake("echo READY; printf 'EV\\t%s\\tstat\\t-\\t-\\t/etc/hosts\\nEXIT\\t%s\\nSTOP\\n' \"$0\" \"$0\""),
+            "",
+            &argv,
+            Path::new("/"),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            true,
+        )
+        .unwrap();
+        assert_eq!(d.raw.len(), 4, "{:?}", d.raw);
     }
 
     #[test]
@@ -919,6 +1366,7 @@ mod tests {
             Path::new("/"),
             Duration::from_millis(400),
             Duration::from_secs(1),
+            false,
         );
         assert!(started.is_err());
         assert!(
@@ -942,6 +1390,7 @@ mod tests {
             Path::new("/"),
             Duration::from_secs(5),
             Duration::from_secs(1),
+            false,
         );
         assert!(started.is_err());
         assert!(!file.exists());
@@ -963,6 +1412,7 @@ mod tests {
             Path::new("/"),
             Duration::from_secs(5),
             Duration::from_secs(5),
+            false,
         )
         .unwrap();
         assert_eq!(d.trace.status, 7);
@@ -984,6 +1434,7 @@ mod tests {
             Path::new("/"),
             Duration::from_secs(5),
             Duration::from_secs(5),
+            false,
         )
         .unwrap();
         assert_eq!(d.trace.status, 0);
@@ -1003,6 +1454,7 @@ mod tests {
             Path::new("/"),
             Duration::from_secs(5),
             Duration::from_secs(5),
+            false,
         )
         .unwrap();
         assert_eq!(reasons(&d), [DIAGNOSTIC_ONLY]);

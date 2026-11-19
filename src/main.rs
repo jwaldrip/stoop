@@ -65,6 +65,9 @@ ENVIRONMENT
   STOOP_FULL=1      never skip; still record (nightly runs)
   STOOP_OFF=1       do not trace or skip anything
                     (switches: empty, 0, false, no and off mean off; anything else is on)
+  STOOP_DTRACE_DIAGNOSTIC=1  macOS with passwordless sudo: run the command under DTrace and print
+                    what it saw. Records nothing (see BLIND SPOTS). `list` adds the paths and
+                    the process tree, `raw` also prints every tracer line
   STOOP_PASS_ENV    comma- or space-separated OIDC request variable names to pass;
                     requires --allow-id-token and disables proof use for the run
   STOOP_LEARN_VOLATILE=0  same as --no-learn-volatile (empty, 0, false, no and off mean off)
