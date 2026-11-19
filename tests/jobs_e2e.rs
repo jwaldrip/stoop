@@ -1266,6 +1266,8 @@ fn clean_children_still_publish_an_attestation_the_planner_verifies() {
     let script = "env > \"$RUNNER_TEMP/child.env\"\n";
     let mut w = Ws::new("oidc-filter", &[script]);
     let workflow = format!("name: fixture\non: push\ndefaults:\n  run:\n    shell: stoop sh {{0}}\njobs:\n  stoop-plan:\n    runs-on: ubuntu-latest\n    steps: []\n  test:\n    needs: [stoop-plan]\n    if: ${{{{ !cancelled() && !contains(needs.stoop-plan.outputs.skip, ',test,') }}}}\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: |\n          {}\n", script.trim_end());
+    let runner = if cfg!(target_arch = "aarch64") { "ubuntu-24.04-arm" } else { "ubuntu-latest" };
+    let workflow = workflow.replace("runs-on: ubuntu-latest", &format!("runs-on: {runner}"));
     fs::write(w.root.join(".github/workflows/ci.yml"), workflow).unwrap();
     git(&w.root, &["add", ".github/workflows/ci.yml"]);
     git(
