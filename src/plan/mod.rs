@@ -224,7 +224,7 @@ pub fn cmd(args: &[String]) -> i32 {
         .clone()
         .unwrap_or_else(|| run::find_root(&std::env::current_dir().unwrap_or_default()));
     let path = workflow_path(&o).unwrap_or_default();
-    let mut plan = json!({"schema":"stoop.plan/1","workflow":"","path":path,"rev":"","plan_job":o.plan_job,"full":run::env_flag("STOOP_FULL"),"skip":[],"jobs":[]});
+    let mut plan = json!({"schema":"stoop.plan/1","workflow":"","path":path,"rev":"","plan_job":o.plan_job,"full":run::env_switch("STOOP_FULL", true),"skip":[],"jobs":[]});
     let result = build(
         &o,
         &root,
@@ -523,22 +523,23 @@ fn build<S: attest::KeySource>(
         let gated = gate
             .as_ref()
             .is_none_or(|(code, _)| *code != Code::NotGated);
-        let decision =
-            if !graph_error && (run::env_flag("STOOP_FULL") || run::env_flag("STOOP_OFF")) {
-                run_decision(Code::Full, "STOOP_FULL or STOOP_OFF enabled")
-            } else if let Some(error) = &global_error {
-                run_decision(Code::Error, error.clone())
-            } else if (spec.blocked.is_some() || spec.key.is_none())
-                && gate
-                    .as_ref()
-                    .is_none_or(|(code, _)| *code != Code::NotGated)
-            {
-                eval::decide(spec, &mut ctx)
-            } else if let Some((code, detail)) = gate {
-                run_decision(code, detail)
-            } else {
-                eval::decide(spec, &mut ctx)
-            };
+        let decision = if !graph_error
+            && (run::env_switch("STOOP_FULL", true) || run::env_switch("STOOP_OFF", true))
+        {
+            run_decision(Code::Full, "STOOP_FULL or STOOP_OFF enabled")
+        } else if let Some(error) = &global_error {
+            run_decision(Code::Error, error.clone())
+        } else if (spec.blocked.is_some() || spec.key.is_none())
+            && gate
+                .as_ref()
+                .is_none_or(|(code, _)| *code != Code::NotGated)
+        {
+            eval::decide(spec, &mut ctx)
+        } else if let Some((code, detail)) = gate {
+            run_decision(code, detail)
+        } else {
+            eval::decide(spec, &mut ctx)
+        };
         if decision.skip {
             skip.push(spec.job.clone());
         }

@@ -271,16 +271,21 @@ pub fn run_probes(probes: &[String], cwd: &Path, quiet: bool) -> Option<BTreeMap
 pub const SALT_VAR: &str = "STOOP_ENV_SALT";
 
 pub fn env_hash(name: &str, value: &str, salt: Option<&str>) -> String {
+    env_hash_bytes(name, value.as_bytes(), salt)
+}
+
+/// `env_hash` for a value that may not be UTF-8: the exact bytes are hashed.
+pub fn env_hash_bytes(name: &str, value: &[u8], salt: Option<&str>) -> String {
     match salt {
         Some(salt) => {
             let key = blake3::derive_key("stoop env hash v1", salt.as_bytes());
             let mut h = blake3::Hasher::new_keyed(&key);
             h.update(name.as_bytes());
             h.update(&[0]);
-            h.update(value.as_bytes());
+            h.update(value);
             format!("s:{}", h.finalize().to_hex())
         }
-        None => blake3::hash(value.as_bytes()).to_hex().to_string(),
+        None => blake3::hash(value).to_hex().to_string(),
     }
 }
 
@@ -288,10 +293,8 @@ fn env_hashes(names: &[String], salt: Option<&str>) -> BTreeMap<String, String> 
     names
         .iter()
         .map(|n| {
-            (
-                n.clone(),
-                env_hash(n, &std::env::var(n).unwrap_or_default(), salt),
-            )
+            let value = std::env::var_os(n).unwrap_or_default();
+            (n.clone(), env_hash_bytes(n, value.as_bytes(), salt))
         })
         .collect()
 }
@@ -311,6 +314,16 @@ pub fn env_flag(name: &str) -> bool {
             !(v.is_empty() || matches!(v.as_str(), "0" | "false" | "no" | "off"))
         }
         Err(_) => false,
+    }
+}
+
+/// An on/off switch stoop must not misread. A value that is not UTF-8 is not a switch it
+/// recognises, so `unreadable_on` decides: `true` for a switch whose "on" only makes stoop
+/// run more and skip less, `false` for a switch whose "on" publishes or stores more.
+pub fn env_switch(name: &str, unreadable_on: bool) -> bool {
+    match std::env::var_os(name) {
+        Some(value) if value.to_str().is_none() => unreadable_on,
+        _ => env_flag(name),
     }
 }
 
@@ -559,7 +572,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         }
     }
     // STOOP_OFF runs a hook's first-run form without tracing, and its hints still print above.
-    if env_flag("STOOP_OFF") && !explain {
+    if env_switch("STOOP_OFF", true) && !explain {
         return Outcome {
             status: plain(&o.argv),
             key: initial_key,
@@ -610,7 +623,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             how: How::Untraced,
         };
     }
-    let full = env_flag("STOOP_FULL");
+    let full = env_switch("STOOP_FULL", true);
     let max_age = o
         .max_age
         .or_else(|| {
