@@ -349,7 +349,7 @@ fn shell_mode(o: &mut Opts, script: &str, rest: &[String]) -> i32 {
     let blocked =
         run::env_str("RUNNER_TEMP").map(|t| PathBuf::from(t).join("stoop/journal.blocked"));
     if !o.pass_env.is_empty() {
-        if run::env_flag("GITHUB_ACTIONS") {
+        if run::env_switch("GITHUB_ACTIONS", true) {
             if let Some(path) = &blocked {
                 let result =
                     std::fs::create_dir_all(path.parent().expect("journal marker has a parent"))
