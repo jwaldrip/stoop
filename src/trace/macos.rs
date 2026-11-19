@@ -85,6 +85,9 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(30);
 /// and then the path, which is the last field, so a path that holds a newline cannot pass as
 /// two records. A call that returns -1 also prints `FAIL`. The tracer stops itself half a
 /// second after the root exits, which flushes every buffer first.
+/// The posix_spawn clauses come first in the script, because the D compiler rejects a read of a
+/// thread-local variable that precedes its first assignment in the program text, and the
+/// process-creation clauses read the spawn flag.
 const SCRIPT: &str = r#"#pragma D option quiet
 #pragma D option dynvarsize=128m
 #pragma D option strsize=1024
@@ -97,6 +100,18 @@ BEGIN
 {
 	tree[$1] = 1;
 	printf("READY\n");
+}
+
+syscall::posix_spawn:entry
+/tree[pid]/
+{
+	self->spawning = 1;
+}
+
+syscall::posix_spawn:return
+/self->spawning/
+{
+	self->spawning = 0;
 }
 
 proc:::create
@@ -146,18 +161,6 @@ tick-50ms
 {
 	printf("STOP\n");
 	exit(0);
-}
-
-syscall::posix_spawn:entry
-/tree[pid]/
-{
-	self->spawning = 1;
-}
-
-syscall::posix_spawn:return
-/self->spawning/
-{
-	self->spawning = 0;
 }
 
 syscall::open:entry, syscall::open_nocancel:entry
