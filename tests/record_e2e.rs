@@ -499,15 +499,24 @@ fn prior_blob_attributes_are_queried_once_for_128_overwrites() {
 }
 
 #[test]
-fn any_inherited_git_environment_omits_input_and_prior_oid_evidence() {
-    for (name, override_var) in [
-        ("clean", None),
-        ("prompt", Some(("GIT_TERMINAL_PROMPT", "0"))),
-        ("global", Some(("GIT_CONFIG_GLOBAL", "/dev/null"))),
-        ("count", Some(("GIT_CONFIG_COUNT", "0"))),
-        ("attributes", Some(("GIT_ATTR_SOURCE", "HEAD"))),
-        ("directory", Some(("GIT_DIR", "/nonexistent"))),
-        ("unknown", Some(("GIT_CUSTOM_UNRECOGNIZED", "1"))),
+fn inherited_git_environment_declines_unless_it_is_harmless() {
+    for (name, override_var, expect_oid) in [
+        ("clean", None, true),
+        ("pager", Some(("GIT_PAGER", "cat")), true),
+        ("editor", Some(("GIT_EDITOR", "true")), true),
+        (
+            "sequence-editor",
+            Some(("GIT_SEQUENCE_EDITOR", "true")),
+            true,
+        ),
+        ("prompt", Some(("GIT_TERMINAL_PROMPT", "0")), true),
+        ("askpass", Some(("GIT_ASKPASS", "true")), true),
+        ("merge-autoedit", Some(("GIT_MERGE_AUTOEDIT", "no")), true),
+        ("global", Some(("GIT_CONFIG_GLOBAL", "/dev/null")), false),
+        ("count", Some(("GIT_CONFIG_COUNT", "0")), false),
+        ("attributes", Some(("GIT_ATTR_SOURCE", "HEAD")), false),
+        ("directory", Some(("GIT_DIR", "/nonexistent")), false),
+        ("unknown", Some(("GIT_CUSTOM_UNRECOGNIZED", "1")), false),
     ] {
         let w = Ws::new(&format!("oid-git-env-{name}"));
         w.init_git();
@@ -543,12 +552,12 @@ fn any_inherited_git_environment_omits_input_and_prior_oid_evidence() {
         assert!(out.status.success(), "{name}: {err}");
         assert!(err.contains("recorded"), "{name}: {err}");
         let p = w.proof();
-        if override_var.is_some() {
-            assert_unknown_oid_basis(entry(&p, "inputs", "in.txt"));
-            assert_unknown_oid_basis(entry(&p, "priors", "prior.txt"));
-        } else {
+        if expect_oid {
             assert_blob_oid(&p, "inputs", "in.txt", &input_oid);
             assert_blob_oid(&p, "priors", "prior.txt", &prior_oid);
+        } else {
+            assert_unknown_oid_basis(entry(&p, "inputs", "in.txt"));
+            assert_unknown_oid_basis(entry(&p, "priors", "prior.txt"));
         }
         w.clean();
     }
@@ -660,9 +669,24 @@ fn owner_change_makes_every_oid_of_its_run_unknown() {
     let w = Ws::new("oid-chown");
     w.init_git();
     w.commit_all();
+    w.syscall_probe();
     let p = recorded(
         &w,
-        "cat in.txt >/dev/null && chown \"$(id -u):$(id -g)\" in.txt",
+        "cat in.txt >/dev/null && ./syscall-probe chown-same in.txt",
+    );
+    assert_unknown_oid_basis(entry(&p, "inputs", "in.txt"));
+    w.clean();
+}
+
+#[test]
+fn fchown_makes_every_oid_of_its_run_unknown() {
+    let w = Ws::new("oid-fchown");
+    w.init_git();
+    w.commit_all();
+    w.syscall_probe();
+    let p = recorded(
+        &w,
+        "cat in.txt >/dev/null && ./syscall-probe fchown-same in.txt",
     );
     assert_unknown_oid_basis(entry(&p, "inputs", "in.txt"));
     w.clean();

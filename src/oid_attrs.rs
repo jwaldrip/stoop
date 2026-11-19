@@ -405,12 +405,29 @@ fn attributes(
     Some(basis)
 }
 
+/// Git variables that cannot change which attribute sources, object format or
+/// directories Git uses. Shells export some of them by default, so declining on
+/// them would leave every interactive run unrecorded.
+const HARMLESS_GIT_ENV: &[&[u8]] = &[
+    b"GIT_ASKPASS",
+    b"GIT_EDITOR",
+    b"GIT_MERGE_AUTOEDIT",
+    b"GIT_PAGER",
+    b"GIT_SEQUENCE_EDITOR",
+    b"GIT_TERMINAL_PROMPT",
+];
+
 /// Capture the repository's configuration and attribute batch for the known
 /// worktree paths, for this process. An inherited `GIT_*` variable declines the
-/// capture, because Git's environment can select attribute sources, object
-/// formats or directories that this capture does not model.
+/// capture unless it is in `HARMLESS_GIT_ENV`, because Git's environment can
+/// select attribute sources, object formats or directories that this capture
+/// does not model.
 pub fn capture(root: &Path) -> Option<Epoch> {
-    if std::env::vars_os().any(|(key, _)| key.as_os_str().as_bytes().starts_with(b"GIT_")) {
+    let declined = std::env::vars_os().any(|(key, _)| {
+        let key = key.as_os_str().as_bytes();
+        key.starts_with(b"GIT_") && !HARMLESS_GIT_ENV.contains(&key)
+    });
+    if declined {
         return None;
     }
     snapshot(root)
@@ -1007,7 +1024,6 @@ mod tests {
             ("GIT_INDEX_FILE", "/nonexistent"),
             ("GIT_CONFIG_GLOBAL", "/dev/null"),
             ("GIT_CONFIG_COUNT", "0"),
-            ("GIT_TERMINAL_PROMPT", "0"),
             ("GIT_UNRECOGNIZED_OVERRIDE", "1"),
         ] {
             let out = Command::new(std::env::current_exe().unwrap())
@@ -1017,6 +1033,35 @@ mod tests {
                 .env("HOME", &repo.0)
                 .env("STOOP_GIT_ENV_PROBE", &repo.0)
                 .env(name, value)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{name}: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+    }
+
+    #[test]
+    fn harmless_git_env_probe_child() {
+        if let Some(root) = std::env::var_os("STOOP_HARMLESS_GIT_ENV_PROBE") {
+            assert!(capture(Path::new(&root)).is_some());
+        }
+    }
+
+    #[test]
+    fn harmless_git_variables_keep_the_snapshot() {
+        let repo = Repo::new();
+        for name in HARMLESS_GIT_ENV {
+            let name = std::str::from_utf8(name).unwrap();
+            let out = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "oid_attrs::tests::harmless_git_env_probe_child"])
+                .env_clear()
+                .env("PATH", std::env::var_os("PATH").unwrap())
+                .env("HOME", &repo.0)
+                .env("STOOP_HARMLESS_GIT_ENV_PROBE", &repo.0)
+                .env(name, "1")
                 .output()
                 .unwrap();
             assert!(

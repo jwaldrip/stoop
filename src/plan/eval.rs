@@ -245,10 +245,7 @@ fn known_github(name: &str) -> bool {
     name == "GITHUB_JOB" || crate::gha::context::VERIFIED_VARS.contains(&name)
 }
 
-/// Recorder semantics older than this floor may produce unsound plan proofs.
-/// When recorder changes make earlier proofs unsound, bump this floor and
-/// `TRACER_VERSION` together. This is not the planner runner's runtime version.
-const MIN_PLANNABLE_RECORDER_VERSION: u32 = 6;
+use crate::trace::version::MIN_PLANNABLE_RECORDER_VERSION;
 
 /// Resolve only runner labels whose platform is known without executing the job.
 fn declared_platform(runs_on: &serde_json::Value) -> Option<(&'static str, &'static str)> {

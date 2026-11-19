@@ -91,6 +91,14 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(op, "truncate")) return truncate(argv[2], 2) != 0;
     if (!strcmp(op, "fchmodat2")) return syscall(452, AT_FDCWD, argv[2], 0755, 0) != 0;
+    if (!strcmp(op, "chown-same")) return fchownat(AT_FDCWD, argv[2], getuid(), getgid(), 0) != 0;
+    if (!strcmp(op, "fchown-same")) {
+        int fd = open(argv[2], O_RDONLY);
+        if (fd < 0) return 3;
+        int result = fchown(fd, getuid(), getgid());
+        close(fd);
+        return result != 0;
+    }
     if (!strcmp(op, "fchmod")) {
         int fd = open(argv[2], O_RDONLY);
         if (fd < 0) return 3;

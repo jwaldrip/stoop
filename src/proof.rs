@@ -12,8 +12,7 @@ use std::path::PathBuf;
 /// between branches does not evict the proof the other branch still matches.
 const MAX_PROOFS: usize = 8;
 
-/// Older proof formats may contain Git object IDs without complete safety evidence.
-const PROOF_VERSION: u32 = 4;
+use crate::trace::version::PROOF_VERSION;
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Proof {
