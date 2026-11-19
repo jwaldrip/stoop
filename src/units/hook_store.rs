@@ -149,7 +149,8 @@ pub(crate) fn records(store: &Path, now: u64, max_age: u64) -> Result<Vec<Record
             .filter(|record| current(record, now, max_age))
             .collect()),
         Err(Damage::Replace(why) | Damage::Keep(why)) => Err(format!(
-            "stoop: hook records are unavailable ({why}); running the command as typed"
+            "stoop: hook records are unavailable ({}); running the command as typed",
+            super::hook::safe(&why)
         )),
     }
 }
@@ -176,18 +177,20 @@ pub(crate) fn record(store: &Path, record: Record) -> Result<(), String> {
     let mut repaired = None;
     let mut catalog = match read_catalog(store) {
         Ok(catalog) => catalog,
-        Err(Damage::Replace(why)) => {
+        Err(Damage::Replace(replaced)) => {
             repaired = Some(format!(
-                "stoop: hook records were replaced because {why}; running the full command"
+                "stoop: hook records were replaced because {}; running the full command",
+                super::hook::safe(&replaced)
             ));
             Catalog {
                 version: 1,
                 records: Vec::new(),
             }
         }
-        Err(Damage::Keep(why)) => {
+        Err(Damage::Keep(kept)) => {
             return Err(format!(
-                "stoop: hook records are kept as they are ({why}); running the full command without recording it"
+                "stoop: hook records are kept as they are ({}); running the full command without recording it",
+                super::hook::safe(&kept)
             ));
         }
     };
@@ -232,8 +235,11 @@ pub(crate) fn forget(store: &Path, key: &str) -> Result<bool, String> {
         lock(store).map_err(|error| format!("stoop: cannot lock hook records ({error})"))?;
     let mut catalog = match read_catalog(store) {
         Ok(catalog) => catalog,
-        Err(Damage::Replace(why) | Damage::Keep(why)) => {
-            return Err(format!("stoop: hook records are unavailable ({why})"));
+        Err(Damage::Replace(reason) | Damage::Keep(reason)) => {
+            return Err(format!(
+                "stoop: hook records are unavailable ({})",
+                super::hook::safe(&reason)
+            ));
         }
     };
     let before = catalog.records.len();
@@ -303,5 +309,57 @@ mod tests {
         let path = store("expiry");
         record(&path, template("old", 0)).unwrap();
         assert!(records(&path, 1_000, 60).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_damaged_catalog_warning_cannot_carry_text_from_the_file() {
+        let path = store("poisoned-version");
+        fs::write(
+            path.join("hooks-v1.json"),
+            "{\"version\":\"##[error]poisoned\"}",
+        )
+        .unwrap();
+        let warning = records(&path, 0, 0).err().unwrap();
+        assert!(!warning.contains("##["), "{warning}");
+        assert!(warning.contains("#%23[error]poisoned"), "{warning}");
+    }
+
+    #[test]
+    fn an_argv_in_a_damaged_catalog_is_escaped_in_the_warning() {
+        let path = store("poisoned-argv");
+        fs::write(
+            path.join("hooks-v1.json"),
+            "{\"version\":1,\"records\":[{\"key\":\"k\",\"argv\":\"##[add-mask]x\",\"cwd\":\"\",\"scope\":null,\"label\":null,\"created\":0}]}",
+        )
+        .unwrap();
+        let warning = records(&path, 0, 0).err().unwrap();
+        assert!(!warning.contains("##[add-mask]"), "{warning}");
+        assert!(warning.contains("#%23[add-mask]x"), "{warning}");
+    }
+
+    #[test]
+    fn a_replaced_catalog_note_from_record_is_escaped() {
+        let path = store("poisoned-record");
+        fs::write(
+            path.join("hooks-v1.json"),
+            "{\"version\":\"##[error]poisoned\"}",
+        )
+        .unwrap();
+        let note = record(&path, template("k", 0)).unwrap_err();
+        assert!(!note.contains("##["), "{note}");
+        assert!(note.contains("#%23[error]poisoned"), "{note}");
+    }
+
+    #[test]
+    fn a_forget_warning_is_escaped() {
+        let path = store("poisoned-forget");
+        fs::write(
+            path.join("hooks-v1.json"),
+            "{\"version\":\"##[error]poisoned\"}",
+        )
+        .unwrap();
+        let warning = forget(&path, "k").unwrap_err();
+        assert!(!warning.contains("##["), "{warning}");
+        assert!(warning.contains("#%23[error]poisoned"), "{warning}");
     }
 }

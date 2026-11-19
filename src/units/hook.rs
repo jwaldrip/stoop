@@ -511,7 +511,7 @@ pub(crate) fn expanded_matches(hook: &Hook, incoming: &[String]) -> bool {
 
 /// Argv text made safe to print on one line of stoop's output. Control characters become
 /// `\u{..}` text; then the plan CLI's escape neutralises `::` and `##[` (GitHub workflow
-/// commands) and `%`.
+/// commands), `%`, and bidirectional formatting characters.
 pub(crate) fn safe(text: &str) -> String {
     let mut shown = String::with_capacity(text.len());
     for ch in text.chars() {
@@ -634,4 +634,16 @@ pub(crate) fn empty_value_line(argv: &[String], explain: bool) -> Option<String>
     } else {
         format!("stoop: {label} has an empty value; if a shell expanded a placeholder there, quote it: '{{changed}}'")
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::safe;
+
+    #[test]
+    fn safe_neutralises_control_bidi_and_workflow_text() {
+        assert_eq!(safe("a\nb\u{1b}c"), "a\\u{a}b\\u{1b}c");
+        assert_eq!(safe("x\u{202E}y"), "x\\u{202e}y");
+        assert_eq!(safe("##[error]z::w"), "#%23[error]z%3A%3Aw");
+    }
 }
