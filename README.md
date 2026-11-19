@@ -130,7 +130,7 @@ Put `'{changed}'` where a test command takes test files, and name which files ar
 stoop run -- npx jest '{changed:*.test.ts}'
 ```
 
-Always single-quote the placeholder. Stoop refuses the shell-mangled forms before anything runs. In this release the placeholder runs the full command, with the placeholder and its option removed, so it never runs a subset. Each run prints the words it removed. The [CLI reference](https://stoop.build/docs/cli.html#changed-hook) has the quoting table, the option rules and the premise.
+Always single-quote the placeholder. Stoop refuses the shell-mangled forms before anything runs. In this release the placeholder runs the full command, with the placeholder and its option removed, so it never runs a subset. When it runs the command, stoop prints the words it removed. The [CLI reference](https://stoop.build/docs/cli.html#changed-hook) has the quoting table, the option rules and the premise.
 
 ## What it sees, and what it can't
 
