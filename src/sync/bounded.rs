@@ -3,7 +3,9 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fmt;
 use std::io::{self, BufReader, Read, Write};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, RawFd};
+#[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +53,7 @@ impl fmt::Display for Operation {
 pub enum Failure {
     Run(Operation),
     Exit(Operation, i32),
+    #[cfg_attr(windows, allow(dead_code))]
     Signal(Operation, i32),
     Wait(Operation),
     Output(Operation),
@@ -322,12 +325,26 @@ impl Drop for ManagedChild {
     }
 }
 
+#[cfg(unix)]
 fn stop(child: &mut Child) {
     let pgid = child.id() as libc::pid_t;
     // The leader has not been reaped, so this process-group id cannot be reused.
     unsafe { libc::kill(-pgid, libc::SIGTERM) };
     thread::sleep(Duration::from_millis(200));
     unsafe { libc::kill(-pgid, libc::SIGKILL) };
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+// Windows has no process groups here, so `taskkill /T` ends the leader and what it started.
+#[cfg(windows)]
+fn stop(child: &mut Child) {
+    let _ = Command::new("taskkill")
+        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -363,6 +380,7 @@ fn timeout_error() -> io::Error {
     io::Error::new(io::ErrorKind::TimedOut, "git deadline expired")
 }
 
+#[cfg(unix)]
 fn nonblocking(fd: RawFd) -> io::Result<()> {
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
@@ -371,6 +389,7 @@ fn nonblocking(fd: RawFd) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn wait_ready(fd: RawFd, events: libc::c_short, deadline: Instant) -> io::Result<()> {
     loop {
         let remaining = deadline
@@ -403,11 +422,24 @@ fn wait_ready(fd: RawFd, events: libc::c_short, deadline: Instant) -> io::Result
 
 // Nonblocking pipes are also necessary if a descendant escapes the group while
 // retaining a descriptor. The deadline still bounds the caller's reads/writes.
+#[cfg(unix)]
 struct TimedPipe<T> {
     inner: T,
     deadline: Instant,
 }
 
+#[cfg(unix)]
+impl<T: AsRawFd> TimedPipe<T> {
+    fn open(pipe: T, deadline: Instant) -> io::Result<Self> {
+        nonblocking(pipe.as_raw_fd())?;
+        Ok(Self {
+            inner: pipe,
+            deadline,
+        })
+    }
+}
+
+#[cfg(unix)]
 impl<T: Read + AsRawFd> Read for TimedPipe<T> {
     fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
         if buffer.is_empty() {
@@ -428,6 +460,7 @@ impl<T: Read + AsRawFd> Read for TimedPipe<T> {
     }
 }
 
+#[cfg(unix)]
 impl<T: Write + AsRawFd> Write for TimedPipe<T> {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
         if buffer.is_empty() {
@@ -449,6 +482,124 @@ impl<T: Write + AsRawFd> Write for TimedPipe<T> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+// Anonymous pipes on Windows cannot be read with a timeout, so a thread pumps each pipe and
+// the caller waits on a channel with the deadline.
+#[cfg(windows)]
+struct TimedPipe<T> {
+    deadline: Instant,
+    incoming: Option<std::sync::mpsc::Receiver<Vec<u8>>>,
+    outgoing: Option<std::sync::mpsc::Sender<Vec<u8>>>,
+    pending: Vec<u8>,
+    at: usize,
+    _pipe: std::marker::PhantomData<T>,
+}
+
+#[cfg(windows)]
+impl TimedPipe<ChildStdout> {
+    fn open(mut pipe: ChildStdout, deadline: Instant) -> io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::Builder::new().spawn(move || {
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx.send(chunk[..n].to_vec()).is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })?;
+        Ok(Self {
+            deadline,
+            incoming: Some(rx),
+            outgoing: None,
+            pending: Vec::new(),
+            at: 0,
+            _pipe: std::marker::PhantomData,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl TimedPipe<ChildStdin> {
+    fn open(mut pipe: ChildStdin, deadline: Instant) -> io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        thread::Builder::new().spawn(move || {
+            for bytes in rx {
+                if pipe.write_all(&bytes).and_then(|()| pipe.flush()).is_err() {
+                    break;
+                }
+            }
+        })?;
+        Ok(Self {
+            deadline,
+            incoming: None,
+            outgoing: Some(tx),
+            pending: Vec::new(),
+            at: 0,
+            _pipe: std::marker::PhantomData,
+        })
+    }
+}
+
+#[cfg(windows)]
+impl Read for TimedPipe<ChildStdout> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        use std::sync::mpsc::RecvTimeoutError;
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.at < self.pending.len() {
+                let n = buffer.len().min(self.pending.len() - self.at);
+                buffer[..n].copy_from_slice(&self.pending[self.at..self.at + n]);
+                self.at += n;
+                return Ok(n);
+            }
+            let remaining = self
+                .deadline
+                .checked_duration_since(Instant::now())
+                .filter(|left| !left.is_zero())
+                .ok_or_else(timeout_error)?;
+            let incoming = self.incoming.as_ref().ok_or_else(timeout_error)?;
+            match incoming.recv_timeout(remaining) {
+                Ok(chunk) => {
+                    self.pending = chunk;
+                    self.at = 0;
+                }
+                Err(RecvTimeoutError::Timeout) => return Err(timeout_error()),
+                Err(RecvTimeoutError::Disconnected) => return Ok(0),
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Write for TimedPipe<ChildStdin> {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
+        if Instant::now() >= self.deadline {
+            return Err(timeout_error());
+        }
+        let outgoing = self
+            .outgoing
+            .as_ref()
+            .ok_or_else(|| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        outgoing
+            .send(buffer.to_vec())
+            .map_err(|_| io::Error::from(io::ErrorKind::BrokenPipe))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
     }
 }
 
@@ -491,8 +642,9 @@ fn run_git<T>(
         } else {
             Stdio::null()
         })
-        .stderr(Stdio::null())
-        .process_group(0);
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    command.process_group(0);
     #[cfg(test)]
     command
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -518,20 +670,14 @@ fn run_git<T>(
     let result = (|| {
         let input = stdin
             .map(|pipe| {
-                nonblocking(pipe.as_raw_fd()).map_err(|_| Failure::Output(op).to_string())?;
-                Ok::<_, String>(TimedPipe {
-                    inner: pipe,
-                    deadline,
-                })
+                TimedPipe::<ChildStdin>::open(pipe, deadline)
+                    .map_err(|_| Failure::Output(op).to_string())
             })
             .transpose()?;
         let output = stdout
             .map(|pipe| {
-                nonblocking(pipe.as_raw_fd()).map_err(|_| Failure::Output(op).to_string())?;
-                Ok::<_, String>(TimedPipe {
-                    inner: pipe,
-                    deadline,
-                })
+                TimedPipe::<ChildStdout>::open(pipe, deadline)
+                    .map_err(|_| Failure::Output(op).to_string())
             })
             .transpose()?;
         work(input, output)
@@ -547,18 +693,19 @@ fn run_git<T>(
         Outcome::Exited(status) if status.success() => result,
         Outcome::Exited(status) => {
             if let Some(code) = status.code() {
-                Err(Failure::Exit(op, code).to_string())
-            } else if let Some(signal) = status.signal() {
-                Err(Failure::Signal(op, signal).to_string())
-            } else {
-                Err(Failure::Output(op).to_string())
+                return Err(Failure::Exit(op, code).to_string());
             }
+            #[cfg(unix)]
+            if let Some(signal) = status.signal() {
+                return Err(Failure::Signal(op, signal).to_string());
+            }
+            Err(Failure::Output(op).to_string())
         }
         Outcome::Aborted => Err(Failure::Output(op).to_string()),
         Outcome::Lost => Err(Failure::Wait(op).to_string()),
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "bounded_tests.rs"]
 mod tests;

@@ -8,7 +8,7 @@
 <pre><code><span class="p">$</span> git clone https://github.com/jwaldrip/stoop &amp;&amp; cd stoop
 <span class="p">$</span> cargo build --release      <span class="c"># binary at target/release/stoop</span></code></pre>
 <div class="note">
-  <p><strong>Tracing needs Linux on x86-64 or arm64.</strong> On macOS stoop builds and runs the wrapped command untraced, so it never skips and never records. That keeps a workflow portable; the savings happen on Linux runners.</p>
+  <p><strong>Tracing needs Linux on x86-64 or arm64.</strong> On macOS and Windows stoop builds and runs the wrapped command untraced, so it never skips and never records. That keeps a workflow portable; the savings happen on Linux runners. Windows has no installer yet, so build it with <code>cargo build --release</code>.</p>
 </div>
 
 <h2 id="first-run">Wrap a command</h2>

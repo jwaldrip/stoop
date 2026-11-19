@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! The server's lifetime and its argument contract. A run never outlives the server: end of
 //! input, SIGTERM, SIGINT, SIGHUP and SIGKILL all stop the command. A cancelled request that is
 //! still queued is never answered. Argument mistakes follow the protocol's error rules, and

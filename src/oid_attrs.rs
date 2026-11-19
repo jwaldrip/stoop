@@ -2,9 +2,36 @@
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+
+/// A path Git printed, as an `OsStr`. Git for Windows prints UTF-8, and a name that is not
+/// valid UTF-8 there cannot be used as evidence.
+#[cfg(unix)]
+fn os_str(bytes: &[u8]) -> Option<&OsStr> {
+    use std::os::unix::ffi::OsStrExt;
+    Some(OsStr::from_bytes(bytes))
+}
+
+#[cfg(windows)]
+fn os_str(bytes: &[u8]) -> Option<&OsStr> {
+    std::str::from_utf8(bytes).ok().map(OsStr::new)
+}
+
+/// Whether a file has no other hard link. Windows reports no link count on stable Rust, so a
+/// file there is never known to be single-linked and carries no blob id.
+fn single_link(metadata: &std::fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        metadata.nlink() == 1
+    }
+    #[cfg(windows)]
+    {
+        let _ = metadata;
+        false
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OidBasis {
@@ -64,7 +91,7 @@ fn valid_path(path: &str) -> bool {
 
 fn safe_file_or_absent(path: &Path) -> bool {
     match std::fs::symlink_metadata(path) {
-        Ok(m) => m.file_type().is_file() && m.nlink() == 1,
+        Ok(m) => m.file_type().is_file() && single_link(&m),
         Err(e) => e.kind() == std::io::ErrorKind::NotFound,
     }
 }
@@ -135,15 +162,9 @@ fn repo_dirs(root: &Path) -> Option<(PathBuf, PathBuf)> {
     )?;
     let report = report.strip_suffix(b"\n")?;
     let mut lines = report.split(|byte| *byte == b'\n');
-    let top = Path::new(OsStr::from_bytes(lines.next()?))
-        .canonicalize()
-        .ok()?;
-    let git_dir = Path::new(OsStr::from_bytes(lines.next()?))
-        .canonicalize()
-        .ok()?;
-    let common_dir = Path::new(OsStr::from_bytes(lines.next()?))
-        .canonicalize()
-        .ok()?;
+    let top = Path::new(os_str(lines.next()?)?).canonicalize().ok()?;
+    let git_dir = Path::new(os_str(lines.next()?)?).canonicalize().ok()?;
+    let common_dir = Path::new(os_str(lines.next()?)?).canonicalize().ok()?;
     let format = lines.next()?;
     if lines.next().is_some()
         || format != b"sha1"
@@ -199,7 +220,7 @@ fn config(root: &Path) -> Option<String> {
             return None;
         }
         if let Some(path) = origin.strip_prefix(b"file:") {
-            let path = Path::new(OsStr::from_bytes(path));
+            let path = Path::new(os_str(path)?);
             let path = if path.is_absolute() {
                 path.to_path_buf()
             } else {
@@ -208,7 +229,7 @@ fn config(root: &Path) -> Option<String> {
             // A config emitted by Git must still exist and must not redirect
             // to another file or be a FIFO.
             let metadata = std::fs::symlink_metadata(&path).ok()?;
-            if !metadata.file_type().is_file() || metadata.nlink() != 1 {
+            if !metadata.file_type().is_file() || !single_link(&metadata) {
                 return None;
             }
         } else if origin != b"command line:" {
@@ -424,7 +445,7 @@ const HARMLESS_GIT_ENV: &[&[u8]] = &[
 /// does not model.
 pub fn capture(root: &Path) -> Option<Epoch> {
     let declined = std::env::vars_os().any(|(key, _)| {
-        let key = key.as_os_str().as_bytes();
+        let key = key.as_encoded_bytes();
         key.starts_with(b"GIT_") && !HARMLESS_GIT_ENV.contains(&key)
     });
     if declined {
@@ -530,7 +551,7 @@ mod tests {
         fn git(&self, args: &[&str]) {
             let mut cmd = Command::new("git");
             for (key, _) in std::env::vars_os() {
-                if key.as_os_str().as_bytes().starts_with(b"GIT_") {
+                if key.as_encoded_bytes().starts_with(b"GIT_") {
                     cmd.env_remove(key);
                 }
             }
@@ -774,6 +795,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn redirected_attribute_files_in_the_worktree_are_rejected() {
         use std::os::unix::fs::symlink;
@@ -922,13 +944,14 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn fifo_attribute_source_does_not_hang() {
         use std::os::unix::process::CommandExt;
         use std::time::{Duration, Instant};
         let repo = Repo::new();
         let fifo = repo.0.join("attrs-fifo");
-        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         repo.git(&[
             "config",
@@ -966,6 +989,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn global_config_fifo_is_bounded_by_the_deadline() {
         use std::os::unix::process::CommandExt;
@@ -974,7 +998,7 @@ mod tests {
         let home = repo.0.join("home");
         fs::create_dir(&home).unwrap();
         let fifo = home.join(".gitconfig");
-        let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([

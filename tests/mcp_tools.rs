@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! The MCP tools on real repositories, through the real `stoop mcp` binary.
 //! Recorded-proof behaviour needs tracing, so those cases only run on Linux.
 

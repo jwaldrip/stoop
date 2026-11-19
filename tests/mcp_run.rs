@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! `run` reports stoop's decision on the status descriptor, never from the command's output. And
 //! explain never fetches from a sync remote.
 

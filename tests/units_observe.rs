@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! Exercise diagnostic observations against real traced processes, without runner installs.
 #[cfg(all(
     target_os = "linux",

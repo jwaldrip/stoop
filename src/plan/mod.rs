@@ -5,7 +5,7 @@ pub(crate) mod output;
 mod probes;
 pub mod spec;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod recorded_tests;
 use crate::{attest, gha, input, job, proof, run, sync};
 use serde_json::{json, Value};

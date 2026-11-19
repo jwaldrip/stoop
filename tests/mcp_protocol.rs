@@ -1,3 +1,4 @@
+#![cfg(unix)]
 //! The MCP wire protocol, end to end: the real `stoop mcp` binary, scripted over stdio.
 //! Nothing here depends on tracing, so these run on every platform.
 

@@ -33,41 +33,237 @@ pub fn without_dots(path: &Path) -> PathBuf {
     path.components().collect()
 }
 
+/// Whether a path component names the Git directory. Windows ignores case and trailing dots
+/// and spaces, and `GIT~1` is the short name its file systems may give `.git`.
+pub fn is_git_name(name: &std::ffi::OsStr) -> bool {
+    #[cfg(unix)]
+    {
+        name == ".git"
+    }
+    #[cfg(windows)]
+    {
+        name.to_str().is_some_and(|name| {
+            let name = name.trim_end_matches(['.', ' ']);
+            name.eq_ignore_ascii_case(".git") || name.eq_ignore_ascii_case("git~1")
+        })
+    }
+}
+
 /// Root-relative text for paths under `root`, absolute text otherwise.
 /// A relative result never starts with `/`, so the two cannot collide.
 pub fn to_key(root: &Path, p: &Path) -> String {
-    match p.strip_prefix(root) {
-        Ok(rel) => rel.to_string_lossy().into_owned(),
-        Err(_) => p.to_string_lossy().into_owned(),
+    #[cfg(unix)]
+    {
+        match p.strip_prefix(root) {
+            Ok(rel) => rel.to_string_lossy().into_owned(),
+            Err(_) => p.to_string_lossy().into_owned(),
+        }
+    }
+    #[cfg(windows)]
+    {
+        match windows::strip_root(root, p) {
+            Some(rel) => windows::relative_key(&rel, false),
+            None => windows::absolute_key(p),
+        }
     }
 }
 
 /// The relative working directory used to identify a command. Percent escapes
 /// preserve non-UTF-8 bytes without colliding with literal percent signs.
 pub fn cwd_key(root: &Path, cwd: &Path) -> String {
-    use std::fmt::Write;
-    use std::os::unix::ffi::OsStrExt;
+    #[cfg(unix)]
+    {
+        use std::fmt::Write;
+        use std::os::unix::ffi::OsStrExt;
 
-    let path = cwd.strip_prefix(root).unwrap_or(cwd);
-    if let Some(text) = path.to_str() {
-        return text.replace('%', "%25");
+        let path = cwd.strip_prefix(root).unwrap_or(cwd);
+        if let Some(text) = path.to_str() {
+            return text.replace('%', "%25");
+        }
+        let mut key = String::new();
+        for &byte in path.as_os_str().as_bytes() {
+            if byte.is_ascii() && byte != b'%' {
+                key.push(char::from(byte));
+            } else {
+                write!(key, "%{byte:02X}").unwrap();
+            }
+        }
+        key
     }
-    let mut key = String::new();
-    for &byte in path.as_os_str().as_bytes() {
-        if byte.is_ascii() && byte != b'%' {
-            key.push(char::from(byte));
-        } else {
-            write!(key, "%{byte:02X}").unwrap();
+    #[cfg(windows)]
+    {
+        match windows::strip_root(root, cwd) {
+            Some(rel) => windows::relative_key(&rel, true),
+            None => windows::absolute_key(cwd),
         }
     }
-    key
 }
 
 pub fn from_key(root: &Path, key: &str) -> PathBuf {
-    if key.starts_with('/') {
-        PathBuf::from(key)
-    } else {
-        root.join(key)
+    #[cfg(unix)]
+    {
+        if key.starts_with('/') {
+            PathBuf::from(key)
+        } else {
+            root.join(key)
+        }
+    }
+    #[cfg(windows)]
+    {
+        if key.starts_with('/') {
+            windows::from_absolute_key(key)
+        } else {
+            root.join(windows::unescape(key))
+        }
+    }
+}
+
+/// Keys on Windows: `/`-separated, so they match across machines and the `.git` component
+/// check splits them the same way. A DOS path outside the root is `/C:/dir/file`, a UNC path
+/// is `//server/share/dir`. Names are never case-folded; only the root prefix is matched
+/// without regard to case. Unpaired UTF-16 surrogates are written `%uXXXX`.
+#[cfg(windows)]
+mod windows {
+    use std::ffi::OsStr;
+    use std::fmt::Write;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::path::{Component, Path, PathBuf, Prefix};
+
+    fn canon(component: Component<'_>) -> String {
+        match component {
+            Component::Prefix(prefix) => match prefix.kind() {
+                Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                    format!("{}:", (letter as char).to_ascii_uppercase())
+                }
+                Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => format!(
+                    "//{}/{}",
+                    server.to_string_lossy().to_lowercase(),
+                    share.to_string_lossy().to_lowercase()
+                ),
+                _ => prefix.as_os_str().to_string_lossy().to_lowercase(),
+            },
+            other => other.as_os_str().to_string_lossy().to_lowercase(),
+        }
+    }
+
+    /// `p` below `root`, comparing the root's components without regard to case.
+    pub fn strip_root(root: &Path, p: &Path) -> Option<PathBuf> {
+        if let Ok(rel) = p.strip_prefix(root) {
+            return Some(rel.to_path_buf());
+        }
+        let mut rest = p.components();
+        for want in root.components() {
+            if canon(want) != canon(rest.next()?) {
+                return None;
+            }
+        }
+        Some(rest.as_path().to_path_buf())
+    }
+
+    fn push_name(name: &OsStr, escape_percent: bool, out: &mut String) {
+        for unit in char::decode_utf16(name.encode_wide()) {
+            match unit {
+                Ok('%') if escape_percent => out.push_str("%25"),
+                Ok(c) => out.push(c),
+                Err(e) => write!(out, "%u{:04X}", e.unpaired_surrogate()).unwrap(),
+            }
+        }
+    }
+
+    pub fn relative_key(rel: &Path, escape_percent: bool) -> String {
+        let mut key = String::new();
+        for component in rel.components() {
+            if let Component::Normal(name) = component {
+                if !key.is_empty() {
+                    key.push('/');
+                }
+                push_name(name, escape_percent, &mut key);
+            }
+        }
+        key
+    }
+
+    pub fn absolute_key(p: &Path) -> String {
+        let mut key = String::new();
+        let mut components = p.components().peekable();
+        match components.peek() {
+            Some(Component::Prefix(prefix)) => {
+                match prefix.kind() {
+                    Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                        write!(key, "/{}:", (letter as char).to_ascii_uppercase()).unwrap();
+                    }
+                    Prefix::UNC(server, share) | Prefix::VerbatimUNC(server, share) => {
+                        key.push_str("//");
+                        push_name(server, false, &mut key);
+                        key.push('/');
+                        push_name(share, false, &mut key);
+                    }
+                    _ => {
+                        key.push('/');
+                        let text = prefix.as_os_str().to_string_lossy().replace('\\', "/");
+                        key.push_str(text.trim_start_matches('/'));
+                    }
+                }
+                components.next();
+            }
+            _ => key.push('/'),
+        }
+        for component in components {
+            if let Component::Normal(name) = component {
+                key.push('/');
+                push_name(name, false, &mut key);
+            }
+        }
+        key
+    }
+
+    /// Undoes `%uXXXX` escapes in a relative key.
+    pub fn unescape(key: &str) -> std::ffi::OsString {
+        let mut units: Vec<u16> = Vec::new();
+        let bytes = key.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && bytes.get(i + 1) == Some(&b'u') && i + 6 <= bytes.len() {
+                if let Ok(unit) = u16::from_str_radix(&key[i + 2..i + 6], 16) {
+                    units.push(unit);
+                    i += 6;
+                    continue;
+                }
+            }
+            let ch = key[i..].chars().next().unwrap();
+            let mut buf = [0u16; 2];
+            units.extend_from_slice(ch.encode_utf16(&mut buf));
+            i += ch.len_utf8();
+        }
+        std::ffi::OsString::from_wide(&units)
+    }
+
+    pub fn from_absolute_key(key: &str) -> PathBuf {
+        if let Some(unc) = key.strip_prefix("//") {
+            return PathBuf::from(format!(
+                r"\\{}",
+                unescape(unc).to_string_lossy().replace('/', r"\")
+            ));
+        }
+        let rest = &key[1..];
+        let bytes = rest.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            let tail = unescape(&rest[2..]);
+            let tail = tail.to_string_lossy().replace('/', r"\");
+            return PathBuf::from(format!(
+                "{}:{}",
+                rest.as_bytes()[0] as char,
+                if tail.is_empty() {
+                    r"\".to_owned()
+                } else {
+                    tail
+                }
+            ));
+        }
+        PathBuf::from(format!(
+            r"\\?\{}",
+            unescape(rest).to_string_lossy().replace('/', r"\")
+        ))
     }
 }
 
@@ -285,6 +481,7 @@ mod tests {
         Scratch(fs::canonicalize(&d).unwrap())
     }
 
+    #[cfg(unix)]
     #[test]
     fn a_symlinked_parent_resolves_to_its_target_and_is_flagged() {
         let root = scratch("redirect");
@@ -299,6 +496,7 @@ mod tests {
         assert!(!direct.redirected);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_final_name_is_not_resolved() {
         let root = scratch("final");
@@ -317,6 +515,7 @@ mod tests {
         assert!(!loc.redirected);
     }
 
+    #[cfg(unix)]
     #[test]
     fn missing_parents_follow_existing_links_and_stop_before_missing_dotdot() {
         let root = scratch("missing-link");
@@ -374,6 +573,7 @@ mod tests {
         assert_eq!(p.parents.len(), 9_999);
     }
 
+    #[cfg(unix)]
     #[test]
     fn missing_parent_is_rerooted_when_lexical_root_is_a_symlink() {
         let root = scratch("reroot");
@@ -388,6 +588,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn cwd_keys_do_not_fold_non_utf8() {
         use std::ffi::OsString;
@@ -398,5 +599,98 @@ mod tests {
         let b = root.join(OsString::from_vec(b"dir-\x81".to_vec()));
         assert_ne!(cwd_key(root, &a), cwd_key(root, &b));
         assert_ne!(cwd_key(root, &a), cwd_key(root, &root.join("dir-%80")));
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::windows::ffi::OsStringExt;
+
+    const ROOT: &str = r"C:\src\repo";
+
+    fn key(p: &str) -> String {
+        to_key(Path::new(ROOT), Path::new(p))
+    }
+
+    fn back(key: &str) -> PathBuf {
+        from_key(Path::new(ROOT), key)
+    }
+
+    #[test]
+    fn paths_in_the_root_use_forward_slashes_and_never_start_with_one() {
+        assert_eq!(key(r"C:\src\repo\a\b.txt"), "a/b.txt");
+        assert_eq!(key(r"C:\src\repo\a"), "a");
+        assert!(!key(r"C:\src\repo\a\b").starts_with('/'));
+        assert_eq!(back("a/b.txt"), Path::new(ROOT).join("a").join("b.txt"));
+    }
+
+    #[test]
+    fn the_root_matches_without_regard_to_case_but_names_keep_theirs() {
+        assert_eq!(
+            key(r"c:\SRC\Repo\Dir\File.TXT"),
+            "Dir/File.TXT",
+            "the root prefix is case-insensitive, the names are not folded"
+        );
+    }
+
+    #[test]
+    fn a_verbatim_spelling_of_the_root_is_the_same_root() {
+        assert_eq!(key(r"\\?\C:\src\repo\a\b"), "a/b");
+    }
+
+    #[test]
+    fn outside_paths_get_absolute_keys_and_come_back() {
+        for (path, expected, restored) in [
+            (r"D:\tools\x.exe", "/D:/tools/x.exe", r"D:\tools\x.exe"),
+            (r"d:\tools\x.exe", "/D:/tools/x.exe", r"D:\tools\x.exe"),
+            (r"\\?\D:\tools\x.exe", "/D:/tools/x.exe", r"D:\tools\x.exe"),
+            (
+                r"\\server\share\dir\f.txt",
+                "//server/share/dir/f.txt",
+                r"\\server\share\dir\f.txt",
+            ),
+            (
+                r"\\?\UNC\server\share\f.txt",
+                "//server/share/f.txt",
+                r"\\server\share\f.txt",
+            ),
+            (r"E:\", "/E:", r"E:\"),
+        ] {
+            assert_eq!(key(path), expected, "{path}");
+            assert_eq!(back(expected), PathBuf::from(restored), "{expected}");
+            assert!(key(path).starts_with('/'), "{path}");
+        }
+    }
+
+    #[test]
+    fn an_unpaired_surrogate_is_escaped_and_round_trips() {
+        let name = OsString::from_wide(&[0x61, 0xD800, 0x62]);
+        let path = Path::new(ROOT).join(&name);
+        assert_eq!(to_key(Path::new(ROOT), &path), "a%uD800b");
+        assert_eq!(from_key(Path::new(ROOT), "a%uD800b"), path);
+    }
+
+    #[test]
+    fn cwd_keys_escape_percent_signs() {
+        assert_eq!(
+            cwd_key(Path::new(ROOT), Path::new(r"C:\src\repo\sub\100%")),
+            "sub/100%25"
+        );
+        assert_eq!(cwd_key(Path::new(ROOT), Path::new(ROOT)), "");
+    }
+
+    #[test]
+    fn the_git_directory_is_found_under_its_windows_spellings() {
+        for name in [".git", ".GIT", ".git.", ".git ", "GIT~1", "git~1"] {
+            assert!(is_git_name(std::ffi::OsStr::new(name)), "{name}");
+        }
+        for name in [".gitignore", "git", ".gi", "x.git"] {
+            assert!(!is_git_name(std::ffi::OsStr::new(name)), "{name}");
+        }
+        assert!(key(r"C:\src\repo\.GIT\config")
+            .split('/')
+            .any(|part| is_git_name(std::ffi::OsStr::new(part))));
     }
 }
