@@ -168,12 +168,18 @@ pub(crate) fn record(store: &Path, record: Record, now: u64, max_age: u64) -> Re
     let _lock = lock(store).map_err(|error| {
         format!("stoop: cannot lock hook records ({error}); running the command as typed")
     })?;
+    let mut repaired = None;
     let mut catalog = match read_catalog(store) {
         Ok(catalog) => catalog,
-        Err(Damage::Replace(_)) => Catalog {
-            version: 1,
-            records: Vec::new(),
-        },
+        Err(Damage::Replace(why)) => {
+            repaired = Some(format!(
+                "stoop: hook records were replaced because {why}; running the command as typed"
+            ));
+            Catalog {
+                version: 1,
+                records: Vec::new(),
+            }
+        }
         Err(Damage::Keep(why)) => {
             return Err(format!(
                 "stoop: hook records are kept as they are ({why}); running the command as typed"
@@ -192,9 +198,13 @@ pub(crate) fn record(store: &Path, record: Record, now: u64, max_age: u64) -> Re
             format!("stoop: cannot save hook records ({error}); running the command as typed")
         })?;
         if bytes.len() as u64 <= MAX_FILE_BYTES {
-            return write_bytes(store, &bytes).map_err(|error| {
+            write_bytes(store, &bytes).map_err(|error| {
                 format!("stoop: cannot save hook records ({error}); running the command as typed")
-            });
+            })?;
+            return match repaired {
+                Some(note) => Err(note),
+                None => Ok(()),
+            };
         }
         if catalog.records.len() <= 1 {
             return Err(
