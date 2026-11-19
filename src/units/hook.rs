@@ -310,7 +310,7 @@ pub(crate) fn prepare(argv: &[String]) -> Result<Option<Hook>, String> {
                 if parts.iter().any(|&(a, _)| word.as_bytes()[a] == b'{') {
                     return Err("a brace placeholder cannot be substituted into shell code; pass it as a separate argument".into());
                 }
-                env_code = CHANGED.iter().any(|(_, env)| {
+                env_code = CHANGED.iter().filter_map(|&(_, env)| env).any(|env| {
                     word.contains(&format!("${env}")) || word.contains(&format!("${{{env}"))
                 }) || word.contains("$STOOP_CHANGED_FILE")
                     || word.contains("${STOOP_CHANGED_FILE")
