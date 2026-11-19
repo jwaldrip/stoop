@@ -710,13 +710,9 @@ mod windows_tests {
 
     #[test]
     fn input_reaches_the_command_and_is_closed() {
-        let out = run(
-            Command::new("findstr").arg("x"),
-            b"x1\r\ny\r\nx2\r\n",
-            100,
-            WAIT,
-        )
-        .unwrap();
+        let mut findstr = Command::new("findstr");
+        findstr.arg("x");
+        let out = run(findstr, b"x1\r\ny\r\nx2\r\n", 100, WAIT).unwrap();
         assert_eq!(String::from_utf8_lossy(&out).replace("\r\n", "|"), "x1|x2|");
     }
 
