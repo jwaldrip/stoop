@@ -2628,6 +2628,20 @@ mod tests {
         assert!(rec.invalidates_oids(&root.join("nested/.git/config"), true));
         fs::hard_link(&ordinary, root.join("linked")).unwrap();
         assert!(rec.invalidates_oids(&ordinary, true));
+        // A path that cannot be placed, and a name that cannot be read, both count.
+        assert!(
+            rec.invalidates_oids(Path::new("/"), true),
+            "an unplaceable path counts"
+        );
+        if unsafe { libc::geteuid() } != 0 {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = base.join("locked");
+            fs::create_dir_all(locked.join("inner")).unwrap();
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+            let unreadable = rec.invalidates_oids(&locked.join("inner/file"), true);
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(unreadable, "a name that cannot be read counts");
+        }
         fs::remove_dir_all(base).unwrap();
     }
 

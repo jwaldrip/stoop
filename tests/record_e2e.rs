@@ -1356,6 +1356,7 @@ fn sparse_input_over_two_gib_keeps_its_blob_oid() {
     let file = fs::File::create(w.root.join("large-sparse")).unwrap();
     file.set_len(len).unwrap();
     drop(file);
+    w.track(&["large-sparse"]);
     let p = recorded(&w, "head -c 1 large-sparse >/dev/null");
     let mut blake = blake3::Hasher::new();
     let zeros = vec![0; 1024 * 1024];
