@@ -1890,3 +1890,20 @@ mod exact_key_tests {
         std::env::remove_var(&name);
     }
 }
+
+#[cfg(test)]
+mod env_hash_name_tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::os::unix::ffi::OsStringExt;
+
+    #[test]
+    fn env_hashes_read_a_non_utf8_name_by_its_exact_bytes() {
+        let name = OsString::from_vec(b"S0_N3_\xfe".to_vec());
+        std::env::set_var(&name, "v");
+        let key = env_key(&name);
+        let got = env_hashes(std::slice::from_ref(&key), None);
+        assert_eq!(got[&key], env_hash_bytes(&key, b"v", None));
+        std::env::remove_var(&name);
+    }
+}

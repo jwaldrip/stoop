@@ -515,3 +515,113 @@ fn a_non_utf8_salt_keys_every_recorded_environment_hash() {
         );
     }
 }
+
+const WORKFLOW_REF: &str = "owner/repo/.github/workflows/ci.yml@refs/heads/main";
+
+fn head_sha(dir: &Path) -> String {
+    let output = Command::new("git")
+        .current_dir(dir)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .unwrap();
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn a_non_utf8_github_actions_keeps_the_planned_revision_guard() {
+    let dir = Dir::new("guard-sha");
+    repo(
+        dir.path(),
+        &[(".github/workflows/ci.yml", WORKFLOW), ("a.txt", "a\n")],
+    );
+    let output = plan_with(
+        dir.path(),
+        &[
+            ("GITHUB_ACTIONS", raw(b"\xff")),
+            ("GITHUB_REPOSITORY", OsString::from("owner/repo")),
+            ("GITHUB_WORKFLOW_REF", OsString::from(WORKFLOW_REF)),
+            ("STOOP_JOB_WORKFLOW_REF", OsString::from(WORKFLOW_REF)),
+            ("GITHUB_SHA", OsString::from("1".repeat(40))),
+        ],
+    );
+    assert_no_panic(&output);
+    assert!(output.status.success(), "{}", text(&output));
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["jobs"][0]["decision"], "run", "{plan}");
+    assert_eq!(plan["jobs"][0]["code"], "error", "{plan}");
+    assert_eq!(
+        plan["jobs"][0]["detail"], "planned revision differs from GITHUB_SHA",
+        "{plan}"
+    );
+}
+
+#[test]
+fn a_non_utf8_github_actions_keeps_the_workflow_ref_guard() {
+    let dir = Dir::new("guard-ref");
+    repo(
+        dir.path(),
+        &[(".github/workflows/ci.yml", WORKFLOW), ("a.txt", "a\n")],
+    );
+    let sha = head_sha(dir.path());
+    let output = plan_with(
+        dir.path(),
+        &[
+            ("GITHUB_ACTIONS", raw(b"\xff")),
+            ("GITHUB_REPOSITORY", OsString::from("owner/repo")),
+            ("GITHUB_WORKFLOW_REF", OsString::from(WORKFLOW_REF)),
+            ("GITHUB_SHA", OsString::from(sha)),
+        ],
+    );
+    assert_no_panic(&output);
+    assert!(output.status.success(), "{}", text(&output));
+    let plan: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(plan["jobs"][0]["code"], "error", "{plan}");
+    assert_eq!(
+        plan["jobs"][0]["detail"], "STOOP_JOB_WORKFLOW_REF must equal GITHUB_WORKFLOW_REF",
+        "{plan}"
+    );
+}
+
+#[test]
+fn a_non_utf8_github_actions_opens_the_journal_and_blocks_it_on_failure() {
+    let dir = Dir::new("journal-open");
+    repo(dir.path(), &[("a.txt", "a\n")]);
+    let runner = dir.path().join("runner");
+    fs::create_dir_all(&runner).unwrap();
+    fs::write(dir.path().join("step.sh"), "echo ok\n").unwrap();
+    let output = stoop(dir.path(), &["sh", "step.sh"])
+        .env("GITHUB_ACTIONS", raw(b"\xff"))
+        .env("RUNNER_TEMP", &runner)
+        .output()
+        .unwrap();
+    assert_no_panic(&output);
+    assert!(output.status.success(), "{}", text(&output));
+    assert!(
+        runner.join("stoop/journal.blocked").exists(),
+        "an unreadable GITHUB_ACTIONS must open the journal; without GITHUB_REPOSITORY the open fails and blocks it:\n{}",
+        text(&output)
+    );
+}
+
+#[test]
+fn a_non_utf8_github_actions_writes_the_oidc_block_marker() {
+    let dir = Dir::new("oidc-marker");
+    repo(dir.path(), &[("a.txt", "a\n")]);
+    let runner = dir.path().join("runner");
+    fs::create_dir_all(&runner).unwrap();
+    fs::write(dir.path().join("step.sh"), "echo ok\n").unwrap();
+    let output = stoop(dir.path(), &["sh", "--allow-id-token", "step.sh"])
+        .env("GITHUB_ACTIONS", raw(b"\xff"))
+        .env("RUNNER_TEMP", &runner)
+        .env("STOOP_PASS_ENV", "ACTIONS_ID_TOKEN_REQUEST_URL")
+        .output()
+        .unwrap();
+    assert_no_panic(&output);
+    assert!(output.status.success(), "{}", text(&output));
+    assert_eq!(
+        fs::read(runner.join("stoop/journal.blocked")).unwrap(),
+        b"OIDC request credentials passed".to_vec(),
+        "{}",
+        text(&output)
+    );
+}
