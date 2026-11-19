@@ -10,6 +10,7 @@ mod input;
 #[allow(dead_code)]
 mod job;
 mod journal;
+mod mcp;
 mod oid_attrs;
 mod pathutil;
 #[allow(dead_code)]
@@ -38,6 +39,7 @@ USAGE
   stoop ls [--store DIR]                        list recorded proofs
   stoop forget [--volatile] <key> [--store DIR]  drop a proof (--volatile: what was learned)
   stoop plan [options]                          plan experimental job skips
+  stoop mcp [--allow-run] [--root DIR]          serve stoop to AI agents (stoop mcp --help)
   stoop pull | prune [--sync git[:remote]]       fetch or expire shared proofs
 
 OPTIONS
@@ -116,7 +118,9 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
             println!("stoop {}", env!("CARGO_PKG_VERSION"));
             return 0;
         }
-        Some(c @ ("run" | "explain" | "sh" | "ls" | "forget" | "pull" | "prune" | "plan")) => {
+        Some(
+            c @ ("run" | "explain" | "sh" | "ls" | "forget" | "pull" | "prune" | "plan" | "mcp"),
+        ) => {
             let c = c.to_string();
             args.remove(0);
             c
@@ -126,6 +130,9 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
     if cmd == "plan" {
         return plan::cmd(&args);
     }
+    if cmd == "mcp" {
+        return mcp::cmd(&args);
+    }
     let (mut o, rest) = match parse(&args) {
         Ok(x) => x,
         Err(e) => {
@@ -133,6 +140,10 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
             return 2;
         }
     };
+    if o.status_fd.is_some() && cmd != "run" {
+        eprintln!("stoop: --status-fd is for stoop run only");
+        return 2;
+    }
     if matches!(cmd.as_str(), "run" | "explain" | "sh") {
         match run::parse_pass_env(
             std::env::var_os("STOOP_PASS_ENV").as_deref(),
@@ -286,7 +297,10 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
         }
         c => {
             o.argv = rest;
-            run::run(o, c == "explain")
+            match o.status_fd.take() {
+                Some(fd) if c == "run" => report_run(o, fd),
+                _ => run::run(o, c == "explain"),
+            }
         }
     }
 }
@@ -362,6 +376,13 @@ fn parse(args: &[OsString]) -> Result<(Opts, Vec<OsString>), String> {
             "--sync" => o.sync = Some(val("--sync")?),
             "--sync-write" => o.sync_write = true,
             "--quiet" => o.quiet = true,
+            "--status-fd" => {
+                o.status_fd = Some(
+                    val("--status-fd")?
+                        .parse()
+                        .map_err(|_| "--status-fd needs a descriptor number".to_string())?,
+                )
+            }
             _ => return Err(format!("unknown option {a}")),
         }
         i += 1;
@@ -470,6 +491,75 @@ fn shell_mode(o: &mut Opts, script: &OsStr, rest: &[OsString]) -> i32 {
         }
     }
     outcome.status
+}
+
+/// Refuses a `--status-fd` that cannot carry a report, before anything runs. Descriptors 0 to 2 are
+/// the standard streams, and stdout is the protocol stream, so a report there would corrupt it. A
+/// descriptor that is not open cannot be written, and closing it would abort the process.
+fn check_status_fd(fd: i32) -> Result<(), String> {
+    if fd < 3 {
+        return Err(format!(
+            "--status-fd {fd} must be 3 or higher: 0, 1 and 2 are the standard streams"
+        ));
+    }
+    // SAFETY: F_GETFD reads a descriptor's flags and changes nothing.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(format!(
+            "--status-fd {fd} is not open: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// Keeps the MCP server's status descriptor from every child: close-on-exec, set before any
+/// child exists in this process.
+fn take_status_fd(fd: i32) {
+    // SAFETY: fcntl on a descriptor the MCP server gave this process.
+    unsafe {
+        libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+    }
+}
+
+/// `stoop run` for the MCP server. The decision goes to the status descriptor as one JSON line.
+/// The command's stdout and stderr stay its own, and nothing parses them for a decision.
+fn report_run(o: Opts, fd: i32) -> i32 {
+    if let Err(error) = check_status_fd(fd) {
+        eprintln!("stoop: {error}");
+        return 2;
+    }
+    take_status_fd(fd);
+    if let Some(error) = run::hook_refusal(&o.argv) {
+        eprintln!("stoop: {error}");
+        emit_decision(
+            fd,
+            serde_json::json!({"decision": "refused", "how": "refused", "key": null, "traced": null, "exit": 2}),
+        );
+        return 2;
+    }
+    let outcome = run::run_observed(o);
+    let (decision, how, traced) = match &outcome.how {
+        run::How::Skipped { .. } => ("skipped", "skipped", true),
+        run::How::Recorded { .. } => ("ran", "recorded", true),
+        run::How::Unrecorded(_) => ("ran", "unrecorded", true),
+        run::How::Failed => ("ran", "failed", true),
+        run::How::Untraced => ("ran", "untraced", false),
+    };
+    emit_decision(
+        fd,
+        serde_json::json!({"decision": decision, "how": how, "key": outcome.key, "traced": traced, "exit": outcome.status}),
+    );
+    outcome.status
+}
+
+/// Writes the decision line and closes the descriptor, which ends the server's read.
+fn emit_decision(fd: i32, value: serde_json::Value) {
+    use std::io::Write;
+    use std::os::unix::io::FromRawFd;
+    // SAFETY: the MCP server handed this descriptor over for the decision alone. The file takes
+    // ownership and closes it.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let _ = writeln!(file, "{value}");
 }
 
 /// The name of a proof is text. A name that is not UTF-8 names no proof, so none is removed.
