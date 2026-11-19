@@ -34,6 +34,10 @@ jobs:
           node-version: 22
       - name: Build and check links
         run: node site/build.mjs
+      - name: Test the discovery files and WebMCP tools
+        env:
+          STOOP_SITE_CHROME: /usr/bin/google-chrome
+        run: node --test --test-concurrency=1 site/test/*.test.mjs
       - uses: actions/configure-pages@v5
         if: github.event_name != 'pull_request'
       - uses: actions/upload-pages-artifact@v3
