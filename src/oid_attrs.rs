@@ -1377,4 +1377,15 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_config_value_with_a_newline_declines_the_snapshot() {
+        let repo = Repo::new();
+        repo.git(&[
+            "config",
+            "stoop.injected",
+            "a\nGIT_CONFIG_GLOBAL=/nonexistent/injected",
+        ]);
+        assert!(snapshot(&repo.0).is_none());
+    }
 }
