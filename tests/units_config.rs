@@ -200,6 +200,44 @@ options = [{ names = ["--label"], values = "many" }]
 }
 
 #[test]
+fn erased_full_forms_remain_ambiguous_after_configuration_is_removed() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "one"
+match = ["./runner", "--files={changed}", "{changed-inputs}", "--label"]
+options = [{ names = ["--files"], values = "many" }, { names = ["--label"], values = 0 }]
+independent = false
+[[units.suite]]
+id = "two"
+match = ["./runner", "--files={changed}", "--label", "{changed-inputs}"]
+options = [{ names = ["--files"], values = "many" }, { names = ["--label"], values = 1 }]
+independent = false
+"#,
+    );
+    let first = f.off(&["--files={changed}", "{changed-inputs}", "--label"]);
+    let second = f.off(&["--files={changed}", "--label", "{changed-inputs}"]);
+    assert!(
+        first.status.success() && second.status.success(),
+        "{} {}",
+        stderr(&first),
+        stderr(&second)
+    );
+    f.config("[units]\n");
+    let out = f.off(&["--files=", "--label"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn undeclared_single_dash_options_keep_their_exact_spelling() {
+    let f = Fixture::new();
+    let out = f.off(&["-v=debug", "-vv", "{changed}"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"run <-v=debug>\n");
+}
+
+#[test]
 fn changed_declarations_cannot_change_a_recorded_full_form() {
     let f = Fixture::new();
     f.config(
@@ -1083,5 +1121,15 @@ match = ["./runner", "*"]
         fifo(&f.root.join("event.json"));
         let out = bounded(run());
         assert_ran(&out);
+    }
+    #[test]
+    fn push_with_pull_request_payload_forces_full() {
+        let f = Fixture::repo();
+        f.event(valid_event());
+        let run = || f.github("push", "refs/heads/feature").output().unwrap();
+        assert_ran(&run());
+        assert_skipped(&run());
+        f.event(r#"{"number":42,"pull_request":{"number":42,"head":{"ref":"feature"},"base":{"ref":"main"}},"repository":{"default_branch":"main"}}"#);
+        assert_ran(&run());
     }
 }
