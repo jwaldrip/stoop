@@ -670,3 +670,44 @@ fn a_file_the_command_overwrites_and_reads_back_still_records() {
     );
     assert_recorded(&out, &case, "t21-read-back");
 }
+
+#[test]
+fn a_write_through_an_alias_read_back_through_the_real_path_records() {
+    // The command creates real/x through an alias and then reads it through its real path. The
+    // created file is the command's own output, so the read back is not an outside change.
+    let case = Case::new("t19-own-readback");
+    case.file("src/keep", b"keep\n");
+    fs::create_dir_all(case.root().join("real")).unwrap();
+    symlink("real", case.root().join("alias")).unwrap();
+    let script = "test -e real/x; echo made > alias/x; cat real/x >/dev/null";
+    let out = run(&case, "t19-own-readback", script, &[]);
+    assert_recorded(&out, &case, "t19-own-readback");
+}
+
+#[test]
+fn a_directory_link_retargeted_mid_run_is_refused_for_the_link_read_through_it() {
+    // src/link1 leads through the directory link src/dl to src/dirA/x. The command reads it once,
+    // then another process retargets src/dl to src/dirB. The file the command read is no longer
+    // what src/link1 names, so the record would follow the old file and could skip wrongly.
+    let case = Case::new("t22-outside-dir-link");
+    case.file("src/dirA/x", b"alpha\n");
+    case.file("src/dirB/x", b"bravo\n");
+    symlink("dirA", case.root().join("src/dl")).unwrap();
+    symlink("dl/x", case.root().join("src/link1")).unwrap();
+    age();
+    let fifo = case.fifo("t22.fifo");
+    let script = "cat src/link1 >/dev/null; cat \"$FIFO\" >/dev/null";
+    let child = spawn(&case, "t22-outside-dir-link", script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    let dl = case.root().join("src/dl");
+    fs::remove_file(&dl).unwrap();
+    symlink("dirB", &dl).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_not_recorded(
+        &out,
+        &case,
+        "t22-outside-dir-link",
+        "src/link1 changed while the command ran",
+    );
+}
