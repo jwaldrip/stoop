@@ -1699,8 +1699,15 @@ pub fn build_inputs(
                 continue;
             }
         }
-        let Some(target) = now else {
-            continue;
+        let target = match first {
+            Some(Some(Seen::Symlink {
+                resolved: Some(first_target),
+                ..
+            })) => first_target.clone(),
+            _ => match now {
+                Some(now) => now,
+                None => continue,
+            },
         };
         if target == real_root {
             continue;
