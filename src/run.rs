@@ -249,7 +249,7 @@ fn default_key(argv: &[std::ffi::OsString], rel_cwd: &str, scope: Option<&str>) 
     format!("{}-{}", sanitize(&base), &h.finalize().to_hex()[..16])
 }
 
-fn hook_key(
+fn hook_key_with_config(
     hook: &units::hook::Hook,
     label: Option<&str>,
     cwd: &str,
@@ -678,7 +678,7 @@ fn recover_hooks(
                     return (warnings, Err("the recorded hook has invalid configuration; quote the placeholder or use --literal".into()));
                 }
                 if let Some(candidate) = prepared.hook {
-                    if hook_key(
+                    if hook_key_with_config(
                         &candidate,
                         record.label.as_deref(),
                         cwd,
@@ -925,7 +925,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     let key = recovered_key
         .or_else(|| {
             hook.as_ref().map(|h| {
-                hook_key(
+                hook_key_with_config(
                     h,
                     o.key.as_deref(),
                     &rel_cwd,
@@ -2351,7 +2351,7 @@ mod hook_key_tests {
             OsString::from_vec(word.to_vec()),
         ];
         let hook = units::hook::prepare(&words).unwrap().unwrap();
-        hook_key(&hook, None, "", None, None, false)
+        hook_key(&hook, None, "", None)
     }
 
     #[test]

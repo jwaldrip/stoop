@@ -601,7 +601,7 @@ fn removals(
 impl ParsedHook {
     /// Match an erased shell shape before option arities are known.
     pub(crate) fn expanded_matches(&self, exact: &[OsString]) -> bool {
-        expanded_matches(&self.argv, &self.spans, exact)
+        expanded_matches_parts(&self.argv, &self.spans, exact)
     }
 
     pub(crate) fn finish(
@@ -679,7 +679,11 @@ fn expanded_matches(hook: &Hook, exact: &[OsString]) -> bool {
 }
 
 /// Does this argv equal a shell-expanded form of the recorded hook?
-fn expanded_matches(original: &[String], all: &[Vec<(usize, usize)>], exact: &[OsString]) -> bool {
+fn expanded_matches_parts(
+    original: &[String],
+    all: &[Vec<(usize, usize)>],
+    exact: &[OsString],
+) -> bool {
     let incoming = shadows(exact);
     let n = original.len();
     let m = incoming.len();
