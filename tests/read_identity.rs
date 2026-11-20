@@ -738,3 +738,21 @@ fn a_racy_target_reached_through_a_link_is_hashed_at_the_read() {
         stderr(&out)
     );
 }
+
+#[test]
+fn received_descriptor_uncertainty_skips_comparison() {
+    let case = Case::new("x8");
+    case.file("src/a", b"before\n");
+    let out = run(
+        &case,
+        "x8",
+        "cat src/a >/dev/null; python3 -c 'import socket; a,b=socket.socketpair(); a.send(b\"x\"); b.recvmsg(1)'",
+        &[("STOOP_DEBUG", Path::new("1"))],
+    );
+    assert_recorded(&out, &case, "x8");
+    assert!(
+        stderr(&out).contains("stoop: debug: not compared src/a: Unknown"),
+        "{}",
+        stderr(&out)
+    );
+}
