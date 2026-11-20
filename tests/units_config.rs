@@ -1,6 +1,10 @@
 //! Configuration and full-verification behavior through the public CLI.
 #![cfg(unix)]
 
+mod common;
+
+use serde_json::json;
+
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -117,6 +121,46 @@ options = [{ names = ["--verbose"], values = 0 }]
     let zero = f.off(&["--verbose", "{changed}"]);
     assert!(zero.status.success(), "{}", stderr(&zero));
     assert_eq!(zero.stdout, b"run <--verbose>\n");
+}
+
+#[test]
+fn mcp_and_cli_share_declared_and_ambiguous_option_handling() {
+    let f = Fixture::new();
+    let args = ["./runner", "--files", "base", "more", "{changed}"];
+    f.config(
+        r#"[[units.suite]]
+id = "files"
+match = ["./runner", "--files", "base", "more", "{changed}"]
+options = [{ names = ["--files"], values = "many" }]
+"#,
+    );
+    let mut mcp = common::Mcp::spawn(&["--allow-run"], &f.root);
+    let invoke = |mcp: &mut common::Mcp, id| {
+        mcp.call(
+            json!(id),
+            "tools/call",
+            common::modern(common::tool_call("run", json!({"argv": args}))),
+        )
+    };
+    let accepted = invoke(&mut mcp, 1);
+    assert_eq!(
+        common::result(&accepted)["structuredContent"]["decision"],
+        "ran"
+    );
+    assert_eq!(
+        common::result(&accepted)["structuredContent"]["exit_code"],
+        0
+    );
+    assert_ran(&f.off(&args[1..]));
+    f.config("[units]\n");
+    let cli = f.off(&args[1..]);
+    assert_eq!(cli.status.code(), Some(2), "{}", stderr(&cli));
+    let refused = invoke(&mut mcp, 2);
+    let outcome = &common::result(&refused)["structuredContent"];
+    assert_eq!(outcome["decision"], "refused", "{refused}");
+    assert_eq!(outcome["exit_code"], 2, "{refused}");
+    assert_eq!(outcome["stderr"]["text"], stderr(&cli));
+    mcp.finish();
 }
 
 #[cfg(target_os = "linux")]
