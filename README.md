@@ -142,7 +142,7 @@ Always single-quote the placeholder. Stoop refuses the shell-mangled forms befor
 | External state you can check | `--probe CMD`: its output must match for a skip |
 | What the run wrote in the repository | Must still be in place for a skip; throwaway output goes in `.stoopignore` |
 
-Before saving a proof, stoop also checks eligible inputs for changes during the run. Paths that overlap the command's own writes or lack a reliable physical route keep the earlier behavior. [Read the limits](https://stoop.build/docs/blind-spots.html#mid-run-edits).
+Before saving a proof, stoop also checks eligible inputs for changes during the run. Paths that overlap the command's own writes or lack a reliable physical route keep the earlier behavior. A timestamp, xattr or bind-alias change made by the command can make stoop refuse to record. [Read the limits](https://stoop.build/docs/blind-spots.html#mid-run-edits).
 
 stoop sees files. It can't see:
 

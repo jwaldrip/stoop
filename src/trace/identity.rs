@@ -694,6 +694,92 @@ mod tests {
     }
 
     #[test]
+    fn access_change_skips_every_first_look_that_became_unreadable() {
+        let path = Path::new("/root/d/f");
+        let footprint = Footprint {
+            access_changed: true,
+            ..Footprint::default()
+        };
+        let link = LinkSeen {
+            dev: 1,
+            ino: 5,
+            ctime_ns: NOW,
+            target: "t".into(),
+        };
+        for seen in [
+            Seen::File(stat(), ReadHash::NotNeeded),
+            Seen::Dir(directory()),
+            Seen::Absent,
+            Seen::Symlink(link),
+            Seen::Special,
+        ] {
+            let label = format!("{seen:?}");
+            assert_eq!(
+                skip(
+                    &footprint,
+                    Some(&observation(seen)),
+                    path,
+                    false,
+                    &Post::Unreadable
+                ),
+                Some(Skip::OwnAccess),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
+    fn access_change_leaves_readable_and_already_unreadable_looks_to_the_comparison() {
+        let path = Path::new("/root/d/f");
+        let footprint = Footprint {
+            access_changed: true,
+            ..Footprint::default()
+        };
+        let file = Post::File {
+            stat: stat(),
+            hash: "h".into(),
+        };
+        let first = observation(Seen::File(stat(), ReadHash::NotNeeded));
+        assert_eq!(skip(&footprint, Some(&first), path, false, &file), None);
+        assert_eq!(
+            skip(
+                &footprint,
+                Some(&observation(Seen::Unreadable)),
+                path,
+                false,
+                &Post::Unreadable
+            ),
+            None
+        );
+        let quiet = Footprint::default();
+        assert_eq!(
+            skip(&quiet, Some(&first), path, false, &Post::Unreadable),
+            None
+        );
+    }
+
+    #[test]
+    fn a_listed_directory_inside_an_own_parent_inode_skips_as_own_entries() {
+        let path = Path::new("/root/d");
+        let dir = directory();
+        let seen = observation(Seen::Dir(dir));
+        let post = Post::Dir {
+            stat: dir,
+            names: None,
+        };
+        let mut footprint = Footprint::default();
+        footprint.parent_inodes.insert((dir.dev, dir.ino));
+        assert_eq!(
+            skip(&footprint, Some(&seen), path, true, &post),
+            Some(Skip::OwnEntries)
+        );
+        assert_eq!(skip(&footprint, Some(&seen), path, false, &post), None);
+        footprint.parent_inodes.clear();
+        footprint.parent_inodes.insert((dir.dev, dir.ino + 1));
+        assert_eq!(skip(&footprint, Some(&seen), path, true, &post), None);
+    }
+
+    #[test]
     fn capped_names_consume_no_more_than_one_extra_entry() {
         let visited = std::cell::Cell::new(0);
         let entries = (0..).map(|index| {

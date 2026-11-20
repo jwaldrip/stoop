@@ -1208,20 +1208,44 @@ fn concurrent_symlink_rename_skips_comparison() {
 }
 
 #[test]
-fn concurrent_hard_link_creation_skips_comparison() {
-    let case = Case::new("review-hard-link");
+fn concurrent_symlink_source_hard_link_skips_comparison() {
+    let case = Case::new("review-symlink-source-link");
     case.file("input", b"before\n");
-    case.file("source", b"source\n");
+    symlink("input", case.root().join("source")).unwrap();
     let out = run(
         &case,
-        "review-hard-link",
-        "cat input >/dev/null; sleep 1 & ln source other; wait",
+        "review-symlink-source-link",
+        "cat input >/dev/null; sleep 1 & python3 -c 'import os; os.link(\"source\", \"other\", follow_symlinks=False)'; wait",
         &[("STOOP_DEBUG", Path::new("1"))],
     );
-    assert_recorded(&out, &case, "review-hard-link");
+    assert_recorded(&out, &case, "review-symlink-source-link");
     assert!(
         stderr(&out).contains("stoop: debug: not compared input: Unknown"),
         "{}",
         stderr(&out)
+    );
+}
+
+#[test]
+fn hard_link_of_a_regular_file_with_a_live_task_keeps_comparison() {
+    let case = Case::new("review-regular-hard-link");
+    let input = case.file("input", b"before\n");
+    case.file("source", b"source\n");
+    let fifo = case.fifo("regular-hard-link.fifo");
+    let child = spawn(
+        &case,
+        "review-regular-hard-link",
+        "cat input >/dev/null; sleep 2 & ln source other; cat \"$FIFO\" >/dev/null; wait",
+        &[("FIFO", &fifo)],
+    );
+    let release = meet(&fifo);
+    fs::write(input, b"changed externally\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_not_recorded(
+        &out,
+        &case,
+        "review-regular-hard-link",
+        "input changed while the command ran",
     );
 }
