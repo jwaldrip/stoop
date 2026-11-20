@@ -601,6 +601,11 @@ fn syscall_result(r: &libc::user_regs_struct) -> i64 {
 
 type FileIdentity = (u64, u64);
 
+/// A watched mkdir of an existing name preserves OIDs only when it fails with EEXIST.
+fn deferred_mkdir_invalidates_oid(deferred: bool, result: i64) -> bool {
+    deferred && result != -(libc::EEXIST as i64)
+}
+
 #[derive(Clone)]
 enum WriteKind {
     Open {
@@ -681,6 +686,8 @@ struct PendingPath {
     key: Option<String>,
     before: Option<FileIdentity>,
     absent: bool,
+    /// The name existed at a watched mkdir entry, so its OID effect depends on the exit result.
+    deferred_mkdir_oid: bool,
     read_priors: Vec<PathBuf>,
     rename_before: Option<Seen>,
     confirmed_after: Option<FileIdentity>,
@@ -3073,12 +3080,15 @@ impl Tracer<'_> {
             .as_ref()
             .and_then(|m| m.as_ref().ok())
             .map(file_identity);
-        if !self.t.oid_attrs_changed
+        let oid_sensitive = !self.t.oid_attrs_changed
             && self
                 .rec
                 .as_mut()
-                .is_some_and(|rec| rec.oid_epoch.is_some() && rec.invalidates_oids(raw, follows))
-        {
+                .is_some_and(|rec| rec.oid_epoch.is_some() && rec.invalidates_oids(raw, follows));
+        let deferred_mkdir_oid = oid_sensitive
+            && matches!(&kind, WriteKind::Create { directory: true })
+            && metadata.as_ref().is_some_and(Result::is_ok);
+        if oid_sensitive && !deferred_mkdir_oid {
             self.t.oid_attrs_changed = true;
         }
         self.touch(raw.to_path_buf(), Use::Name);
@@ -3159,6 +3169,7 @@ impl Tracer<'_> {
             key: key.clone(),
             before,
             absent,
+            deferred_mkdir_oid,
             read_priors,
             confirmed_after: None,
             rename_before: None,
@@ -3177,6 +3188,9 @@ impl Tracer<'_> {
     }
 
     fn uncertain_write(&mut self, path: &PendingPath) {
+        if path.deferred_mkdir_oid {
+            self.t.oid_attrs_changed = true;
+        }
         if let Some(expected) = &path.expected {
             self.landed_inodes.remove(expected);
             self.uncertain_paths.insert(expected.clone());
@@ -3215,15 +3229,21 @@ impl Tracer<'_> {
         let Some(mut pending) = self.pending_writes.remove(&pid) else {
             return;
         };
+        let deferred_mkdir_oid = pending.paths.iter().any(|path| path.deferred_mkdir_oid);
         let Some(regs) = get_regs(pid) else {
+            self.t.oid_attrs_changed |= deferred_mkdir_oid;
             self.flag("could not read registers at a write exit");
             return;
         };
         if decode(&regs).0 != pending.syscall {
+            self.t.oid_attrs_changed |= deferred_mkdir_oid;
             self.flag("it lost the exit stop of a pending write");
             return;
         }
         let result = syscall_result(&regs);
+        if deferred_mkdir_invalidates_oid(deferred_mkdir_oid, result) {
+            self.t.oid_attrs_changed = true;
+        }
         if result < 0 {
             // Internal restart results may resume a syscall after a signal rather than fail it.
             if matches!(result, -512 | -513 | -514 | -516) {
@@ -3999,6 +4019,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn watched_mkdir_preserves_oid_only_on_eexist() {
+        assert!(!deferred_mkdir_invalidates_oid(
+            true,
+            -(libc::EEXIST as i64)
+        ));
+        assert!(deferred_mkdir_invalidates_oid(true, -(libc::EACCES as i64)));
+        assert!(deferred_mkdir_invalidates_oid(true, -(libc::EPERM as i64)));
+        assert!(deferred_mkdir_invalidates_oid(true, 0));
+        assert!(!deferred_mkdir_invalidates_oid(false, 0));
+    }
+
+    #[test]
     fn fd_attribution_requires_the_exact_resolved_destination() {
         let expected = Path::new("/repo/a");
         let other = Path::new("/repo/b");
@@ -4271,6 +4303,7 @@ mod tests {
             key,
             before: Some((3, 9)),
             absent: false,
+            deferred_mkdir_oid: false,
             read_priors: Vec::new(),
             rename_before: None,
             confirmed_after: None,
@@ -4352,6 +4385,7 @@ mod tests {
                     key: None,
                     before: Some(own),
                     absent: false,
+                    deferred_mkdir_oid: false,
                     read_priors: Vec::new(),
                     rename_before: None,
                     confirmed_after: None,

@@ -1575,6 +1575,32 @@ fn a_write_outside_the_repository_keeps_blob_ids() {
     assert_eq!(job["legs"][0]["checked"]["hashed"], 0, "{result}");
 }
 
+#[test]
+fn mkdir_watched_existing_ancestor_keeps_blob_ids() {
+    let result = plan_recorded_step(
+        "mkdir-existing-watched",
+        "cat a.txt; mkdir -p \"$RUNNER_TEMP\"\n",
+        &[("a.txt", "a\n")],
+    );
+    let job = &result["jobs"][0];
+    assert_eq!(job["code"], "proved", "{result}");
+    assert_eq!(job["legs"][0]["checked"]["by_oid"], 1, "{result}");
+    assert_eq!(job["legs"][0]["checked"]["hashed"], 0, "{result}");
+}
+
+#[test]
+fn mkdir_watched_new_directory_drops_blob_ids() {
+    let result = plan_recorded_step(
+        "mkdir-new-watched",
+        "cat a.txt; mkdir -p \"$HOME/.config/git\"\n",
+        &[("a.txt", "a\n")],
+    );
+    let job = &result["jobs"][0];
+    assert_eq!(job["code"], "proved", "{result}");
+    assert_eq!(job["legs"][0]["checked"]["by_oid"], 0, "{result}");
+    assert_eq!(job["legs"][0]["checked"]["hashed"], 1, "{result}");
+}
+
 /// The same step also creates `.git/info/attributes`, a file Git reads for attributes. That write
 /// drops every blob id in the run, and the step is still proved, by hashing.
 #[test]
