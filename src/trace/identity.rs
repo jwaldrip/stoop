@@ -81,6 +81,8 @@ pub struct Footprint {
     /// Directory inodes containing names the command may have changed.
     pub parent_inodes: HashSet<(u64, u64)>,
     pub inodes: HashSet<(u64, u64)>,
+    /// A directory permission or ownership change may hide descendants through an alias.
+    pub access_changed: bool,
     pub unknown: bool,
 }
 
@@ -110,6 +112,7 @@ pub enum Skip {
     OwnPath,
     OwnEntries,
     OwnInode,
+    OwnAccess,
 }
 
 #[derive(Default)]
@@ -412,6 +415,15 @@ pub fn skip(
         .any(|inode| footprint.inodes.contains(&inode))
     {
         return Some(Skip::OwnInode);
+    }
+    if footprint.access_changed
+        && matches!(post, Post::Unreadable)
+        && matches!(
+            observation.seen,
+            Seen::File(..) | Seen::Dir(..) | Seen::Absent
+        )
+    {
+        return Some(Skip::OwnAccess);
     }
     None
 }

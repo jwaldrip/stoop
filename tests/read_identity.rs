@@ -1031,7 +1031,7 @@ fn read_only_proc_cwd_alias_does_not_hide_an_external_edit() {
     );
 }
 #[test]
-fn inherited_readonly_unlinked_descriptor_excludes_its_inode() {
+fn inherited_readonly_unlinked_descriptor_does_not_hide_external_edit() {
     let case = Case::new("review-inherited-readonly");
     let a = case.file("a", b"before\n");
     let b = case.root().join("b");
@@ -1065,8 +1065,12 @@ fn inherited_readonly_unlinked_descriptor_excludes_its_inode() {
     fs::write(b, b"changed externally\n").unwrap();
     drop(release);
     let out = child.wait_with_output().unwrap();
-    assert_recorded(&out, &case, "review-inherited-readonly");
-    assert!(stderr(&out).contains("stoop: debug: not compared b: OwnInode"));
+    assert_not_recorded(
+        &out,
+        &case,
+        "review-inherited-readonly",
+        "b changed while the command ran",
+    );
 }
 
 #[test]
@@ -1107,5 +1111,117 @@ fn listed_directory_alias_candidates_both_exclude_own_entries() {
             .count()
             >= 2,
         "{log}"
+    );
+}
+
+#[test]
+fn missing_parent_write_does_not_hide_external_edit() {
+    let case = Case::new("review-missing-parent");
+    let file = case.file("input", b"before\n");
+    let fifo = case.fifo("missing-parent.fifo");
+    let child = spawn(
+        &case,
+        "review-missing-parent",
+        "cat input >/dev/null; python3 -c 'import os; p=\"target/a/b\"; exec(\"try:\\n os.mkdir(p)\\nexcept FileNotFoundError:\\n os.makedirs(p)\")'; cat \"$FIFO\" >/dev/null",
+        &[("FIFO", &fifo)],
+    );
+    let release = meet(&fifo);
+    fs::write(file, b"changed externally\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_not_recorded(
+        &out,
+        &case,
+        "review-missing-parent",
+        "input changed while the command ran",
+    );
+}
+
+#[test]
+fn concurrent_symlink_creation_skips_comparison() {
+    let case = Case::new("review-symlink-create");
+    case.file("input", b"before\n");
+    let out = run(
+        &case,
+        "review-symlink-create",
+        "cat input >/dev/null; sleep 1 & ln -s input link; wait",
+        &[("STOOP_DEBUG", Path::new("1"))],
+    );
+    assert_recorded(&out, &case, "review-symlink-create");
+    assert!(
+        stderr(&out).contains("stoop: debug: not compared input: Unknown"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+#[ignore = "requires sudo mount --bind on an isolated Linux CI runner"]
+fn chmod_directory_through_bind_alias_keeps_v9_recording() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Mount(PathBuf);
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            let _ = Command::new("sudo").arg("umount").arg(&self.0).status();
+        }
+    }
+    let case = Case::new("review-bind-chmod");
+    case.file("d/f", b"input\n");
+    let alias = case.dir.join("alias");
+    fs::create_dir(&alias).unwrap();
+    assert!(Command::new("sudo")
+        .args(["mount", "--bind"])
+        .arg(case.root().join("d"))
+        .arg(&alias)
+        .status()
+        .unwrap()
+        .success());
+    let mount = Mount(alias.clone());
+    let out = run(
+        &case,
+        "review-bind-chmod",
+        "cat d/f >/dev/null; chmod 000 \"$ALIAS\"",
+        &[("ALIAS", &alias)],
+    );
+    fs::set_permissions(case.root().join("d"), fs::Permissions::from_mode(0o700)).unwrap();
+    drop(mount);
+    assert_recorded(&out, &case, "review-bind-chmod");
+}
+
+#[test]
+fn concurrent_symlink_rename_skips_comparison() {
+    let case = Case::new("review-symlink-rename");
+    case.file("input", b"before\n");
+    symlink("input", case.root().join("link")).unwrap();
+    let out = run(
+        &case,
+        "review-symlink-rename",
+        "cat input >/dev/null; sleep 1 & mv -T link other; wait",
+        &[("STOOP_DEBUG", Path::new("1"))],
+    );
+    assert_recorded(&out, &case, "review-symlink-rename");
+    assert!(
+        stderr(&out).contains("stoop: debug: not compared input: Unknown"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn concurrent_hard_link_creation_skips_comparison() {
+    let case = Case::new("review-hard-link");
+    case.file("input", b"before\n");
+    case.file("source", b"source\n");
+    let out = run(
+        &case,
+        "review-hard-link",
+        "cat input >/dev/null; sleep 1 & ln source other; wait",
+        &[("STOOP_DEBUG", Path::new("1"))],
+    );
+    assert_recorded(&out, &case, "review-hard-link");
+    assert!(
+        stderr(&out).contains("stoop: debug: not compared input: Unknown"),
+        "{}",
+        stderr(&out)
     );
 }

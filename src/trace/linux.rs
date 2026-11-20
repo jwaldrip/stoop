@@ -1887,7 +1887,9 @@ impl Tracer<'_> {
                 self.t.footprint.unknown = true;
                 continue;
             };
-            if flags & libc::O_CLOEXEC as u32 != 0 {
+            if flags & libc::O_CLOEXEC as u32 != 0
+                || flags & libc::O_ACCMODE as u32 == libc::O_RDONLY as u32
+            {
                 continue;
             }
             footprint_inode(&mut self.t, fs::metadata(entry.path()));
@@ -1911,17 +1913,14 @@ impl Tracer<'_> {
         note_symlink_write(&mut self.t, symlink_route, self.live_tasks.len());
         match location {
             Some(location) => {
-                match location
-                    .path
-                    .parent()
-                    .and_then(|parent| fs::metadata(parent).ok())
-                {
-                    Some(metadata) if metadata.is_dir() => {
+                match location.path.parent().map(fs::metadata) {
+                    Some(Ok(metadata)) if metadata.is_dir() => {
                         self.t
                             .footprint
                             .parent_inodes
                             .insert((metadata.dev(), metadata.ino()));
                     }
+                    Some(Err(error)) if is_absent(&error) => {}
                     _ => self.t.footprint.unknown = true,
                 }
                 self.t.footprint.entries.insert(location.path);
@@ -2552,6 +2551,9 @@ impl Tracer<'_> {
         let b_dir = b_meta.as_ref().is_some_and(|m| m.is_dir());
         let symlink = a_meta.as_ref().is_some_and(|m| m.file_type().is_symlink())
             || b_meta.as_ref().is_some_and(|m| m.file_type().is_symlink());
+        if self.rec.is_some() && symlink {
+            note_symlink_write(&mut self.t, true, self.live_tasks.len());
+        }
         let directory = a_dir || (exchange && b_dir);
         // A moved directory may contain attribute sources, and a symlink changes their
         // resolution, even when neither endpoint names an attribute file. Outside the repository
@@ -2591,6 +2593,16 @@ impl Tracer<'_> {
             }
             return;
         }
+        if self.rec.is_some() {
+            let metadata = if follows {
+                fs::metadata(raw)
+            } else {
+                fs::symlink_metadata(raw)
+            };
+            if !metadata.as_ref().is_ok_and(|metadata| !metadata.is_dir()) {
+                self.t.footprint.access_changed = true;
+            }
+        }
         match fs::symlink_metadata(raw) {
             Ok(m) if m.is_dir() => {
                 if self.rec.is_some() {
@@ -2621,7 +2633,11 @@ impl Tracer<'_> {
     /// Resolve descriptor-only chmods, including fchmodat2 with AT_EMPTY_PATH.
     fn chmod_fd(&mut self, pid: i32, fd: i32) {
         if self.rec.is_some() && fd != AT_FDCWD {
-            footprint_inode(&mut self.t, fs::metadata(format!("/proc/{pid}/fd/{fd}")));
+            let metadata = fs::metadata(format!("/proc/{pid}/fd/{fd}"));
+            if !metadata.as_ref().is_ok_and(|metadata| !metadata.is_dir()) {
+                self.t.footprint.access_changed = true;
+            }
+            footprint_inode(&mut self.t, metadata);
         }
         let path = if fd == AT_FDCWD {
             self.cwd(pid)
@@ -2693,6 +2709,16 @@ impl Tracer<'_> {
         };
         let nofollow = nofollow || flags.is_some_and(|i| args[i] as i32 & AT_SYMLINK_NOFOLLOW != 0);
         if self.rec.is_some() {
+            let metadata = if nofollow {
+                fs::symlink_metadata(&p)
+            } else {
+                fs::metadata(&p)
+            };
+            if !metadata.as_ref().is_ok_and(|metadata| !metadata.is_dir()) {
+                self.t.footprint.access_changed = true;
+            }
+        }
+        if self.rec.is_some() {
             self.footprint_write(&p, !nofollow);
         }
         let inside = self.rec.as_mut().is_some_and(|rec| rec.in_repo(&p));
@@ -2706,6 +2732,9 @@ impl Tracer<'_> {
     fn owner_fd(&mut self, pid: i32, fd: i32) {
         let proc_path = PathBuf::from(format!("/proc/{pid}/fd/{fd}"));
         let identity = fs::metadata(&proc_path).ok();
+        if self.rec.is_some() && identity.as_ref().is_none_or(|metadata| metadata.is_dir()) {
+            self.t.footprint.access_changed = true;
+        }
         let named = fs::read_link(&proc_path).ok().filter(|path| {
             path.is_absolute() && !path.as_os_str().as_bytes().ends_with(b" (deleted)")
         });
@@ -2847,12 +2876,18 @@ impl Tracer<'_> {
                     path,
                     target,
                 } => {
+                    if self.rec.is_some() {
+                        note_symlink_write(&mut self.t, true, self.live_tasks.len());
+                    }
                     if let Some(p) = self.resolve(pid, &args, dirfd, path, Access::Modify) {
                         self.symlink_target(pid, &args, &p, target);
                         self.create_at(pid, p, false);
                     }
                 }
                 Op::LinkSource { dirfd, path, flags } => {
+                    if self.rec.is_some() {
+                        note_symlink_write(&mut self.t, true, self.live_tasks.len());
+                    }
                     let by_fd = flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0);
                     if let Some(p) = self.resolve(pid, &args, dirfd, path, Access::Modify) {
                         if self.rec.is_some() {
