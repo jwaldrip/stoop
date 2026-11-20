@@ -2011,6 +2011,7 @@ mod tests {
             trace::Touch {
                 read: true,
                 listed: false,
+                content: false,
             },
         );
         let mut phys = Physical::new(&root, &root);
@@ -2113,6 +2114,7 @@ mod tests {
             trace::Touch {
                 read: true,
                 listed: false,
+                content: false,
             },
         );
         let mut phys = Physical::new(&root, &root);

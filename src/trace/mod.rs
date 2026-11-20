@@ -26,6 +26,9 @@ pub struct Touch {
     /// stat, access or readlink on it. Decides whether a write must record content.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub read: bool,
+    /// The run opened this path for content or executed it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub content: bool,
 }
 use serde::{Deserialize, Serialize};
 
@@ -84,6 +87,15 @@ pub struct ExecEvent {
 pub struct Trace {
     /// Every path the process tree looked at, lexically resolved.
     pub touched: HashMap<PathBuf, Touch>,
+    /// First observations are present only for Linux runs with a recording scope.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub seen: Option<HashMap<PathBuf, identity::Observation>>,
+    /// First getdents observations.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub listings: HashMap<PathBuf, identity::ListSeen>,
+    /// Paths and inodes that the run may have modified.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub footprint: identity::Footprint,
     /// Repository symlinks whose targets passed through a proc magic link at entry.
     pub magic_links: HashSet<PathBuf>,
     /// Paths the run wrote, renamed, removed or created, as the run named them.

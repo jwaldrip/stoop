@@ -9,6 +9,7 @@
 //! except for priors: what a path held before the run first wrote it is read at the
 //! same stop, because the write is about to change it.
 
+use super::identity::{self, Observation, ReadBudget, Seen};
 use super::{ExecEvent, Scope, Trace};
 use crate::ignore::Ignore;
 use crate::input::{file_id, hash_file, hash_file_with_oid};
@@ -592,6 +593,7 @@ struct Rec<'a> {
     /// The root as the user spelled it; keys in reasons are relative to it.
     root: PathBuf,
     hashed: u64,
+    read_budget: ReadBudget,
     oid_epoch: Option<Arc<crate::oid_attrs::Epoch>>,
     link_walks: BTreeMap<PathBuf, Vec<PathBuf>>,
     redirected_reads: HashSet<String>,
@@ -680,11 +682,13 @@ pub fn run<'a>(
             root: s.root.to_path_buf(),
             oid_epoch: s.oid_epoch.clone(),
             hashed: 0,
+            read_budget: ReadBudget::default(),
             link_walks: BTreeMap::new(),
             redirected_reads: HashSet::new(),
         }),
         t: Trace {
             status: 1,
+            seen: scope.map(|_| HashMap::new()),
             oid_epoch: scope.and_then(|s| s.oid_epoch.clone()),
             #[cfg(test)]
             oid_epoch_captured: scope.is_some(),
@@ -710,6 +714,7 @@ pub fn run<'a>(
         return Err(io::Error::other("could not start the traced command"));
     }
     tr.inspect_inherited_fds(pid);
+    tr.inspect_footprint_fds(pid);
     let opts = libc::PTRACE_O_TRACESECCOMP
         | libc::PTRACE_O_TRACEFORK
         | libc::PTRACE_O_TRACEVFORK
@@ -1384,6 +1389,120 @@ fn push_reason(t: &mut Trace, why: String) {
     }
 }
 
+/// A missing name is comparable only when its nearest extant ancestor is a directory.
+fn physical_missing_parent(path: &Path) -> bool {
+    for ancestor in path.ancestors().skip(1) {
+        match fs::symlink_metadata(ancestor) {
+            Ok(metadata) => return metadata.file_type().is_dir(),
+            Err(error) if is_absent(&error) => {}
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
+/// Only this verified device can be ignored when a write has no physical location.
+fn harmless_null(path: &Path, metadata: &fs::Metadata) -> bool {
+    path == Path::new("/dev/null")
+        && metadata.file_type().is_char_device()
+        && metadata.rdev() == libc::makedev(1, 3)
+}
+
+fn is_harmless_null(path: &Path) -> bool {
+    fs::metadata(path).is_ok_and(|metadata| harmless_null(path, &metadata))
+}
+
+fn footprint_inode(t: &mut Trace, metadata: io::Result<fs::Metadata>) {
+    match metadata {
+        Ok(metadata) => {
+            t.footprint.inodes.insert((metadata.dev(), metadata.ino()));
+        }
+        Err(_) => t.footprint.unknown = true,
+    }
+}
+
+/// Capture first observations without changing the existing touched-path bookkeeping.
+fn record_touch(
+    t: &mut Trace,
+    rec: Option<&mut Rec<'_>>,
+    path: PathBuf,
+    read: bool,
+    listed: bool,
+    content: bool,
+    route_physical: bool,
+) {
+    let entry = t.touched.entry(path);
+    let path = entry.key();
+    if let (Some(rec), Some(seen)) = (rec, t.seen.as_mut()) {
+        let eligible = !path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+            && !["/proc", "/sys", "/dev"]
+                .iter()
+                .any(|prefix| path.starts_with(prefix))
+            && !t.written.contains(path)
+            && !path.strip_prefix(&rec.root).ok().is_some_and(|relative| {
+                relative.components().any(|part| part.as_os_str() == ".git")
+            })
+            && !rec.ignore.is_ignored(&to_key(&rec.root, path));
+        if eligible {
+            if !seen.contains_key(path) {
+                let first = identity::observe(path);
+                let route = route_physical
+                    && (!matches!(first, Seen::Absent) || physical_missing_parent(path));
+                seen.insert(
+                    path.to_path_buf(),
+                    Observation {
+                        seen: first,
+                        route_physical: route,
+                        appeared: false,
+                    },
+                );
+            }
+            if let Some(observation) = seen.get_mut(path) {
+                if matches!(observation.seen, Seen::Absent) && fs::symlink_metadata(path).is_ok() {
+                    observation.appeared = true;
+                }
+                if content
+                    && identity::hash_racy_at_read(
+                        &mut observation.seen,
+                        path,
+                        identity::now_ns(),
+                        &mut rec.read_budget,
+                    )
+                    && rec.read_budget.logged < 32
+                    && std::env::var_os("STOOP_DEBUG").is_some()
+                {
+                    eprintln!(
+                        "stoop: debug: hashed {} at the read",
+                        to_key(&rec.root, path)
+                    );
+                    rec.read_budget.logged += 1;
+                }
+            }
+            if listed && !t.listings.contains_key(path) {
+                if let Ok(metadata) = fs::symlink_metadata(path) {
+                    if metadata.is_dir() {
+                        let stat = identity::dir_stat(&metadata);
+                        let names =
+                            identity::racy(stat.mtime_ns, stat.ctime_ns, identity::now_ns())
+                                .then(|| {
+                                    identity::read_names_capped(path, identity::MAX_LISTED_NAMES)
+                                })
+                                .flatten();
+                        t.listings
+                            .insert(path.to_path_buf(), identity::ListSeen { stat, names });
+                    }
+                }
+            }
+        }
+    }
+    let touch = entry.or_default();
+    touch.read |= read;
+    touch.listed |= listed;
+    touch.content |= content;
+}
+
 impl Rec<'_> {
     /// Whether a write, a namespace change or an owner change at `raw` can change what Git reads
     /// for attributes or configuration. The watched set names those files (see `oid_attrs`), so
@@ -1583,7 +1702,7 @@ impl Rec<'_> {
         let key = self.key_of(&loc.path, t)?;
         for link in self.links_below_root(raw).unwrap_or_default() {
             let name = to_key(self.phys.real(), &link);
-            t.touched.entry(link).or_default().read = true;
+            record_touch(t, Some(self), link, true, false, false, true);
             push_reason(t, format!("it wrote through the symlink {name}"));
         }
         if !t.priors.contains_key(&key) {
@@ -1701,6 +1820,78 @@ impl Rec<'_> {
 }
 
 impl Tracer<'_> {
+    /// Capture writable inherited descriptors even when no Git OID epoch exists.
+    fn inspect_footprint_fds(&mut self, pid: i32) {
+        if self.rec.is_none() {
+            return;
+        }
+        let Ok(entries) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+            self.t.footprint.unknown = true;
+            return;
+        };
+        for entry in entries {
+            let Ok(entry) = entry else {
+                self.t.footprint.unknown = true;
+                continue;
+            };
+            let info = PathBuf::from(format!("/proc/{pid}/fdinfo")).join(entry.file_name());
+            let flags = fs::read_to_string(info).ok().and_then(|text| {
+                text.lines()
+                    .find_map(|line| line.strip_prefix("flags:"))
+                    .and_then(|value| u32::from_str_radix(value.trim(), 8).ok())
+            });
+            let Some(flags) = flags else {
+                self.t.footprint.unknown = true;
+                continue;
+            };
+            if flags & libc::O_ACCMODE as u32 == libc::O_RDONLY as u32
+                || flags & libc::O_CLOEXEC as u32 != 0
+            {
+                continue;
+            }
+            footprint_inode(&mut self.t, fs::metadata(entry.path()));
+        }
+    }
+
+    /// Attribute every potential write at entry, without deciding whether it succeeds.
+    fn footprint_write(&mut self, raw: &Path, follows: bool) {
+        let Some(rec) = self.rec.as_mut() else { return };
+        if follows && is_harmless_null(raw) {
+            return;
+        }
+        match rec.phys.locate(raw) {
+            Some(location) => {
+                self.t.footprint.entries.insert(location.path);
+            }
+            None => self.t.footprint.unknown = true,
+        }
+        if follows
+            && fs::symlink_metadata(raw).is_ok_and(|metadata| metadata.file_type().is_symlink())
+        {
+            match fs::canonicalize(raw) {
+                Ok(target) => {
+                    self.t.footprint.entries.insert(target);
+                }
+                Err(_) => self.t.footprint.unknown = true,
+            }
+        }
+        let metadata = if follows {
+            fs::metadata(raw)
+        } else {
+            fs::symlink_metadata(raw)
+        };
+        match metadata {
+            Ok(metadata) => {
+                self.t
+                    .footprint
+                    .inodes
+                    .insert((metadata.dev(), metadata.ino()));
+            }
+            Err(error) if is_absent(&error) => {}
+            Err(_) => self.t.footprint.unknown = true,
+        }
+    }
+
     /// A tracee can write through an inherited descriptor without opening a path
     /// under ptrace. Inspect writable regular descriptors before its first exec.
     fn inspect_inherited_fds(&mut self, pid: i32) {
@@ -1772,7 +1963,7 @@ impl Tracer<'_> {
 
     /// Resolve proc magic links in the tracee's namespace, not stoop's own `/proc/self`.
     /// Ordinary names remain as written so the regular link walker can track their links.
-    fn map_magic_path(&mut self, pid: i32, raw: PathBuf) -> Option<PathBuf> {
+    fn map_magic_path(&mut self, pid: i32, raw: PathBuf, content: bool) -> Option<PathBuf> {
         use std::collections::VecDeque;
         use std::os::unix::ffi::OsStrExt;
         if self.rec.is_none() {
@@ -1823,11 +2014,21 @@ impl Tracer<'_> {
             }
             if special {
                 magic = true;
-            } else if let Some(rec) = &self.rec {
-                if current.starts_with(rec.phys.real()) {
-                    self.t.touched.entry(current.clone()).or_default().read = true;
-                    repository_links.push(current.clone());
-                }
+            } else if self
+                .rec
+                .as_ref()
+                .is_some_and(|rec| current.starts_with(rec.phys.real()))
+            {
+                record_touch(
+                    &mut self.t,
+                    self.rec.as_mut(),
+                    current.clone(),
+                    true,
+                    false,
+                    false,
+                    true,
+                );
+                repository_links.push(current.clone());
             }
             let target = match fs::read_link(&current) {
                 Ok(target) => target,
@@ -1876,7 +2077,30 @@ impl Tracer<'_> {
                 .as_ref()
                 .is_some_and(|r| r.phys.repo_rel(&current).is_some())
         {
-            self.t.touched.entry(current.clone()).or_default().read = true;
+            record_touch(
+                &mut self.t,
+                self.rec.as_mut(),
+                current.clone(),
+                true,
+                false,
+                content,
+                true,
+            );
+        }
+        if magic
+            && ["/dev", "/proc", "/sys"]
+                .iter()
+                .any(|prefix| raw.starts_with(prefix))
+        {
+            match fs::metadata(&current) {
+                Ok(metadata) if metadata.is_file() => {
+                    self.t
+                        .footprint
+                        .inodes
+                        .insert((metadata.dev(), metadata.ino()));
+                }
+                _ => self.t.footprint.unknown = true,
+            }
         }
         self.magic_cache.insert(parent, (self.magic_epoch, magic));
         if magic {
@@ -1895,6 +2119,7 @@ impl Tracer<'_> {
         args: &[u64; 6],
         dirfd: Option<usize>,
         path: usize,
+        content: bool,
     ) -> Option<PathBuf> {
         if args[path] == 0 {
             return None; // statx(fd, NULL, AT_EMPTY_PATH): no name involved
@@ -1916,7 +2141,7 @@ impl Tracer<'_> {
         }
         let p = PathBuf::from(OsString::from_vec(raw));
         if p.is_absolute() {
-            return self.map_magic_path(pid, without_dots(&p));
+            return self.map_magic_path(pid, without_dots(&p), content);
         }
         let base = match dirfd.map(|i| args[i] as i32) {
             None | Some(AT_FDCWD) => self.cwd(pid),
@@ -1927,7 +2152,7 @@ impl Tracer<'_> {
                 self.flag("it accessed a deleted directory through a file descriptor");
                 None
             }
-            Some(b) => self.map_magic_path(pid, without_dots(&b.join(&p))),
+            Some(b) => self.map_magic_path(pid, without_dots(&b.join(&p)), content),
             None => {
                 self.flag("could not resolve a relative path");
                 None
@@ -1935,14 +2160,16 @@ impl Tracer<'_> {
         }
     }
 
-    fn touch(&mut self, lex: PathBuf, read: bool) {
+    fn touch(&mut self, lex: PathBuf, read: bool, content: bool) {
         let mut path = lex;
+        let mut route_physical = false;
         if let Some(rec) = &mut self.rec {
             for link in rec.links_below_root(&path).unwrap_or_default() {
-                self.t.touched.entry(link).or_default().read = true;
+                record_touch(&mut self.t, Some(rec), link, true, false, false, true);
             }
             // Record observations where the call resolved them, not after the run.
             if let Some(loc) = rec.phys.locate(&path) {
+                route_physical = loc.path == path;
                 if loc.path != path && rec.phys.repo_rel(&loc.path).is_some() {
                     if read && loc.redirected {
                         if let Some(key) = rec.key_of(&loc.path, &mut self.t) {
@@ -1958,10 +2185,19 @@ impl Tracer<'_> {
                         }
                     }
                     path = loc.path;
+                    route_physical = true;
                 }
             }
         }
-        self.t.touched.entry(path).or_default().read |= read;
+        record_touch(
+            &mut self.t,
+            self.rec.as_mut(),
+            path,
+            read,
+            false,
+            content,
+            route_physical,
+        );
     }
 
     /// The kernel loads shebang and ELF interpreters without a traceable open syscall.
@@ -1972,7 +2208,7 @@ impl Tracer<'_> {
         }
         // Linux permits at most four recursive script interpreters.
         for _ in 0..=4 {
-            self.touch(path.clone(), true);
+            self.touch(path.clone(), true, true);
             let mut bytes = [0u8; 256];
             let Ok(mut file) = fs::File::open(&path) else {
                 return;
@@ -1999,7 +2235,7 @@ impl Tracer<'_> {
                     self.flag("could not resolve a shebang interpreter");
                     return;
                 };
-                let Some(next) = self.map_magic_path(pid, absolute) else {
+                let Some(next) = self.map_magic_path(pid, absolute, true) else {
                     return;
                 };
                 path = next;
@@ -2015,8 +2251,8 @@ impl Tracer<'_> {
                         self.flag("could not resolve an ELF interpreter");
                         return;
                     };
-                    if let Some(interpreter) = self.map_magic_path(pid, absolute) {
-                        self.touch(interpreter, true);
+                    if let Some(interpreter) = self.map_magic_path(pid, absolute, true) {
+                        self.touch(interpreter, true, true);
                     }
                 }
                 Ok(None) => {}
@@ -2029,6 +2265,7 @@ impl Tracer<'_> {
     /// Record a write, and what the path held before the first one. Returns the key when in scope.
     fn write(&mut self, raw: &Path, follows: bool) -> Option<String> {
         self.rec.as_ref()?;
+        self.footprint_write(raw, follows);
         if !self.t.oid_attrs_changed
             && self
                 .rec
@@ -2043,7 +2280,7 @@ impl Tracer<'_> {
         if !through_link {
             self.t.written.insert(raw.to_path_buf());
         } else {
-            self.touch(raw.to_path_buf(), true);
+            self.touch(raw.to_path_buf(), true, false);
         }
         let rec = self.rec.as_mut()?;
         let key = rec.write(&mut self.t, raw, follows)?;
@@ -2128,13 +2365,26 @@ impl Tracer<'_> {
         path: usize,
         flags: Option<usize>,
     ) {
-        let Some(p) = self.resolve(pid, args, dirfd, path) else {
+        let content = flags.is_some_and(|i| {
+            let f = args[i] as i32;
+            f & (libc::O_WRONLY
+                | libc::O_RDWR
+                | libc::O_CREAT
+                | libc::O_TRUNC
+                | libc::O_APPEND
+                | libc::O_PATH)
+                == 0
+        });
+        let Some(p) = self.resolve(pid, args, dirfd, path, content) else {
             return;
         };
         match flags.map(|i| args[i] as i32) {
             // An O_TMPFILE open writes nothing; the later linkat names the file.
             Some(f) if f & libc::O_TMPFILE == libc::O_TMPFILE => {
-                self.touch(p, false);
+                if self.rec.is_some() {
+                    self.t.footprint.unknown = true;
+                }
+                self.touch(p, false, false);
             }
             // creat truncates the named file.
             None => {
@@ -2153,14 +2403,14 @@ impl Tracer<'_> {
                     let follows = f & libc::O_NOFOLLOW == 0 && !creates_exclusively;
                     self.write(&p, follows);
                 } else {
-                    self.touch(p, true);
+                    self.touch(p, true, content);
                 }
             }
         }
     }
 
     fn create(&mut self, pid: i32, args: &[u64; 6], dirfd: Option<usize>, path: usize, dir: bool) {
-        let Some(p) = self.resolve(pid, args, dirfd, path) else {
+        let Some(p) = self.resolve(pid, args, dirfd, path, false) else {
             return;
         };
         self.create_at(pid, p, dir);
@@ -2172,7 +2422,7 @@ impl Tracer<'_> {
             // mkdir on a path that exists fails with EEXIST and creates nothing: `mkdir -p`
             // and `create_dir_all` do this for every ancestor. The existence is an input.
             if fs::symlink_metadata(&p).is_ok() {
-                self.touch(p, false);
+                self.touch(p, false, false);
                 return;
             }
         }
@@ -2201,7 +2451,7 @@ impl Tracer<'_> {
         flags: Option<usize>,
         dir: bool,
     ) {
-        let Some(p) = self.resolve(pid, args, dirfd, path) else {
+        let Some(p) = self.resolve(pid, args, dirfd, path, false) else {
             return;
         };
         let removes_dir = dir || flags.is_some_and(|i| args[i] as i32 & AT_REMOVEDIR != 0);
@@ -2242,8 +2492,8 @@ impl Tracer<'_> {
         flags: Option<usize>,
     ) {
         let (Some(a), Some(b)) = (
-            self.resolve(pid, args, from.0, from.1),
-            self.resolve(pid, args, to.0, to.1),
+            self.resolve(pid, args, from.0, from.1, false),
+            self.resolve(pid, args, to.0, to.1, false),
         ) else {
             return;
         };
@@ -2288,31 +2538,43 @@ impl Tracer<'_> {
     fn chmod(&mut self, raw: &Path, follows: bool) {
         if !raw.is_absolute() {
             if self.rec.is_some() {
+                self.t.footprint.unknown = true;
                 self.t.oid_attrs_changed = true;
             }
             return;
         }
         match fs::symlink_metadata(raw) {
             Ok(m) if m.is_dir() => {
+                if self.rec.is_some() {
+                    self.t.footprint.inodes.insert((m.dev(), m.ino()));
+                }
                 // Directory permissions can change which attribute files Git can read.
                 let inside = self.rec.as_mut().is_some_and(|rec| rec.in_repo(raw));
                 if inside || self.oid_sensitive(raw, follows) {
                     self.t.oid_attrs_changed = true;
                 }
-                self.touch(raw.to_path_buf(), false);
+                self.touch(raw.to_path_buf(), false, false);
             }
             Ok(_) => {
                 self.write(raw, follows);
             }
             Err(error) if !is_absent(&error) && self.rec.is_some() => {
+                self.t.footprint.unknown = true;
                 self.t.oid_attrs_changed = true;
             }
-            Err(_) => {}
+            Err(_) => {
+                if self.rec.is_some() {
+                    self.t.footprint.unknown = true;
+                }
+            }
         }
     }
 
     /// Resolve descriptor-only chmods, including fchmodat2 with AT_EMPTY_PATH.
     fn chmod_fd(&mut self, pid: i32, fd: i32) {
+        if self.rec.is_some() && fd != AT_FDCWD {
+            footprint_inode(&mut self.t, fs::metadata(format!("/proc/{pid}/fd/{fd}")));
+        }
         let path = if fd == AT_FDCWD {
             self.cwd(pid)
         } else {
@@ -2370,16 +2632,26 @@ impl Tracer<'_> {
         flags: Option<usize>,
         nofollow: bool,
     ) {
-        let Some(p) = self.resolve(pid, args, dirfd, path) else {
+        let Some(p) = self.resolve(pid, args, dirfd, path, false) else {
             // fchownat with AT_EMPTY_PATH names its descriptor, not a path.
             if let Some(fd) =
                 dirfd.filter(|_| flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0))
             {
                 self.owner_fd(pid, args[fd] as i32);
+            } else if self.rec.is_some() {
+                self.t.footprint.unknown = true;
             }
             return;
         };
         let nofollow = nofollow || flags.is_some_and(|i| args[i] as i32 & AT_SYMLINK_NOFOLLOW != 0);
+        if self.rec.is_some() {
+            let metadata = if nofollow {
+                fs::symlink_metadata(&p)
+            } else {
+                fs::metadata(&p)
+            };
+            footprint_inode(&mut self.t, metadata);
+        }
         let inside = self.rec.as_mut().is_some_and(|rec| rec.in_repo(&p));
         if inside || self.oid_sensitive(&p, !nofollow) {
             self.t.oid_attrs_changed = true;
@@ -2397,6 +2669,15 @@ impl Tracer<'_> {
         let Some(rec) = self.rec.as_mut() else {
             return;
         };
+        match &identity {
+            Some(metadata) => {
+                self.t
+                    .footprint
+                    .inodes
+                    .insert((metadata.dev(), metadata.ino()));
+            }
+            None => self.t.footprint.unknown = true,
+        }
         let risky = match named {
             Some(path) => {
                 rec.in_repo(&path) || rec.oid_epoch.is_some() && rec.invalidates_oids(&path, true)
@@ -2437,8 +2718,8 @@ impl Tracer<'_> {
             match op {
                 Op::Open { dirfd, path, flags } => self.open(pid, &args, dirfd, path, flags),
                 Op::Look { dirfd, path } => {
-                    if let Some(p) = self.resolve(pid, &args, dirfd, path) {
-                        self.touch(p, true);
+                    if let Some(p) = self.resolve(pid, &args, dirfd, path, false) {
+                        self.touch(p, true, false);
                     }
                 }
                 Op::Exec { dirfd, path } => {
@@ -2460,19 +2741,19 @@ impl Tracer<'_> {
                             }
                             _ => self.flag("it executed an unkeyable file descriptor"),
                         }
-                    } else if let Some(p) = self.resolve(pid, &args, dirfd, path) {
+                    } else if let Some(p) = self.resolve(pid, &args, dirfd, path, true) {
                         self.exec_path(pid, p);
                     }
                 }
                 Op::List => {
                     let fd = args[0] as i32;
                     if let Ok(p) = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) {
-                        self.t.touched.entry(p).or_default().listed = true;
+                        record_touch(&mut self.t, self.rec.as_mut(), p, false, true, false, true);
                     }
                 }
                 Op::Chdir { path } => {
-                    if let Some(p) = self.resolve(pid, &args, None, path) {
-                        self.touch(p, false);
+                    if let Some(p) = self.resolve(pid, &args, None, path, false) {
+                        self.touch(p, false, false);
                     }
                     // Threads can share a cwd, so any chdir drops every cached value.
                     self.cwds.clear();
@@ -2493,12 +2774,12 @@ impl Tracer<'_> {
                     flags,
                 } => self.rename(pid, &args, (from_dirfd, from), (to_dirfd, to), flags),
                 Op::Truncate { path } => {
-                    if let Some(p) = self.resolve(pid, &args, None, path) {
+                    if let Some(p) = self.resolve(pid, &args, None, path, false) {
                         self.write(&p, true);
                     }
                 }
                 Op::Chmod { dirfd, path, flags } => {
-                    if let Some(p) = self.resolve(pid, &args, dirfd, path) {
+                    if let Some(p) = self.resolve(pid, &args, dirfd, path, false) {
                         let nofollow =
                             flags.is_some_and(|i| args[i] as i32 & AT_SYMLINK_NOFOLLOW != 0);
                         self.chmod(&p, !nofollow);
@@ -2516,15 +2797,25 @@ impl Tracer<'_> {
                     path,
                     target,
                 } => {
-                    if let Some(p) = self.resolve(pid, &args, dirfd, path) {
+                    if let Some(p) = self.resolve(pid, &args, dirfd, path, false) {
                         self.symlink_target(pid, &args, &p, target);
                         self.create_at(pid, p, false);
                     }
                 }
                 Op::LinkSource { dirfd, path, flags } => {
                     let by_fd = flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0);
-                    if let Some(p) = self.resolve(pid, &args, dirfd, path) {
-                        self.touch(p.clone(), true);
+                    if let Some(p) = self.resolve(pid, &args, dirfd, path, false) {
+                        if self.rec.is_some() {
+                            let follows = flags
+                                .is_some_and(|i| args[i] as i32 & libc::AT_SYMLINK_FOLLOW != 0);
+                            let metadata = if follows {
+                                fs::metadata(&p)
+                            } else {
+                                fs::symlink_metadata(&p)
+                            };
+                            footprint_inode(&mut self.t, metadata);
+                        }
+                        self.touch(p.clone(), true, false);
                         if self.oid_sensitive(&p, true) {
                             self.t.oid_attrs_changed = true;
                         }
@@ -2542,6 +2833,7 @@ impl Tracer<'_> {
                 Op::OwnerFd { fd } => self.owner_fd(pid, args[fd] as i32),
                 Op::UncertainOidState => {
                     if self.rec.is_some() {
+                        self.t.footprint.unknown = true;
                         self.t.oid_attrs_changed = true;
                     }
                 }
@@ -2575,6 +2867,36 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_the_verified_null_device_is_ignored() {
+        let dir = std::env::temp_dir().join(format!("stoop-null-predicate-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let regular = dir.join("null");
+        let link = dir.join("link");
+        let dangling = dir.join("dangling");
+        fs::write(&regular, b"x").unwrap();
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        std::os::unix::fs::symlink(dir.join("missing"), &dangling).unwrap();
+        assert!(is_harmless_null(Path::new("/dev/null")));
+        assert!(!harmless_null(
+            Path::new("/dev/null"),
+            &fs::metadata(&regular).unwrap()
+        ));
+        for path in [
+            &regular,
+            &link,
+            &dangling,
+            Path::new("/dev/zero"),
+            Path::new("/dev/full"),
+            Path::new("/dev/tty"),
+            Path::new("/dev/stdout"),
+            Path::new("/proc/self/fd/1"),
+        ] {
+            assert!(!is_harmless_null(path), "{}", path.display());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn watched_names_decide_which_changes_drop_blob_ids() {
         let base = std::env::temp_dir().join(format!(
             "stoop-oid-watch-{}-{}",
@@ -2600,6 +2922,7 @@ mod tests {
             ignore: &ignore,
             root: root.clone(),
             hashed: 0,
+            read_budget: ReadBudget::default(),
             oid_epoch: Some(Arc::new(crate::oid_attrs::Epoch {
                 basis: HashMap::new(),
                 git_dir: git_dir.clone(),
