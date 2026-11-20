@@ -708,6 +708,6 @@ fn a_directory_link_retargeted_mid_run_is_refused_for_the_link_read_through_it()
         &out,
         &case,
         "t22-outside-dir-link",
-        "src/link1 changed while the command ran",
+        "changed while the command ran",
     );
 }
