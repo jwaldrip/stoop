@@ -274,6 +274,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn refreshed_template_replaces_only_its_exact_context() {
+        let path = store("refresh-context");
+        let original = template("old", 0);
+        record(&path, original.clone()).unwrap();
+
+        let mut different_argv = template("argv", 0);
+        different_argv.argv.push("different".into());
+        record(&path, different_argv).unwrap();
+        let mut different_cwd = template("cwd", 0);
+        different_cwd.cwd = "elsewhere".into();
+        record(&path, different_cwd).unwrap();
+        let mut different_scope = template("scope", 0);
+        different_scope.scope = Some("other-scope".into());
+        record(&path, different_scope).unwrap();
+        let mut different_label = template("label", 0);
+        different_label.label = Some("other-label".into());
+        record(&path, different_label).unwrap();
+
+        let mut refreshed = original;
+        refreshed.key = "new".into();
+        record(&path, refreshed).unwrap();
+        let keys: Vec<String> = records(&path, 0, 0)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(keys, ["argv", "cwd", "scope", "label", "new"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_read_only_store_warns_that_the_full_command_runs() {

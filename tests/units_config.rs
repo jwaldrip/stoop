@@ -413,6 +413,30 @@ options = [{ names = ["--files"], values = "many" }]
 }
 
 #[test]
+fn quoted_hook_refresh_supersedes_stale_config_record() {
+    let f = Fixture::new();
+    let config = r#"[[units.suite]]
+id = "predicate"
+match = ["./runner", "--predicate", "{changed}"]
+options = [{ names = ["--predicate"], values = "many" }]
+"#;
+    f.config(config);
+    assert_ran(&f.off(&["--predicate", "{changed}"]));
+    f.config(&format!("{config}# refreshed\n"));
+    let stale = f.off(&["--predicate"]);
+    assert_eq!(stale.status.code(), Some(2), "{}", stderr(&stale));
+    assert!(stale.stdout.is_empty());
+    assert_ran(&f.off(&["--predicate", "{changed}"]));
+    let refreshed = f.off(&["--predicate"]);
+    assert_ran(&refreshed);
+    assert!(
+        stderr(&refreshed).contains("shell expanded"),
+        "{}",
+        stderr(&refreshed)
+    );
+}
+
+#[test]
 fn invalid_configuration_never_recovers_an_erased_hook() {
     let f = Fixture::new();
     f.config("[units]\nunknown = true\n");
@@ -1119,6 +1143,47 @@ mod traced {
         };
         assert_ran(&run());
         assert_skipped(&run());
+    }
+
+    #[test]
+    fn pull_request_target_always_forces_full() {
+        let f = Fixture::repo();
+        f.event(pull_event());
+        let normal = || {
+            f.github("pull_request", "refs/pull/42/merge")
+                .output()
+                .unwrap()
+        };
+        assert_ran(&normal());
+        assert_skipped(&normal());
+        for reference in ["refs/pull/42/merge", "refs/heads/main"] {
+            let output = f.github("pull_request_target", reference).output().unwrap();
+            assert_ran(&output);
+        }
+    }
+
+    #[test]
+    fn pull_request_requires_a_canonical_merge_ref() {
+        let f = Fixture::repo();
+        f.event(pull_event());
+        let normal = || {
+            f.github("pull_request", "refs/pull/42/merge")
+                .output()
+                .unwrap()
+        };
+        assert_ran(&normal());
+        assert_skipped(&normal());
+        for reference in [
+            "refs/pull/+42/merge",
+            "refs/pull/042/merge",
+            "refs/pull/ 42/merge",
+            "refs/pull/4x2/merge",
+            "refs/pull/42/head",
+            "refs/pull/42/merge/extra",
+        ] {
+            let output = f.github("pull_request", reference).output().unwrap();
+            assert_ran(&output);
+        }
     }
 
     #[test]
