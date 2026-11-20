@@ -255,6 +255,22 @@ options = [{ names = ["--files"], values = "many" }]
 }
 
 #[test]
+fn changed_config_with_same_full_form_cannot_recover_an_old_hook() {
+    let f = Fixture::new();
+    let config = r#"[[units.suite]]
+id = "files"
+match = ["./runner", "--files", "{changed}"]
+options = [{ names = ["--files"], values = "many" }]
+"#;
+    f.config(config);
+    assert_ran(&f.off(&["--files", "{changed}"]));
+    f.config(&format!("{config}# changed\n"));
+    let erased = f.off(&["--files"]);
+    assert_eq!(erased.status.code(), Some(2), "{}", stderr(&erased));
+    assert!(erased.stdout.is_empty());
+}
+
+#[test]
 fn placeholder_words_after_end_of_options_are_positional() {
     let f = Fixture::new();
     f.config(
