@@ -8,7 +8,6 @@ pub(crate) struct Hook {
     pub original: Vec<OsString>,
     pub argv: Vec<OsString>,
     pub removed: Vec<OsString>,
-    pub spans: Vec<Vec<(usize, usize)>>,
     pub placeholder: String,
 }
 
@@ -435,6 +434,7 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
     }))
 }
 
+#[cfg(all(test, unix))]
 pub(crate) fn prepare(exact: &[OsString]) -> Result<Option<Hook>, String> {
     parse(exact)?
         .map(|parsed| parsed.finish(exact, &[]))
@@ -442,6 +442,11 @@ pub(crate) fn prepare(exact: &[OsString]) -> Result<Option<Hook>, String> {
 }
 
 impl ParsedHook {
+    /// Match an erased shell shape before option arities are known.
+    pub(crate) fn expanded_matches(&self, exact: &[OsString]) -> bool {
+        expanded_matches(&self.argv, &self.spans, exact)
+    }
+
     pub(crate) fn finish(
         self,
         exact: &[OsString],
@@ -460,24 +465,31 @@ impl ParsedHook {
                 continue;
             }
             remove[i] = true;
+            let segment_start = (start..i)
+                .rev()
+                .find(|&at| argv[at] == "--")
+                .map_or(start, |at| at + 1);
+            let segment_end = (i + 1..argv.len())
+                .find(|&at| argv[at] == "--")
+                .unwrap_or(argv.len());
             let whole = parts.len() == 1 && parts[0] == (0, argv[i].len());
             if !whole {
                 if let Some(name) = carrier(&argv[i], parts[0].0) {
-                    carriers.push(name);
+                    carriers.push((name, segment_start, segment_end));
                 }
             } else if i > start && option(&argv[i - 1]) && !remove[i - 1] {
                 match declared_word(options, &argv[i - 1]) {
                     Some((item, name)) if item.arity == Arity::Many => {
-                        carriers.push(name.to_string());
+                        carriers.push((name.to_string(), segment_start, segment_end));
                     }
                     Some((item, name)) if item.arity == Arity::One && argv[i - 1] == name => {
                         remove[i - 1] = true;
-                        carriers.push(name.to_string());
+                        carriers.push((name.to_string(), segment_start, segment_end));
                     }
                     Some(_) => {}
                     None if !argv[i - 1].contains('=') => {
                         remove[i - 1] = true;
-                        carriers.push(argv[i - 1].clone());
+                        carriers.push((argv[i - 1].clone(), segment_start, segment_end));
                     }
                     None => {}
                 }
@@ -489,7 +501,7 @@ impl ParsedHook {
                     if option(&argv[j]) && !remove[j] {
                         match declared_word(options, &argv[j]) {
                             Some((item, name)) if item.arity == Arity::Many => {
-                                carriers.push(name.to_string());
+                                carriers.push((name.to_string(), segment_start, segment_end));
                             }
                             Some(_) => {}
                             None if !argv[j].contains('=') => return Err(ambiguous(&argv[j])),
@@ -500,15 +512,23 @@ impl ParsedHook {
                 }
             }
         }
-        for name in &carriers {
+        for (name, segment_start, segment_end) in &carriers {
             let declared = declaration(options, name);
-            let mut i = start;
-            while i < argv.len() {
+            let mut i = *segment_start;
+            while i < *segment_end {
                 let matches = declared.map_or_else(
                     || same_option(&argv[i], name),
-                    |item| item.names.iter().any(|alias| same_option(&argv[i], alias)),
+                    |item| {
+                        item.names.iter().any(|alias| same_option(&argv[i], alias))
+                            && declared_word(options, &argv[i])
+                                .is_none_or(|(owner, _)| std::ptr::eq(owner, item))
+                    },
                 );
-                if matches && all[i].is_empty() && (!remove[i] || declared.is_some()) {
+                let placeholder_carrier = declared.is_some_and(|item| item.arity == Arity::Many);
+                if matches
+                    && (all[i].is_empty() || placeholder_carrier)
+                    && (!remove[i] || declared.is_some())
+                {
                     let exact_option = declared.map_or_else(
                         || argv[i] == *name,
                         |item| item.names.iter().any(|alias| argv[i] == *alias),
@@ -516,7 +536,7 @@ impl ParsedHook {
                     if declared.is_some_and(|item| item.arity == Arity::Many) {
                         remove[i] = true;
                         i += 1;
-                        while i < argv.len() && argv[i] != "--" && !option(&argv[i]) {
+                        while i < *segment_end && argv[i] != "--" && !option(&argv[i]) {
                             remove[i] = true;
                             i += 1;
                         }
@@ -571,7 +591,6 @@ impl ParsedHook {
             original: exact.to_vec(),
             argv: exec,
             removed,
-            spans: all,
             placeholder,
         })
     }
@@ -614,12 +633,11 @@ pub(crate) fn normalize(word: &str) -> Result<String, String> {
 }
 
 /// Does this argv equal a shell-expanded form of the recorded hook?
-pub(crate) fn expanded_matches(hook: &Hook, exact: &[OsString]) -> bool {
-    let original = shadows(&hook.original);
+fn expanded_matches(original: &[String], all: &[Vec<(usize, usize)>], exact: &[OsString]) -> bool {
     let incoming = shadows(exact);
     let n = original.len();
     let m = incoming.len();
-    if !hook.spans.iter().any(|s| !s.is_empty()) || n > 128 || m > 2048 {
+    if !all.iter().any(|s| !s.is_empty()) || n > 128 || m > 2048 {
         return false;
     }
     let mut reachable = vec![false; (n + 1) * (m + 1)];
@@ -627,7 +645,7 @@ pub(crate) fn expanded_matches(hook: &Hook, exact: &[OsString]) -> bool {
     reachable[0] = true;
     for i in 0..n {
         let word = &original[i];
-        let spans = &hook.spans[i];
+        let spans = &all[i];
         let mut erased = String::new();
         let mut cursor = 0;
         for &(start, end) in spans {
@@ -666,7 +684,7 @@ pub(crate) fn expanded_matches(hook: &Hook, exact: &[OsString]) -> bool {
                     reachable[(i + 1) * stride + j + 1] = true;
                 }
                 if i + 1 < n && j < m && option(word) {
-                    let next = &hook.spans[i + 1];
+                    let next = &all[i + 1];
                     if next.len() == 1
                         && next[0] == (0, original[i + 1].len())
                         && incoming[j] == format!("{word}=")
@@ -884,18 +902,18 @@ mod incoming_words_tests {
             OsString::from("--files"),
             OsString::from("{changed}"),
         ];
-        let hook = prepare(&recorded).unwrap().unwrap();
+        let hook = parse(&recorded).unwrap().unwrap();
         let typed = [
             OsString::from("./t"),
             OsString::from_vec(b"\xff".to_vec()),
             OsString::from("--files"),
         ];
-        assert!(!expanded_matches(&hook, &typed));
+        assert!(!hook.expanded_matches(&typed));
         let utf8 = [
             OsString::from("./t"),
             OsString::from("\u{fffd}"),
             OsString::from("--files"),
         ];
-        assert!(expanded_matches(&hook, &utf8));
+        assert!(hook.expanded_matches(&utf8));
     }
 }

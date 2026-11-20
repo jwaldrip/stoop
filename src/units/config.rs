@@ -4,6 +4,7 @@ use super::hook::{self, Arity, OptionDeclaration};
 use serde::Deserialize;
 use std::collections::HashSet;
 use std::ffi::OsString;
+use std::io::{self, Read};
 use std::path::Path;
 
 #[derive(Default, Deserialize)]
@@ -136,11 +137,59 @@ fn valid_option(name: &str) -> bool {
         && !name.chars().any(char::is_whitespace)
 }
 
+const MAX_CONFIG_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Open only regular files and bound the read, including when the file grows after stat.
+/// Nonblocking open prevents a replacement FIFO from hanging between metadata and open.
+pub(crate) fn read_regular_bounded(path: &Path, limit: u64) -> io::Result<Vec<u8>> {
+    let check = |metadata: std::fs::Metadata| {
+        if !metadata.is_file() {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not a regular file",
+            ))
+        } else if metadata.len() > limit {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "file exceeds size limit",
+            ))
+        } else {
+            Ok(())
+        }
+    };
+    check(std::fs::metadata(path)?)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    check(file.metadata()?)?;
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > limit {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "file exceeds size limit",
+        ));
+    }
+    Ok(bytes)
+}
+
 pub(crate) fn load(root: &Path) -> Result<Config, ConfigError> {
     let path = root.join(".stoop.toml");
-    let source = match std::fs::read_to_string(path) {
-        Ok(source) => source,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
+    let source = match read_regular_bounded(&path, MAX_CONFIG_BYTES) {
+        Ok(bytes) => String::from_utf8(bytes)
+            .map_err(|_| ConfigError::at("", 0, "configuration is not UTF-8"))?,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                && std::fs::symlink_metadata(&path)
+                    .is_err_and(|e| e.kind() == io::ErrorKind::NotFound) =>
+        {
+            return Ok(Config::default())
+        }
         Err(error) => {
             return Err(ConfigError::at(
                 "",
@@ -333,6 +382,15 @@ pub(crate) fn prepare(
             }),
         );
     };
+    finish(root, cwd, argv, parsed)
+}
+
+pub(crate) fn finish(
+    root: &Path,
+    cwd: &str,
+    argv: &[OsString],
+    parsed: hook::ParsedHook,
+) -> (Option<String>, Result<Prepared, String>) {
     let mut warning = None;
     let mut invalid = false;
     let config = match load(root) {

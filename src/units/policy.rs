@@ -1,7 +1,7 @@
 //! Full verification is a one-way decision; branch data never authorizes publication.
 
 use super::{config::Config, hook};
-use std::io::Read;
+use serde::Deserialize;
 use std::path::Path;
 
 const MAX_EVENT_BYTES: u64 = 8 * 1024 * 1024;
@@ -23,30 +23,24 @@ pub(crate) fn valid_branch(name: &str) -> bool {
             .any(|byte| byte <= b' ' || byte == 0x7f || b"~^:?*[\\".contains(&byte))
 }
 
+#[derive(Deserialize)]
+struct EventPolicy {
+    repository: EventRepository,
+    #[serde(rename = "ref")]
+    reference: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EventRepository {
+    default_branch: String,
+}
+
 fn event_context() -> Option<(String, Option<String>)> {
     let path = std::env::var_os("GITHUB_EVENT_PATH")?;
-    let file = std::fs::File::open(path).ok()?;
-    let metadata = file.metadata().ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_EVENT_BYTES {
-        return None;
-    }
-    let mut bytes = Vec::new();
-    file.take(MAX_EVENT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .ok()?;
-    if bytes.len() as u64 > MAX_EVENT_BYTES {
-        return None;
-    }
-    let event: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let branch = event.pointer("/repository/default_branch")?.as_str()?;
-    if !valid_branch(branch) {
-        return None;
-    }
-    let reference = match event.get("ref") {
-        None | Some(serde_json::Value::Null) => None,
-        Some(value) => Some(value.as_str()?.to_owned()),
-    };
-    Some((branch.to_owned(), reference))
+    let bytes = super::config::read_regular_bounded(Path::new(&path), MAX_EVENT_BYTES).ok()?;
+    let event: EventPolicy = serde_json::from_slice(&bytes).ok()?;
+    valid_branch(&event.repository.default_branch)
+        .then_some((event.repository.default_branch, event.reference))
 }
 
 fn positive(text: &str) -> Option<u64> {
@@ -157,11 +151,20 @@ pub(crate) fn forced_reason(
         Ok(value) => value,
         Err(()) => return Some("unknown default branch".into()),
     };
+    let remote_default = if root.join(".git").exists() {
+        remote_name(sync).and_then(|remote| crate::gitprobe::remote_head_branch(root, remote))
+    } else {
+        None
+    };
     if github {
         let Some((default, payload_ref)) = event_context() else {
             return Some("unknown GitHub branch context".into());
         };
         if configured.as_ref().is_some_and(|branch| branch != &default)
+            || (ci
+                && remote_default
+                    .as_ref()
+                    .is_some_and(|branch| branch != &default))
             || (ci
                 && std::env::var("STOOP_DEFAULT_BRANCH")
                     .ok()
@@ -199,7 +202,13 @@ pub(crate) fn forced_reason(
             (Some("pull_request" | "pull_request_target"), Some(reference))
                 if pull_ref(reference) =>
             {
-                return None
+                let name = reference.strip_prefix("refs/pull/").unwrap_or_default();
+                if !agrees_if_present("GITHUB_REF_NAME", name)
+                    || !agrees_if_present("GITHUB_REF_TYPE", "branch")
+                {
+                    return Some("conflicting GitHub branch context".into());
+                }
+                return None;
             }
             _ => return Some("unknown GitHub branch context".into()),
         }
@@ -224,31 +233,30 @@ pub(crate) fn forced_reason(
     } else {
         (None, None)
     };
-    if ci
-        && configured
-            .as_ref()
-            .zip(provider_default.as_ref())
-            .is_some_and(|(a, b)| a != b)
-    {
-        return Some("conflicting default branch context".into());
-    }
-    if ci
-        && std::env::var("STOOP_DEFAULT_BRANCH")
-            .ok()
-            .zip(config.default_branch.as_ref())
-            .is_some_and(|(a, b)| a != *b)
-    {
-        return Some("conflicting default branch context".into());
-    }
-    let default = configured.or(provider_default).or_else(|| {
-        remote_name(sync).and_then(|remote| crate::gitprobe::remote_head_branch(root, remote))
-    });
-    let branch = provider_branch.or(local);
-    match (default, branch) {
-        (Some(default), Some(branch)) if is_default_branch(&branch, &default) => {
-            Some(format!("default branch {}", hook::safe(&default)))
+    let defaults = [
+        configured.as_deref(),
+        config.default_branch.as_deref(),
+        provider_default.as_deref(),
+        remote_default.as_deref(),
+    ];
+    if ci {
+        let mut seen = None;
+        for default in defaults.into_iter().flatten() {
+            if seen.is_some_and(|previous| previous != default) {
+                return Some("conflicting default branch context".into());
+            }
+            seen = Some(default);
         }
-        (Some(_), Some(_)) => None,
-        _ => Some("unknown branch context".into()),
     }
+    let Some(branch) = provider_branch.or(local) else {
+        return Some("unknown branch context".into());
+    };
+    let mut known = false;
+    for default in defaults.into_iter().flatten() {
+        known = true;
+        if is_default_branch(&branch, default) {
+            return Some(format!("default branch {}", hook::safe(default)));
+        }
+    }
+    (!known).then(|| "unknown branch context".into())
 }

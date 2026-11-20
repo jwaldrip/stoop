@@ -356,7 +356,9 @@ fn malformed_configuration_warns_and_does_not_interpret_plain_commands() {
         let error = stderr(&hooked);
         assert!(error.contains(".stoop.toml:"), "{text}: {error}");
         assert_eq!(error.matches("ignoring the unit configuration").count(), 1);
-        let plain = f.off(&[]);
+        let plain_fixture = Fixture::new();
+        plain_fixture.config(text);
+        let plain = plain_fixture.off(&[]);
         assert!(plain.status.success(), "{text}: {}", stderr(&plain));
         assert!(
             !stderr(&plain).contains(".stoop.toml"),

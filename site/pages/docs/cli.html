@@ -43,6 +43,7 @@
 
 <h2 id="configuration">Hook configuration</h2>
 <p>An optional <code>.stoop.toml</code> at the selected root configures explicit hooks. Plain commands do not read it. Unknown or duplicate keys, invalid values, or multiple matching suites produce one warning with a location. Stoop ignores the configuration for that invocation and runs the full hook command without a proof skip. An ambiguous option still needs a valid declaration or an unambiguous argv.</p>
+<p>Configuration and GitHub event inputs used by a hook must be regular files no larger than 8 MiB. Unreadable, oversized, or nonregular inputs prevent a proof skip.</p>
 <pre><code>[units]
 default_branch = "main"
 verify_every = 20

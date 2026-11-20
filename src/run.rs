@@ -604,18 +604,100 @@ pub fn run_observed(o: Opts) -> Outcome {
     run_internal(o, false, true)
 }
 
+fn hook_max_age(o: &Opts) -> u64 {
+    o.max_age
+        .or_else(|| {
+            std::env::var("STOOP_MAX_AGE")
+                .ok()
+                .and_then(|v| parse_age(&v).ok())
+        })
+        .unwrap_or(DEFAULT_MAX_AGE)
+}
+
+fn recover_hooks(
+    o: &Opts,
+    root: &Path,
+    cwd: &str,
+    store: &Path,
+    scope: Option<&str>,
+    max_age: u64,
+) -> (Vec<String>, Result<Vec<units::hook::Hook>, String>) {
+    let mut warnings = Vec::new();
+    let records = match units::hook_store::records(store, now(), max_age) {
+        Ok(records) => records,
+        Err(warning) => {
+            if !o.quiet {
+                warnings.push(warning);
+            }
+            return (warnings, Ok(Vec::new()));
+        }
+    };
+    let mut found: Vec<units::hook::Hook> = Vec::new();
+    for record in records.into_iter().filter(|record| {
+        record.cwd == cwd && record.scope.as_deref() == scope && record.label == o.key
+    }) {
+        let words: Vec<OsString> = record.argv.into_iter().map(OsString::from).collect();
+        let Ok(Some(parsed)) = units::hook::parse(&words) else {
+            continue;
+        };
+        if !parsed.expanded_matches(&o.argv) {
+            continue;
+        }
+        let (warning, prepared) = units::config::finish(root, cwd, &words, parsed);
+        if let Some(warning) = warning {
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
+        match prepared {
+            Ok(prepared) => {
+                if let Some(candidate) = prepared.hook {
+                    if !found.iter().any(|known| known.argv == candidate.argv) {
+                        found.push(candidate);
+                    }
+                }
+            }
+            Err(error) => return (warnings, Err(error)),
+        }
+    }
+    (warnings, Ok(found))
+}
+
 /// The error that stops a placeholder argv before anything runs, if there is one.
 pub fn hook_refusal(o: &Opts) -> Option<String> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let root = root_for(o, &cwd);
     let rel_cwd = cwd_key(&root, &cwd);
     let (warning, prepared) = units::config::prepare(&root, &rel_cwd, &o.argv, o.literal);
-    if prepared.is_err() {
-        if let Some(warning) = warning {
-            eprintln!("{warning}");
+    match prepared {
+        Err(error) => {
+            if let Some(warning) = warning {
+                eprintln!("{warning}");
+            }
+            Some(error)
         }
+        Ok(prepared) if prepared.hook.is_none() && !o.literal => {
+            let store = store_for(o, &cwd, &root);
+            let scope = shared_scope(&root, &store);
+            let (warnings, recovered) = recover_hooks(
+                o,
+                &root,
+                &rel_cwd,
+                &store,
+                scope.as_deref(),
+                hook_max_age(o),
+            );
+            if let Err(error) = recovered {
+                for warning in warnings {
+                    eprintln!("{warning}");
+                }
+                Some(error)
+            } else {
+                None
+            }
+        }
+        Ok(_) => None,
     }
-    prepared.err()
 }
 
 /// The variables that carry a placeholder's value (spec section 4.7). Stoop owns them for each run.
@@ -756,48 +838,29 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     if let Some(h) = &hook {
         o.argv.clone_from(&h.argv);
     }
-    let max_age = o
-        .max_age
-        .or_else(|| {
-            std::env::var("STOOP_MAX_AGE")
-                .ok()
-                .and_then(|v| parse_age(&v).ok())
-        })
-        .unwrap_or(DEFAULT_MAX_AGE);
+    let max_age = hook_max_age(&o);
     // An argv without a placeholder may be an expanded shape of a recorded hook. A single full
     // form runs and never skips. Two different full forms cannot be told apart, so the command
     // runs as typed and never skips either.
     let mut expanded = false;
     let mut matches = 0;
     if !literal && hook.is_none() {
-        let records = match units::hook_store::records(&store_path, now(), max_age) {
-            Ok(records) => records,
-            Err(warning) => {
-                if !o.quiet {
-                    eprintln!("{warning}");
-                }
-                Vec::new()
+        let (warnings, recovered) =
+            recover_hooks(&o, &root, &rel_cwd, &store_path, scope.as_deref(), max_age);
+        for warning in warnings {
+            eprintln!("{warning}");
+        }
+        let mut found = match recovered {
+            Ok(found) => found,
+            Err(error) => {
+                eprintln!("stoop: {error}");
+                return Outcome {
+                    status: 2,
+                    key: initial_key,
+                    how: How::Untraced,
+                };
             }
         };
-        let mut found: Vec<units::hook::Hook> = Vec::new();
-        for record in records
-            .into_iter()
-            .filter(|r| r.cwd == rel_cwd && r.scope == scope && r.label == o.key)
-        {
-            let words: Vec<std::ffi::OsString> = record
-                .argv
-                .iter()
-                .cloned()
-                .map(std::ffi::OsString::from)
-                .collect();
-            if let Ok(Some(candidate)) = units::hook::prepare(&words) {
-                if units::hook::expanded_matches(&candidate, &o.argv)
-                    && !found.iter().any(|known| known.argv == candidate.argv)
-                {
-                    found.push(candidate);
-                }
-            }
-        }
         matches = found.len();
         if matches == 1 {
             let candidate = found.swap_remove(0);
