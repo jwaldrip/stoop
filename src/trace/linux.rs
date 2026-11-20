@@ -648,6 +648,7 @@ struct PendingPath {
     absent: bool,
     read_priors: Vec<PathBuf>,
     rename_before: Option<Seen>,
+    confirmed_after: Option<FileIdentity>,
     kind: WriteKind,
 }
 
@@ -684,6 +685,8 @@ struct Tracer<'a> {
     read_inodes: HashMap<FileIdentity, HashSet<PathBuf>>,
     read_routes: HashMap<PathBuf, PathBuf>,
     written_files: HashMap<FileIdentity, HashSet<PathBuf>>,
+    /// Last inode confirmed at each successfully landed destination.
+    landed_inodes: HashMap<PathBuf, FileIdentity>,
     uncertain_paths: HashSet<PathBuf>,
     uncertain_inodes: HashSet<FileIdentity>,
     resolving_write: bool,
@@ -863,15 +866,14 @@ fn verified_rename_snapshot(before: &identity::FileSeen, after: &identity::FileS
 
 /// The path-only checks detect persistent alias retargets and inconsistent post-state. They cannot
 /// rule out a foreign retarget and restoration during the syscall because it returns no descriptor.
-fn verified_path_mutation(path: &PendingPath, all: &[PendingPath]) -> bool {
-    let Some(expected) = path.expected.as_deref() else {
-        return false;
-    };
+fn verified_path_mutation(path: &PendingPath, all: &[PendingPath]) -> Option<Option<FileIdentity>> {
+    let expected = path.expected.as_deref()?;
     if write_destination(&path.raw, path.follows).as_deref() != Some(expected) {
-        return false;
+        return None;
     }
     let after = fs::symlink_metadata(expected);
-    match &path.kind {
+    let after_id = after.as_ref().ok().map(file_identity);
+    let verified = match &path.kind {
         WriteKind::Create { directory } => {
             path.absent && after.as_ref().is_ok_and(|m| m.is_dir() == *directory)
         }
@@ -902,27 +904,23 @@ fn verified_path_mutation(path: &PendingPath, all: &[PendingPath]) -> bool {
             supported,
         } => {
             if !*supported {
-                return false;
+                return None;
             }
             let other = all.iter().find(|candidate| {
                 matches!(&candidate.kind, WriteKind::Rename { source: side, exchange: other_exchange, supported: true }
                     if side != source && other_exchange == exchange)
             });
-            let Some(other) = other else { return false };
-            let Some(other_path) = other.expected.as_deref() else {
-                return false;
-            };
+            let other = other?;
+            let other_path = other.expected.as_deref()?;
             if write_destination(&other.raw, other.follows).as_deref() != Some(other_path) {
-                return false;
+                return None;
             }
             let (from, to, from_after, to_after) = if *source {
                 (path, other, after, fs::symlink_metadata(other_path))
             } else {
                 (other, path, fs::symlink_metadata(other_path), after)
             };
-            let Some(from_id) = from.before else {
-                return false;
-            };
+            let from_id = from.before?;
             let destination_matches = to_after.as_ref().is_ok_and(|m| file_identity(m) == from_id);
             let source_matches = if *exchange {
                 to.before
@@ -941,7 +939,21 @@ fn verified_path_mutation(path: &PendingPath, all: &[PendingPath]) -> bool {
                 .is_ok_and(|metadata| file_identity(metadata) == before)
         }),
         WriteKind::Open { .. } => false,
+    };
+    if !verified {
+        return None;
     }
+    // A successful remove or rename source does not create the object now at that name.
+    let removed = matches!(
+        &path.kind,
+        WriteKind::Remove
+            | WriteKind::Rename {
+                source: true,
+                exchange: false,
+                ..
+            }
+    );
+    Some(if removed { None } else { after_id })
 }
 
 /// Names that describe the process reading them (proc, sys and dev). They are never resolved here
@@ -1029,6 +1041,7 @@ pub fn run<'a>(
         read_inodes: HashMap::new(),
         read_routes: HashMap::new(),
         written_files: HashMap::new(),
+        landed_inodes: HashMap::new(),
         uncertain_paths: HashSet::new(),
         uncertain_inodes: HashSet::new(),
         resolving_write: false,
@@ -2306,32 +2319,61 @@ impl Tracer<'_> {
         }
     }
 
+    /// A metadata look is bookkeeping only for the inode last confirmed at this exact destination.
+    /// A foreign process can still change that inode's metadata between the write and the look;
+    /// this is the accepted v9 parity gap, not a guarantee about the observed metadata.
+    fn own_output_metadata(&self, physical: &Path, inode: Option<FileIdentity>) -> bool {
+        let Some(id) = inode else { return false };
+        self.t.landed.contains(physical)
+            && self.landed_inodes.get(physical) == Some(&id)
+            && !self.uncertain_paths.contains(physical)
+            && !self.uncertain_inodes.contains(&id)
+            && !self.pending_writes.values().any(|pending| {
+                pending.paths.iter().any(|path| {
+                    path.expected.is_none()
+                        || path.expected.as_deref() == Some(physical)
+                        || path.before == Some(id)
+                        || matches!(&path.kind, WriteKind::Link { source: Some((_, source)), .. } if *source == id)
+                })
+            })
+    }
+
     /// Read/write ordering is tracked separately from the synthetic observations used to
     /// describe a write's link route. Inode identity also joins distinct hard-link names.
-    fn note_real_read(&mut self, raw: &Path, how: Use) {
+    fn note_real_read(&mut self, raw: &Path, how: Use) -> bool {
         if self.rec.is_none() || is_dynamic(raw) {
-            return;
+            return true;
         }
         let Some(physical) = write_destination(raw, true) else {
-            return;
+            return true;
         };
         let metadata = fs::metadata(raw).ok();
         if metadata.as_ref().is_some_and(|m| {
             let kind = m.file_type();
             kind.is_char_device() || kind.is_block_device() || kind.is_fifo() || kind.is_socket()
         }) {
-            return;
+            return true;
         }
-        if let Some(first) = self.read_routes.get(raw) {
+        let new_route = if let Some(first) = self.read_routes.get(raw) {
             if first != &physical {
                 let first = first.clone();
                 push_changed(&mut self.t, &first);
                 push_changed(&mut self.t, &physical);
             }
+            false
         } else {
+            true
+        };
+        let inode = metadata.as_ref().map(file_identity);
+        if how == Use::Look
+            && self.own_output_metadata(&physical, inode)
+            && fs::symlink_metadata(raw).is_ok_and(|m| !m.file_type().is_symlink())
+        {
+            return false;
+        }
+        if new_route {
             self.read_routes.insert(raw.to_path_buf(), physical.clone());
         }
-        let inode = metadata.as_ref().map(file_identity);
         let already_written = self.t.landed.contains(&physical)
             || self.uncertain_paths.contains(&physical)
             || inode.is_some_and(|id| {
@@ -2371,6 +2413,7 @@ impl Tracer<'_> {
             observe(self.rec.as_mut(), &mut self.t, raw.to_path_buf(), how);
             observe(self.rec.as_mut(), &mut self.t, physical, how);
         }
+        true
     }
 
     fn observe_fd_look(&mut self, pid: i32, fd: i32) {
@@ -2392,6 +2435,14 @@ impl Tracer<'_> {
             fs::metadata(&fd_path).ok()
         };
         let inode = metadata.as_ref().map(file_identity);
+        if !path.as_os_str().as_bytes().ends_with(b" (deleted)")
+            && inode.is_some_and(|id| self.written_files.contains_key(&id))
+            && fs::metadata(&path).ok().as_ref().map(file_identity) == inode
+            && write_destination(&path, true)
+                .is_some_and(|physical| self.own_output_metadata(&physical, inode))
+        {
+            return;
+        }
         if let Some(written) = inode.and_then(|id| self.written_files.get(&id)) {
             self.t.read_write_conflicts.extend(written.iter().cloned());
         }
@@ -2431,9 +2482,12 @@ impl Tracer<'_> {
     }
 
     fn touch(&mut self, lex: PathBuf, how: Use) {
-        if matches!(how, Use::Look | Use::Content) {
-            self.note_real_read(&lex, how);
-        }
+        let observed = if matches!(how, Use::Look | Use::Content) && !self.note_real_read(&lex, how)
+        {
+            Use::Name
+        } else {
+            how
+        };
         let mut path = lex;
         if let Some(rec) = &mut self.rec {
             for link in rec.links_below_root(&path).unwrap_or_default() {
@@ -2464,7 +2518,7 @@ impl Tracer<'_> {
                 }
             }
         }
-        observe(self.rec.as_mut(), &mut self.t, path, how);
+        observe(self.rec.as_mut(), &mut self.t, path, observed);
     }
 
     /// Record a use of `lex` through the funnel.
@@ -3007,6 +3061,7 @@ impl Tracer<'_> {
             before,
             absent,
             read_priors,
+            confirmed_after: None,
             rename_before: None,
             kind,
         });
@@ -3024,6 +3079,7 @@ impl Tracer<'_> {
 
     fn uncertain_write(&mut self, path: &PendingPath) {
         if let Some(expected) = &path.expected {
+            self.landed_inodes.remove(expected);
             self.uncertain_paths.insert(expected.clone());
             if path.kind.changes_entry(path.absent) {
                 if let Some(parent) = expected.parent() {
@@ -3057,7 +3113,7 @@ impl Tracer<'_> {
     }
 
     fn complete_write(&mut self, pid: i32) {
-        let Some(pending) = self.pending_writes.remove(&pid) else {
+        let Some(mut pending) = self.pending_writes.remove(&pid) else {
             return;
         };
         let Some(regs) = get_regs(pid) else {
@@ -3083,11 +3139,16 @@ impl Tracer<'_> {
             pending.paths.first().map(|path| &path.kind),
             Some(WriteKind::Open { .. })
         ) {
-            let verified = !pending.paths.is_empty()
-                && pending
-                    .paths
-                    .iter()
-                    .all(|path| verified_path_mutation(path, &pending.paths));
+            let mut verified = !pending.paths.is_empty();
+            for index in 0..pending.paths.len() {
+                match verified_path_mutation(&pending.paths[index], &pending.paths) {
+                    Some(after) => pending.paths[index].confirmed_after = after,
+                    None => {
+                        verified = false;
+                        break;
+                    }
+                }
+            }
             let snapshots = if verified {
                 self.rename_snapshots(&pending.paths)
             } else {
@@ -3111,7 +3172,7 @@ impl Tracer<'_> {
             return;
         }
 
-        for path in pending.paths {
+        for mut path in pending.paths {
             let (creates, exclusive) = match &path.kind {
                 WriteKind::Open { creates, exclusive } => (*creates, *exclusive),
                 _ => {
@@ -3144,6 +3205,7 @@ impl Tracer<'_> {
                             "it could not confirm where its change to {actual_key} landed"
                         ));
                     }
+                    self.landed_inodes.remove(&actual);
                     self.uncertain_paths.insert(actual);
                 }
                 if let Some(id) = actual_identity {
@@ -3155,6 +3217,7 @@ impl Tracer<'_> {
             }
             // Without O_EXCL another writer may have created the name after entry. The fd proves
             // the output destination, but not who created the name or the captured absent prior.
+            path.confirmed_after = actual_identity;
             self.land_write(path, actual_identity, may_have_created && exclusive);
         }
     }
@@ -3174,6 +3237,11 @@ impl Tracer<'_> {
         };
         self.t.read_before_write.extend(path.read_priors);
         self.t.landed.insert(destination.clone());
+        if let Some(id) = path.confirmed_after {
+            self.landed_inodes.insert(destination.clone(), id);
+        } else {
+            self.landed_inodes.remove(&destination);
+        }
         self.t.written.insert(destination.clone());
         if let Some(key) = path.key {
             self.t.keys.insert(destination.clone(), key);
@@ -3270,6 +3338,8 @@ impl Tracer<'_> {
             return;
         };
         match flags.map(|i| args[i] as i32) {
+            // O_PATH ignores access mode and does not open file content.
+            Some(f) if f & libc::O_PATH != 0 => self.touch(p, Use::Look),
             // An O_TMPFILE open writes nothing; the later linkat names the file.
             Some(f) if f & libc::O_TMPFILE == libc::O_TMPFILE => {
                 self.touch(p, Use::Name);
@@ -3311,14 +3381,14 @@ impl Tracer<'_> {
                         },
                     );
                 } else {
-                    self.touch(
-                        p,
-                        if f & libc::O_PATH != 0 {
-                            Use::Look
-                        } else {
-                            Use::Content
-                        },
-                    );
+                    let how = if f & libc::O_PATH != 0 || (f & libc::O_DIRECTORY != 0 && is_dir(&p))
+                    {
+                        // O_PATH reads no bytes, and O_DIRECTORY cannot open a regular file here.
+                        Use::Look
+                    } else {
+                        Use::Content
+                    };
+                    self.touch(p, how);
                 }
             }
         }
@@ -3631,13 +3701,15 @@ impl Tracer<'_> {
         self.link_source = None;
         self.resolving_write = ops.iter().any(|op| match op {
             Op::Open { flags, .. } => flags.is_none_or(|index| {
-                args[index] as i32
-                    & (libc::O_WRONLY
-                        | libc::O_RDWR
-                        | libc::O_CREAT
-                        | libc::O_TRUNC
-                        | libc::O_APPEND)
-                    != 0
+                let open_flags = args[index] as i32;
+                open_flags & libc::O_PATH == 0
+                    && open_flags
+                        & (libc::O_WRONLY
+                            | libc::O_RDWR
+                            | libc::O_CREAT
+                            | libc::O_TRUNC
+                            | libc::O_APPEND)
+                        != 0
             }),
             Op::Create { .. }
             | Op::Remove { .. }
@@ -3993,9 +4065,8 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
-    #[test]
-    fn topology_cache_is_cleared_again_on_the_changing_process_stop() {
-        let mut tracer = Tracer {
+    fn empty_tracer() -> Tracer<'static> {
+        Tracer {
             ops: HashMap::new(),
             cwds: HashMap::new(),
             magic_epoch: 0,
@@ -4006,6 +4077,7 @@ mod tests {
             read_inodes: HashMap::new(),
             read_routes: HashMap::new(),
             written_files: HashMap::new(),
+            landed_inodes: HashMap::new(),
             uncertain_paths: HashSet::new(),
             uncertain_inodes: HashSet::new(),
             resolving_write: false,
@@ -4017,7 +4089,86 @@ mod tests {
             rec: None,
             execs: None,
             t: Trace::default(),
+        }
+    }
+
+    #[test]
+    fn metadata_exemption_requires_the_exact_unambiguous_landing() {
+        let mut tracer = empty_tracer();
+        let output = PathBuf::from("/repo/output");
+        let other = PathBuf::from("/repo/other");
+        let own = (3, 9);
+        let other_inode = (3, 10);
+        tracer.t.landed.insert(output.clone());
+        tracer.t.landed.insert(other.clone());
+        tracer.landed_inodes.insert(output.clone(), own);
+        tracer.landed_inodes.insert(other.clone(), other_inode);
+        tracer
+            .written_files
+            .entry(own)
+            .or_default()
+            .insert(output.clone());
+        tracer
+            .written_files
+            .entry(other_inode)
+            .or_default()
+            .insert(other.clone());
+        assert!(tracer.own_output_metadata(&output, Some(own)));
+        assert!(!tracer.own_output_metadata(&output, Some(other_inode)));
+        assert!(!tracer.own_output_metadata(&output, None));
+        tracer.t.landed.remove(&output);
+        assert!(!tracer.own_output_metadata(&output, Some(own)));
+        tracer.t.landed.insert(output.clone());
+        tracer.landed_inodes.remove(&output);
+        assert!(!tracer.own_output_metadata(&output, Some(own)));
+        tracer.landed_inodes.insert(output.clone(), own);
+
+        tracer.uncertain_paths.insert(output.clone());
+        assert!(!tracer.own_output_metadata(&output, Some(own)));
+        tracer.uncertain_paths.clear();
+        tracer.uncertain_inodes.insert(own);
+        assert!(!tracer.own_output_metadata(&output, Some(own)));
+        tracer.uncertain_inodes.clear();
+
+        tracer.pending_writes.insert(
+            1,
+            PendingWrite {
+                syscall: 0,
+                paths: vec![PendingPath {
+                    raw: other.clone(),
+                    expected: Some(other.clone()),
+                    follows: true,
+                    key: None,
+                    before: Some(own),
+                    absent: false,
+                    read_priors: Vec::new(),
+                    rename_before: None,
+                    confirmed_after: None,
+                    kind: WriteKind::Modify,
+                }],
+            },
+        );
+        assert!(!tracer.own_output_metadata(&output, Some(own)));
+        let pending = &mut tracer.pending_writes.get_mut(&1).unwrap().paths[0];
+        pending.before = None;
+        pending.expected = Some(output.clone());
+        assert!(!tracer.own_output_metadata(&output, Some(own)));
+        let pending = &mut tracer.pending_writes.get_mut(&1).unwrap().paths[0];
+        pending.expected = None;
+        assert!(!tracer.own_output_metadata(&output, Some(own)));
+        let pending = &mut tracer.pending_writes.get_mut(&1).unwrap().paths[0];
+        pending.expected = Some(other);
+        pending.kind = WriteKind::Link {
+            source: Some((None, own)),
         };
+        assert!(!tracer.own_output_metadata(&output, Some(own)));
+        tracer.pending_writes.clear();
+        assert!(tracer.own_output_metadata(&output, Some(own)));
+    }
+
+    #[test]
+    fn topology_cache_is_cleared_again_on_the_changing_process_stop() {
+        let mut tracer = empty_tracer();
         tracer.topology_changed(42);
         assert_eq!(tracer.magic_epoch, 1);
         tracer.after_topology_stop(43);

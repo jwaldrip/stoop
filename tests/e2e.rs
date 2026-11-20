@@ -506,6 +506,7 @@ fn mkdir_over_existing_ancestors_does_not_hide_the_inputs() {
     let script = "mkdir -p \"$PWD/out/deep\"; cat in.txt > /dev/null";
     let (c, e) = w.sh(script);
     assert_eq!(c, 0, "{e}");
+    assert!(e.contains("stoop: recorded "), "first run must record: {e}");
     w.write("in.txt", "edited");
     let (_, e) = w.sh(script);
     assert!(

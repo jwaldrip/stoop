@@ -1576,16 +1576,18 @@ pub fn build_inputs(
             .keys()
             .filter_map(|p| p.parent().map(Path::to_path_buf)),
     );
-    // Keep observations of ignored paths so aliases can still reveal tracked targets. A
-    // read/write conflict is relevant only when its spelling, physical name, or observed link
-    // target would be a recordable input.
+    // Outside outputs are untracked. Resolve each conflict physically first so an outside
+    // spelling cannot hide a tracked repository target; retain the first followed link target too.
     for path in &trace.read_write_conflicts {
         let key_for = |candidate: &Path| {
-            let key = if candidate.starts_with(&real_root) {
-                to_key(&real_root, candidate)
+            let base = if candidate.starts_with(&real_root) {
+                &real_root
+            } else if candidate.starts_with(root) {
+                root
             } else {
-                to_key(root, candidate)
+                return None;
             };
+            let key = to_key(base, candidate);
             (!key.is_empty() && !ignore.is_ignored(&key)).then_some(key)
         };
         let recorded_target = trace
@@ -1596,9 +1598,17 @@ pub fn build_inputs(
                 Seen::Symlink { resolved, .. } => resolved.as_deref(),
                 _ => None,
             });
-        let key = key_for(path)
+        let physical = phys.locate(path).map(|loc| loc.path);
+        let key = if physical.as_deref().is_none_or(|candidate| {
+            candidate.starts_with(&real_root) || candidate.starts_with(root)
+        }) {
+            key_for(path)
+        } else {
+            None
+        };
+        let key = key
             .or_else(|| recorded_target.and_then(key_for))
-            .or_else(|| phys.locate(path).and_then(|loc| key_for(&loc.path)));
+            .or_else(|| physical.as_deref().and_then(key_for));
         if let Some(key) = key {
             return Err(NotRecorded::Other(format!(
                 "it read {key} and also wrote it"
@@ -1622,39 +1632,35 @@ pub fn build_inputs(
         // The same entry reached under its physical name, when that differs from the spelled one.
         if let Some(pp) = &physical {
             if let Some(rel) = phys.repo_rel(pp) {
-                match rel.to_str() {
-                    None => {
-                        return Err(
-                            "it used a path in the repository that is not valid UTF-8".into()
-                        )
-                    }
-                    Some(pkey) if pkey != key => {
-                        if rel.components().any(|c| is_git_name(c.as_os_str())) {
-                            if !ignore.is_ignored(pkey) {
-                                reads_git = true;
-                            }
-                        } else if ignore.is_ignored(pkey) {
-                        } else if trace.read_before_write.contains(pp) {
-                            // The first-read state is recorded from the verified prior below.
-                        } else if written.contains(pkey) {
-                            if trace.seen.is_some() && touch.read && !verified_before_write {
-                                refusals.push(NotRecorded::Other(format!(
-                                    "it read {pkey} and also wrote it"
-                                )));
-                            }
-                        } else {
-                            cands.push(Candidate {
-                                path: pp.clone(),
-                                key: pkey.to_string(),
-                                inside: true,
-                                listed: touch.listed,
-                                physical_key: Some(pkey.to_string()),
-                                source: lex.clone(),
-                                followed: false,
-                            });
+                if rel.to_str().is_none() {
+                    return Err("it used a path in the repository that is not valid UTF-8".into());
+                }
+                let pkey = to_key(&real_root, pp);
+                if pkey != key {
+                    if rel.components().any(|c| is_git_name(c.as_os_str())) {
+                        if !ignore.is_ignored(&pkey) {
+                            reads_git = true;
                         }
+                    } else if ignore.is_ignored(&pkey) {
+                    } else if trace.read_before_write.contains(pp) {
+                        // The first-read state is recorded from the verified prior below.
+                    } else if written.contains(&pkey) {
+                        if trace.seen.is_some() && touch.read && !verified_before_write {
+                            refusals.push(NotRecorded::Other(format!(
+                                "it read {pkey} and also wrote it"
+                            )));
+                        }
+                    } else {
+                        cands.push(Candidate {
+                            path: pp.clone(),
+                            key: pkey.clone(),
+                            inside: true,
+                            listed: touch.listed,
+                            physical_key: Some(pkey),
+                            source: lex.clone(),
+                            followed: false,
+                        });
                     }
-                    Some(_) => {}
                 }
             }
         }
@@ -1678,11 +1684,12 @@ pub fn build_inputs(
         {
             return Err("it used a path in the repository that is not valid UTF-8".into());
         }
-        let written_physically = physical
+        let physical_key = physical
             .as_deref()
-            .and_then(|pp| phys.repo_rel(pp))
-            .and_then(|r| r.to_str())
-            .is_some_and(|k| written.contains(k));
+            .and_then(|path| phys.repo_rel(path).map(|_| to_key(&real_root, path)));
+        let written_physically = physical_key
+            .as_ref()
+            .is_some_and(|key| written.contains(key));
         if trace.read_before_write.contains(lex)
             || physical
                 .as_ref()
@@ -1692,8 +1699,16 @@ pub fn build_inputs(
             // prior is recorded as an input instead.
             continue;
         }
-        if trace.is_output(lex) || written_physically {
-            if trace.seen.is_some() && touch.read && !verified_before_write {
+        let external_written_physically = physical
+            .as_deref()
+            .is_some_and(|path| !path.starts_with(&real_root) && trace.is_output(path));
+        if trace.is_output(lex) || written_physically || external_written_physically {
+            let tracked_output = physical
+                .as_deref()
+                .map_or(inside || lex.starts_with(&real_root), |path| {
+                    path.starts_with(&real_root)
+                });
+            if tracked_output && trace.seen.is_some() && touch.read && !verified_before_write {
                 refusals.push(NotRecorded::Other(format!(
                     "it read {key} and also wrote it"
                 )));
@@ -1704,18 +1719,12 @@ pub fn build_inputs(
             reads_git = true;
             continue;
         }
-        let physical_key = physical
-            .as_deref()
-            .and_then(|p| phys.repo_rel(p))
-            .and_then(Path::to_str)
-            .filter(|_| inside)
-            .map(str::to_owned);
         cands.push(Candidate {
             path: lex.clone(),
             key,
             inside,
             listed: touch.listed,
-            physical_key,
+            physical_key: physical_key.filter(|_| inside),
             source: lex.clone(),
             followed: false,
         });
@@ -1742,12 +1751,18 @@ pub fn build_inputs(
                 _ => None,
             });
             let current_target = std::fs::canonicalize(lex).ok();
-            let tracked_target = first_target
-                .into_iter()
-                .chain(current_target.as_deref())
-                .filter_map(|target| target.strip_prefix(&real_root).ok())
-                .filter_map(Path::to_str)
-                .any(|key| !key.is_empty() && !ignore.is_ignored(key));
+            let mut tracked_target = false;
+            for target in first_target.into_iter().chain(current_target.as_deref()) {
+                if let Ok(rel) = target.strip_prefix(&real_root) {
+                    if rel.to_str().is_none() {
+                        return Err(
+                            "it used a path in the repository that is not valid UTF-8".into()
+                        );
+                    }
+                    let key = to_key(&real_root, target);
+                    tracked_target |= !key.is_empty() && !ignore.is_ignored(&key);
+                }
+            }
             if !tracked_target {
                 continue;
             }
@@ -1804,16 +1819,17 @@ pub fn build_inputs(
         }
         match target.strip_prefix(&real_root) {
             Ok(rel) if !rel.as_os_str().is_empty() => {
-                let Some(tkey) = rel.to_str() else {
+                if rel.to_str().is_none() {
                     return Err("it used a path in the repository that is not valid UTF-8".into());
-                };
+                }
+                let tkey = to_key(&real_root, &target);
                 if rel.components().any(|c| is_git_name(c.as_os_str())) {
-                    if !ignore.is_ignored(tkey) {
+                    if !ignore.is_ignored(&tkey) {
                         reads_git = true;
                     }
                     continue;
                 }
-                if ignore.is_ignored(tkey) {
+                if ignore.is_ignored(&tkey) {
                     continue;
                 }
                 if trace.read_before_write.contains(&target) {
@@ -1821,7 +1837,7 @@ pub fn build_inputs(
                     // link itself and its resolution above.
                     continue;
                 }
-                if written.contains(tkey) {
+                if written.contains(&tkey) {
                     if trace.seen.is_some() && touch.read {
                         refusals.push(NotRecorded::Other(format!(
                             "it read {tkey} through {link_key} and also wrote it"
@@ -1831,10 +1847,10 @@ pub fn build_inputs(
                 }
                 cands.push(Candidate {
                     path: target.clone(),
-                    key: tkey.to_string(),
+                    key: tkey.clone(),
                     inside: true,
                     listed: false,
-                    physical_key: Some(tkey.to_string()),
+                    physical_key: Some(tkey),
                     source: lex.clone(),
                     followed: true,
                 });
@@ -1851,13 +1867,8 @@ pub fn build_inputs(
                 if trace.read_before_write.contains(&target) {
                     continue;
                 }
+                // External writes are untracked outputs, even when reached through a link.
                 if trace.is_output(&target) {
-                    if trace.seen.is_some() && touch.read {
-                        refusals.push(NotRecorded::Other(format!(
-                            "it read {} through {link_key} and also wrote it",
-                            to_key(root, &target)
-                        )));
-                    }
                     continue;
                 }
                 let tk = to_key(root, &target);
@@ -1935,25 +1946,24 @@ pub fn build_inputs(
                 path.display()
             )));
         };
-        let Some(key) = relative.to_str() else {
+        if relative.to_str().is_none() {
             return Err("it used a path in the repository that is not valid UTF-8".into());
-        };
-        if ignore.is_ignored(key) {
+        }
+        let key = to_key(&real_root, path);
+        if ignore.is_ignored(&key) {
             continue;
         }
         if trace.changed_during.contains(path) {
-            return Err(NotRecorded::Changed {
-                key: key.to_owned(),
-            });
+            return Err(NotRecorded::Changed { key });
         }
-        let Some(id) = trace.priors.get(key) else {
+        let Some(id) = trace.priors.get(&key) else {
             return Err(NotRecorded::Other(format!(
                 "it could not verify what {key} held before writing it"
             )));
         };
-        keys.insert(key.to_owned());
+        keys.insert(key.clone());
         out.push(Input {
-            path: key.to_owned(),
+            path: key,
             id: id.clone(),
             oid: None,
             oid_basis: None,
@@ -2651,6 +2661,281 @@ mod read_identity_refusals {
             "tracked changed while the command ran"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn nested_ignored_physical_paths_use_normalized_keys() {
+        let root =
+            std::env::temp_dir().join(format!("stoop-windows-ignored-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("scratch/nested")).unwrap();
+        std::fs::create_dir_all(root.join("src/nested")).unwrap();
+        std::fs::write(root.join("scratch/nested/ignored"), b"ignored").unwrap();
+        std::fs::write(root.join("src/nested/tracked"), b"tracked").unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let ignored = root.join("scratch/nested/ignored");
+        let tracked = root.join("src/nested/tracked");
+        let ignore = Ignore::new(&["scratch/nested".to_owned()], None, &[]);
+        let mut phys = Physical::new(&root, &root);
+        assert!(phys
+            .repo_rel(&ignored)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .contains('\\'));
+        let mut trace = Trace {
+            seen: Some(HashMap::new()),
+            ..Trace::default()
+        };
+        trace.touched.insert(
+            ignored.clone(),
+            Touch {
+                read: true,
+                content: true,
+                ..Touch::default()
+            },
+        );
+        trace.changed_during.insert(ignored.clone());
+        trace.read_write_conflicts.insert(ignored);
+        let (inputs, _) =
+            build_inputs(&root, &mut phys, &trace, &ignore, &BTreeSet::new()).unwrap();
+        assert!(inputs.is_empty());
+
+        trace.touched.insert(
+            tracked.clone(),
+            Touch {
+                read: true,
+                content: true,
+                ..Touch::default()
+            },
+        );
+        trace
+            .seen
+            .as_mut()
+            .unwrap()
+            .insert(tracked.clone(), identity::observe(&tracked, true));
+        trace.changed_during.insert(tracked.clone());
+        assert_eq!(
+            build_inputs(&root, &mut phys, &trace, &ignore, &BTreeSet::new())
+                .unwrap_err()
+                .to_string(),
+            "src/nested/tracked changed while the command ran"
+        );
+        trace.changed_during.remove(&tracked);
+        let (inputs, _) =
+            build_inputs(&root, &mut phys, &trace, &ignore, &BTreeSet::new()).unwrap();
+        assert!(inputs
+            .iter()
+            .any(|input| input.path == "src/nested/tracked"));
+
+        std::fs::write(&tracked, b"actually changed").unwrap();
+        assert_eq!(
+            build_inputs(&root, &mut phys, &trace, &ignore, &BTreeSet::new())
+                .unwrap_err()
+                .to_string(),
+            "src/nested/tracked changed while the command ran"
+        );
+        let prior = format!("f:{}", blake3::hash(b"tracked").to_hex());
+        trace.read_before_write.insert(tracked.clone());
+        trace
+            .priors
+            .insert("src/nested/tracked".to_owned(), prior.clone());
+        trace.written.insert(tracked);
+        let written = BTreeSet::from(["src/nested/tracked".to_owned()]);
+        let (inputs, _) = build_inputs(&root, &mut phys, &trace, &ignore, &written).unwrap();
+        assert!(inputs
+            .iter()
+            .any(|input| input.path == "src/nested/tracked" && input.id == prior));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn an_external_written_file_is_untracked_but_an_external_input_is_checked() {
+        let root =
+            std::env::temp_dir().join(format!("stoop-external-output-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        // These existing paths are outside the root and the default temporary-directory ignores.
+        #[cfg(unix)]
+        let external = std::fs::canonicalize("/usr/bin/env").unwrap();
+        #[cfg(windows)]
+        let external = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("Cargo.toml");
+        let mut trace = Trace {
+            seen: Some(HashMap::from([(
+                external.clone(),
+                identity::observe(&external, true),
+            )])),
+            ..Trace::default()
+        };
+        trace.touched.insert(
+            external.clone(),
+            Touch {
+                read: true,
+                content: true,
+                ..Touch::default()
+            },
+        );
+        trace.written.insert(external.clone());
+        trace.read_write_conflicts.insert(external.clone());
+        let ignore = Ignore::new(&[], None, &[]);
+        assert!(!ignore.is_ignored(&to_key(&root, &external)));
+        let mut phys = Physical::new(&root, &root);
+        let (inputs, _) =
+            build_inputs(&root, &mut phys, &trace, &ignore, &BTreeSet::new()).unwrap();
+        assert!(inputs.is_empty());
+        trace.read_write_conflicts.clear();
+        let (inputs, _) =
+            build_inputs(&root, &mut phys, &trace, &ignore, &BTreeSet::new()).unwrap();
+        assert!(inputs.is_empty());
+
+        trace.written.clear();
+        trace.changed_during.insert(external.clone());
+        assert_eq!(
+            build_inputs(&root, &mut phys, &trace, &ignore, &BTreeSet::new())
+                .unwrap_err()
+                .to_string(),
+            format!("{} changed while the command ran", to_key(&root, &external))
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_external_alias_cannot_hide_a_written_repository_target() {
+        use std::os::unix::fs::symlink;
+
+        let base =
+            std::env::temp_dir().join(format!("stoop-external-alias-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("root/src")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let root = base.join("root");
+        let tracked = root.join("src/data");
+        std::fs::write(&tracked, b"content").unwrap();
+        symlink(root.join("src"), base.join("alias")).unwrap();
+        let alias = base.join("alias/data");
+        let mut trace = Trace {
+            seen: Some(HashMap::from([(
+                alias.clone(),
+                identity::observe(&alias, true),
+            )])),
+            ..Trace::default()
+        };
+        trace.touched.insert(
+            alias.clone(),
+            Touch {
+                read: true,
+                content: true,
+                ..Touch::default()
+            },
+        );
+        trace.read_write_conflicts.insert(alias.clone());
+        let ignore = Ignore::new(&[to_key(&root, &alias)], None, &[]);
+        let mut phys = Physical::new(&root, &root);
+        assert_eq!(
+            build_inputs(&root, &mut phys, &trace, &ignore, &BTreeSet::new())
+                .unwrap_err()
+                .to_string(),
+            "it read src/data and also wrote it"
+        );
+
+        trace.read_write_conflicts.clear();
+        trace.written.insert(tracked);
+        let written = BTreeSet::from(["src/data".to_owned()]);
+        assert_eq!(
+            build_inputs(&root, &mut phys, &trace, &ignore, &written)
+                .unwrap_err()
+                .to_string(),
+            "it read src/data and also wrote it"
+        );
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_to_an_external_output_remains_a_tracked_link() {
+        use std::os::unix::fs::symlink;
+
+        let base =
+            std::env::temp_dir().join(format!("stoop-external-link-output-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("root")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let root = base.join("root");
+        let external = base.join("cache");
+        let link = root.join("cache-link");
+        std::fs::write(&external, b"before").unwrap();
+        symlink(&external, &link).unwrap();
+        let mut trace = Trace {
+            seen: Some(HashMap::from([(
+                link.clone(),
+                identity::observe(&link, true),
+            )])),
+            ..Trace::default()
+        };
+        trace.touched.insert(
+            link,
+            Touch {
+                read: true,
+                content: true,
+                ..Touch::default()
+            },
+        );
+        trace.written.insert(external.clone());
+        std::fs::write(&external, b"after output").unwrap();
+        let ignore = Ignore::new(&[], None, &[]);
+        let mut phys = Physical::new(&root, &root);
+        let (inputs, _) =
+            build_inputs(&root, &mut phys, &trace, &ignore, &BTreeSet::new()).unwrap();
+        assert!(inputs.iter().any(|input| input.path == "cache-link"));
+        assert!(!inputs
+            .iter()
+            .any(|input| input.path == to_key(&root, &external)));
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_external_output_reached_through_a_directory_alias_is_untracked() {
+        use std::os::unix::fs::symlink;
+
+        let base =
+            std::env::temp_dir().join(format!("stoop-external-dir-output-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("root")).unwrap();
+        std::fs::create_dir_all(base.join("outside")).unwrap();
+        let base = std::fs::canonicalize(&base).unwrap();
+        let root = base.join("root");
+        let external = base.join("outside/cache");
+        std::fs::write(&external, b"before").unwrap();
+        symlink(base.join("outside"), root.join("alias")).unwrap();
+        let alias = root.join("alias/cache");
+        let mut trace = Trace {
+            seen: Some(HashMap::from([(
+                alias.clone(),
+                identity::observe(&alias, true),
+            )])),
+            ..Trace::default()
+        };
+        trace.touched.insert(
+            alias,
+            Touch {
+                read: true,
+                content: true,
+                ..Touch::default()
+            },
+        );
+        trace.written.insert(external.clone());
+        trace.read_write_conflicts.insert(external.clone());
+        std::fs::write(external, b"after output").unwrap();
+        let ignore = Ignore::new(&[], None, &[]);
+        let mut phys = Physical::new(&root, &root);
+        let (inputs, _) =
+            build_inputs(&root, &mut phys, &trace, &ignore, &BTreeSet::new()).unwrap();
+        assert!(inputs.is_empty());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

@@ -14,6 +14,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
@@ -743,6 +744,192 @@ fn a_file_the_command_overwrites_and_reads_back_refuses_the_record() {
         &[],
     );
     assert_refused_for(&out, &case, "t21-read-back", &["src/f"]);
+}
+
+#[test]
+fn metadata_and_directory_opens_of_confirmed_outputs_are_bookkeeping() {
+    let key = "own-metadata-looks";
+    let case = Case::new(key);
+    let script = concat!(
+        "python3 -c 'import ctypes, os; ",
+        "fd = os.open(\"out\", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600); ",
+        "os.write(fd, b\"data\"); os.fstat(fd); os.close(fd); ",
+        "fd = os.open(\"out\", os.O_PATH | os.O_RDWR); os.fstat(fd); ",
+        "libc = ctypes.CDLL(None, use_errno=True); buf = ctypes.create_string_buffer(512); ",
+        "assert libc.fstatat(fd, b\"\", ctypes.byref(buf), 0x1000) == 0; ",
+        "os.close(fd); os.stat(\"out\"); ",
+        "os.mkdir(\"dir\"); fd = os.open(\"dir\", os.O_RDONLY | os.O_DIRECTORY); ",
+        "os.fstat(fd); os.close(fd)'",
+    );
+    let out = run(&case, key, script, &[]);
+    assert_recorded(&out, &case, key);
+}
+
+#[test]
+fn executing_a_new_output_is_still_a_content_read() {
+    let key = "own-executable-readback";
+    let case = Case::new(key);
+    let out = run(
+        &case,
+        key,
+        "cat /bin/true > program; chmod +x program; ./program",
+        &[],
+    );
+    assert_refused_for(&out, &case, key, &["program"]);
+}
+
+#[test]
+fn stat_of_an_output_replaced_from_outside_refuses_the_record() {
+    let key = "foreign-output-stat";
+    let case = Case::new(key);
+    let replacement = case.outside("replacement", b"foreign\n");
+    let fifo = case.fifo("before-stat.fifo");
+    let script = "printf 'own\\n' > out; cat \"$FIFO\" >/dev/null; test -s out";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    let output = case.root().join("out");
+    let original = fs::metadata(&output).unwrap();
+    let foreign = fs::metadata(&replacement).unwrap();
+    assert_ne!(
+        (original.dev(), original.ino()),
+        (foreign.dev(), foreign.ino())
+    );
+    fs::rename(&replacement, &output).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_refused_for(&out, &case, key, &["out"]);
+}
+
+#[test]
+fn stat_of_an_output_replaced_with_another_own_output_refuses_the_record() {
+    let key = "other-output-inode-stat";
+    let case = Case::new(key);
+    let fifo = case.fifo("before-stat.fifo");
+    let script =
+        "printf 'first\\n' > out; printf 'second\\n' > other; cat \"$FIFO\" >/dev/null; test -s out";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    let output = case.root().join("out");
+    let other = case.root().join("other");
+    let original = fs::metadata(&output).unwrap();
+    let replacement = fs::metadata(&other).unwrap();
+    assert_ne!(
+        (original.dev(), original.ino()),
+        (replacement.dev(), replacement.ino())
+    );
+    fs::rename(&other, &output).unwrap();
+    assert_eq!(
+        fs::metadata(&output).map(|m| (m.dev(), m.ino())).unwrap(),
+        (replacement.dev(), replacement.ino())
+    );
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_refused_for(&out, &case, key, &["out"]);
+}
+
+#[test]
+fn restoring_the_pre_rename_inode_does_not_count_as_a_landing() {
+    let key = "restored-pre-rename-inode";
+    let case = Case::new(key);
+    let output = case.file("out", b"old\n");
+    let saved = case.dir.join("saved-old");
+    fs::hard_link(&output, &saved).unwrap();
+    let old = fs::metadata(&output).unwrap();
+    let fifo = case.fifo("before-stat.fifo");
+    let script = concat!(
+        "python3 -c 'import os; ",
+        "fd = os.open(\"stage\", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600); ",
+        "os.write(fd, b\"new\"); os.close(fd); os.replace(\"stage\", \"out\"); ",
+        "f = open(os.environ[\"FIFO\"]); f.read(); f.close(); os.stat(\"out\")'",
+    );
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    let landed = fs::metadata(&output).unwrap();
+    assert_ne!((old.dev(), old.ino()), (landed.dev(), landed.ino()));
+    fs::rename(&saved, &output).unwrap();
+    assert_eq!(
+        fs::metadata(&output).map(|m| (m.dev(), m.ino())).unwrap(),
+        (old.dev(), old.ino())
+    );
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_refused_for(&out, &case, key, &["out"]);
+}
+
+#[test]
+fn fstat_of_a_replaced_output_descriptor_refuses_the_record() {
+    let key = "foreign-output-fstat";
+    let case = Case::new(key);
+    let replacement = case.outside("replacement", b"foreign\n");
+    let fifo = case.fifo("before-fstat.fifo");
+    let script = concat!(
+        "python3 -c 'import os; ",
+        "fd = os.open(\"out\", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600); ",
+        "os.write(fd, b\"own\"); ",
+        "f = open(os.environ[\"FIFO\"]); f.read(); f.close(); ",
+        "os.fstat(fd); os.close(fd)'",
+    );
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::rename(&replacement, case.root().join("out")).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_refused_for(&out, &case, key, &["out"]);
+}
+
+#[test]
+fn foreign_same_inode_metadata_change_is_an_accepted_v9_gap() {
+    let key = "same-inode-metadata-gap";
+    let case = Case::new(key);
+    let before = case.fifo("before.fifo");
+    let after = case.fifo("after.fifo");
+    let script = concat!(
+        "printf 'own\\n' > out; cat \"$BEFORE\" >/dev/null; ",
+        "if [ -x out ]; then printf executable > choice; else printf plain > choice; fi; ",
+        "cat \"$AFTER\" >/dev/null",
+    );
+    let env = [("BEFORE", before.as_path()), ("AFTER", after.as_path())];
+    let child = spawn(&case, key, script, &env);
+    let release = meet(&before);
+    let output = case.root().join("out");
+    let original = fs::metadata(&output).unwrap();
+    fs::set_permissions(
+        &output,
+        fs::Permissions::from_mode(original.permissions().mode() | 0o111),
+    )
+    .unwrap();
+    let changed = fs::metadata(&output).unwrap();
+    assert_eq!(
+        (original.dev(), original.ino()),
+        (changed.dev(), changed.ino())
+    );
+    drop(release);
+    let release = meet(&after);
+    assert_eq!(fs::read(case.root().join("choice")).unwrap(), b"executable");
+    fs::set_permissions(&output, original.permissions()).unwrap();
+    let restored = fs::metadata(&output).unwrap();
+    assert_eq!(
+        (original.dev(), original.ino()),
+        (restored.dev(), restored.ino())
+    );
+    drop(release);
+    let first = child.wait_with_output().unwrap();
+    assert_recorded(&first, &case, key);
+
+    // The restored output identity allows a skip even though a rerun would take the other branch.
+    let mut retry = spawn(&case, key, script, &env);
+    let release = meet_if_running(&before, &mut retry);
+    let reran = release.is_some();
+    drop(release);
+    if reran {
+        drop(meet_if_running(&after, &mut retry));
+    }
+    let second = retry.wait_with_output().unwrap();
+    assert!(
+        !reran && stderr(&second).contains("stoop: skip"),
+        "{}",
+        stderr(&second)
+    );
 }
 
 #[test]

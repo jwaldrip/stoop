@@ -136,7 +136,7 @@ Always single-quote the placeholder. Stoop refuses the shell-mangled forms befor
 
 | Counts as an input | How |
 |---|---|
-| Files read, executed, looked up or listed | Traced; every byte hashed, inside the repository and out |
+| Files read, executed, looked up or listed | Traced inside and outside the repository, except ignored paths and files outside the repository that the command also writes |
 | A file that was absent and appears | Recorded as absent inside the repository |
 | Changes detected while the command runs | Not recorded; see the [limits of this check](https://stoop.build/docs/blind-spots.html#edits-while-running) |
 | The environment | Every variable, minus runner bookkeeping, a curated list of per-run and per-commit variables, and any variable learned to change on every run while it holds an identifier; `--ignore-env NAME` exempts one, `--env NAME` counts one back |
@@ -147,7 +147,7 @@ stoop sees files. It can't see:
 
 - **The network.** A run that connects out isn't recorded, and stoop names where it connected. Cover it with `--probe`, or pass `--allow-network`.
 - **The clock and randomness.** Proofs expire after 7 days (`--max-age`), and `STOOP_FULL=1` re-proves everything. Run that nightly.
-- **Services outside the process tree**, and output written outside the repository.
+- **Services outside the process tree**, output written outside the repository, and metadata changes to a run-written inode before a later metadata-only look.
 
 [Blind spots and how to cover them](https://stoop.build/docs/blind-spots.html)
 
