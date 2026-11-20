@@ -98,14 +98,14 @@ fn empty_if_present(name: &str) -> bool {
     std::env::var_os(name).is_none_or(|value| value.is_empty())
 }
 
-fn pull_ref(reference: &str) -> bool {
-    let Some((number, kind)) = reference
-        .strip_prefix("refs/pull/")
-        .and_then(|tail| tail.split_once('/'))
-    else {
-        return false;
-    };
-    positive(number).is_some() && matches!(kind, "head" | "merge")
+fn pull_ref(reference: &str) -> Option<u64> {
+    let number = reference
+        .strip_prefix("refs/pull/")?
+        .strip_suffix("/merge")?;
+    if number.starts_with('0') || !number.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    positive(number)
 }
 
 fn configured_default(config: &Config) -> Result<Option<String>, ()> {
@@ -246,21 +246,19 @@ pub(crate) fn forced_reason(
                 return is_default_branch(branch, &default)
                     .then(|| format!("default branch {}", hook::safe(&default)));
             }
-            (Some("pull_request" | "pull_request_target"), Some(reference))
-                if pull_ref(reference) =>
-            {
+            (Some("pull_request"), Some(reference)) => {
+                let Some(number) = pull_ref(reference) else {
+                    return Some("unknown GitHub branch context".into());
+                };
                 let name = reference.strip_prefix("refs/pull/").unwrap_or_default();
-                let number = name
-                    .split_once('/')
-                    .and_then(|(number, _)| positive(number));
                 if !pull.present || pull.value.is_none() {
                     return Some("conflicting GitHub pull request context".into());
                 }
                 let pull = pull.value.as_ref();
-                if (payload_number.present && payload_number.value != number)
+                if (payload_number.present && payload_number.value != Some(number))
                     || pull
                         .and_then(|p| p.number)
-                        .is_some_and(|value| Some(value) != number)
+                        .is_some_and(|value| value != number)
                     || (std::env::var_os("GITHUB_HEAD_REF").is_some()
                         && pull.and_then(|p| p.head.as_ref()).is_none())
                     || (std::env::var_os("GITHUB_BASE_REF").is_some()

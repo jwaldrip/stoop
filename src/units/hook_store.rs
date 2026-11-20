@@ -152,9 +152,9 @@ pub(crate) fn records(store: &Path, now: u64, max_age: u64) -> Result<Vec<Record
     }
 }
 
-/// Save one template before the command runs, whatever its outcome. The write replaces only this
-/// key's record and keeps the newest 128; other commands' templates expire by their own age on
-/// read. Any failure is a warning, and the caller runs the full form without recording it.
+/// Save one template before the command runs, whatever its outcome. A new template supersedes
+/// older records for the same original argv, cwd, scope and label. Other templates expire by
+/// their own age on read. Any failure warns and runs the full form without recording it.
 pub(crate) fn record(store: &Path, record: Record) -> Result<(), String> {
     if record.argv.len() > 128
         || serde_json::to_vec(&record)
@@ -191,7 +191,13 @@ pub(crate) fn record(store: &Path, record: Record) -> Result<(), String> {
             ));
         }
     };
-    catalog.records.retain(|old| old.key != record.key);
+    catalog.records.retain(|old| {
+        old.key != record.key
+            && (old.argv != record.argv
+                || old.cwd != record.cwd
+                || old.scope != record.scope
+                || old.label != record.label)
+    });
     catalog.records.push(record);
     while catalog.records.len() > MAX_RECORDS {
         catalog.records.remove(0);
@@ -319,7 +325,9 @@ mod tests {
     fn the_catalog_keeps_at_most_128_records() {
         let path = store("cap");
         for i in 0..130 {
-            record(&path, template(&format!("k{i}"), 0)).unwrap();
+            let mut entry = template(&format!("k{i}"), 0);
+            entry.argv.push(i.to_string());
+            record(&path, entry).unwrap();
         }
         let keys: Vec<String> = read_catalog(&path)
             .ok()
