@@ -271,6 +271,50 @@ fn legacy_attached_carrier_removes_prior_occurrences() {
 }
 
 #[test]
+fn consecutive_legacy_placeholders_do_not_reuse_a_removed_carrier() {
+    let f = Fixture::new();
+    assert_ran(&f.off(&["--files", "{changed}", "{changed-inputs}"]));
+}
+
+#[test]
+fn declared_long_name_does_not_claim_a_distinct_prefix_option() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "files"
+match = ["./runner", "--files-extra", "keep", "--files", "{changed}"]
+options = [{ names = ["--files"], values = 1 }]
+"#,
+    );
+    let out = f.off(&["--files-extra", "keep", "--files", "{changed}"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"run <--files-extra> <keep>\n");
+    f.config(
+        r#"[[units.suite]]
+id = "files"
+match = ["./runner", "--files-extra={changed}"]
+options = [{ names = ["--files"], values = 1 }]
+"#,
+    );
+    assert_ran(&f.off(&["--files-extra={changed}"]));
+}
+
+#[test]
+fn declared_zero_arity_rejects_an_attached_placeholder() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "flag"
+match = ["./runner", "--flag={changed}", "--flag", "keep"]
+options = [{ names = ["--flag"], values = 0 }]
+"#,
+    );
+    let out = f.off(&["--flag={changed}", "--flag", "keep"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
 fn declared_long_partial_placeholder_is_refused() {
     let f = Fixture::new();
     f.config(
@@ -1334,5 +1378,30 @@ match = ["./runner", "*"]
             f.event(payload);
             assert_ran(&run());
         }
+    }
+    #[test]
+    fn push_payload_without_ref_forces_full() {
+        let f = Fixture::repo();
+        f.event(r#"{"ref":"refs/heads/feature","repository":{"default_branch":"main"}}"#);
+        let run = || f.github("push", "refs/heads/feature").output().unwrap();
+        assert_ran(&run());
+        assert_skipped(&run());
+        f.event(valid_event());
+        assert_ran(&run());
+    }
+
+    #[test]
+    fn pull_request_payload_without_identity_forces_full() {
+        let f = Fixture::repo();
+        f.event(r#"{"number":42,"pull_request":{"number":42,"head":{"ref":"feature"},"base":{"ref":"main"}},"repository":{"default_branch":"main"}}"#);
+        let run = || {
+            f.github("pull_request", "refs/pull/42/merge")
+                .output()
+                .unwrap()
+        };
+        assert_ran(&run());
+        assert_skipped(&run());
+        f.event(valid_event());
+        assert_ran(&run());
     }
 }
