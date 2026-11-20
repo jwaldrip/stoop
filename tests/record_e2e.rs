@@ -2977,3 +2977,112 @@ fn open_by_handle_attempt_is_not_recorded() {
         "{err}"
     );
 }
+
+/// Compares the capture workloads on the same runner with fresh proof stores.
+#[test]
+fn read_identity_timing_fixture() {
+    use std::time::{Duration, Instant};
+
+    let Some(base) = std::env::var_os("STOOP_BENCH_BASE_BIN") else {
+        eprintln!("read identity timing not run: STOOP_BENCH_BASE_BIN is unset");
+        return;
+    };
+    let base = fs::canonicalize(base).unwrap();
+    let head = fs::canonicalize(env!("CARGO_BIN_EXE_stoop")).unwrap();
+    let w = Ws::new("read-identity-timing");
+    w.init_git();
+    fs::create_dir_all(w.root.join("reads")).unwrap();
+    fs::create_dir_all(w.root.join("racy")).unwrap();
+    for i in 0..10_000 {
+        fs::write(w.root.join(format!("reads/{i:05}")), b"input\n").unwrap();
+    }
+    for i in 0..1_000 {
+        let directory = w.root.join(format!("dirs/{i:04}"));
+        fs::create_dir_all(&directory).unwrap();
+        for j in 0..10 {
+            fs::write(directory.join(format!("{j:02}")), b"entry\n").unwrap();
+        }
+    }
+    for i in 0..128 {
+        fs::write(w.root.join(format!("racy/{i:03}")), b"input\n").unwrap();
+    }
+    w.commit_all();
+    std::thread::sleep(Duration::from_millis(2_200));
+
+    for (workload, script, expected_count) in [
+        ("reads-10k", "cat reads/* >/dev/null", 10_000),
+        (
+            "listdirs-1k",
+            "find dirs -mindepth 2 -maxdepth 2 -print >/dev/null",
+            1_000,
+        ),
+        ("racy-128", "cat racy/* >/dev/null", 128),
+    ] {
+        for iteration in 0..3 {
+            let binaries = if iteration % 2 == 0 {
+                [("base", &base), ("head", &head)]
+            } else {
+                [("head", &head), ("base", &base)]
+            };
+            for (label, binary) in binaries {
+                if workload == "racy-128" {
+                    for i in 0..128 {
+                        fs::write(w.root.join(format!("racy/{i:03}")), b"input\n").unwrap();
+                    }
+                }
+                let store = w
+                    .root
+                    .join(".git")
+                    .join(format!("identity-{workload}-{iteration}-{label}"));
+                let mut command = Command::new(binary);
+                clear_git_env(&mut command);
+                let started = Instant::now();
+                let out = command
+                    .args(["run", "--root"])
+                    .arg(&w.root)
+                    .args(["--key", "bench", "--", "sh", "-c", script])
+                    .current_dir(&w.root)
+                    .env("STOOP_STORE", &store)
+                    .env("HOME", w.store().join("home"))
+                    .env("XDG_CONFIG_HOME", w.store().join("xdg"))
+                    .env_remove("STOOP_FULL")
+                    .env_remove("STOOP_OFF")
+                    .env_remove("GITHUB_ACTIONS")
+                    .env_remove("RUNNER_TEMP")
+                    .env_remove("STOOP_SYNC")
+                    .env_remove("STOOP_SYNC_WRITE")
+                    .output()
+                    .unwrap();
+                let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                eprintln!("stoop identity benchmark: workload={workload} pair={} revision={label} elapsed_ms={elapsed_ms:.3}\n{stderr}", iteration + 1);
+                assert!(
+                    out.status.success() && stderr.contains("stoop: recorded"),
+                    "{stderr}"
+                );
+                let proof: Value =
+                    serde_json::from_slice(&fs::read(store.join("proofs/bench.json")).unwrap())
+                        .unwrap();
+                let count = proof["proofs"][0]["inputs"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|item| {
+                        let path = item["path"].as_str().unwrap();
+                        match workload {
+                            "reads-10k" => path.starts_with("reads/"),
+                            "racy-128" => path.starts_with("racy/"),
+                            _ => {
+                                path.starts_with("dirs/")
+                                    && path.split('/').count() == 2
+                                    && item["id"].as_str().is_some_and(|id| id.starts_with("dl:"))
+                            }
+                        }
+                    })
+                    .count();
+                assert_eq!(count, expected_count, "{workload}: recorded {count}");
+            }
+        }
+    }
+    fs::remove_dir_all(&w.root).unwrap();
+}
