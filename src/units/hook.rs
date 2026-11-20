@@ -329,12 +329,49 @@ fn same_option(word: &str, name: &str) -> bool {
         })
 }
 
-fn ambiguous(name: &str) -> String {
-    let name = safe(&lossy_shadow(name));
-    format!("cannot tell where the values for {name} end; attach the placeholder with =, put it right after {name} or after --, or declare the option (declarations arrive with the configuration slice)")
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Arity {
+    Zero,
+    One,
+    Many,
 }
 
-pub(crate) fn prepare(exact: &[OsString]) -> Result<Option<Hook>, String> {
+#[derive(Clone, Debug)]
+pub(crate) struct OptionDeclaration {
+    pub names: Vec<String>,
+    pub arity: Arity,
+}
+
+fn declaration<'a>(options: &'a [OptionDeclaration], name: &str) -> Option<&'a OptionDeclaration> {
+    options
+        .iter()
+        .find(|item| item.names.iter().any(|alias| alias == name))
+}
+
+fn declared_word<'a>(
+    options: &'a [OptionDeclaration],
+    word: &str,
+) -> Option<(&'a OptionDeclaration, &'a str)> {
+    options
+        .iter()
+        .flat_map(|item| item.names.iter().map(move |name| (item, name.as_str())))
+        .filter(|(_, name)| same_option(word, name))
+        .max_by_key(|(_, name)| name.len())
+}
+
+fn ambiguous(name: &str) -> String {
+    let name = safe(&lossy_shadow(name));
+    format!("cannot tell where the values for {name} end; attach the placeholder with =, put it right after {name} or after --, or declare the option in .stoop.toml")
+}
+
+pub(crate) struct ParsedHook {
+    argv: Vec<String>,
+    spans: Vec<Vec<(usize, usize)>>,
+    placeholder: String,
+    start: usize,
+}
+
+pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
     let argv = shadows(exact);
     let shell = shell_code(&argv);
     let mut all = Vec::with_capacity(argv.len());
@@ -390,87 +427,190 @@ pub(crate) fn prepare(exact: &[OsString]) -> Result<Option<Hook>, String> {
         return Ok(None);
     }
     let start = shell.and_then(|(_, zero)| zero).map_or(1, |zero| zero + 1);
-    let mut remove = vec![false; argv.len()];
-    let mut carriers = Vec::new();
-    for (i, parts) in all.iter().enumerate().skip(1) {
-        if parts.is_empty() {
-            continue;
-        }
-        remove[i] = true;
-        let whole = parts.len() == 1 && parts[0] == (0, argv[i].len());
-        if !whole {
-            if let Some(name) = carrier(&argv[i], parts[0].0) {
-                carriers.push(name);
-            }
-        } else if i > start && option(&argv[i - 1]) && !argv[i - 1].contains('=') && !remove[i - 1]
-        {
-            remove[i - 1] = true;
-            carriers.push(argv[i - 1].clone());
-        } else if i > start && argv[i - 1] != "--" {
-            for j in (start..i).rev() {
-                if argv[j] == "--" {
-                    break;
-                }
-                if option(&argv[j]) && !remove[j] {
-                    if !argv[j].contains('=') {
-                        return Err(ambiguous(&argv[j]));
-                    }
-                    break;
-                }
-            }
-        }
-    }
-    for name in &carriers {
-        let mut i = start;
-        while i < argv.len() {
-            if !remove[i] && same_option(&argv[i], name) {
-                if argv[i] == *name {
-                    remove[i] = true;
-                    if i + 1 < argv.len()
-                        && !remove[i + 1]
-                        && argv[i + 1] != "--"
-                        && !option(&argv[i + 1])
-                    {
-                        if i + 2 < argv.len()
-                            && !remove[i + 2]
-                            && argv[i + 2] != "--"
-                            && !option(&argv[i + 2])
-                        {
-                            return Err(ambiguous(name));
-                        }
-                        remove[i + 1] = true;
-                        i += 1;
-                    }
-                } else if !name.starts_with("--") && !argv[i].starts_with(&format!("{name}=")) {
-                    return Err(ambiguous(name));
-                } else {
-                    remove[i] = true;
-                }
-            }
-            i += 1;
-        }
-    }
-    if let Some(i) = (1..argv.len()).rev().find(|&i| !remove[i]) {
-        if argv[i] == "--" {
-            remove[i] = true;
-        }
-    }
-    let mut exec = Vec::with_capacity(exact.len());
-    let mut removed = Vec::new();
-    for (i, word) in exact.iter().enumerate() {
-        if remove[i] {
-            removed.push(word.clone());
-        } else {
-            exec.push(word.clone());
-        }
-    }
-    Ok(Some(Hook {
-        original: exact.to_vec(),
-        argv: exec,
-        removed,
+    Ok(Some(ParsedHook {
+        argv,
         spans: all,
         placeholder,
+        start,
     }))
+}
+
+pub(crate) fn prepare(exact: &[OsString]) -> Result<Option<Hook>, String> {
+    parse(exact)?
+        .map(|parsed| parsed.finish(exact, &[]))
+        .transpose()
+}
+
+impl ParsedHook {
+    pub(crate) fn finish(
+        self,
+        exact: &[OsString],
+        options: &[OptionDeclaration],
+    ) -> Result<Hook, String> {
+        let Self {
+            argv,
+            spans: all,
+            placeholder,
+            start,
+        } = self;
+        let mut remove = vec![false; argv.len()];
+        let mut carriers = Vec::new();
+        for (i, parts) in all.iter().enumerate().skip(1) {
+            if parts.is_empty() {
+                continue;
+            }
+            remove[i] = true;
+            let whole = parts.len() == 1 && parts[0] == (0, argv[i].len());
+            if !whole {
+                if let Some(name) = carrier(&argv[i], parts[0].0) {
+                    carriers.push(name);
+                }
+            } else if i > start && option(&argv[i - 1]) && !remove[i - 1] {
+                match declared_word(options, &argv[i - 1]) {
+                    Some((item, name)) if item.arity == Arity::Many => {
+                        carriers.push(name.to_string());
+                    }
+                    Some((item, name)) if item.arity == Arity::One && argv[i - 1] == name => {
+                        remove[i - 1] = true;
+                        carriers.push(name.to_string());
+                    }
+                    Some(_) => {}
+                    None if !argv[i - 1].contains('=') => {
+                        remove[i - 1] = true;
+                        carriers.push(argv[i - 1].clone());
+                    }
+                    None => {}
+                }
+            } else if i > start && argv[i - 1] != "--" {
+                for j in (start..i).rev() {
+                    if argv[j] == "--" {
+                        break;
+                    }
+                    if option(&argv[j]) && !remove[j] {
+                        match declared_word(options, &argv[j]) {
+                            Some((item, name)) if item.arity == Arity::Many => {
+                                carriers.push(name.to_string());
+                            }
+                            Some(_) => {}
+                            None if !argv[j].contains('=') => return Err(ambiguous(&argv[j])),
+                            None => {}
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        for name in &carriers {
+            let declared = declaration(options, name);
+            let mut i = start;
+            while i < argv.len() {
+                let matches = declared.map_or_else(
+                    || same_option(&argv[i], name),
+                    |item| item.names.iter().any(|alias| same_option(&argv[i], alias)),
+                );
+                if matches && all[i].is_empty() && (!remove[i] || declared.is_some()) {
+                    let exact_option = declared.map_or_else(
+                        || argv[i] == *name,
+                        |item| item.names.iter().any(|alias| argv[i] == *alias),
+                    );
+                    if declared.is_some_and(|item| item.arity == Arity::Many) {
+                        remove[i] = true;
+                        i += 1;
+                        while i < argv.len() && argv[i] != "--" && !option(&argv[i]) {
+                            remove[i] = true;
+                            i += 1;
+                        }
+                        continue;
+                    }
+                    if exact_option {
+                        remove[i] = true;
+                        if declared.is_none_or(|item| item.arity == Arity::One)
+                            && i + 1 < argv.len()
+                            && !remove[i + 1]
+                            && argv[i + 1] != "--"
+                            && !option(&argv[i + 1])
+                        {
+                            if declared.is_none()
+                                && i + 2 < argv.len()
+                                && !remove[i + 2]
+                                && argv[i + 2] != "--"
+                                && !option(&argv[i + 2])
+                            {
+                                return Err(ambiguous(name));
+                            }
+                            remove[i + 1] = true;
+                            i += 1;
+                        }
+                    } else if declared.is_none()
+                        && !name.starts_with("--")
+                        && !argv[i].starts_with(&format!("{name}="))
+                    {
+                        return Err(ambiguous(name));
+                    } else {
+                        remove[i] = true;
+                    }
+                }
+                i += 1;
+            }
+        }
+        if let Some(i) = (1..argv.len()).rev().find(|&i| !remove[i]) {
+            if argv[i] == "--" {
+                remove[i] = true;
+            }
+        }
+        let mut exec = Vec::with_capacity(exact.len());
+        let mut removed = Vec::new();
+        for (i, word) in exact.iter().enumerate() {
+            if remove[i] {
+                removed.push(word.clone());
+            } else {
+                exec.push(word.clone());
+            }
+        }
+        Ok(Hook {
+            original: exact.to_vec(),
+            argv: exec,
+            removed,
+            spans: all,
+            placeholder,
+        })
+    }
+}
+
+/// Normalize aliases and environment spellings while preserving every modifier and filter.
+pub(crate) fn normalize(word: &str) -> Result<String, String> {
+    let parts = spans(word)?;
+    let mut result = String::with_capacity(word.len());
+    let mut cursor = 0;
+    for (start, end) in parts {
+        result.push_str(&word[cursor..start]);
+        let token = &word[start..end];
+        let mut normalized = None;
+        for &(name, env) in CHANGED {
+            let primary = if name == "units" { "changed" } else { name };
+            let brace = format!("{{{name}");
+            if let Some(suffix) = token.strip_prefix(&brace) {
+                normalized = Some(format!("{{{primary}{suffix}"));
+                break;
+            }
+            if let Some(env) = env {
+                let braced = format!("${{{env}");
+                let plain = format!("${env}");
+                if let Some(suffix) = token.strip_prefix(&braced) {
+                    normalized = Some(format!("{{{primary}{suffix}"));
+                    break;
+                }
+                if token == plain {
+                    normalized = Some(format!("{{{primary}}}"));
+                    break;
+                }
+            }
+        }
+        result.push_str(normalized.as_deref().unwrap_or(token));
+        cursor = end;
+    }
+    result.push_str(&word[cursor..]);
+    Ok(result)
 }
 
 /// Does this argv equal a shell-expanded form of the recorded hook?

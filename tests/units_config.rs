@@ -54,6 +54,13 @@ impl Fixture {
             "GITHUB_RUN_NUMBER",
             "GITHUB_EVENT_NAME",
             "GITHUB_REF",
+            "GITHUB_REF_NAME",
+            "GITHUB_REF_TYPE",
+            "GITHUB_HEAD_REF",
+            "GITHUB_BASE_REF",
+            "CI_COMMIT_BRANCH",
+            "CI_DEFAULT_BRANCH",
+            "BUILDKITE_BRANCH",
         ] {
             command.args(["--ignore-env", name]);
         }
@@ -121,6 +128,96 @@ options = [{ names = ["--verbose"], values = 0 }]
     let zero = f.off(&["--verbose", "{changed}"]);
     assert!(zero.status.success(), "{}", stderr(&zero));
     assert_eq!(zero.stdout, b"run <--verbose>\n");
+}
+
+#[test]
+fn many_removes_aliases_until_the_next_option_and_normalizes_placeholders() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "aliases"
+cwd = "."
+match = ["./runner", "--files", "base", "-f", "more", "{changed:*.t}", "--verbose"]
+options = [{ names = ["--files", "-f"], values = "many" }]
+"#,
+    );
+    let out = f.off(&[
+        "--files",
+        "base",
+        "-f",
+        "more",
+        "${STOOP_UNITS:*.t}",
+        "--verbose",
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"run <--verbose>\n", "{}", stderr(&out));
+}
+
+#[test]
+fn many_handles_attached_values_and_one_keeps_an_already_consumed_option() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "many"
+match = ["./runner", "--files=base", "more", "{changed}"]
+options = [{ names = ["--files"], values = "many" }]
+
+[[units.suite]]
+id = "one"
+match = ["./runner", "--label=base", "{changed}"]
+options = [{ names = ["--label"], values = 1 }]
+"#,
+    );
+    assert_ran(&f.off(&["--files=base", "more", "{changed}"]));
+    let one = f.off(&["--label=base", "{changed}"]);
+    assert!(one.status.success(), "{}", stderr(&one));
+    assert_eq!(one.stdout, b"run <--label=base>\n");
+}
+
+#[test]
+fn parser_errors_report_the_offending_line() {
+    let f = Fixture::new();
+    for (text, line) in [
+        ("[units]\nunknown = true\n", 2),
+        ("[units]\nenabled = true\nenabled = false\n", 3),
+    ] {
+        f.config(text);
+        let out = f.off(&["{changed}"]);
+        assert_ran(&out);
+        assert!(
+            stderr(&out).contains(&format!(".stoop.toml:{line}:")),
+            "{}",
+            stderr(&out)
+        );
+    }
+}
+
+#[test]
+fn malformed_configuration_warns_and_does_not_interpret_plain_commands() {
+    let f = Fixture::new();
+    for text in [
+        "[units]\nverify_every = 0\n",
+        "[units]\njobs = 2\n",
+        "[units.runner.pytest]\nenabled = true\n",
+        "[[units.suite]]\nid = 'x'\nmatch = []\n",
+        "[[units.suite]]\nid = 'x'\ncwd = '../outside'\nmatch = ['*']\n",
+        "[[units.suite]]\nid = 'x'\nmatch = ['*']\noptions = [{ names = ['--x'], values = 2 }]\n",
+        "[[units.suite]]\nid = 'x'\nmatch = ['*']\nunits = ['[']\n",
+    ] {
+        f.config(text);
+        let hooked = f.off(&["{changed}"]);
+        assert_ran(&hooked);
+        let error = stderr(&hooked);
+        assert!(error.contains(".stoop.toml:"), "{text}: {error}");
+        assert_eq!(error.matches("ignoring the unit configuration").count(), 1);
+        let plain = f.off(&[]);
+        assert!(plain.status.success(), "{text}: {}", stderr(&plain));
+        assert!(
+            !stderr(&plain).contains(".stoop.toml"),
+            "{text}: {}",
+            stderr(&plain)
+        );
+    }
 }
 
 #[test]
@@ -293,6 +390,30 @@ mod traced {
     }
 
     #[test]
+    fn github_run_number_is_the_fallback_and_invalid_override_forces_full() {
+        let f = Fixture::repo();
+        f.event(valid_event());
+        f.config("[units]\nverify_every = 2\n");
+        let run = |number: &str| {
+            f.github("push", "refs/heads/feature")
+                .env("GITHUB_RUN_NUMBER", number)
+                .output()
+                .unwrap()
+        };
+        assert_ran(&run("1"));
+        assert_skipped(&run("1"));
+        assert_ran(&run("2"));
+        let invalid = f
+            .github("push", "refs/heads/feature")
+            .env("GITHUB_RUN_NUMBER", "1")
+            .env("STOOP_RUN_NUMBER", "bad")
+            .output()
+            .unwrap();
+        assert_ran(&invalid);
+        assert!(stderr(&invalid).contains("no run number for verify_every"));
+    }
+
+    #[test]
     fn a_default_branch_push_runs_full_even_with_a_proof() {
         let f = Fixture::repo();
         f.event(valid_event());
@@ -315,6 +436,58 @@ mod traced {
         };
         assert_ran(&run());
         assert_skipped(&run());
+    }
+
+    #[test]
+    fn conflicting_github_refs_force_full() {
+        let f = Fixture::repo();
+        f.event(valid_event());
+        let run = || f.github("push", "refs/heads/feature");
+        assert_ran(&run().output().unwrap());
+        assert_skipped(&run().output().unwrap());
+        let conflict = run().env("GITHUB_REF_NAME", "main").output().unwrap();
+        assert_ran(&conflict);
+        assert!(stderr(&conflict).contains("conflicting GitHub"));
+        f.event(r#"{"ref":"refs/heads/main","repository":{"default_branch":"main"}}"#);
+        let conflict = run().output().unwrap();
+        assert_ran(&conflict);
+        assert!(stderr(&conflict).contains("conflicting GitHub"));
+    }
+
+    #[test]
+    fn missing_and_conflicting_ci_branch_context_force_a_full_run() {
+        let f = Fixture::repo();
+        let run = || {
+            let mut command = f.command(&["{changed}"]);
+            command.env("CI", "true").env("CI_DEFAULT_BRANCH", "main");
+            command
+        };
+        let initial = run().env("CI_COMMIT_BRANCH", "feature").output().unwrap();
+        assert_ran(&initial);
+        let matching = run().env("CI_COMMIT_BRANCH", "feature").output().unwrap();
+        assert_skipped(&matching);
+        let missing = run().output().unwrap();
+        assert_ran(&missing);
+        let conflict = run()
+            .env("CI_COMMIT_BRANCH", "feature")
+            .env("BUILDKITE_BRANCH", "other")
+            .output()
+            .unwrap();
+        assert_ran(&conflict);
+    }
+
+    #[test]
+    fn local_checkout_ignores_stray_ci_branch_variables() {
+        let f = Fixture::repo();
+        f.hit();
+        f.branch("main");
+        let out = f
+            .command(&["{changed}"])
+            .env("CI_COMMIT_BRANCH", "feature")
+            .output()
+            .unwrap();
+        assert_ran(&out);
+        assert!(stderr(&out).contains("default branch main"));
     }
 
     #[test]
@@ -342,6 +515,35 @@ mod traced {
         let writer = command.output().unwrap();
         assert_ran(&writer);
         assert!(stderr(&writer).contains("sync writer"));
+    }
+
+    #[test]
+    fn a_suite_declared_not_independent_runs_even_on_a_hit() {
+        let f = Fixture::repo();
+        f.hit();
+        f.config(
+            r#"[[units.suite]]
+id = "coupled"
+match = ["./runner", "{changed}"]
+independent = false
+"#,
+        );
+        let out = f.hook();
+        assert_ran(&out);
+        assert!(stderr(&out).contains("not independent"));
+    }
+
+    #[test]
+    fn configured_default_branch_can_require_more_work() {
+        let f = Fixture::repo();
+        f.hit();
+        let out = f
+            .command(&["{changed}"])
+            .env("STOOP_DEFAULT_BRANCH", "feature")
+            .output()
+            .unwrap();
+        assert_ran(&out);
+        assert!(stderr(&out).contains("default branch feature"));
     }
 
     #[test]

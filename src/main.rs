@@ -63,8 +63,14 @@ OPTIONS
   --literal         treat placeholders as ordinary text (no changed-unit hooks)
   --quiet           print nothing about the decision
 
+CONFIGURATION
+  .stoop.toml       optional at the selected root; hook suites, option arity and
+                    full-verification policy. See https://stoop.build/docs/cli.html
+
 ENVIRONMENT
   STOOP_FULL=1      never skip; still record (nightly runs)
+  STOOP_RUN_NUMBER  positive run ordinal for configured verify_every
+  STOOP_DEFAULT_BRANCH  default branch override for hooked full verification
   STOOP_OFF=1       do not trace or skip anything
                     (switches: empty, 0, false, no and off mean off; anything else is on)
   STOOP_DTRACE_DIAGNOSTIC=1  macOS with passwordless sudo: run the command under DTrace and print
@@ -562,7 +568,7 @@ fn report_run(o: Opts, fd: i32) -> i32 {
         return 2;
     }
     take_status_fd(fd);
-    if let Some(error) = run::hook_refusal(&o.argv) {
+    if let Some(error) = run::hook_refusal(&o) {
         eprintln!("stoop: {error}");
         emit_decision(
             fd,

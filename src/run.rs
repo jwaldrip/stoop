@@ -605,8 +605,17 @@ pub fn run_observed(o: Opts) -> Outcome {
 }
 
 /// The error that stops a placeholder argv before anything runs, if there is one.
-pub fn hook_refusal(argv: &[OsString]) -> Option<String> {
-    units::hook::prepare(argv).err()
+pub fn hook_refusal(o: &Opts) -> Option<String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = root_for(o, &cwd);
+    let rel_cwd = cwd_key(&root, &cwd);
+    let (warning, prepared) = units::config::prepare(&root, &rel_cwd, &o.argv, o.literal);
+    if prepared.is_err() {
+        if let Some(warning) = warning {
+            eprintln!("{warning}");
+        }
+    }
+    prepared.err()
 }
 
 /// The variables that carry a placeholder's value (spec section 4.7). Stoop owns them for each run.
@@ -716,20 +725,30 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             how: How::Unrecorded("OIDC request credentials passed".into()),
         };
     }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = root_for(&o, &cwd);
+    let rel_cwd = cwd_key(&root, &cwd);
+    let store_path = store_for(&o, &cwd, &root);
+    let scope = shared_scope(&root, &store_path);
     let literal = o.literal || !observe_runners;
-    let mut hook = if literal {
-        None
-    } else {
-        match units::hook::prepare(&o.argv) {
-            Ok(hook) => hook,
-            Err(error) => {
-                eprintln!("stoop: {error}");
-                return Outcome {
-                    status: 2,
-                    key: initial_key,
-                    how: How::Untraced,
-                };
-            }
+    let (warning, prepared) = units::config::prepare(&root, &rel_cwd, &o.argv, literal);
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    let units::config::Prepared {
+        mut hook,
+        config,
+        invalid: config_invalid,
+        independent_false,
+    } = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("stoop: {error}");
+            return Outcome {
+                status: 2,
+                key: initial_key,
+                how: How::Untraced,
+            };
         }
     };
     // A placeholder that reached stoop intact: the shell expanded nothing into it.
@@ -737,11 +756,6 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     if let Some(h) = &hook {
         o.argv.clone_from(&h.argv);
     }
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let root = root_for(&o, &cwd);
-    let rel_cwd = cwd_key(&root, &cwd);
-    let store_path = store_for(&o, &cwd, &root);
-    let scope = shared_scope(&root, &store_path);
     let max_age = o
         .max_age
         .or_else(|| {
@@ -930,7 +944,23 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             how: How::Untraced,
         };
     }
-    let full = env_switch("STOOP_FULL", true);
+    let full_reason = if env_switch("STOOP_FULL", true) {
+        Some("STOOP_FULL is set".to_string())
+    } else if hook.is_some() && config_invalid {
+        Some("invalid unit configuration".to_string())
+    } else if hook.is_some() && independent_false {
+        Some("suite is not independent".to_string())
+    } else if hook.is_some() {
+        let sync = o.sync.clone().or_else(|| env_str("STOOP_SYNC"));
+        units::policy::forced_reason(
+            &root,
+            &config,
+            sync.as_deref(),
+            o.sync_write || env_flag("STOOP_SYNC_WRITE"),
+        )
+    } else {
+        None
+    };
     let max_age = o
         .max_age
         .or_else(|| {
@@ -1108,7 +1138,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     }
     let hit: Option<&Proof> = hit_idx.map(|i| &proofs[i]);
     if let Some(p) = hit {
-        if !full {
+        if full_reason.is_none() {
             if !o.quiet {
                 eprintln!(
                     "stoop: skip {key}: {} inputs unchanged since {} ({}ms)",
@@ -1123,7 +1153,12 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 how: How::Skipped { proof: p.digest() },
             };
         }
-        why = "STOOP_FULL is set".into();
+        why = full_reason.clone().unwrap_or_else(|| why.clone());
+    }
+    if hook.is_some() {
+        if let Some(reason) = &full_reason {
+            why.clone_from(reason);
+        }
     }
     if explain {
         match &hook {
