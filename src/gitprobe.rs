@@ -45,8 +45,64 @@ const ALLOWED: &[&[&str]] = &[
     &["check-attr", "--all", "-z", "--stdin"],
 ];
 
+fn valid_remote(remote: &str) -> bool {
+    !remote.is_empty()
+        && !remote.starts_with(['-', '.'])
+        && !remote.contains("..")
+        && remote
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
+}
+
+fn remote_head_ref(remote: &str) -> Option<String> {
+    valid_remote(remote).then(|| format!("refs/remotes/{remote}/HEAD"))
+}
+
 fn allowed(args: &[&str]) -> bool {
     ALLOWED.contains(&args)
+        || matches!(args, ["symbolic-ref", "-q", "HEAD"])
+        || matches!(args, ["symbolic-ref", "-q", reference]
+            if reference.strip_prefix("refs/remotes/")
+                .and_then(|tail| tail.strip_suffix("/HEAD"))
+                .is_some_and(valid_remote))
+}
+
+// The branch name is used only to require more verification. Still reject malformed or
+// multi-line output rather than mistaking a failed probe for a non-default branch.
+fn branch_name(output: &[u8], prefix: &str) -> Option<String> {
+    let text = std::str::from_utf8(output).ok()?.strip_suffix('\n')?;
+    let name = text.strip_prefix(prefix)?;
+    if name.is_empty()
+        || name == "@"
+        || name.chars().any(char::is_control)
+        || name.starts_with('/')
+        || name.ends_with(['/', '.'])
+        || name.contains("..")
+        || name.contains("//")
+        || name.contains("@{")
+        || name
+            .split('/')
+            .any(|part| part.starts_with('.') || part.ends_with(".lock"))
+        || name
+            .bytes()
+            .any(|byte| byte <= b' ' || byte == 0x7f || b"~^:?*[\\".contains(&byte))
+    {
+        return None;
+    }
+    Some(name.to_owned())
+}
+
+/// The checked-out branch, or None for a detached HEAD or an invalid probe.
+pub fn head_branch(root: &Path) -> Option<String> {
+    let bytes = output(root, &["symbolic-ref", "-q", "HEAD"], &[], 16 * 1024)?;
+    branch_name(&bytes, "refs/heads/")
+}
+
+/// The local symbolic HEAD of a named sync remote, without contacting that remote.
+pub fn remote_head_branch(root: &Path, remote: &str) -> Option<String> {
+    let reference = remote_head_ref(remote)?;
+    let bytes = output(root, &["symbolic-ref", "-q", &reference], &[], 16 * 1024)?;
+    branch_name(&bytes, &format!("refs/remotes/{remote}/"))
 }
 
 /// Runs `git -C root <args>` with `input` on stdin. Returns stdout only when
@@ -523,6 +579,59 @@ mod tests {
         assert!(!allowed(&["config", "--edit"]));
         assert!(!allowed(&["-c", "alias.x=!sh", "x"]));
         assert!(!allowed(&["status"]));
+    }
+
+    #[test]
+    fn symbolic_ref_probes_are_exact_and_validate_remote_names() {
+        assert!(allowed(&["symbolic-ref", "-q", "HEAD"]));
+        assert!(allowed(&[
+            "symbolic-ref",
+            "-q",
+            "refs/remotes/upstream-1/HEAD"
+        ]));
+        for remote in ["", "-origin", ".origin", "a..b", "a/b", "a\0b", "a b"] {
+            assert!(remote_head_ref(remote).is_none(), "{remote:?}");
+            let reference = format!("refs/remotes/{remote}/HEAD");
+            assert!(!allowed(&["symbolic-ref", "-q", &reference]));
+        }
+        assert!(!allowed(&["symbolic-ref", "HEAD"]));
+        assert!(!allowed(&["symbolic-ref", "-q", "--short", "HEAD"]));
+        assert!(!allowed(&["symbolic-ref", "-q", "HEAD", "extra"]));
+        assert!(!allowed(&[
+            "symbolic-ref",
+            "-q",
+            "refs/remotes/origin/main"
+        ]));
+    }
+
+    #[test]
+    fn symbolic_ref_output_must_be_a_single_valid_branch() {
+        assert_eq!(
+            branch_name(b"refs/heads/feature/x\n", "refs/heads/"),
+            Some("feature/x".to_string())
+        );
+        for invalid in [
+            &b"refs/heads/\n"[..],
+            &b"refs/heads/main"[..],
+            &b"refs/heads/main\nrefs/heads/other\n"[..],
+            &b"refs/heads/main\r\n"[..],
+            &b"refs/heads/a..b\n"[..],
+            "refs/heads/main\u{0085}\n".as_bytes(),
+            &b"refs/heads/@\n"[..],
+        ] {
+            assert_eq!(branch_name(invalid, "refs/heads/"), None);
+        }
+    }
+
+    #[test]
+    fn detached_head_is_unknown() {
+        let dir = repo();
+        fs::write(
+            dir.0.join(".git/HEAD"),
+            "0123456789012345678901234567890123456789\n",
+        )
+        .unwrap();
+        assert_eq!(head_branch(&dir.0), None);
     }
 
     #[test]
