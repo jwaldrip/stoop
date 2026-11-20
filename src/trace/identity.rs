@@ -83,6 +83,10 @@ pub struct Footprint {
     pub inodes: HashSet<(u64, u64)>,
     /// A directory permission or ownership change may hide descendants through an alias.
     pub access_changed: bool,
+    /// A hard link was made while another traced task was alive.
+    pub link_with_live_task: bool,
+    /// A directory was exchanged or renamed, or a rename could not be classified.
+    pub dir_swap_seen: bool,
     pub unknown: bool,
 }
 
@@ -374,6 +378,13 @@ fn post_inode(post: &Post) -> Option<(u64, u64)> {
     }
 }
 
+/// A hard link made while another task is alive can link the inode that a concurrent directory
+/// exchange or rename moved into its path. Either event alone does not redirect a link, so the
+/// footprint is unknown only when both occur in the run.
+pub fn link_route_unknown(footprint: &Footprint) -> bool {
+    footprint.link_with_live_task && footprint.dir_swap_seen
+}
+
 /// Skip comparisons not covered by the observed physical route and the command's footprint.
 pub fn skip(
     footprint: &Footprint,
@@ -388,7 +399,7 @@ pub fn skip(
     if !observation.route_physical {
         return Some(Skip::Route);
     }
-    if footprint.unknown {
+    if footprint.unknown || link_route_unknown(footprint) {
         return Some(Skip::Unknown);
     }
     if path
@@ -774,6 +785,40 @@ mod tests {
         footprint.parent_inodes.clear();
         footprint.parent_inodes.insert((dir.dev, dir.ino + 1));
         assert_eq!(skip(&footprint, Some(&seen), path, true, &post), None);
+    }
+
+    #[test]
+    fn a_hard_link_and_a_directory_swap_are_unknown_only_together() {
+        let neither = Footprint::default();
+        let link = Footprint {
+            link_with_live_task: true,
+            ..Footprint::default()
+        };
+        let swap = Footprint {
+            dir_swap_seen: true,
+            ..Footprint::default()
+        };
+        let both = Footprint {
+            link_with_live_task: true,
+            dir_swap_seen: true,
+            ..Footprint::default()
+        };
+        assert!(!link_route_unknown(&neither));
+        assert!(!link_route_unknown(&link));
+        assert!(!link_route_unknown(&swap));
+        assert!(link_route_unknown(&both));
+        let path = Path::new("/root/d/f");
+        let first = observation(Seen::File(stat(), ReadHash::NotNeeded));
+        let post = Post::File {
+            stat: stat(),
+            hash: "h".into(),
+        };
+        assert_eq!(skip(&link, Some(&first), path, false, &post), None);
+        assert_eq!(skip(&swap, Some(&first), path, false, &post), None);
+        assert_eq!(
+            skip(&both, Some(&first), path, false, &post),
+            Some(Skip::Unknown)
+        );
     }
 
     #[test]

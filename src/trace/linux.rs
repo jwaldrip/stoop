@@ -2542,6 +2542,9 @@ impl Tracer<'_> {
             self.resolve(pid, args, from.0, from.1, Access::Modify),
             self.resolve(pid, args, to.0, to.1, Access::Modify),
         ) else {
+            if self.rec.is_some() {
+                self.t.footprint.dir_swap_seen = true;
+            }
             return;
         };
         let exchange = flags.is_some_and(|i| args[i] as u32 & RENAME_EXCHANGE != 0);
@@ -2551,6 +2554,12 @@ impl Tracer<'_> {
         let b_dir = b_meta.as_ref().is_some_and(|m| m.is_dir());
         let symlink = a_meta.as_ref().is_some_and(|m| m.file_type().is_symlink())
             || b_meta.as_ref().is_some_and(|m| m.file_type().is_symlink());
+        // A directory exchange or rename can move the inode a concurrent link resolves to. An
+        // unclassifiable source counts, because it could be a directory.
+        let swaps_dirs = exchange || a_meta.as_ref().is_none_or(|m| m.is_dir());
+        if self.rec.is_some() && swaps_dirs {
+            self.t.footprint.dir_swap_seen = true;
+        }
         if self.rec.is_some() && symlink {
             note_symlink_write(&mut self.t, true, self.live_tasks.len());
         }
@@ -2886,6 +2895,10 @@ impl Tracer<'_> {
                 }
                 Op::LinkSource { dirfd, path, flags } => {
                     let by_fd = flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0);
+                    if self.rec.is_some() {
+                        // Any link made while another task lives can race a directory swap.
+                        self.t.footprint.link_with_live_task |= self.live_tasks.len() > 1;
+                    }
                     if by_fd && self.rec.is_some() {
                         // The source is named by a descriptor, which is not classified here.
                         note_symlink_write(&mut self.t, true, self.live_tasks.len());
