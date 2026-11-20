@@ -228,6 +228,50 @@ fn undeclared_single_dash_options_keep_their_exact_spelling() {
 }
 
 #[test]
+fn legacy_undeclared_adjacent_options_keep_exact_spelling() {
+    for (args, expected) in [
+        (vec!["--files", "{changed}"], "run\n"),
+        (vec!["-v=debug", "-vv", "{changed}"], "run <-v=debug>\n"),
+        (vec!["-files=old", "-files", "{changed}"], "run\n"),
+    ] {
+        let f = Fixture::new();
+        let out = f.off(&args);
+        assert!(out.status.success(), "{args:?}: {}", stderr(&out));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), expected, "{args:?}");
+    }
+}
+
+#[test]
+fn legacy_undeclared_attached_placeholders_remain_supported() {
+    for args in [
+        vec!["--files={changed}"],
+        vec!["-f={changed}"],
+        vec!["-f{changed}"],
+        vec!["@{changed:file}"],
+    ] {
+        let f = Fixture::new();
+        assert_ran(&f.off(&args));
+    }
+}
+
+#[test]
+fn legacy_carrier_does_not_remove_identical_option_after_terminator() {
+    let f = Fixture::new();
+    let out = f.off(&["--files", "{changed}", "--", "--files", "positional"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"run <--> <--files> <positional>\n");
+}
+
+#[test]
+fn option_like_word_after_terminator_is_positional_not_adjacent_carrier() {
+    let f = Fixture::new();
+    // `--files` is positional after `--`, so the 2a adjacent-option rule cannot own it.
+    let out = f.off(&["--", "--files", "{changed}"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"run <--> <--files>\n");
+}
+
+#[test]
 fn undeclared_options_survive_when_placeholder_is_after_terminator() {
     let f = Fixture::new();
     let out = f.off(&["-v=debug", "-vv", "--", "{changed}"]);
