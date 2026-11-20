@@ -1460,6 +1460,13 @@ fn note_symlink_write(t: &mut Trace, symlink_route: bool, live_tasks: usize) {
     }
 }
 
+/// A link whose source is relative to an explicit directory descriptor. Another task that shares
+/// the descriptor table can rebind that descriptor between the tracer's read of it and the
+/// kernel's lookup, so the link can take a different inode. Path-named sources are not affected.
+fn source_named_by_descriptor(olddirfd: Option<i32>, source: &[u8]) -> bool {
+    olddirfd.is_some_and(|fd| fd != AT_FDCWD) && source.first().is_some_and(|byte| *byte != b'/')
+}
+
 /// Capture first observations without changing the existing touched-path bookkeeping.
 fn record_touch(
     t: &mut Trace,
@@ -2903,6 +2910,14 @@ impl Tracer<'_> {
                         // The source is named by a descriptor, which is not classified here.
                         note_symlink_write(&mut self.t, true, self.live_tasks.len());
                     }
+                    if self.rec.is_some() && self.live_tasks.len() > 1 {
+                        let source = read_cstr(pid, args[path]);
+                        if source.as_deref().is_some_and(|source| {
+                            source_named_by_descriptor(dirfd.map(|i| args[i] as i32), source)
+                        }) {
+                            note_symlink_write(&mut self.t, true, self.live_tasks.len());
+                        }
+                    }
                     if let Some(p) = self.resolve(pid, &args, dirfd, path, Access::Modify) {
                         if self.rec.is_some() {
                             let follows = flags
@@ -2971,6 +2986,15 @@ impl Tracer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn only_a_relative_source_through_an_explicit_directory_descriptor_is_descriptor_named() {
+        assert!(source_named_by_descriptor(Some(3), b"source"));
+        assert!(!source_named_by_descriptor(Some(AT_FDCWD), b"source"));
+        assert!(!source_named_by_descriptor(Some(3), b"/absolute/source"));
+        assert!(!source_named_by_descriptor(None, b"source"));
+        assert!(!source_named_by_descriptor(Some(3), b""));
+    }
+
     #[test]
     fn symlink_write_is_unknown_only_with_another_live_task() {
         for (route, count, expected) in [
