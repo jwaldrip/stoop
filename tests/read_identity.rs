@@ -1315,3 +1315,22 @@ fn a_directory_exchange_and_a_hard_link_in_one_run_skip_comparison() {
         stderr(&out)
     );
 }
+
+#[test]
+fn a_hard_link_from_an_explicit_directory_descriptor_with_a_live_task_skips_comparison() {
+    let case = Case::new("review-dirfd-link");
+    case.file("input", b"before\n");
+    case.file("d/source", b"source\n");
+    let out = run(
+        &case,
+        "review-dirfd-link",
+        "cat input >/dev/null; sleep 1 & python3 -c 'import os; fd = os.open(\"d\", os.O_RDONLY | os.O_DIRECTORY); os.link(\"source\", \"other\", src_dir_fd=fd)'; wait",
+        &[("STOOP_DEBUG", Path::new("1"))],
+    );
+    assert_recorded(&out, &case, "review-dirfd-link");
+    assert!(
+        stderr(&out).contains("stoop: debug: not compared input: Unknown"),
+        "{}",
+        stderr(&out)
+    );
+}
