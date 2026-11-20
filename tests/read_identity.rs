@@ -481,7 +481,8 @@ fn a_stoop_sh_step_with_a_mid_run_edit_is_not_recorded() {
     let mut command = Command::new(env!("CARGO_BIN_EXE_stoop"));
     clean(&mut command);
     let child = command
-        .args(["sh"])
+        .args(["sh", "--root"])
+        .arg(case.root())
         .arg(&step)
         .current_dir(case.root())
         .env("FIFO", &fifo)

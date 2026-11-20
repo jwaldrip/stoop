@@ -1404,16 +1404,19 @@ fn physical_missing_parent(path: &Path) -> bool {
     false
 }
 
-/// Only this verified device can be ignored when a write has no physical location.
-fn harmless_null(path: &Path, metadata: &fs::Metadata) -> bool {
-    path == Path::new("/dev/null")
-        && metadata.file_type().is_char_device()
-        && metadata.rdev() == libc::makedev(1, 3)
+/// Only the verified null and controlling-terminal devices are harmless to covered paths.
+fn harmless_device(path: &Path, metadata: &fs::Metadata) -> bool {
+    let device = match path.to_str() {
+        Some("/dev/null") => libc::makedev(1, 3),
+        Some("/dev/tty") => libc::makedev(5, 0),
+        _ => return false,
+    };
+    metadata.file_type().is_char_device() && metadata.rdev() == device
 }
 
-fn is_harmless_null(path: &Path) -> bool {
-    path == Path::new("/dev/null")
-        && fs::metadata(path).is_ok_and(|metadata| harmless_null(path, &metadata))
+fn is_harmless_device(path: &Path) -> bool {
+    (path == Path::new("/dev/null") || path == Path::new("/dev/tty"))
+        && fs::metadata(path).is_ok_and(|metadata| harmless_device(path, &metadata))
 }
 
 fn footprint_inode(t: &mut Trace, metadata: io::Result<fs::Metadata>) {
@@ -1860,7 +1863,7 @@ impl Tracer<'_> {
     /// Attribute every potential write at entry, without deciding whether it succeeds.
     fn footprint_write(&mut self, raw: &Path, follows: bool) {
         let Some(rec) = self.rec.as_mut() else { return };
-        if follows && is_harmless_null(raw) {
+        if follows && is_harmless_device(raw) {
             return;
         }
         rec.footprint_phys.clear();
@@ -2872,31 +2875,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_verified_null_device_is_ignored() {
-        let dir = std::env::temp_dir().join(format!("stoop-null-predicate-{}", std::process::id()));
+    fn only_the_verified_null_and_controlling_terminal_devices_are_ignored() {
+        let dir =
+            std::env::temp_dir().join(format!("stoop-device-predicate-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let regular = dir.join("null");
+        let regular = dir.join("tty");
         let link = dir.join("link");
         let dangling = dir.join("dangling");
         fs::write(&regular, b"x").unwrap();
         std::os::unix::fs::symlink(&regular, &link).unwrap();
         std::os::unix::fs::symlink(dir.join("missing"), &dangling).unwrap();
-        assert!(is_harmless_null(Path::new("/dev/null")));
-        assert!(!harmless_null(
-            Path::new("/dev/null"),
-            &fs::metadata(&regular).unwrap()
-        ));
+        assert!(is_harmless_device(Path::new("/dev/null")));
+        assert!(is_harmless_device(Path::new("/dev/tty")));
+        let regular_metadata = fs::metadata(&regular).unwrap();
+        assert!(!harmless_device(Path::new("/dev/null"), &regular_metadata));
+        assert!(!harmless_device(Path::new("/dev/tty"), &regular_metadata));
         for path in [
             &regular,
             &link,
             &dangling,
             Path::new("/dev/zero"),
             Path::new("/dev/full"),
-            Path::new("/dev/tty"),
+            Path::new("/dev/pts/ptmx"),
+            Path::new("/dev/loop0"),
             Path::new("/dev/stdout"),
+            Path::new("/dev/fd/1"),
             Path::new("/proc/self/fd/1"),
         ] {
-            assert!(!is_harmless_null(path), "{}", path.display());
+            assert!(!is_harmless_device(path), "{}", path.display());
         }
         fs::remove_dir_all(dir).unwrap();
     }
