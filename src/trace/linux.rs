@@ -2282,6 +2282,20 @@ impl Tracer<'_> {
                 parts.push_front(part);
             }
         }
+        // A path reached through an alias into .git was a history read in v9, even if the
+        // resulting syscall also writes that path. Do not let output filtering hide it.
+        if links > 0
+            && self.rec.as_ref().is_some_and(|rec| {
+                rec.phys.repo_rel(&current).is_some_and(|relative| {
+                    relative
+                        .components()
+                        .any(|part| crate::pathutil::is_git_name(part.as_os_str()))
+                        && !rec.ignore.is_ignored(&to_key(rec.phys.real(), &current))
+                })
+            })
+        {
+            self.flag("it reads .git, so a skip could hide a history change (add `.git` to .stoopignore if that read cannot change the result)");
+        }
         let link_use = if self.resolving_write {
             Use::Name
         } else {

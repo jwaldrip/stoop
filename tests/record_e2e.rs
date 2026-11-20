@@ -1192,6 +1192,19 @@ fn a_symlink_into_git_is_not_recorded() {
     w.clean();
 }
 
+#[test]
+fn an_explicit_git_ignore_allows_the_alias_without_blob_ids() {
+    let (w, _) = committed_input("oid-ignored-symlink-into-git");
+    seed(&w, &[]);
+    w.write(".stoopignore", ".git\n");
+    let p = recorded(
+        &w,
+        "cat in.txt >/dev/null && ln -s \"$PWD/.git/info\" \"$HOME/link\" && printf '# x\\n' >> \"$HOME/link/attributes\"",
+    );
+    assert_unknown_oid_basis(entry(&p, "inputs", "in.txt"));
+    w.clean();
+}
+
 /// Appending through another name can hide an outside rewrite of the attributes file.
 #[test]
 fn a_hard_link_to_worktree_attributes_then_append_refuses_the_record() {
