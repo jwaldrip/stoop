@@ -1,7 +1,7 @@
 //! Observing what a command reads and writes.
 
 use crate::ignore::Ignore;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -123,9 +123,19 @@ pub struct Trace {
     pub seen: Option<HashMap<PathBuf, identity::Seen>>,
     /// Directory listings the run made, keyed by physical directory path.
     pub listings: HashMap<PathBuf, identity::ListSeen>,
-    /// Paths that changed while the run was still going, found at a later look, in the order found.
-    pub changed_during: Vec<PathBuf>,
+    /// Paths whose first observation no longer held at a later stop, in deterministic order.
+    pub changed_during: BTreeSet<PathBuf>,
+    /// Read or look dependencies that cannot be safely separated from the run's own writes.
+    pub read_write_conflicts: BTreeSet<PathBuf>,
+    /// Paths read before their first verified own write, whose prior must also be a runtime input.
+    pub read_before_write: BTreeSet<PathBuf>,
+    /// Last observed destination identity after a verified atomic-replace syscall.
+    pub settled_outputs: HashMap<PathBuf, identity::Seen>,
+    /// Physical paths whose mutation was verified at a successful syscall exit.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub landed: HashSet<PathBuf>,
     /// Names the run created, removed or renamed directly in each physical directory.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub own_names: HashMap<PathBuf, identity::Names>,
     /// Directory entries snapshotted so far, counted against `identity::MAX_LISTED_NAMES`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]

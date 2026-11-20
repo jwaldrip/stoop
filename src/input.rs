@@ -154,6 +154,7 @@ fn names_hash(names: &identity::Names) -> String {
 }
 
 /// Every byte counts, whatever the file is: source, binary, archive, model weights.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn hash_file(path: &Path) -> io::Result<String> {
     let (mut f, _) = open_regular_file(path)?;
     let mut h = blake3::Hasher::new();

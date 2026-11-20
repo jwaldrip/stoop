@@ -8,18 +8,22 @@
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use crate::oid_attrs::is_absent;
-use crate::pathutil::absolutize;
 
 use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::fs;
+use std::io::{self, Read};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+#[cfg(windows)]
+use std::os::windows::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Git's racy-clean rule: a file changed this recently may change again without its stat data
 /// changing, so its bytes are compared as well. A timestamp in the future counts as recent.
 pub const RACY_WINDOW_NS: i128 = 2_000_000_000;
-/// Bytes hashed at read stops in one run. Past it a racy file refuses the record.
+/// Bytes read for hashing at read stops in one run. One extra byte detects overflow.
 pub const READ_HASH_BUDGET: u64 = 1 << 30;
 /// Directory entries snapshotted in one run. Past it the record is refused.
 pub const MAX_LISTED_NAMES: usize = 1 << 20;
@@ -42,8 +46,6 @@ pub enum Seen {
         target: OsString,
         followed: Box<Seen>,
         resolved: Option<PathBuf>,
-        /// The links the path passes through on its way to what it names (see `link_hops`).
-        hops: Vec<PathBuf>,
     },
     /// A device, FIFO or socket: never an input.
     Special,
@@ -77,6 +79,8 @@ pub enum ReadHash {
     OverBudget,
     /// Racy when read, and its bytes could not be read to hash them: the record is refused.
     Unhashable,
+    /// The opened file no longer has the identity captured at the read stop.
+    Moved,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -115,7 +119,7 @@ pub enum Refusal {
     Unhashable,
 }
 
-/// Bytes hashed at read stops in one run, and the debug lines printed about them.
+/// Bytes actually read at read stops, including any overflow byte, and debug-line count.
 #[derive(Default)]
 pub struct ReadBudget {
     pub hashed: u64,
@@ -187,6 +191,52 @@ pub fn read_names(dir: &Path) -> Option<Names> {
     Some(names)
 }
 
+/// The result of a directory snapshot, including why no snapshot could be made.
+#[derive(Debug, PartialEq, Eq)]
+pub enum NameSnapshot {
+    /// Deduplicated raw names and the number of entries consumed from the directory.
+    Names {
+        names: Names,
+        entries: usize,
+    },
+    OverCap,
+    Unreadable,
+}
+
+/// Read at most `cap + 1` directory entries, preserving the raw-name ordering of `read_names`.
+pub fn read_names_capped(dir: &Path, cap: usize) -> NameSnapshot {
+    match fs::read_dir(dir) {
+        Ok(entries) => take_names(
+            entries.map(|entry| entry.map(|entry| entry.file_name())),
+            cap,
+        ),
+        Err(_) => NameSnapshot::Unreadable,
+    }
+}
+
+fn take_names<I>(entries: I, cap: usize) -> NameSnapshot
+where
+    I: IntoIterator<Item = io::Result<OsString>>,
+{
+    let mut names = Names::new();
+    let mut count = 0;
+    for entry in entries {
+        let name = match entry {
+            Ok(name) => name,
+            Err(_) => return NameSnapshot::Unreadable,
+        };
+        if count == cap {
+            return NameSnapshot::OverCap;
+        }
+        count += 1;
+        names.insert(name.as_encoded_bytes().into());
+    }
+    NameSnapshot::Names {
+        names,
+        entries: count,
+    }
+}
+
 fn from_metadata(metadata: &fs::Metadata) -> Seen {
     let kind = metadata.file_type();
     if kind.is_dir() {
@@ -225,50 +275,74 @@ pub fn observe(path: &Path, follow: bool) -> Seen {
                 target: target.into_os_string(),
                 followed: Box::new(followed),
                 resolved,
-                hops: if follow { link_hops(path) } else { Vec::new() },
             }
         }
         Ok(metadata) => from_metadata(&metadata),
     }
 }
 
-/// The symbolic links a path passes through on its way to what it names, in order. The path itself
-/// and the final target are not included. A run that writes one of them has changed what the path
-/// resolves to, so that change is the run's own.
-fn link_hops(path: &Path) -> Vec<PathBuf> {
-    let mut hops = Vec::new();
-    let mut current = path.to_path_buf();
-    while hops.len() < 40 {
-        let Ok(target) = fs::read_link(&current) else {
-            break;
-        };
-        let parent = current.parent().unwrap_or(Path::new("/"));
-        let next = absolutize(parent, &target);
-        if !fs::symlink_metadata(&next).is_ok_and(|m| m.file_type().is_symlink()) {
-            break;
-        }
-        hops.push(next.clone());
-        current = next;
-    }
-    hops
-}
-
 fn needs_hash(file: &FileSeen, now: i128) -> bool {
     file.read_hash == ReadHash::NotNeeded && racy(file.stat.mtime_ns, file.stat.ctime_ns, now)
 }
 
-/// Hash a racy file the run is reading now, charging its size to the budget.
-fn hash_at_read(path: &Path, size: u64, budget: &mut ReadBudget) -> ReadHash {
-    if budget.hashed.saturating_add(size) > READ_HASH_BUDGET {
+/// Hash an opened regular file only when its full stat matches `expected` before and after the read.
+pub(crate) fn hash_bound(path: &Path, expected: &FileStat, budget: &mut ReadBudget) -> ReadHash {
+    if budget.hashed > READ_HASH_BUDGET {
         return ReadHash::OverBudget;
     }
-    match crate::input::hash_file(path) {
-        Ok(hash) => {
-            budget.hashed += size;
-            ReadHash::Hashed(hash)
-        }
-        Err(_) => ReadHash::Unhashable,
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+    #[cfg(windows)]
+    options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+    let Ok(file) = options.open(path) else {
+        return ReadHash::Unhashable;
+    };
+    hash_opened(&file, &file, expected, budget)
+}
+
+/// Hash bytes from the opened descriptor, requiring the full captured stat on both sides.
+fn hash_opened<R: Read>(
+    file: &fs::File,
+    mut reader: R,
+    expected: &FileStat,
+    budget: &mut ReadBudget,
+) -> ReadHash {
+    let Ok(before) = file.metadata() else {
+        return ReadHash::Unhashable;
+    };
+    if !before.is_file() || file_stat(&before) != *expected {
+        return ReadHash::Moved;
     }
+    let remaining = READ_HASH_BUDGET.saturating_sub(budget.hashed);
+    let mut consumed = 0_u64;
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let limit = (remaining + 1 - consumed).min(buffer.len() as u64) as usize;
+        let n = match reader.read(&mut buffer[..limit]) {
+            Ok(n) => n,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(_) => return ReadHash::Unhashable,
+        };
+        if n == 0 {
+            break;
+        }
+        consumed += n as u64;
+        budget.hashed = budget.hashed.saturating_add(n as u64);
+        if consumed > remaining {
+            return ReadHash::OverBudget;
+        }
+        hasher.update(&buffer[..n]);
+    }
+    let Ok(after) = file.metadata() else {
+        return ReadHash::Unhashable;
+    };
+    if !after.is_file() || file_stat(&after) != *expected || consumed != expected.size {
+        return ReadHash::Moved;
+    }
+    ReadHash::Hashed(hasher.finalize().to_hex().to_string())
 }
 
 /// At a read stop for `path`, hash its bytes if the file is racy and not yet hashed. A symbolic
@@ -276,7 +350,7 @@ fn hash_at_read(path: &Path, size: u64, budget: &mut ReadBudget) -> ReadHash {
 pub fn hash_racy_at_read(seen: &mut Seen, path: &Path, now: i128, budget: &mut ReadBudget) -> bool {
     match seen {
         Seen::File(file) if needs_hash(file, now) => {
-            file.read_hash = hash_at_read(path, file.stat.size, budget);
+            file.read_hash = hash_bound(path, &file.stat, budget);
             matches!(file.read_hash, ReadHash::Hashed(_))
         }
         Seen::Symlink {
@@ -285,11 +359,74 @@ pub fn hash_racy_at_read(seen: &mut Seen, path: &Path, now: i128, budget: &mut R
             ..
         } => match followed.as_mut() {
             Seen::File(file) if needs_hash(file, now) => {
-                file.read_hash = hash_at_read(target.as_path(), file.stat.size, budget);
+                file.read_hash = hash_bound(target.as_path(), &file.stat, budget);
                 matches!(file.read_hash, ReadHash::Hashed(_))
             }
             _ => false,
         },
+        _ => false,
+    }
+}
+
+/// Check the first-seen identity at a later stop, charging any repeat hash to the run's budget.
+/// Unreadable or special paths cannot establish that the first identity still holds.
+pub fn still_holds(seen: &Seen, path: &Path, budget: &mut ReadBudget) -> bool {
+    let current = observe(path, true);
+    match (seen, &current) {
+        (Seen::Absent, Seen::Absent) => true,
+        (Seen::Dir(before), Seen::Dir(now)) => before == now,
+        (Seen::File(before), Seen::File(now)) if before.stat == now.stat => {
+            match &before.read_hash {
+                ReadHash::NotNeeded => true,
+                ReadHash::Hashed(expected) => {
+                    matches!(hash_bound(path, &before.stat, budget), ReadHash::Hashed(actual) if actual == *expected)
+                }
+                ReadHash::OverBudget | ReadHash::Unhashable | ReadHash::Moved => false,
+            }
+        }
+        (
+            Seen::Symlink {
+                target,
+                followed,
+                resolved,
+            },
+            Seen::Symlink {
+                target: now_target,
+                followed: now_followed,
+                resolved: now_resolved,
+            },
+        ) if target == now_target
+            && resolved == now_resolved
+            && snapshot_matches(followed, now_followed) =>
+        {
+            let held = match (followed.as_ref(), resolved.as_deref()) {
+                (Seen::Absent, None) => true,
+                (Seen::File(_) | Seen::Dir(_), Some(destination)) => {
+                    still_holds(followed, destination, budget)
+                }
+                _ => false,
+            };
+            held && matches!(
+                observe(path, true),
+                Seen::Symlink {
+                    target: later_target,
+                    followed: later_followed,
+                    resolved: later_resolved,
+                } if *target == later_target
+                    && *resolved == later_resolved
+                    && snapshot_matches(followed, &later_followed)
+            )
+        }
+        _ => false,
+    }
+}
+
+/// Match the non-symlink target states that an observed link can safely resolve to.
+fn snapshot_matches(before: &Seen, now: &Seen) -> bool {
+    match (before, now) {
+        (Seen::Absent, Seen::Absent) => true,
+        (Seen::File(before), Seen::File(now)) => before.stat == now.stat,
+        (Seen::Dir(before), Seen::Dir(now)) => before == now,
         _ => false,
     }
 }
@@ -325,10 +462,9 @@ fn compare_file(seen: &FileSeen, stat: &FileStat, hash: &str) -> Result<(), Refu
     match &seen.read_hash {
         ReadHash::OverBudget => Err(Refusal::OverBudget),
         ReadHash::Unhashable => Err(Refusal::Unhashable),
+        ReadHash::Moved => Err(Refusal::Changed),
         ReadHash::Hashed(before) => {
-            let same = (seen.stat.dev, seen.stat.ino, seen.stat.mode)
-                == (stat.dev, stat.ino, stat.mode)
-                && before == hash;
+            let same = seen.stat == *stat && before == hash;
             if same {
                 Ok(())
             } else {
@@ -477,34 +613,43 @@ mod tests {
     }
 
     #[test]
-    fn a_hashed_file_compares_bytes_and_ignores_timestamps() {
+    fn a_hashed_file_requires_both_the_bytes_and_every_stat_field() {
         let base = stat(NOW, NOW);
-        let seen = match file(base, ReadHash::Hashed("abc".into())) {
-            Seen::File(f) => f,
-            _ => unreachable!(),
+        let seen = FileSeen {
+            stat: base,
+            read_hash: ReadHash::Hashed("abc".into()),
         };
-        let touched = FileStat {
-            mtime_ns: NOW + 5,
-            ctime_ns: NOW + 5,
-            ..base
-        };
-        assert!(compare_file(&seen, &touched, "abc").is_ok());
+        assert!(compare_file(&seen, &base, "abc").is_ok());
         assert_eq!(compare_file(&seen, &base, "abd"), Err(Refusal::Changed));
-        assert_eq!(
-            compare_file(&seen, &FileStat { ino: 7, ..base }, "abc"),
-            Err(Refusal::Changed)
-        );
-        assert_eq!(
-            compare_file(
-                &seen,
-                &FileStat {
-                    mode: 0o755,
-                    ..base
-                },
-                "abc"
-            ),
-            Err(Refusal::Changed)
-        );
+        for changed in [
+            FileStat { dev: 9, ..base },
+            FileStat { ino: 9, ..base },
+            FileStat { size: 9, ..base },
+            FileStat {
+                mtime_ns: base.mtime_ns + 1,
+                ..base
+            },
+            // Restored bytes and mtime cannot hide a changed ctime.
+            FileStat {
+                ctime_ns: base.ctime_ns + 1,
+                ..base
+            },
+            FileStat {
+                mode: 0o755,
+                ..base
+            },
+        ] {
+            assert_eq!(
+                compare_file(&seen, &changed, "abc"),
+                Err(Refusal::Changed),
+                "{changed:?}"
+            );
+        }
+        let moved = FileSeen {
+            stat: base,
+            read_hash: ReadHash::Moved,
+        };
+        assert_eq!(compare_file(&moved, &base, "abc"), Err(Refusal::Changed));
     }
 
     #[test]
@@ -600,7 +745,6 @@ mod tests {
             target: "a".into(),
             followed: Box::new(Seen::Absent),
             resolved: None,
-            hops: Vec::new(),
         };
         let same = Post::Symlink { target: "a".into() };
         let retargeted = Post::Symlink { target: "b".into() };
@@ -615,7 +759,6 @@ mod tests {
             target: "a".into(),
             followed: Box::new(Seen::Absent),
             resolved: resolved.map(PathBuf::from),
-            hops: Vec::new(),
         };
         assert!(same_identity(&link(Some("/r/a")), &link(Some("/r/a"))));
         assert!(!same_identity(&link(Some("/r/a")), &link(Some("/r/b"))));
@@ -659,6 +802,452 @@ mod tests {
             Seen::File(file) => assert_eq!(file.read_hash, ReadHash::OverBudget),
             _ => panic!("a regular file"),
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("stoop-identity-{}-{name}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_before_open_is_reported_as_moved() {
+        let dir = test_dir("replaced");
+        let path = dir.join("payload");
+        let replacement = dir.join("replacement");
+        fs::write(&path, b"old").unwrap();
+        let mut seen = observe(&path, true);
+        let now = match &seen {
+            Seen::File(file) => file.stat.mtime_ns.max(file.stat.ctime_ns),
+            _ => panic!("a regular file"),
+        };
+        fs::write(&replacement, b"new").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+
+        let mut budget = ReadBudget::default();
+        assert!(!hash_racy_at_read(&mut seen, &path, now, &mut budget));
+        assert!(matches!(
+            seen,
+            Seen::File(FileSeen {
+                read_hash: ReadHash::Moved,
+                ..
+            })
+        ));
+        assert_eq!(budget.hashed, 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_replacement_symlink_is_not_followed_for_hashing() {
+        use std::os::unix::fs::symlink;
+
+        let dir = test_dir("symlink");
+        let path = dir.join("payload");
+        let original = dir.join("original");
+        fs::write(&path, b"bytes").unwrap();
+        fs::rename(&path, &original).unwrap();
+        let expected = file_stat(&fs::metadata(&original).unwrap());
+        symlink(&original, &path).unwrap();
+
+        let mut budget = ReadBudget::default();
+        assert_eq!(
+            hash_bound(&path, &expected, &mut budget),
+            ReadHash::Unhashable
+        );
+        assert_eq!(budget.hashed, 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn changed_metadata_before_hashing_refuses_without_reading() {
+        let dir = test_dir("changed-stat");
+        let path = dir.join("payload");
+        fs::write(&path, b"bytes").unwrap();
+        let mut expected = file_stat(&fs::metadata(&path).unwrap());
+        expected.mtime_ns -= 1;
+        let mut budget = ReadBudget::default();
+
+        assert_eq!(hash_bound(&path, &expected, &mut budget), ReadHash::Moved);
+        assert_eq!(budget.hashed, 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    struct AppendOnRead<'a> {
+        file: &'a fs::File,
+        path: &'a Path,
+        consumed: &'a std::cell::Cell<u64>,
+        appended: bool,
+    }
+
+    impl Read for AppendOnRead<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            use std::io::Write;
+
+            if !self.appended {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(self.path)?
+                    .write_all(b"defghi")?;
+                self.appended = true;
+            }
+            let n = self.file.read(buffer)?;
+            self.consumed.set(self.consumed.get() + n as u64);
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn growing_past_the_remaining_budget_reads_only_the_extra_byte() {
+        let dir = test_dir("grows-over-budget");
+        let path = dir.join("payload");
+        fs::write(&path, b"abc").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        let expected = file_stat(&file.metadata().unwrap());
+        let consumed = std::cell::Cell::new(0);
+        let reader = AppendOnRead {
+            file: &file,
+            path: &path,
+            consumed: &consumed,
+            appended: false,
+        };
+        let mut budget = ReadBudget {
+            hashed: READ_HASH_BUDGET - expected.size,
+            ..ReadBudget::default()
+        };
+
+        assert_eq!(
+            hash_opened(&file, reader, &expected, &mut budget),
+            ReadHash::OverBudget
+        );
+        assert_eq!(consumed.get(), expected.size + 1);
+        assert_eq!(budget.hashed, READ_HASH_BUDGET + 1);
+        let now = file_stat(&file.metadata().unwrap());
+        assert_eq!(hash_bound(&path, &now, &mut budget), ReadHash::OverBudget);
+        assert_eq!(budget.hashed, READ_HASH_BUDGET + 1);
+        drop(file);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn growth_within_the_budget_fails_the_post_read_stat_check() {
+        let dir = test_dir("grows-within-budget");
+        let path = dir.join("payload");
+        fs::write(&path, b"abc").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        let expected = file_stat(&file.metadata().unwrap());
+        let consumed = std::cell::Cell::new(0);
+        let reader = AppendOnRead {
+            file: &file,
+            path: &path,
+            consumed: &consumed,
+            appended: false,
+        };
+        let mut budget = ReadBudget::default();
+
+        assert_eq!(
+            hash_opened(&file, reader, &expected, &mut budget),
+            ReadHash::Moved
+        );
+        assert_eq!(consumed.get(), 9);
+        assert_eq!(budget.hashed, 9);
+        drop(file);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn restored_bytes_with_changed_metadata_fail_the_post_read_stat_check() {
+        struct RewriteAndRestore<'a> {
+            file: &'a fs::File,
+            path: &'a Path,
+            modified: SystemTime,
+            done: bool,
+        }
+        impl Read for RewriteAndRestore<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if !self.done {
+                    fs::write(self.path, b"other")?;
+                    fs::write(self.path, b"bytes")?;
+                    fs::OpenOptions::new()
+                        .write(true)
+                        .open(self.path)?
+                        .set_modified(self.modified)?;
+                    self.done = true;
+                }
+                self.file.read(buffer)
+            }
+        }
+        let dir = test_dir("rewrite-restore");
+        let path = dir.join("payload");
+        fs::write(&path, b"bytes").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        let expected = file_stat(&file.metadata().unwrap());
+        let seconds = if expected.mtime_ns == 1_000_000_000 {
+            2
+        } else {
+            1
+        };
+        let reader = RewriteAndRestore {
+            file: &file,
+            path: &path,
+            modified: UNIX_EPOCH + std::time::Duration::from_secs(seconds),
+            done: false,
+        };
+        let mut budget = ReadBudget::default();
+
+        assert_eq!(
+            hash_opened(&file, reader, &expected, &mut budget),
+            ReadHash::Moved
+        );
+        assert_eq!(budget.hashed, expected.size);
+        assert_eq!(fs::read(&path).unwrap(), b"bytes");
+        assert_ne!(
+            file_stat(&file.metadata().unwrap()).mtime_ns,
+            expected.mtime_ns
+        );
+        drop(file);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn hashing_exactly_the_remaining_budget_succeeds() {
+        let dir = test_dir("exact-budget");
+        let path = dir.join("payload");
+        fs::write(&path, b"bytes").unwrap();
+        let expected = file_stat(&fs::metadata(&path).unwrap());
+        let mut budget = ReadBudget {
+            hashed: READ_HASH_BUDGET - expected.size,
+            ..ReadBudget::default()
+        };
+
+        assert_eq!(
+            hash_bound(&path, &expected, &mut budget),
+            ReadHash::Hashed(blake3::hash(b"bytes").to_hex().to_string())
+        );
+        assert_eq!(budget.hashed, READ_HASH_BUDGET);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn failed_hashes_charge_bytes_already_read() {
+        struct FailAfterRead<'a> {
+            file: &'a fs::File,
+            used: bool,
+        }
+        impl Read for FailAfterRead<'_> {
+            fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+                if self.used {
+                    return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+                }
+                self.used = true;
+                let length = buffer.len().min(2);
+                self.file.read(&mut buffer[..length])
+            }
+        }
+        let dir = test_dir("read-error");
+        let path = dir.join("payload");
+        fs::write(&path, b"bytes").unwrap();
+        let file = fs::File::open(&path).unwrap();
+        let expected = file_stat(&file.metadata().unwrap());
+        let reader = FailAfterRead {
+            file: &file,
+            used: false,
+        };
+        let mut budget = ReadBudget::default();
+
+        assert_eq!(
+            hash_opened(&file, reader, &expected, &mut budget),
+            ReadHash::Unhashable
+        );
+        assert_eq!(budget.hashed, 2);
+        drop(file);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn capped_snapshot_stops_at_the_first_entry_over_the_limit() {
+        let visited = std::cell::Cell::new(0);
+        let entries = (0..).map(|index| {
+            assert!(index < 3, "the iterator was read beyond cap + 1");
+            visited.set(visited.get() + 1);
+            Ok(OsString::from(format!("name-{index}")))
+        });
+        assert_eq!(take_names(entries, 2), NameSnapshot::OverCap);
+        assert_eq!(visited.get(), 3);
+
+        let repeated = ["same", "same", "third"]
+            .into_iter()
+            .map(|name| Ok(OsString::from(name)));
+        assert_eq!(take_names(repeated, 2), NameSnapshot::OverCap);
+        let repeated = ["same", "same"]
+            .into_iter()
+            .map(|name| Ok(OsString::from(name)));
+        assert_eq!(
+            take_names(repeated, 2),
+            NameSnapshot::Names {
+                names: names(&["same"]),
+                entries: 2,
+            }
+        );
+    }
+
+    #[test]
+    fn capped_snapshot_accepts_exact_limit_and_distinguishes_errors() {
+        let dir = test_dir("names");
+        fs::write(dir.join("b"), b"").unwrap();
+        fs::write(dir.join("a"), b"").unwrap();
+        assert_eq!(
+            read_names_capped(&dir, 2),
+            NameSnapshot::Names {
+                names: names(&["a", "b"]),
+                entries: 2,
+            }
+        );
+        assert_eq!(read_names_capped(&dir, 1), NameSnapshot::OverCap);
+        assert_eq!(read_names_capped(&dir, 0), NameSnapshot::OverCap);
+        assert_eq!(
+            read_names_capped(&dir.join("missing"), 2),
+            NameSnapshot::Unreadable
+        );
+        let entries = vec![
+            Ok(OsString::from("a")),
+            Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        ];
+        assert_eq!(take_names(entries, 2), NameSnapshot::Unreadable);
+        assert_eq!(
+            take_names(std::iter::empty::<io::Result<OsString>>(), 0),
+            NameSnapshot::Names {
+                names: Names::new(),
+                entries: 0,
+            }
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn still_holds_checks_absence_and_full_directory_stat() {
+        let dir = test_dir("still-holds-directory");
+        let missing = dir.join("missing");
+        let mut budget = ReadBudget::default();
+        assert!(still_holds(&Seen::Absent, &missing, &mut budget));
+        fs::write(&missing, b"bytes").unwrap();
+        assert!(!still_holds(&Seen::Absent, &missing, &mut budget));
+
+        let directory = observe(&dir, true);
+        assert!(still_holds(&directory, &dir, &mut budget));
+        let Seen::Dir(stat) = directory else {
+            panic!("a directory");
+        };
+        let moved = Seen::Dir(DirSeen {
+            ctime_ns: stat.ctime_ns + 1,
+            ..stat
+        });
+        assert!(!still_holds(&moved, &dir, &mut budget));
+        assert!(!still_holds(&Seen::Unreadable, &dir, &mut budget));
+        assert!(!still_holds(&Seen::Special, &dir, &mut budget));
+        assert_eq!(budget.hashed, 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn still_holds_hashes_within_the_remaining_budget_and_fails_closed() {
+        let dir = test_dir("still-holds-file");
+        let path = dir.join("payload");
+        fs::write(&path, b"bytes").unwrap();
+        let stat = file_stat(&fs::metadata(&path).unwrap());
+        let hash = blake3::hash(b"bytes").to_hex().to_string();
+        let seen = file(stat, ReadHash::Hashed(hash));
+        let mut budget = ReadBudget {
+            hashed: READ_HASH_BUDGET - stat.size,
+            ..ReadBudget::default()
+        };
+        assert!(still_holds(&seen, &path, &mut budget));
+        assert_eq!(budget.hashed, READ_HASH_BUDGET);
+        assert!(!still_holds(&seen, &path, &mut budget));
+        assert_eq!(budget.hashed, READ_HASH_BUDGET + 1);
+        assert!(!still_holds(&seen, &path, &mut budget));
+        assert_eq!(budget.hashed, READ_HASH_BUDGET + 1);
+
+        let mut budget = ReadBudget::default();
+        let wrong = file(stat, ReadHash::Hashed("different".into()));
+        assert!(!still_holds(&wrong, &path, &mut budget));
+        assert_eq!(budget.hashed, stat.size);
+        let stale = file(
+            FileStat {
+                ctime_ns: stat.ctime_ns + 1,
+                ..stat
+            },
+            ReadHash::NotNeeded,
+        );
+        assert!(!still_holds(&stale, &path, &mut budget));
+        for reason in [ReadHash::OverBudget, ReadHash::Unhashable, ReadHash::Moved] {
+            assert!(!still_holds(&file(stat, reason), &path, &mut budget));
+        }
+        assert_eq!(budget.hashed, stat.size);
+        assert!(still_holds(
+            &file(stat, ReadHash::NotNeeded),
+            &path,
+            &mut budget
+        ));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn still_holds_checks_symlink_route_and_followed_identity() {
+        use std::os::unix::fs::symlink;
+
+        let dir = test_dir("still-holds-link");
+        let target = dir.join("payload");
+        let replacement = dir.join("replacement");
+        let link = dir.join("link");
+        fs::write(&target, b"bytes").unwrap();
+        symlink("payload", &link).unwrap();
+        let mut seen = observe(&link, true);
+        let now = match &seen {
+            Seen::Symlink { followed, .. } => match followed.as_ref() {
+                Seen::File(file) => file.stat.mtime_ns.max(file.stat.ctime_ns),
+                _ => panic!("a link to a regular file"),
+            },
+            _ => panic!("a symbolic link"),
+        };
+        let mut budget = ReadBudget::default();
+        assert!(hash_racy_at_read(&mut seen, &link, now, &mut budget));
+        let mut budget = ReadBudget::default();
+        assert!(still_holds(&seen, &link, &mut budget));
+        assert_eq!(budget.hashed, 5);
+        fs::write(&replacement, b"other").unwrap();
+        fs::rename(&replacement, &target).unwrap();
+        assert!(!still_holds(&seen, &link, &mut budget));
+
+        let unresolved = observe(&link, false);
+        assert!(!still_holds(&unresolved, &link, &mut budget));
+        let new_target = dir.join("new-target");
+        fs::write(&new_target, b"bytes").unwrap();
+        fs::remove_file(&link).unwrap();
+        symlink("new-target", &link).unwrap();
+        assert!(!still_holds(&seen, &link, &mut budget));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn still_holds_tracks_a_dangling_link_becoming_present() {
+        use std::os::unix::fs::symlink;
+
+        let dir = test_dir("still-holds-dangling");
+        let target = dir.join("missing");
+        let link = dir.join("link");
+        symlink("missing", &link).unwrap();
+        let seen = observe(&link, true);
+        let mut budget = ReadBudget::default();
+        assert!(still_holds(&seen, &link, &mut budget));
+        fs::write(&target, b"bytes").unwrap();
+        assert!(!still_holds(&seen, &link, &mut budget));
+        assert_eq!(budget.hashed, 0);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

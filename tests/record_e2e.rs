@@ -4,6 +4,7 @@
 
 use serde_json::Value;
 use std::fs;
+use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -211,6 +212,16 @@ fn recorded(w: &Ws, script: &str) -> Value {
     assert_eq!(code, 0, "{err}");
     assert!(err.contains("stoop: recorded"), "not recorded: {err}");
     w.proof()
+}
+
+fn assert_refused(w: &Ws, code: i32, err: &str, paths: &[&str]) {
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("stoop: not recorded:"), "{err}");
+    assert!(
+        paths.iter().any(|path| err.contains(path)),
+        "expected one of {paths:?} in:\n{err}"
+    );
+    assert!(!w.store().join("proofs/t.json").exists(), "{err}");
 }
 
 /// (path, id) pairs of a proof array field (`inputs`, `outputs`, `priors`).
@@ -1181,20 +1192,17 @@ fn a_symlink_into_git_is_not_recorded() {
     w.clean();
 }
 
-/// A hard link made during the run to the worktree's `.gitattributes`, then written through its
-/// outside name, changes what Git reads for attributes. No outside name is watched, and the file
-/// is not a watched name, so the link itself must drop the run's blob ids. The same script without
-/// the link keeps them.
+/// Appending through another name can hide an outside rewrite of the attributes file.
 #[test]
-fn a_hard_link_to_the_worktree_attributes_file_drops_blob_ids() {
+fn a_hard_link_to_worktree_attributes_then_append_refuses_the_record() {
     let attributes = [("R:.gitattributes", Some("*.bin -text\n"))];
-    let (changed, _) = seeded_run(
-        "oid-link-attributes",
-        &attributes,
-        |_| {},
+    let (w, _) = committed_input("oid-link-attributes");
+    seed(&w, &attributes);
+    let (code, err) = w.sh(
         "cat in.txt >/dev/null && ln .gitattributes \"$HOME/attrs\" && printf '*.txt eol=crlf\\n' >> \"$HOME/attrs\"",
     );
-    assert_unknown_oid_basis(entry(&changed, "inputs", "in.txt"));
+    assert_refused(&w, code, &err, &[".gitattributes", "attrs"]);
+    w.clean();
     let (control, control_oid) = seeded_run(
         "oid-link-attributes",
         &attributes,
@@ -1204,21 +1212,51 @@ fn a_hard_link_to_the_worktree_attributes_file_drops_blob_ids() {
     assert_blob_oid(&control, "inputs", "in.txt", &control_oid);
 }
 
-/// `linkat` with AT_EMPTY_PATH names its source by descriptor. The tracer judges that descriptor as
-/// it judges a named one, when the call is entered, so the run's blob ids drop whether or not the
-/// kernel lets the link succeed.
+/// A successful descriptor-based link and append cannot attribute the attributes file's bytes.
+/// A failed link leaves it unchanged and retains the existing OID-invalidation control.
 #[test]
-fn a_link_made_from_a_descriptor_for_the_worktree_attributes_drops_blob_ids() {
+fn a_descriptor_link_and_append_refuse_if_the_link_succeeds() {
     let attributes = [("R:.gitattributes", Some("*.bin -text\n"))];
-    let (changed, _) = seeded_run(
+    let (w, _) = committed_input("oid-link-fd-attributes");
+    seed(&w, &attributes);
+    w.syscall_probe();
+    let (code, err) = w.sh(
+        "cat in.txt >/dev/null; exec 3< .gitattributes; ./syscall-probe linkat-empty 3 \"$HOME/attrs\"; printf '*.txt eol=crlf\\n' >> \"$HOME/attrs\"",
+    );
+    assert_eq!(code, 0, "{err}");
+    let source = fs::metadata(w.root.join(".gitattributes")).unwrap();
+    let alias = fs::metadata(w.store().join("home/attrs")).unwrap();
+    if (source.dev(), source.ino()) == (alias.dev(), alias.ino()) {
+        assert_refused(&w, code, &err, &[".gitattributes", "attrs"]);
+    } else {
+        assert!(err.contains("stoop: recorded"), "{err}");
+        assert_unknown_oid_basis(entry(&w.proof(), "inputs", "in.txt"));
+    }
+    w.clean();
+    let (control, control_oid) = seeded_run(
         "oid-link-fd-attributes",
         &attributes,
         |_| {},
-        "cat in.txt >/dev/null; exec 3< .gitattributes; ./syscall-probe linkat-empty 3 \"$HOME/attrs\"; printf '*.txt eol=crlf\\n' >> \"$HOME/attrs\"",
+        "cat in.txt >/dev/null; exec 3< .gitattributes; cat <&3 >/dev/null",
+    );
+    assert_blob_oid(&control, "inputs", "in.txt", &control_oid);
+}
+
+#[test]
+fn a_failed_descriptor_link_attempt_still_drops_blob_ids() {
+    let attributes = [
+        ("R:.gitattributes", Some("*.bin -text\n")),
+        ("H:attrs", Some("already present\n")),
+    ];
+    let (changed, _) = seeded_run(
+        "oid-failed-link-fd-attributes",
+        &attributes,
+        |_| {},
+        "cat in.txt >/dev/null; exec 3< .gitattributes; if ./syscall-probe linkat-empty 3 \"$HOME/attrs\"; then exit 8; fi",
     );
     assert_unknown_oid_basis(entry(&changed, "inputs", "in.txt"));
     let (control, control_oid) = seeded_run(
-        "oid-link-fd-attributes",
+        "oid-failed-link-fd-attributes",
         &attributes,
         |_| {},
         "cat in.txt >/dev/null; exec 3< .gitattributes; cat <&3 >/dev/null",
@@ -1719,7 +1757,18 @@ fn a_file_over_eight_mebibytes_is_too_large_to_record() {
     let big = fs::File::create(w.root.join("big")).unwrap();
     big.set_len(9 << 20).unwrap();
     drop(big);
-    let p = recorded(&w, "cat big >/dev/null && echo x >> big");
+    // Without a serialized prior, the earlier read cannot be retained as a runtime input.
+    let (code, err) = w.sh("cat big >/dev/null && echo x >> big");
+    assert_refused(&w, code, &err, &["big"]);
+}
+
+#[test]
+fn a_large_existing_output_prior_is_too_large_to_plan() {
+    let w = Ws::new("big-write-only");
+    let big = fs::File::create(w.root.join("big")).unwrap();
+    big.set_len(9 << 20).unwrap();
+    drop(big);
+    let p = recorded(&w, "echo x >> big");
     assert!(has_reason(&p, "too large"), "{:?}", reasons(&p));
 }
 
@@ -1962,17 +2011,13 @@ fn a_write_through_a_dangling_link_in_the_repository_is_unplannable() {
 }
 
 #[test]
-fn reading_a_link_after_writing_through_it_keeps_the_link_as_an_input() {
+fn reading_a_link_after_writing_through_it_refuses_the_record() {
+    // The target read through the link may have been changed by another process.
     let w = Ws::new("linkread");
     w.write("t.txt", "t");
     std::os::unix::fs::symlink(w.root.join("t.txt"), w.root.join("l")).unwrap();
-    let p = recorded(&w, "echo x > l && cat l > /dev/null");
-    assert!(
-        pairs(&p, "inputs")
-            .contains(&("l".into(), format!("l:{}", w.root.join("t.txt").display()))),
-        "{:?}",
-        pairs(&p, "inputs")
-    );
+    let (code, err) = w.sh("echo x > l && cat l > /dev/null");
+    assert_refused(&w, code, &err, &["t.txt", "read l ", "change to l"]);
 }
 
 #[test]
@@ -2029,9 +2074,16 @@ fn proc_alias_read_then_truncate_records_old_content() {
         &w,
         "cat /proc/self/cwd/config.txt >/dev/null; echo new > config.txt",
     );
+    let before = format!("f:{}", hash(b"old content"));
+    assert_eq!(prior(&p, "config.txt"), Some(before.clone()));
     assert_eq!(
-        prior(&p, "config.txt"),
-        Some(format!("f:{}", hash(b"old content")))
+        entry(&p, "inputs", "config.txt")["id"].as_str(),
+        Some(before.as_str())
+    );
+    let after = format!("f:{}", hash(b"new\n"));
+    assert_eq!(
+        entry(&p, "outputs", "config.txt")["id"].as_str(),
+        Some(after.as_str())
     );
 }
 
@@ -2047,9 +2099,16 @@ fn outside_alias_read_then_truncate_records_old_content() {
         &format!("cat {} >/dev/null; echo new > config.txt", alias.display()),
     );
     let _ = fs::remove_file(alias);
+    let before = format!("f:{}", hash(b"old content"));
+    assert_eq!(prior(&p, "config.txt"), Some(before.clone()));
     assert_eq!(
-        prior(&p, "config.txt"),
-        Some(format!("f:{}", hash(b"old content")))
+        entry(&p, "inputs", "config.txt")["id"].as_str(),
+        Some(before.as_str())
+    );
+    let after = format!("f:{}", hash(b"new\n"));
+    assert_eq!(
+        entry(&p, "outputs", "config.txt")["id"].as_str(),
+        Some(after.as_str())
     );
 }
 

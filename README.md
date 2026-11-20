@@ -6,7 +6,7 @@
 <h3 align="center">Run only what matters.</h3>
 
 <p align="center">
-  Wrap a command. <b>stoop</b> traces every file it reads, and skips it when none of them changed since it last passed.<br>
+  Wrap a command. <b>stoop</b> traces its file activity and can skip it when its recorded inputs and outputs still match.<br>
   No input lists to write, and none to keep current.
 </p>
 
@@ -138,7 +138,7 @@ Always single-quote the placeholder. Stoop refuses the shell-mangled forms befor
 |---|---|
 | Files read, executed, looked up or listed | Traced; every byte hashed, inside the repository and out |
 | A file that was absent and appears | Recorded as absent inside the repository |
-| A change made while the command runs | Not recorded: the run passes, but the next run runs the command again |
+| Changes detected while the command runs | Not recorded; see the [limits of this check](https://stoop.build/docs/blind-spots.html#edits-while-running) |
 | The environment | Every variable, minus runner bookkeeping, a curated list of per-run and per-commit variables, and any variable learned to change on every run while it holds an identifier; `--ignore-env NAME` exempts one, `--env NAME` counts one back |
 | External state you can check | `--probe CMD`: its output must match for a skip |
 | What the run wrote in the repository | Must still be in place for a skip; throwaway output goes in `.stoopignore` |

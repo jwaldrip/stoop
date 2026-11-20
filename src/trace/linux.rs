@@ -43,6 +43,7 @@ const PATH_MAX: usize = 4096;
 /// Linux ABI flags, the same on every architecture.
 const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
 const AT_REMOVEDIR: i32 = 0x200;
+const AT_SYMLINK_FOLLOW: i32 = 0x400;
 const AT_EMPTY_PATH: i32 = 0x1000;
 const RENAME_EXCHANGE: u32 = 2;
 
@@ -76,6 +77,8 @@ enum Op {
         dirfd: Option<usize>,
         path: usize,
     },
+    /// fstat: metadata was read through an already open descriptor.
+    FdLook,
     Exec {
         dirfd: Option<usize>,
         path: usize,
@@ -203,6 +206,7 @@ fn table() -> Vec<(i64, Vec<Op>)> {
                 path: 1,
             }],
         ),
+        (s(libc::SYS_fstat), vec![FdLook]),
         (
             s(libc::SYS_statx),
             vec![Look {
@@ -585,6 +589,73 @@ fn decode(r: &libc::user_regs_struct) -> (i64, [u64; 6]) {
     )
 }
 
+#[cfg(target_arch = "x86_64")]
+fn syscall_result(r: &libc::user_regs_struct) -> i64 {
+    r.rax as i64
+}
+
+#[cfg(target_arch = "aarch64")]
+fn syscall_result(r: &libc::user_regs_struct) -> i64 {
+    r.regs[0] as i64
+}
+
+type FileIdentity = (u64, u64);
+
+#[derive(Clone)]
+enum WriteKind {
+    Open {
+        creates: bool,
+        exclusive: bool,
+    },
+    Create {
+        directory: bool,
+    },
+    Symlink {
+        target: Option<OsString>,
+    },
+    Link {
+        source: Option<(Option<PathBuf>, FileIdentity)>,
+    },
+    Remove,
+    Rename {
+        source: bool,
+        exchange: bool,
+        supported: bool,
+    },
+    Modify,
+}
+
+impl WriteKind {
+    fn changes_entry(&self, absent: bool) -> bool {
+        match self {
+            Self::Open { creates, .. } => *creates && absent,
+            Self::Create { .. }
+            | Self::Symlink { .. }
+            | Self::Link { .. }
+            | Self::Remove
+            | Self::Rename { .. } => true,
+            Self::Modify => false,
+        }
+    }
+}
+
+struct PendingPath {
+    raw: PathBuf,
+    expected: Option<PathBuf>,
+    follows: bool,
+    key: Option<String>,
+    before: Option<FileIdentity>,
+    absent: bool,
+    read_priors: Vec<PathBuf>,
+    rename_before: Option<Seen>,
+    kind: WriteKind,
+}
+
+struct PendingWrite {
+    syscall: i64,
+    paths: Vec<PendingPath>,
+}
+
 /// What priors need beyond the trace: where paths live, what is excluded, and how much
 /// content has been read so far.
 struct Rec<'a> {
@@ -606,9 +677,18 @@ struct Tracer<'a> {
     magic_epoch: u64,
     magic_cache: HashMap<PathBuf, (u64, bool)>,
     pending_topology: HashSet<i32>,
-    /// Writes in flight, by pid: the physical links each pending write went through. Another process
-    /// replacing one of them while the write is in flight refuses the record.
-    writing: HashMap<i32, Vec<PathBuf>>,
+    /// A write may be attributed only at its matching syscall-exit stop.
+    pending_writes: HashMap<i32, PendingWrite>,
+    /// Actual read dependencies and the physical identities reached by successful opens.
+    read_files: HashSet<PathBuf>,
+    read_inodes: HashMap<FileIdentity, HashSet<PathBuf>>,
+    read_routes: HashMap<PathBuf, PathBuf>,
+    written_files: HashMap<FileIdentity, HashSet<PathBuf>>,
+    uncertain_paths: HashSet<PathBuf>,
+    uncertain_inodes: HashSet<FileIdentity>,
+    resolving_write: bool,
+    linking: bool,
+    link_source: Option<(Option<PathBuf>, FileIdentity)>,
     /// The pid whose stop is being handled.
     current: i32,
     syscall: i64,
@@ -656,28 +736,7 @@ fn observe(rec: Option<&mut Rec<'_>>, t: &mut Trace, lex: PathBuf, how: Use) {
     let resolve = !lex.starts_with("/proc");
     let hash = !is_dynamic(&lex);
     let now = identity::now_ns();
-    let absent_before = matches!(
-        t.seen.as_ref().and_then(|seen| seen.get(&lex)),
-        Some(Seen::Absent)
-    );
-    let created_here = absent_before && t.is_output(&lex);
-    // A file the run wrote is its own output: a later read of it says nothing about the world.
-    let rechecked = how == Use::Content
-        && matches!(
-            t.seen.as_ref().and_then(|seen| seen.get(&lex)),
-            Some(before) if !matches!(before, Seen::Dir(_) | Seen::Absent)
-        );
-    let output = rechecked
-        && (t.is_output(&lex)
-            || matches!(
-                t.seen.as_ref().and_then(|seen| seen.get(&lex)),
-                Some(Seen::Symlink { resolved: Some(target), .. }) if t.is_output(target)
-            ));
-    // A file whose inode the run changed itself is not a change from outside.
-    let own_inode = matches!(
-        t.seen.as_ref().and_then(|seen| seen.get(&lex)),
-        Some(Seen::File(file)) if t.own_inodes.contains(&(file.stat.dev, file.stat.ino))
-    );
+    let rechecked = matches!(how, Use::Look | Use::Content);
     let Some(seen) = t.seen.as_mut() else { return };
     let mut changed = false;
     match seen.get_mut(&lex) {
@@ -689,14 +748,12 @@ fn observe(rec: Option<&mut Rec<'_>>, t: &mut Trace, lex: PathBuf, how: Use) {
             seen.insert(lex.clone(), fresh);
         }
         Some(Seen::Absent) => {
-            // Something absent may appear later. A path the run created is its own output.
-            changed = !created_here && !matches!(identity::observe(&lex, resolve), Seen::Absent);
+            // Name-only observations are write bookkeeping, not another lookup by the command.
+            changed = rechecked && !matches!(identity::observe(&lex, resolve), Seen::Absent);
         }
-        Some(before)
-            if how == Use::Content && !output && !own_inode && !matches!(before, Seen::Dir(_)) =>
-        {
+        Some(before) if rechecked && !matches!(before, Seen::Dir(_)) => {
             if identity::same_identity(before, &identity::observe(&lex, resolve)) {
-                if hash {
+                if how == Use::Content && hash {
                     rec.read_hash(before, &lex, now);
                 }
             } else {
@@ -712,54 +769,178 @@ fn observe(rec: Option<&mut Rec<'_>>, t: &mut Trace, lex: PathBuf, how: Use) {
 
 /// Record that `path` changed while the command was running, once.
 fn push_changed(t: &mut Trace, path: &Path) {
-    if !t
-        .changed_during
-        .iter()
-        .any(|changed| changed.as_path() == path)
-    {
-        t.changed_during.push(path.to_path_buf());
+    t.changed_during.insert(path.to_path_buf());
+}
+
+/// Resolve the destination without `Physical`'s cache, including every expanded symlink hop.
+/// An absent final name is allowed; an absent parent or an unreadable route is not.
+fn write_destination(raw: &Path, follows: bool) -> Option<PathBuf> {
+    use std::collections::VecDeque;
+
+    if !raw.is_absolute() {
+        return None;
     }
-}
-
-/// The physical paths of the symbolic links on the way to `raw`, when the write goes through one.
-/// A link that is an ancestor of the root (a system alias for a temporary directory, say) cannot be
-/// retargeted from inside the repository, so it does not count.
-fn crossed_links(root: &Path, raw: &Path, follows: bool) -> Vec<PathBuf> {
-    let Ok(root) = fs::canonicalize(root) else {
-        return Vec::new();
-    };
-    let mut hops: Vec<&Path> = raw.ancestors().skip(1).collect();
-    if follows {
-        hops.insert(0, raw);
-    }
-    hops.into_iter()
-        .filter(|hop| fs::symlink_metadata(hop).is_ok_and(|m| m.file_type().is_symlink()))
-        .filter(|hop| {
-            !fs::canonicalize(hop).is_ok_and(|target| target != root && root.starts_with(&target))
-        })
-        .filter_map(phys_link_path)
-        .collect()
-}
-
-/// The physical path of a symbolic link: its parent resolved, then its own name.
-fn phys_link_path(link: &Path) -> Option<PathBuf> {
-    let name = link.file_name()?;
-    let parent = fs::canonicalize(link.parent()?).ok()?;
-    Some(parent.join(name))
-}
-
-/// Record the inode a call is about to change, through the name it uses, so that the run's own
-/// change to it is not taken for a change from outside.
-fn note_inode(t: &mut Trace, path: &Path, follows: bool) {
-    let metadata = if follows {
-        fs::metadata(path)
-    } else {
-        fs::symlink_metadata(path)
-    };
-    if let Ok(metadata) = metadata {
-        if metadata.is_file() {
-            t.own_inodes.insert((metadata.dev(), metadata.ino()));
+    let mut parts: VecDeque<OsString> = raw
+        .as_os_str()
+        .as_bytes()
+        .split(|byte| *byte == b'/')
+        .filter(|part| !part.is_empty() && *part != b".")
+        .map(|part| OsString::from_vec(part.to_vec()))
+        .collect();
+    let mut current = PathBuf::from("/");
+    let mut links = 0;
+    while let Some(part) = parts.pop_front() {
+        if part.as_bytes() == b".." {
+            current.pop();
+            continue;
         }
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() && (follows || !parts.is_empty()) => {
+                links += 1;
+                if links > 40 {
+                    return None;
+                }
+                let target = fs::read_link(&current).ok()?;
+                current.pop();
+                if target.is_absolute() {
+                    current = PathBuf::from("/");
+                }
+                for component in target
+                    .as_os_str()
+                    .as_bytes()
+                    .split(|byte| *byte == b'/')
+                    .filter(|part| !part.is_empty() && *part != b".")
+                    .rev()
+                {
+                    parts.push_front(OsString::from_vec(component.to_vec()));
+                }
+            }
+            Ok(metadata) if !parts.is_empty() && !metadata.is_dir() => return None,
+            Ok(_) => {}
+            Err(error) if is_absent(&error) && parts.is_empty() => return Some(current),
+            Err(_) => return None,
+        }
+    }
+    Some(current)
+}
+
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    (metadata.dev(), metadata.ino())
+}
+
+/// The returned descriptor must identify both the expected physical name and object.
+fn verified_open(
+    expected: Option<&Path>,
+    actual: Option<&Path>,
+    before: Option<FileIdentity>,
+    after: Option<FileIdentity>,
+    may_have_created: bool,
+) -> bool {
+    expected.is_some()
+        && expected == actual
+        && after.is_some()
+        && (before.is_some_and(|id| after == Some(id)) || (before.is_none() && may_have_created))
+}
+
+fn same_rename_stat(before: &identity::FileStat, after: &identity::FileStat) -> bool {
+    (
+        before.dev,
+        before.ino,
+        before.size,
+        before.mode,
+        before.mtime_ns,
+    ) == (after.dev, after.ino, after.size, after.mode, after.mtime_ns)
+}
+
+fn verified_rename_snapshot(before: &identity::FileSeen, after: &identity::FileSeen) -> bool {
+    same_rename_stat(&before.stat, &after.stat)
+        && matches!(
+            (&before.read_hash, &after.read_hash),
+            (identity::ReadHash::Hashed(a), identity::ReadHash::Hashed(b)) if a == b
+        )
+}
+
+/// The path-only checks detect persistent alias retargets and inconsistent post-state. They cannot
+/// rule out a foreign retarget and restoration during the syscall because it returns no descriptor.
+fn verified_path_mutation(path: &PendingPath, all: &[PendingPath]) -> bool {
+    let Some(expected) = path.expected.as_deref() else {
+        return false;
+    };
+    if write_destination(&path.raw, path.follows).as_deref() != Some(expected) {
+        return false;
+    }
+    let after = fs::symlink_metadata(expected);
+    match &path.kind {
+        WriteKind::Create { directory } => {
+            path.absent && after.as_ref().is_ok_and(|m| m.is_dir() == *directory)
+        }
+        WriteKind::Symlink { target } => {
+            path.absent
+                && after.as_ref().is_ok_and(|m| m.file_type().is_symlink())
+                && target.as_ref().is_some_and(|target| {
+                    fs::read_link(expected)
+                        .is_ok_and(|actual| actual.as_os_str() == target.as_os_str())
+                })
+        }
+        WriteKind::Link { source } => {
+            path.absent
+                && source
+                    .as_ref()
+                    .is_some_and(|(_, id)| after.as_ref().is_ok_and(|m| file_identity(m) == *id))
+        }
+        WriteKind::Remove => {
+            path.before.is_some()
+                && match after {
+                    Err(error) => is_absent(&error),
+                    Ok(metadata) => Some(file_identity(&metadata)) != path.before,
+                }
+        }
+        WriteKind::Rename {
+            source,
+            exchange,
+            supported,
+        } => {
+            if !*supported {
+                return false;
+            }
+            let other = all.iter().find(|candidate| {
+                matches!(&candidate.kind, WriteKind::Rename { source: side, exchange: other_exchange, supported: true }
+                    if side != source && other_exchange == exchange)
+            });
+            let Some(other) = other else { return false };
+            let Some(other_path) = other.expected.as_deref() else {
+                return false;
+            };
+            if write_destination(&other.raw, other.follows).as_deref() != Some(other_path) {
+                return false;
+            }
+            let (from, to, from_after, to_after) = if *source {
+                (path, other, after, fs::symlink_metadata(other_path))
+            } else {
+                (other, path, fs::symlink_metadata(other_path), after)
+            };
+            let Some(from_id) = from.before else {
+                return false;
+            };
+            let destination_matches = to_after.as_ref().is_ok_and(|m| file_identity(m) == from_id);
+            let source_matches = if *exchange {
+                to.before
+                    .is_some_and(|id| from_after.as_ref().is_ok_and(|m| file_identity(m) == id))
+            } else {
+                match from_after {
+                    Err(error) => is_absent(&error),
+                    Ok(metadata) => file_identity(&metadata) != from_id,
+                }
+            };
+            destination_matches && source_matches
+        }
+        WriteKind::Modify => path.before.is_some_and(|before| {
+            after
+                .as_ref()
+                .is_ok_and(|metadata| file_identity(metadata) == before)
+        }),
+        WriteKind::Open { .. } => false,
     }
 }
 
@@ -843,7 +1024,16 @@ pub fn run<'a>(
         magic_epoch: 0,
         magic_cache: HashMap::new(),
         pending_topology: HashSet::new(),
-        writing: HashMap::new(),
+        pending_writes: HashMap::new(),
+        read_files: HashSet::new(),
+        read_inodes: HashMap::new(),
+        read_routes: HashMap::new(),
+        written_files: HashMap::new(),
+        uncertain_paths: HashSet::new(),
+        uncertain_inodes: HashSet::new(),
+        resolving_write: false,
+        linking: false,
+        link_source: None,
         current: 0,
         syscall: 0,
         execs: observe_execs.then(|| ExecObserver::new(pid)),
@@ -952,13 +1142,15 @@ pub fn run<'a>(
             }
         }
         wait_failed = false;
-        // Topology syscalls resume with PTRACE_SYSCALL, so their next syscall
-        // stop occurs after the kernel has applied or rejected the mutation.
+        // A write gets an additional syscall-exit stop before it can be attributed.
         let syscall_exit = libc::WIFSTOPPED(st) && libc::WSTOPSIG(st) == (libc::SIGTRAP | 0x80);
         tr.current = p;
-        if syscall_exit || libc::WIFEXITED(st) || libc::WIFSIGNALED(st) {
+        if syscall_exit {
             tr.after_topology_stop(p);
-            tr.after_write_stop(p);
+            tr.complete_write(p);
+        } else if libc::WIFEXITED(st) || libc::WIFSIGNALED(st) {
+            tr.after_topology_stop(p);
+            tr.discard_write(p);
         }
         if libc::WIFEXITED(st) {
             if p == pid {
@@ -1008,7 +1200,7 @@ pub fn run<'a>(
                 resume(
                     p,
                     pass,
-                    tr.pending_topology.contains(&p) || tr.writing.contains_key(&p),
+                    tr.pending_topology.contains(&p) || tr.pending_writes.contains_key(&p),
                 );
             }
             e if e == libc::PTRACE_EVENT_SECCOMP => {
@@ -1016,23 +1208,30 @@ pub fn run<'a>(
                 resume(
                     p,
                     0,
-                    tr.pending_topology.contains(&p) || tr.writing.contains_key(&p),
+                    tr.pending_topology.contains(&p) || tr.pending_writes.contains_key(&p),
                 );
             }
             libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
                 if let Some(execs) = &mut tr.execs {
                     execs.fork(p);
                 }
-                cont(p, 0);
+                resume(p, 0, tr.pending_writes.contains_key(&p));
             }
             e if e == libc::PTRACE_EVENT_EXEC => {
+                if let Some(former) = event_message(p) {
+                    tr.discard_write(former);
+                }
+                tr.discard_write(p);
                 if let Some(execs) = &mut tr.execs {
                     execs.exec(p);
                 }
                 cont(p, 0);
             }
-            _ => cont(p, 0),
+            _ => resume(p, 0, tr.pending_writes.contains_key(&p)),
         }
+    }
+    if !tr.pending_writes.is_empty() {
+        tr.flag("it lost the exit stop of a pending write");
     }
     tr.t.execs = tr.execs.and_then(ExecObserver::finish);
     Ok(tr.t)
@@ -1569,13 +1768,6 @@ fn push_reason(t: &mut Trace, why: String) {
     }
 }
 
-/// A reason the run is not recorded. Unlike `push_reason`, it refuses the record.
-fn push_unsound(t: &mut Trace, why: String) {
-    if t.unsound.len() < MAX_REASONS && !t.unsound.contains(&why) {
-        t.unsound.push(why);
-    }
-}
-
 impl Rec<'_> {
     /// Whether a write, a namespace change or an owner change at `raw` can change what Git reads
     /// for attributes or configuration. The watched set names those files (see `oid_attrs`), so
@@ -1740,53 +1932,33 @@ impl Rec<'_> {
         }
     }
 
-    /// Record a write to `raw` (absolute, possibly with `..`). `follows` indicates
-    /// whether a symlink at `raw` is followed. Returns the key when in scope.
-    fn write(&mut self, t: &mut Trace, raw: &Path, follows: bool) -> Option<String> {
+    /// Capture the prior at entry; the caller adds the output key only after a verified exit.
+    fn write(&mut self, t: &mut Trace, raw: &Path, destination: &Path) -> Option<String> {
         let lex = absolutize(Path::new("/"), raw);
         self.forget_walks(&lex);
         self.forget_walks(raw);
         self.phys.forget(&lex);
         self.phys.forget(raw);
-        let mut target = raw.to_path_buf();
-        if follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink()) {
-            // The write lands on the link's target, which is not named here. A link whose
-            // link and target are both outside the repository is nothing to record.
-            let resolved = fs::canonicalize(raw).ok();
-            let link_path = self.phys.locate(raw)?.path;
-            let link_in_scope = self.key_of(&link_path, t).is_some();
-            let target_in_scope = match &resolved {
-                Some(r) => {
-                    let target_path = self.phys.locate(r)?.path;
-                    self.key_of(&target_path, t).is_some()
-                }
-                None => false,
-            };
-            if !link_in_scope && !target_in_scope {
-                return None;
-            }
-            let link = self.key_text(&lex);
-            push_reason(t, format!("it wrote through the symlink {link}"));
-            target = resolved?;
+        self.forget_walks(destination);
+        self.phys.forget(destination);
+        let key = self.key_of(destination, t)?;
+        if fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink()) {
+            push_reason(
+                t,
+                format!("it wrote through the symlink {}", self.key_text(&lex)),
+            );
         }
-        let loc = self.phys.locate(&target)?;
-        self.forget_walks(&loc.path);
-        self.phys.forget(&loc.path);
-        let key = self.key_of(&loc.path, t)?;
         for link in self.links_below_root(raw).unwrap_or_default() {
             let name = to_key(self.phys.real(), &link);
-            observe(Some(&mut *self), t, link, Use::Look);
+            observe(Some(&mut *self), t, link, Use::Name);
             push_reason(t, format!("it wrote through the symlink {name}"));
         }
         if !t.priors.contains_key(&key) {
-            // A create fails when its parent is missing or is not a directory. A later commit
-            // that adds the parent would change that outcome, so the parent's state is recorded.
-            self.parent_prior(t, &loc.path);
-            if let Some(id) = self.prior_id(t, &loc.path, &key) {
+            self.parent_prior(t, destination);
+            if let Some(id) = self.prior_id(t, destination, &key) {
                 t.priors.insert(key.clone(), id);
             }
         }
-        t.keys.insert(loc.path, key.clone());
         Some(key)
     }
 
@@ -2058,8 +2230,13 @@ impl Tracer<'_> {
                 parts.push_front(part);
             }
         }
+        let link_use = if self.resolving_write {
+            Use::Name
+        } else {
+            Use::Look
+        };
         for link in repository_links.clone() {
-            self.observe(link, Use::Look);
+            self.observe(link, link_use);
         }
         // A final-component symlink can be retargeted or removed later in this run.
         // Preserve its call-time in-repository target instead of relying on the
@@ -2070,7 +2247,7 @@ impl Tracer<'_> {
                 .as_ref()
                 .is_some_and(|r| r.phys.repo_rel(&current).is_some())
         {
-            self.observe(current.clone(), Use::Look);
+            self.observe(current.clone(), link_use);
         }
         self.magic_cache.insert(parent, (self.magic_epoch, magic));
         if magic {
@@ -2129,11 +2306,143 @@ impl Tracer<'_> {
         }
     }
 
+    /// Read/write ordering is tracked separately from the synthetic observations used to
+    /// describe a write's link route. Inode identity also joins distinct hard-link names.
+    fn note_real_read(&mut self, raw: &Path, how: Use) {
+        if self.rec.is_none() || is_dynamic(raw) {
+            return;
+        }
+        let Some(physical) = write_destination(raw, true) else {
+            return;
+        };
+        let metadata = fs::metadata(raw).ok();
+        if metadata.as_ref().is_some_and(|m| {
+            let kind = m.file_type();
+            kind.is_char_device() || kind.is_block_device() || kind.is_fifo() || kind.is_socket()
+        }) {
+            return;
+        }
+        if let Some(first) = self.read_routes.get(raw) {
+            if first != &physical {
+                let first = first.clone();
+                push_changed(&mut self.t, &first);
+                push_changed(&mut self.t, &physical);
+            }
+        } else {
+            self.read_routes.insert(raw.to_path_buf(), physical.clone());
+        }
+        let inode = metadata.as_ref().map(file_identity);
+        let already_written = self.t.landed.contains(&physical)
+            || self.uncertain_paths.contains(&physical)
+            || inode.is_some_and(|id| {
+                self.written_files.contains_key(&id) || self.uncertain_inodes.contains(&id)
+            })
+            || self.pending_writes.values().any(|pending| {
+                pending.paths.iter().any(|path| {
+                    path.expected.as_ref() == Some(&physical)
+                        || inode.is_some_and(|id| path.before == Some(id))
+                })
+            });
+        if already_written {
+            self.t.read_write_conflicts.insert(physical.clone());
+            if let Some(written) = inode.and_then(|id| self.written_files.get(&id)) {
+                self.t.read_write_conflicts.extend(written.iter().cloned());
+            }
+            for pending in self.pending_writes.values() {
+                for path in &pending.paths {
+                    if path.expected.as_ref() == Some(&physical)
+                        || inode.is_some_and(|id| path.before == Some(id))
+                    {
+                        if let Some(destination) = &path.expected {
+                            self.t.read_write_conflicts.insert(destination.clone());
+                        }
+                    }
+                }
+            }
+        }
+        self.read_files.insert(physical.clone());
+        if let Some(id) = inode {
+            self.read_inodes
+                .entry(id)
+                .or_default()
+                .insert(physical.clone());
+        }
+        if physical != raw {
+            observe(self.rec.as_mut(), &mut self.t, raw.to_path_buf(), how);
+            observe(self.rec.as_mut(), &mut self.t, physical, how);
+        }
+    }
+
+    fn observe_fd_look(&mut self, pid: i32, fd: i32) {
+        if self.rec.is_none() {
+            return;
+        }
+        let fd_path = format!("/proc/{pid}/fd/{fd}");
+        let path = if fd == AT_FDCWD {
+            self.cwd(pid)
+        } else {
+            fs::read_link(&fd_path).ok()
+        };
+        let Some(path) = path.filter(|path| path.is_absolute()) else {
+            return;
+        };
+        let metadata = if fd == AT_FDCWD {
+            fs::metadata(&path).ok()
+        } else {
+            fs::metadata(&fd_path).ok()
+        };
+        let inode = metadata.as_ref().map(file_identity);
+        if let Some(written) = inode.and_then(|id| self.written_files.get(&id)) {
+            self.t.read_write_conflicts.extend(written.iter().cloned());
+        }
+        for pending in self.pending_writes.values() {
+            for pending_path in &pending.paths {
+                if inode.is_some_and(|id| pending_path.before == Some(id)) {
+                    if let Some(destination) = &pending_path.expected {
+                        self.t.read_write_conflicts.insert(destination.clone());
+                    }
+                }
+            }
+        }
+        let bytes = path.as_os_str().as_bytes();
+        if let Some(name) = bytes.strip_suffix(b" (deleted)") {
+            let physical = PathBuf::from(OsString::from_vec(name.to_vec()));
+            // The descriptor still names an inode even after its last pathname was removed.
+            if self.t.landed.contains(&physical)
+                || inode.is_some_and(|id| {
+                    self.written_files.contains_key(&id) || self.uncertain_inodes.contains(&id)
+                })
+            {
+                self.t.read_write_conflicts.insert(physical);
+            } else if self
+                .rec
+                .as_ref()
+                .and_then(|rec| rec.key_of(&physical, &mut self.t))
+                .is_some()
+            {
+                self.flag("it looked at a deleted file descriptor");
+            }
+        } else {
+            if inode.is_some() && fs::metadata(&path).ok().as_ref().map(file_identity) != inode {
+                push_changed(&mut self.t, &path);
+            }
+            self.touch(path, Use::Look);
+        }
+    }
+
     fn touch(&mut self, lex: PathBuf, how: Use) {
+        if matches!(how, Use::Look | Use::Content) {
+            self.note_real_read(&lex, how);
+        }
         let mut path = lex;
         if let Some(rec) = &mut self.rec {
             for link in rec.links_below_root(&path).unwrap_or_default() {
-                observe(Some(&mut *rec), &mut self.t, link, Use::Look);
+                let link_use = if how == Use::Name {
+                    Use::Name
+                } else {
+                    Use::Look
+                };
+                observe(Some(&mut *rec), &mut self.t, link, link_use);
             }
             // Record observations where the call resolved them, not after the run.
             if let Some(loc) = rec.phys.locate(&path) {
@@ -2187,24 +2496,29 @@ impl Tracer<'_> {
     /// The names of a listed directory, counted against the run's cap. A directory that cannot be
     /// read, or a run past the cap, refuses the record.
     fn read_listing(&mut self, dir: &Path) -> Option<identity::Names> {
-        let Some(names) = identity::read_names(dir) else {
-            let key = self
-                .rec
-                .as_ref()
-                .map(|rec| rec.key_text(dir))
-                .unwrap_or_default();
-            self.flag(&format!("could not read the entries of {key}"));
-            return None;
-        };
-        if self.t.listed_names + names.len() > identity::MAX_LISTED_NAMES {
-            self.flag(&format!(
-                "it listed more than {} directory entries",
-                identity::MAX_LISTED_NAMES
-            ));
-            return None;
+        let remaining = identity::MAX_LISTED_NAMES.saturating_sub(self.t.listed_names);
+        match identity::read_names_capped(dir, remaining) {
+            identity::NameSnapshot::Names { names, entries } => {
+                self.t.listed_names += entries;
+                Some(names)
+            }
+            identity::NameSnapshot::OverCap => {
+                self.flag(&format!(
+                    "it listed more than {} directory entries",
+                    identity::MAX_LISTED_NAMES
+                ));
+                None
+            }
+            identity::NameSnapshot::Unreadable => {
+                let key = self
+                    .rec
+                    .as_ref()
+                    .map(|rec| rec.key_text(dir))
+                    .unwrap_or_default();
+                self.flag(&format!("could not read the entries of {key}"));
+                None
+            }
         }
-        self.t.listed_names += names.len();
-        Some(names)
     }
 
     /// Before the run's first change to a listed directory, pin what the listing showed. A directory
@@ -2244,33 +2558,21 @@ impl Tracer<'_> {
         self.pin_listing(&loc.path);
     }
 
-    /// A change the run makes to an entry: its name is the run's own in the entry's directory, and
-    /// any listing of that directory is pinned before the change.
-    fn note_entry_change(&mut self, raw: &Path, follows: bool) {
-        let through_link =
-            follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink());
-        let Some(rec) = self.rec.as_mut() else {
-            return;
-        };
-        // A write through a link lands on what the link names.
-        let entry = if through_link {
-            fs::canonicalize(raw).unwrap_or_else(|_| raw.to_path_buf())
-        } else {
-            raw.to_path_buf()
-        };
-        let Some(loc) = rec.phys.locate(&entry) else {
-            return;
-        };
-        let (Some(dir), Some(name)) = (loc.path.parent(), loc.path.file_name()) else {
-            return;
-        };
-        let dir = dir.to_path_buf();
-        self.t
-            .own_names
-            .entry(dir.clone())
-            .or_default()
-            .insert(name.as_encoded_bytes().into());
-        self.pin_listing(&dir);
+    /// Pin a listing before a possible namespace mutation. Ownership is decided at exit.
+    fn note_entry_change(&mut self, entry: &Path) {
+        if let Some(dir) = entry.parent() {
+            self.pin_listing(dir);
+        }
+    }
+
+    fn mark_entry_change(&mut self, entry: &Path) {
+        if let (Some(dir), Some(name)) = (entry.parent(), entry.file_name()) {
+            self.t
+                .own_names
+                .entry(dir.to_path_buf())
+                .or_default()
+                .insert(name.as_encoded_bytes().into());
+        }
     }
 
     /// The kernel loads shebang and ELF interpreters without a traceable open syscall.
@@ -2334,11 +2636,290 @@ impl Tracer<'_> {
             return;
         }
     }
+    /// Compare a prior real read at the first write stop. Hard-link aliases are not equivalent:
+    /// an outside writer can restore one after our write and make both prior and output match.
+    fn capture_read_prior(
+        &mut self,
+        destination: &Path,
+        before: Option<FileIdentity>,
+    ) -> Vec<PathBuf> {
+        if let Some(reads) = before.and_then(|id| self.read_inodes.get(&id)) {
+            for read in reads.iter().filter(|read| read.as_path() != destination) {
+                self.t.read_write_conflicts.insert(read.clone());
+                self.t
+                    .read_write_conflicts
+                    .insert(destination.to_path_buf());
+            }
+        }
+        if !self.read_files.contains(destination) || self.t.read_before_write.contains(destination)
+        {
+            return Vec::new();
+        }
+        let in_flight = self.pending_writes.values().any(|pending| {
+            pending.paths.iter().any(|path| {
+                path.expected.as_deref() == Some(destination)
+                    || before.is_some_and(|id| path.before == Some(id))
+            })
+        });
+        if in_flight
+            || self.t.landed.contains(destination)
+            || before.is_some_and(|id| self.written_files.contains_key(&id))
+        {
+            self.t
+                .read_write_conflicts
+                .insert(destination.to_path_buf());
+            return Vec::new();
+        }
+        let Some(seen) = self
+            .t
+            .seen
+            .as_ref()
+            .and_then(|seen| seen.get(destination))
+            .cloned()
+        else {
+            self.t
+                .read_write_conflicts
+                .insert(destination.to_path_buf());
+            return Vec::new();
+        };
+        if !matches!(&seen, Seen::File(_) | Seen::Absent) {
+            self.t
+                .read_write_conflicts
+                .insert(destination.to_path_buf());
+            return Vec::new();
+        }
+        let Some(rec) = self.rec.as_mut() else {
+            return Vec::new();
+        };
+        let Some(key) = rec.key_of(destination, &mut self.t) else {
+            self.t
+                .read_write_conflicts
+                .insert(destination.to_path_buf());
+            return Vec::new();
+        };
+        let prior_bytes = match &seen {
+            Seen::File(file) => file.stat.size,
+            _ => 0,
+        };
+        let new_prior = !self.t.priors.contains_key(&key);
+        if prior_bytes > MAX_FILE_BYTES
+            || (new_prior && rec.hashed.saturating_add(prior_bytes) > MAX_RUN_BYTES)
+        {
+            self.t
+                .read_write_conflicts
+                .insert(destination.to_path_buf());
+            return Vec::new();
+        }
+        if !identity::still_holds(&seen, destination, &mut rec.reads) {
+            push_changed(&mut self.t, destination);
+            return Vec::new();
+        }
+        let prior = match &seen {
+            Seen::Absent => Some("a".to_string()),
+            Seen::File(file) => match &file.read_hash {
+                identity::ReadHash::Hashed(hash) => {
+                    Some(file_id(file.stat.mode & 0o111 != 0, hash))
+                }
+                identity::ReadHash::NotNeeded => {
+                    match identity::hash_bound(destination, &file.stat, &mut rec.reads) {
+                        identity::ReadHash::Hashed(hash) => {
+                            Some(file_id(file.stat.mode & 0o111 != 0, &hash))
+                        }
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        let Some(prior) = prior else {
+            self.t
+                .read_write_conflicts
+                .insert(destination.to_path_buf());
+            return Vec::new();
+        };
+        if self
+            .t
+            .priors
+            .get(&key)
+            .is_some_and(|existing| existing != &prior)
+        {
+            push_changed(&mut self.t, destination);
+            return Vec::new();
+        }
+        if new_prior {
+            rec.hashed += prior_bytes;
+        }
+        self.t.priors.entry(key).or_insert(prior);
+        vec![destination.to_path_buf()]
+    }
+    fn invalidate_settled(&mut self, destination: Option<&Path>, inode: Option<FileIdentity>) {
+        if let Some(destination) = destination {
+            self.t.settled_outputs.remove(destination);
+        }
+        if let Some(paths) = inode.and_then(|id| self.written_files.get(&id)) {
+            for path in paths {
+                self.t.settled_outputs.remove(path);
+            }
+        }
+    }
 
-    /// Record a write, and what the path held before the first one. Returns the key when in scope.
-    fn write(&mut self, raw: &Path, follows: bool) -> Option<String> {
+    /// Snapshot a rename source before the kernel acts only when its destination was read.
+    fn prepare_rename_evidence(&mut self, pid: i32) {
+        let Some(pending) = self.pending_writes.get(&pid) else {
+            return;
+        };
+        let Some((source_index, source)) = pending
+            .paths
+            .iter()
+            .enumerate()
+            .find(|(_, path)| matches!(&path.kind, WriteKind::Rename { source: true, .. }))
+        else {
+            return;
+        };
+        let Some((target_index, target)) = pending
+            .paths
+            .iter()
+            .enumerate()
+            .find(|(_, path)| matches!(&path.kind, WriteKind::Rename { source: false, .. }))
+        else {
+            return;
+        };
+        let exchange = matches!(&source.kind, WriteKind::Rename { exchange: true, .. });
+        let needs = |path: &PendingPath| {
+            !path.read_priors.is_empty()
+                || path
+                    .expected
+                    .as_ref()
+                    .is_some_and(|p| self.t.read_before_write.contains(p))
+        };
+        let mut captures = Vec::new();
+        if needs(target) {
+            if let (Some(path), Some(id)) = (&source.expected, source.before) {
+                captures.push((source_index, path.clone(), id));
+            }
+        }
+        if exchange && needs(source) {
+            if let (Some(path), Some(id)) = (&target.expected, target.before) {
+                captures.push((target_index, path.clone(), id));
+            }
+        }
+        for (index, path, expected) in captures {
+            let mut seen = identity::observe(&path, true);
+            let Seen::File(file) = &mut seen else {
+                continue;
+            };
+            if (file.stat.dev, file.stat.ino) != expected {
+                continue;
+            }
+            let Some(rec) = self.rec.as_mut() else {
+                continue;
+            };
+            file.read_hash = identity::hash_bound(&path, &file.stat, &mut rec.reads);
+            if !matches!(&file.read_hash, identity::ReadHash::Hashed(_)) {
+                continue;
+            }
+            if let Some(pending) = self.pending_writes.get_mut(&pid) {
+                pending.paths[index].rename_before = Some(seen);
+            }
+        }
+    }
+
+    /// Bind the renamed destination to the source bytes observed before rename.
+    fn rename_output_snapshot(&mut self, destination: &Path, before: &Seen) -> Option<Seen> {
+        let Seen::File(before) = before else {
+            return None;
+        };
+        let mut seen = identity::observe(destination, true);
+        let Seen::File(after) = &mut seen else {
+            return None;
+        };
+        if !same_rename_stat(&before.stat, &after.stat) {
+            return None;
+        }
+        let rec = self.rec.as_mut()?;
+        let hash = identity::hash_bound(destination, &after.stat, &mut rec.reads);
+        after.read_hash = hash;
+        if !verified_rename_snapshot(before, after) {
+            return None;
+        }
+        Some(seen)
+    }
+
+    fn rename_snapshots(&mut self, paths: &[PendingPath]) -> Vec<(PathBuf, Seen)> {
+        let mut snapshots = Vec::new();
+        for path in paths {
+            let WriteKind::Rename {
+                source, exchange, ..
+            } = &path.kind
+            else {
+                continue;
+            };
+            if *source && !*exchange {
+                continue;
+            }
+            let Some(destination) = &path.expected else {
+                continue;
+            };
+            if path.read_priors.is_empty() && !self.t.read_before_write.contains(destination) {
+                continue;
+            }
+            let Some(other) = paths.iter().find(|candidate| {
+                matches!(&candidate.kind, WriteKind::Rename { source: side, .. } if side != source)
+            }) else { continue };
+            let Some(before) = &other.rename_before else {
+                continue;
+            };
+            let inode = match before {
+                Seen::File(file) => Some((file.stat.dev, file.stat.ino)),
+                _ => None,
+            };
+            if self.pending_writes.values().any(|pending| {
+                pending.paths.iter().any(|other| {
+                    other.expected.as_ref() == Some(destination)
+                        || inode.is_some_and(|id| other.before == Some(id))
+                })
+            }) {
+                continue;
+            }
+            if let Some(seen) = self.rename_output_snapshot(destination, before) {
+                snapshots.push((destination.clone(), seen));
+            }
+        }
+        snapshots
+    }
+
+    /// Capture entry state without granting ownership. Only a verified successful exit can land it.
+    fn write(&mut self, raw: &Path, follows: bool, kind: WriteKind) -> Option<String> {
         self.rec.as_ref()?;
-        self.note_entry_change(raw, follows);
+        if is_dynamic(raw) {
+            return None;
+        }
+        let expected = write_destination(raw, follows);
+        if expected.as_deref().is_some_and(is_dynamic) {
+            return None;
+        }
+        let metadata = expected.as_deref().map(fs::symlink_metadata);
+        if metadata
+            .as_ref()
+            .and_then(|m| m.as_ref().ok())
+            .is_some_and(|m| {
+                let kind = m.file_type();
+                kind.is_char_device()
+                    || kind.is_block_device()
+                    || kind.is_fifo()
+                    || kind.is_socket()
+            })
+        {
+            return None;
+        }
+        let absent = metadata
+            .as_ref()
+            .is_some_and(|m| m.as_ref().is_err_and(is_absent));
+        let before = metadata
+            .as_ref()
+            .and_then(|m| m.as_ref().ok())
+            .map(file_identity);
         if !self.t.oid_attrs_changed
             && self
                 .rec
@@ -2347,35 +2928,270 @@ impl Tracer<'_> {
         {
             self.t.oid_attrs_changed = true;
         }
-        // A write through a link changes what the link points to, not the link itself.
-        let through_link =
-            follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink());
-        note_inode(&mut self.t, raw, follows);
-        if !through_link {
-            self.t.written.insert(raw.to_path_buf());
-        } else {
-            // A write through a dangling link creates what the link names: that path is the run's own output.
-            if fs::canonicalize(raw).is_err() {
-                if let Ok(named) = fs::read_link(raw) {
-                    let parent = raw.parent().unwrap_or(Path::new("/"));
-                    self.t.written.insert(absolutize(parent, &named));
+        self.touch(raw.to_path_buf(), Use::Name);
+        self.invalidate_settled(expected.as_deref(), before);
+        if let Some(destination) = &expected {
+            if kind.changes_entry(absent) {
+                self.note_entry_change(destination);
+                if let Some(parent) = destination.parent() {
+                    if self.read_files.contains(parent) {
+                        self.t.read_write_conflicts.insert(parent.to_path_buf());
+                    }
                 }
             }
-            self.touch(raw.to_path_buf(), Use::Look);
+            if self
+                .t
+                .touched
+                .get(destination)
+                .is_some_and(|touch| touch.read)
+                && self
+                    .t
+                    .seen
+                    .as_ref()
+                    .and_then(|seen| seen.get(destination))
+                    .is_some_and(|seen| matches!(seen, Seen::Symlink { .. }))
+            {
+                self.t.read_write_conflicts.insert(destination.clone());
+            }
         }
+        if let WriteKind::Link {
+            source: Some((_, id)),
+        } = &kind
+        {
+            self.invalidate_settled(None, Some(*id));
+            if let Some(reads) = self.read_inodes.get(id) {
+                self.t.read_write_conflicts.extend(reads.iter().cloned());
+                if let Some(destination) = &expected {
+                    self.t.read_write_conflicts.insert(destination.clone());
+                }
+            }
+        }
+        let read_priors = expected
+            .as_deref()
+            .map(|destination| self.capture_read_prior(destination, before))
+            .unwrap_or_default();
         let rec = self.rec.as_mut()?;
-        let key = rec.write(&mut self.t, raw, follows)?;
-        let crossed = crossed_links(&rec.root, raw, follows);
-        if !crossed.is_empty() {
-            self.writing.insert(self.current, crossed);
-        }
-        if rec.redirected_reads.contains(&key) {
+        let key = expected
+            .as_deref()
+            .and_then(|destination| rec.write(&mut self.t, raw, destination))
+            .or_else(|| {
+                expected
+                    .is_none()
+                    .then(|| rec.key_of(raw, &mut self.t))
+                    .flatten()
+            });
+        if key
+            .as_ref()
+            .is_some_and(|key| rec.redirected_reads.contains(key))
+        {
             push_reason(
                 &mut self.t,
-                format!("it read {key} through a directory alias and also wrote it"),
+                format!(
+                    "it read {} through a directory alias and also wrote it",
+                    key.as_ref().unwrap()
+                ),
             );
         }
-        Some(key)
+        let pending = self
+            .pending_writes
+            .entry(self.current)
+            .or_insert_with(|| PendingWrite {
+                syscall: self.syscall,
+                paths: Vec::new(),
+            });
+        pending.paths.push(PendingPath {
+            raw: raw.to_path_buf(),
+            expected,
+            follows,
+            key: key.clone(),
+            before,
+            absent,
+            read_priors,
+            rename_before: None,
+            kind,
+        });
+        key
+    }
+
+    fn discard_write(&mut self, pid: i32) {
+        if let Some(pending) = self.pending_writes.remove(&pid) {
+            for path in pending.paths {
+                self.uncertain_write(&path);
+                self.refuse_landing(&path);
+            }
+        }
+    }
+
+    fn uncertain_write(&mut self, path: &PendingPath) {
+        if let Some(expected) = &path.expected {
+            self.uncertain_paths.insert(expected.clone());
+            if path.kind.changes_entry(path.absent) {
+                if let Some(parent) = expected.parent() {
+                    self.uncertain_paths.insert(parent.to_path_buf());
+                }
+            }
+        }
+        if let Some(id) = path.before {
+            self.uncertain_inodes.insert(id);
+        }
+    }
+
+    fn refuse_landing(&mut self, path: &PendingPath) {
+        if self
+            .t
+            .touched
+            .get(&path.raw)
+            .is_some_and(|touch| touch.read || touch.listed)
+        {
+            self.t.read_write_conflicts.insert(path.raw.clone());
+        }
+        if path.key.is_some() || path.expected.is_none() {
+            let name = path
+                .key
+                .clone()
+                .unwrap_or_else(|| path.raw.display().to_string());
+            self.flag(&format!(
+                "it could not confirm where its change to {name} landed"
+            ));
+        }
+    }
+
+    fn complete_write(&mut self, pid: i32) {
+        let Some(pending) = self.pending_writes.remove(&pid) else {
+            return;
+        };
+        let Some(regs) = get_regs(pid) else {
+            self.flag("could not read registers at a write exit");
+            return;
+        };
+        if decode(&regs).0 != pending.syscall {
+            self.flag("it lost the exit stop of a pending write");
+            return;
+        }
+        let result = syscall_result(&regs);
+        if result < 0 {
+            // Internal restart results may resume a syscall after a signal rather than fail it.
+            if matches!(result, -512 | -513 | -514 | -516) {
+                for path in pending.paths {
+                    self.uncertain_write(&path);
+                    self.refuse_landing(&path);
+                }
+            }
+            return;
+        }
+        if !matches!(
+            pending.paths.first().map(|path| &path.kind),
+            Some(WriteKind::Open { .. })
+        ) {
+            let verified = !pending.paths.is_empty()
+                && pending
+                    .paths
+                    .iter()
+                    .all(|path| verified_path_mutation(path, &pending.paths));
+            let snapshots = if verified {
+                self.rename_snapshots(&pending.paths)
+            } else {
+                Vec::new()
+            };
+            for path in pending.paths {
+                if verified {
+                    let after = path
+                        .expected
+                        .as_deref()
+                        .and_then(|destination| fs::symlink_metadata(destination).ok())
+                        .as_ref()
+                        .map(file_identity);
+                    self.land_write(path, after, true);
+                } else {
+                    self.uncertain_write(&path);
+                    self.refuse_landing(&path);
+                }
+            }
+            self.t.settled_outputs.extend(snapshots);
+            return;
+        }
+
+        for path in pending.paths {
+            let (creates, exclusive) = match &path.kind {
+                WriteKind::Open { creates, exclusive } => (*creates, *exclusive),
+                _ => {
+                    self.uncertain_write(&path);
+                    self.refuse_landing(&path);
+                    continue;
+                }
+            };
+            let fd = format!("/proc/{pid}/fd/{result}");
+            let actual = fs::read_link(&fd)
+                .ok()
+                .filter(|p| p.is_absolute() && !p.as_os_str().as_bytes().ends_with(b" (deleted)"));
+            let metadata = fs::metadata(&fd).ok();
+            let actual_identity = metadata.as_ref().map(file_identity);
+            let may_have_created = creates && path.absent;
+            if !verified_open(
+                path.expected.as_deref(),
+                actual.as_deref(),
+                path.before,
+                actual_identity,
+                may_have_created,
+            ) {
+                if let Some(actual) = actual {
+                    let actual_key = self
+                        .rec
+                        .as_ref()
+                        .and_then(|rec| rec.key_of(&actual, &mut self.t));
+                    if let Some(actual_key) = actual_key {
+                        self.flag(&format!(
+                            "it could not confirm where its change to {actual_key} landed"
+                        ));
+                    }
+                    self.uncertain_paths.insert(actual);
+                }
+                if let Some(id) = actual_identity {
+                    self.uncertain_inodes.insert(id);
+                }
+                self.uncertain_write(&path);
+                self.refuse_landing(&path);
+                continue;
+            }
+            // Without O_EXCL another writer may have created the name after entry. The fd proves
+            // the output destination, but not who created the name or the captured absent prior.
+            self.land_write(path, actual_identity, may_have_created && exclusive);
+        }
+    }
+
+    fn land_write(&mut self, path: PendingPath, after: Option<FileIdentity>, mark_name: bool) {
+        if let WriteKind::Link {
+            source: Some((Some(source), _)),
+        } = &path.kind
+        {
+            // A link source is bookkeeping, not a read by the command. Capture its post-link ctime
+            // only when no earlier real observation exists; observe() preserves an earlier one.
+            observe(self.rec.as_mut(), &mut self.t, source.clone(), Use::Name);
+        }
+        let Some(destination) = path.expected else {
+            self.flag("it could not confirm where its change landed");
+            return;
+        };
+        self.t.read_before_write.extend(path.read_priors);
+        self.t.landed.insert(destination.clone());
+        self.t.written.insert(destination.clone());
+        if let Some(key) = path.key {
+            self.t.keys.insert(destination.clone(), key);
+        }
+        if path.kind.changes_entry(path.absent) {
+            if mark_name {
+                self.mark_entry_change(&destination);
+            }
+            if let Some(parent) = destination.parent() {
+                self.uncertain_paths.insert(parent.to_path_buf());
+            }
+        }
+        for id in [path.before, after].into_iter().flatten() {
+            self.written_files
+                .entry(id)
+                .or_default()
+                .insert(destination.clone());
+        }
     }
 
     /// An alias topology change invalidates cache entries under every spelling.
@@ -2385,32 +3201,6 @@ impl Tracer<'_> {
             rec.phys.clear();
             rec.link_walks.clear();
         }
-    }
-
-    /// A link another process replaces or removes while a write through it is in flight refuses the
-    /// record: where that write lands is not known from the tracer's view of the link.
-    fn note_link_replaced(&mut self, pid: i32, link: &Path) {
-        let Some(phys) = phys_link_path(link) else {
-            return;
-        };
-        let racing = self
-            .writing
-            .iter()
-            .any(|(writer, links)| *writer != pid && links.contains(&phys));
-        if racing {
-            push_unsound(
-                &mut self.t,
-                format!(
-                    "it replaced the link {} while it wrote through it",
-                    phys.display()
-                ),
-            );
-        }
-    }
-
-    /// The write has landed, so it is no longer in flight.
-    fn after_write_stop(&mut self, pid: i32) {
-        self.writing.remove(&pid);
     }
 
     fn topology_changed(&mut self, pid: i32) {
@@ -2486,7 +3276,14 @@ impl Tracer<'_> {
             }
             // creat truncates the named file.
             None => {
-                self.write(&p, true);
+                self.write(
+                    &p,
+                    true,
+                    WriteKind::Open {
+                        creates: true,
+                        exclusive: false,
+                    },
+                );
             }
             Some(f) => {
                 let writes = f
@@ -2499,7 +3296,20 @@ impl Tracer<'_> {
                 if writes {
                     let creates_exclusively = f & libc::O_CREAT != 0 && f & libc::O_EXCL != 0;
                     let follows = f & libc::O_NOFOLLOW == 0 && !creates_exclusively;
-                    self.write(&p, follows);
+                    if !creates_exclusively
+                        && f & libc::O_ACCMODE != libc::O_WRONLY
+                        && f & libc::O_PATH == 0
+                    {
+                        self.touch(p.clone(), Use::Content);
+                    }
+                    self.write(
+                        &p,
+                        follows,
+                        WriteKind::Open {
+                            creates: f & libc::O_CREAT != 0,
+                            exclusive: creates_exclusively,
+                        },
+                    );
                 } else {
                     self.touch(
                         p,
@@ -2518,20 +3328,19 @@ impl Tracer<'_> {
         let Some(p) = self.resolve(pid, args, dirfd, path) else {
             return;
         };
-        self.create_at(pid, p, dir);
+        let kind = if self.linking {
+            WriteKind::Link {
+                source: self.link_source.clone(),
+            }
+        } else {
+            WriteKind::Create { directory: dir }
+        };
+        self.create_at(pid, p, kind);
     }
 
     /// A name the call creates: a directory, a symbolic link, a hard link or a node.
-    fn create_at(&mut self, pid: i32, p: PathBuf, dir: bool) {
-        if dir {
-            // mkdir on a path that exists fails with EEXIST and creates nothing: `mkdir -p`
-            // and `create_dir_all` do this for every ancestor. The existence is an input.
-            if fs::symlink_metadata(&p).is_ok() {
-                self.touch(p, Use::Name);
-                return;
-            }
-        }
-        if !dir {
+    fn create_at(&mut self, pid: i32, p: PathBuf, kind: WriteKind) {
+        if !matches!(&kind, WriteKind::Create { directory: true }) {
             // A new link or node inside the repository can change how an attribute source is
             // reached. Outside it, only a watched name matters, and write() checks that.
             if self.rec.as_mut().is_some_and(|rec| rec.in_repo(&p)) {
@@ -2539,12 +3348,7 @@ impl Tracer<'_> {
             }
             self.topology_changed(pid);
         }
-        self.write(&p, false);
-        if dir {
-            if let Some(loc) = self.rec.as_mut().and_then(|r| r.phys.locate(&p)) {
-                self.t.created_dirs.push(loc.path);
-            }
-        }
+        self.write(&p, false, kind);
     }
 
     fn remove(
@@ -2573,12 +3377,9 @@ impl Tracer<'_> {
             if metadata.is_dir() || metadata.file_type().is_symlink() {
                 self.topology_changed(pid);
             }
-            if metadata.file_type().is_symlink() {
-                self.note_link_replaced(pid, &p);
-            }
         }
         // Read the directory's contents before the call, while they are still there.
-        let key = self.write(&p, false);
+        let key = self.write(&p, false, WriteKind::Remove);
         if let Some(key) = key.filter(|_| removes_dir && is_dir(&p)) {
             if let Ok(mut entries) = fs::read_dir(&p) {
                 if entries.next().is_some() {
@@ -2605,7 +3406,9 @@ impl Tracer<'_> {
         ) else {
             return;
         };
-        let exchange = flags.is_some_and(|i| args[i] as u32 & RENAME_EXCHANGE != 0);
+        let rename_flags = flags.map_or(0, |i| args[i] as u32);
+        let exchange = rename_flags & RENAME_EXCHANGE != 0;
+        let supported = rename_flags & !(RENAME_EXCHANGE | 1) == 0;
         let a_meta = fs::symlink_metadata(&a).ok();
         let b_meta = fs::symlink_metadata(&b).ok();
         let a_dir = a_meta.as_ref().is_some_and(|m| m.is_dir());
@@ -2627,14 +3430,25 @@ impl Tracer<'_> {
         if a_dir || b_dir || symlink {
             self.topology_changed(pid);
         }
-        if exchange && a_meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
-            self.note_link_replaced(pid, &a);
-        }
-        if b_meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
-            self.note_link_replaced(pid, &b);
-        }
-        let ka = self.write(&a, false);
-        let kb = self.write(&b, false);
+        let ka = self.write(
+            &a,
+            false,
+            WriteKind::Rename {
+                source: true,
+                exchange,
+                supported,
+            },
+        );
+        let kb = self.write(
+            &b,
+            false,
+            WriteKind::Rename {
+                source: false,
+                exchange,
+                supported,
+            },
+        );
+        self.prepare_rename_evidence(pid);
         if directory && (ka.is_some() || kb.is_some()) {
             let name = |k: Option<String>, p: &Path| {
                 k.unwrap_or_else(|| absolutize(Path::new("/"), p).to_string_lossy().into_owned())
@@ -2664,15 +3478,17 @@ impl Tracer<'_> {
                     self.t.oid_attrs_changed = true;
                 }
                 self.note_listed_change(raw);
-                self.touch(raw.to_path_buf(), Use::Name);
+                self.write(raw, follows, WriteKind::Modify);
             }
             Ok(_) => {
-                self.write(raw, follows);
+                self.write(raw, follows, WriteKind::Modify);
             }
-            Err(error) if !is_absent(&error) && self.rec.is_some() => {
-                self.t.oid_attrs_changed = true;
+            Err(_) => {
+                if self.rec.is_some() {
+                    self.t.oid_attrs_changed = true;
+                }
+                self.write(raw, follows, WriteKind::Modify);
             }
-            Err(_) => {}
         }
     }
 
@@ -2689,7 +3505,10 @@ impl Tracer<'_> {
             {
                 self.chmod(&path, false);
             }
-            _ if self.rec.is_some() => self.t.oid_attrs_changed = true,
+            _ if self.rec.is_some() => {
+                self.t.oid_attrs_changed = true;
+                self.flag("it changed an unkeyable file descriptor");
+            }
             _ => {}
         }
     }
@@ -2740,7 +3559,7 @@ impl Tracer<'_> {
             if let Some(fd) =
                 dirfd.filter(|_| flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0))
             {
-                self.owner_fd(pid, args[fd] as i32);
+                self.owner_fd(pid, args[fd] as i32, true);
             }
             return;
         };
@@ -2750,11 +3569,12 @@ impl Tracer<'_> {
             self.t.oid_attrs_changed = true;
         }
         self.note_listed_change(&p);
+        self.write(&p, !nofollow, WriteKind::Modify);
     }
 
     /// fchown. The descriptor's name decides when it has one. A descriptor whose file is deleted
     /// counts only by identity, and an identity that cannot be read counts.
-    fn owner_fd(&mut self, pid: i32, fd: i32) {
+    fn owner_fd(&mut self, pid: i32, fd: i32, mutate: bool) {
         let proc_path = PathBuf::from(format!("/proc/{pid}/fd/{fd}"));
         let identity = fs::metadata(&proc_path).ok();
         let named = fs::read_link(&proc_path).ok().filter(|path| {
@@ -2763,9 +3583,9 @@ impl Tracer<'_> {
         let Some(rec) = self.rec.as_mut() else {
             return;
         };
-        let risky = match named {
+        let risky = match &named {
             Some(path) => {
-                rec.in_repo(&path) || rec.oid_epoch.is_some() && rec.invalidates_oids(&path, true)
+                rec.in_repo(path) || rec.oid_epoch.is_some() && rec.invalidates_oids(path, true)
             }
             None => identity.as_ref().is_none_or(|m| {
                 rec.oid_epoch
@@ -2776,9 +3596,17 @@ impl Tracer<'_> {
         if risky {
             self.t.oid_attrs_changed = true;
         }
+        if mutate {
+            if let Some(path) = named {
+                self.write(&path, false, WriteKind::Modify);
+            } else {
+                self.flag("it changed an unkeyable file descriptor");
+            }
+        }
     }
 
     fn on_syscall(&mut self, pid: i32) {
+        self.discard_write(pid);
         let Some(regs) = get_regs(pid) else {
             self.flag("could not read registers");
             if let Some(execs) = &mut self.execs {
@@ -2799,14 +3627,47 @@ impl Tracer<'_> {
             );
             return;
         };
+        self.linking = ops.iter().any(|op| matches!(op, Op::LinkSource { .. }));
+        self.link_source = None;
+        self.resolving_write = ops.iter().any(|op| match op {
+            Op::Open { flags, .. } => flags.is_none_or(|index| {
+                args[index] as i32
+                    & (libc::O_WRONLY
+                        | libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_TRUNC
+                        | libc::O_APPEND)
+                    != 0
+            }),
+            Op::Create { .. }
+            | Op::Remove { .. }
+            | Op::Rename { .. }
+            | Op::Truncate { .. }
+            | Op::Chmod { .. }
+            | Op::Fchmod { .. }
+            | Op::Symlink { .. }
+            | Op::Owner { .. }
+            | Op::OwnerFd { .. } => true,
+            _ => false,
+        });
         for op in ops {
             match op {
                 Op::Open { dirfd, path, flags } => self.open(pid, &args, dirfd, path, flags),
                 Op::Look { dirfd, path } => {
                     if let Some(p) = self.resolve(pid, &args, dirfd, path) {
                         self.touch(p, Use::Look);
+                    } else {
+                        let empty_fd = (nr == libc::SYS_newfstatat
+                            && args[3] as i32 & AT_EMPTY_PATH != 0)
+                            || (nr == libc::SYS_statx && args[2] as i32 & AT_EMPTY_PATH != 0);
+                        if empty_fd {
+                            if let Some(fd) = dirfd {
+                                self.observe_fd_look(pid, args[fd] as i32);
+                            }
+                        }
                     }
                 }
+                Op::FdLook => self.observe_fd_look(pid, args[0] as i32),
                 Op::Exec { dirfd, path } => {
                     let empty_fd_exec = nr == libc::SYS_execveat
                         && args[4] as i32 & AT_EMPTY_PATH != 0
@@ -2860,7 +3721,7 @@ impl Tracer<'_> {
                 } => self.rename(pid, &args, (from_dirfd, from), (to_dirfd, to), flags),
                 Op::Truncate { path } => {
                     if let Some(p) = self.resolve(pid, &args, None, path) {
-                        self.write(&p, true);
+                        self.write(&p, true, WriteKind::Modify);
                     }
                 }
                 Op::Chmod { dirfd, path, flags } => {
@@ -2883,21 +3744,38 @@ impl Tracer<'_> {
                     target,
                 } => {
                     if let Some(p) = self.resolve(pid, &args, dirfd, path) {
+                        let link_text = read_cstr(pid, args[target]).map(OsString::from_vec);
                         self.symlink_target(pid, &args, &p, target);
-                        self.create_at(pid, p, false);
+                        self.create_at(pid, p, WriteKind::Symlink { target: link_text });
                     }
                 }
                 Op::LinkSource { dirfd, path, flags } => {
                     let by_fd = flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0);
                     if let Some(p) = self.resolve(pid, &args, dirfd, path) {
-                        note_inode(&mut self.t, &p, false);
-                        self.touch(p.clone(), Use::Look);
+                        let follows =
+                            flags.is_some_and(|i| args[i] as i32 & AT_SYMLINK_FOLLOW != 0);
+                        let metadata = if follows {
+                            fs::metadata(&p)
+                        } else {
+                            fs::symlink_metadata(&p)
+                        };
+                        self.link_source = metadata
+                            .ok()
+                            .map(|m| (write_destination(&p, follows), file_identity(&m)));
                         if self.oid_sensitive(&p, true) {
                             self.t.oid_attrs_changed = true;
                         }
                     } else if let (Some(fd), true) = (dirfd, by_fd) {
                         // AT_EMPTY_PATH names the source by descriptor, as fchownat does.
-                        self.owner_fd(pid, args[fd] as i32);
+                        self.owner_fd(pid, args[fd] as i32, false);
+                        let proc_fd = format!("/proc/{pid}/fd/{}", args[fd] as i32);
+                        let source_name = fs::read_link(&proc_fd).ok().filter(|name| {
+                            name.is_absolute()
+                                && !name.as_os_str().as_bytes().ends_with(b" (deleted)")
+                        });
+                        self.link_source = fs::metadata(&proc_fd)
+                            .ok()
+                            .map(|m| (source_name, file_identity(&m)));
                     }
                 }
                 Op::Owner {
@@ -2906,7 +3784,7 @@ impl Tracer<'_> {
                     flags,
                     nofollow,
                 } => self.owner(pid, &args, dirfd, path, flags, nofollow),
-                Op::OwnerFd { fd } => self.owner_fd(pid, args[fd] as i32),
+                Op::OwnerFd { fd } => self.owner_fd(pid, args[fd] as i32, true),
                 Op::UncertainOidState => {
                     if self.rec.is_some() {
                         self.t.oid_attrs_changed = true;
@@ -2940,6 +3818,99 @@ impl Tracer<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fd_attribution_requires_the_exact_resolved_destination() {
+        let expected = Path::new("/repo/a");
+        let other = Path::new("/repo/b");
+        let inode = Some((3, 9));
+        assert!(verified_open(
+            Some(expected),
+            Some(expected),
+            inode,
+            inode,
+            false
+        ));
+        assert!(!verified_open(
+            Some(expected),
+            Some(other),
+            inode,
+            inode,
+            false
+        ));
+        assert!(!verified_open(Some(expected), None, inode, inode, false));
+    }
+
+    #[test]
+    fn fd_attribution_rejects_an_unresolved_expected_destination() {
+        let actual = Path::new("/repo/a");
+        assert!(!verified_open(None, Some(actual), None, Some((3, 9)), true));
+        assert!(!verified_open(None, None, None, None, true));
+    }
+
+    #[test]
+    fn fd_attribution_requires_the_same_inode_or_an_actual_creation() {
+        let path = Path::new("/repo/a");
+        assert!(!verified_open(
+            Some(path),
+            Some(path),
+            Some((3, 9)),
+            Some((3, 10)),
+            true
+        ));
+        assert!(!verified_open(
+            Some(path),
+            Some(path),
+            None,
+            Some((3, 9)),
+            false
+        ));
+        assert!(!verified_open(Some(path), Some(path), None, None, true));
+        assert!(verified_open(
+            Some(path),
+            Some(path),
+            None,
+            Some((3, 9)),
+            true
+        ));
+    }
+
+    #[test]
+    fn rename_snapshot_requires_source_bytes_and_identity() {
+        let before = identity::FileSeen {
+            stat: identity::FileStat {
+                dev: 3,
+                ino: 9,
+                size: 4,
+                mtime_ns: 10,
+                ctime_ns: 11,
+                mode: 0o100644,
+            },
+            read_hash: identity::ReadHash::Hashed("source".into()),
+        };
+        let mut after = before.clone();
+        after.stat.ctime_ns += 1;
+        assert!(verified_rename_snapshot(&before, &after));
+        after.read_hash = identity::ReadHash::Hashed("restored-prior".into());
+        assert!(!verified_rename_snapshot(&before, &after));
+        after.read_hash = identity::ReadHash::NotNeeded;
+        assert!(!verified_rename_snapshot(&before, &after));
+        after = before.clone();
+        after.stat.dev += 1;
+        assert!(!verified_rename_snapshot(&before, &after));
+        after = before.clone();
+        after.stat.ino += 1;
+        assert!(!verified_rename_snapshot(&before, &after));
+        after = before.clone();
+        after.stat.mtime_ns += 1;
+        assert!(!verified_rename_snapshot(&before, &after));
+        after = before.clone();
+        after.stat.size += 1;
+        assert!(!verified_rename_snapshot(&before, &after));
+        after = before.clone();
+        after.stat.mode ^= 0o111;
+        assert!(!verified_rename_snapshot(&before, &after));
+    }
 
     #[test]
     fn watched_names_decide_which_changes_drop_blob_ids() {
@@ -3030,7 +4001,16 @@ mod tests {
             magic_epoch: 0,
             magic_cache: HashMap::new(),
             pending_topology: HashSet::new(),
-            writing: HashMap::new(),
+            pending_writes: HashMap::new(),
+            read_files: HashSet::new(),
+            read_inodes: HashMap::new(),
+            read_routes: HashMap::new(),
+            written_files: HashMap::new(),
+            uncertain_paths: HashSet::new(),
+            uncertain_inodes: HashSet::new(),
+            resolving_write: false,
+            linking: false,
+            link_source: None,
             current: 0,
             syscall: 0,
             allow_network: false,

@@ -199,6 +199,20 @@ fn proof(case: &Case, key: &str) -> Value {
     value["proofs"][0].clone()
 }
 
+fn assert_entry_id(stored: &Value, field: &str, path: &str, expected: &str) {
+    let entries = stored[field].as_array().unwrap();
+    let entry = entries
+        .iter()
+        .find(|entry| entry["path"] == path)
+        .unwrap_or_else(|| panic!("missing {path} in {field}: {entries:?}"));
+    assert_eq!(entry["id"].as_str(), Some(expected), "{entry}");
+}
+
+fn assert_file_entry(stored: &Value, field: &str, path: &str, bytes: &[u8]) {
+    let expected = format!("f:{}", blake3::hash(bytes).to_hex());
+    assert_entry_id(stored, field, path, &expected);
+}
+
 fn touch_ahead(path: &Path) {
     let status = Command::new("touch")
         .args(["-d", "+60 seconds"])
@@ -308,26 +322,32 @@ fn a_stat_only_look_at_a_recent_file_is_not_hashed() {
 }
 
 #[test]
-fn the_commands_own_entries_in_a_listed_directory_do_not_refuse_the_record() {
+fn an_own_entry_change_after_a_directory_listing_refuses_the_record() {
+    // Excluding the command's entry can also hide a foreign change to that entry.
     let case = Case::new("t7-aged");
     case.file("d/x", b"x\n");
     age();
     let out = run(&case, "t7-aged", "ls d >/dev/null; touch d/out", &[]);
-    assert_recorded(&out, &case, "t7-aged");
+    assert_refused_for(&out, &case, "t7-aged", &["read d ", "d changed", "d/out"]);
 
     let case = Case::new("t7-racy");
     case.file("d/x", b"x\n");
     let out = run(&case, "t7-racy", "ls d >/dev/null; touch d/out", &[]);
-    assert_recorded(&out, &case, "t7-racy");
+    assert_refused_for(&out, &case, "t7-racy", &["read d ", "d changed", "d/out"]);
 }
 
 #[test]
 fn a_file_read_then_written_by_the_command_still_records() {
+    // The verified read-time bytes stay an input and prior, separate from the final output.
     let case = Case::new("t8");
     case.file("f", b"start\n");
     age();
     let out = run(&case, "t8", "cat f >/dev/null; echo x >> f", &[]);
     assert_recorded(&out, &case, "t8");
+    let stored = proof(&case, "t8");
+    assert_file_entry(&stored, "inputs", "f", b"start\n");
+    assert_file_entry(&stored, "priors", "f", b"start\n");
+    assert_file_entry(&stored, "outputs", "f", b"start\nx\n");
 }
 
 #[test]
@@ -583,9 +603,8 @@ fn a_stoop_sh_step_with_a_mid_run_edit_is_not_recorded() {
 }
 
 #[test]
-fn a_link_hop_the_command_replaces_does_not_refuse_its_reader() {
-    // src/link1 leads through src/link2 to src/a. The command replaces src/link2 itself, so the
-    // change of target is its own, and the record of the reader stands.
+fn replacing_a_link_hop_after_reading_through_it_refuses_the_record() {
+    // Owning one hop does not prove that the read route still resolves to the observed target.
     let case = Case::new("t17-own-hop");
     case.file("src/a", b"alpha\n");
     case.file("src/b", b"bravo\n");
@@ -594,7 +613,7 @@ fn a_link_hop_the_command_replaces_does_not_refuse_its_reader() {
     age();
     let script = "cat src/link1 >/dev/null; ln -s b src/link2.new && mv -f src/link2.new src/link2";
     let out = run(&case, "t17-own-hop", script, &[]);
-    assert_recorded(&out, &case, "t17-own-hop");
+    assert_refused_for(&out, &case, "t17-own-hop", &["src/link1", "src/link2"]);
 }
 
 #[test]
@@ -628,7 +647,12 @@ fn a_write_through_a_dangling_link_records_the_target_as_output() {
         "test -e src/new; echo made > src/dl",
         &[],
     );
+    // The observed absence remains an input and prior, even though the command created the file.
     assert_recorded(&out, &case, "t18-own-dangling");
+    let stored = proof(&case, "t18-own-dangling");
+    assert_entry_id(&stored, "inputs", "src/new", "a");
+    assert_entry_id(&stored, "priors", "src/new", "a");
+    assert_file_entry(&stored, "outputs", "src/new", b"made\n");
 }
 
 #[test]
@@ -654,6 +678,7 @@ fn a_dangling_link_target_another_process_creates_is_not_recorded() {
 
 #[test]
 fn a_write_through_an_alias_inside_the_root_records_the_real_path() {
+    // The absence that preceded the write is retained under the physical target.
     let case = Case::new("t19-own-alias");
     case.file("src/keep", b"keep\n");
     fs::create_dir_all(case.root().join("real")).unwrap();
@@ -665,6 +690,10 @@ fn a_write_through_an_alias_inside_the_root_records_the_real_path() {
         &[],
     );
     assert_recorded(&out, &case, "t19-own-alias");
+    let stored = proof(&case, "t19-own-alias");
+    assert_entry_id(&stored, "inputs", "real/x", "a");
+    assert_entry_id(&stored, "priors", "real/x", "a");
+    assert_file_entry(&stored, "outputs", "real/x", b"made\n");
 }
 
 #[test]
@@ -690,21 +719,20 @@ fn a_file_another_process_creates_at_an_alias_target_is_not_recorded() {
 }
 
 #[test]
-fn a_hard_link_name_the_command_writes_is_recorded() {
-    // The command reads src/a, then writes src/b, which is the same inode. The write is the
-    // command's own change, so the record stands.
+fn writing_a_hard_link_name_after_reading_its_twin_refuses_the_record() {
+    // An outside writer can restore the original bytes after the command writes the other name.
     let case = Case::new("t20-hard-link");
     let a = case.file("src/a", b"alpha-one\n");
     fs::hard_link(&a, case.root().join("src/b")).unwrap();
     age();
     let script = "cat src/a >/dev/null; printf 'bravo-two\\n' > src/b";
     let out = run(&case, "t20-hard-link", script, &[]);
-    assert_recorded(&out, &case, "t20-hard-link");
+    assert_refused_for(&out, &case, "t20-hard-link", &["src/a", "src/b"]);
 }
 
 #[test]
-fn a_file_the_command_overwrites_and_reads_back_still_records() {
-    // The command's own write is its output, so its read back of the file is not an input.
+fn a_file_the_command_overwrites_and_reads_back_refuses_the_record() {
+    // Final output bytes cannot prove whether the command or a foreign writer supplied the read.
     let case = Case::new("t21-read-back");
     case.file("src/f", b"start\n");
     age();
@@ -714,20 +742,19 @@ fn a_file_the_command_overwrites_and_reads_back_still_records() {
         "echo fresh > src/f; cat src/f >/dev/null",
         &[],
     );
-    assert_recorded(&out, &case, "t21-read-back");
+    assert_refused_for(&out, &case, "t21-read-back", &["src/f"]);
 }
 
 #[test]
-fn a_write_through_an_alias_read_back_through_the_real_path_records() {
-    // The command creates real/x through an alias and then reads it through its real path. The
-    // created file is the command's own output, so the read back is not an outside change.
+fn a_write_through_an_alias_read_back_through_the_real_path_refuses_the_record() {
+    // The real path still names bytes that an outside writer could have supplied.
     let case = Case::new("t19-own-readback");
     case.file("src/keep", b"keep\n");
     fs::create_dir_all(case.root().join("real")).unwrap();
     symlink("real", case.root().join("alias")).unwrap();
     let script = "test -e real/x; echo made > alias/x; cat real/x >/dev/null";
     let out = run(&case, "t19-own-readback", script, &[]);
-    assert_recorded(&out, &case, "t19-own-readback");
+    assert_refused_for(&out, &case, "t19-own-readback", &["real/x", "alias/x"]);
 }
 
 #[test]
@@ -759,7 +786,7 @@ fn a_directory_link_retargeted_mid_run_is_refused_for_the_link_read_through_it()
 }
 
 #[test]
-fn dangling_link_writes_record_the_actual_target_and_rerun_if_it_disappears() {
+fn dangling_link_writes_record_the_target_or_refuse_and_rerun_if_it_disappears() {
     for (key, two_hops) in [
         ("dangling-output-one", false),
         ("dangling-output-two", true),
@@ -772,21 +799,26 @@ fn dangling_link_writes_record_the_actual_target_and_rerun_if_it_disappears() {
         } else {
             symlink("new", case.root().join("src/dl")).unwrap();
         }
-        let script = "test -e src/new; printf 'made\\n' > src/dl";
+        let script = "printf 'made\\n' > src/dl";
         let first = run(&case, key, script, &[]);
-        assert_recorded(&first, &case, key);
-        let stored = proof(&case, key);
-        let outputs = stored["outputs"].as_array().unwrap();
-        let target = outputs
-            .iter()
-            .find(|entry| entry["path"] == "src/new")
-            .unwrap_or_else(|| panic!("missing created target in {outputs:?}"));
-        let expected = format!("f:{}", blake3::hash(b"made\n").to_hex());
-        assert_eq!(target["id"].as_str(), Some(expected.as_str()), "{target}");
-        assert!(
-            !outputs.iter().any(|entry| entry["path"] == "src/dl2"),
-            "{outputs:?}"
-        );
+        let err = stderr(&first);
+        assert!(first.status.success(), "{err}");
+        if err.contains("stoop: recorded ") {
+            let stored = proof(&case, key);
+            let outputs = stored["outputs"].as_array().unwrap();
+            let target = outputs
+                .iter()
+                .find(|entry| entry["path"] == "src/new")
+                .unwrap_or_else(|| panic!("missing created target in {outputs:?}"));
+            let expected = format!("f:{}", blake3::hash(b"made\n").to_hex());
+            assert_eq!(target["id"].as_str(), Some(expected.as_str()), "{target}");
+            assert!(
+                !outputs.iter().any(|entry| entry["path"] == "src/dl2"),
+                "{outputs:?}"
+            );
+        } else {
+            assert_refused_for(&first, &case, key, &["src/new", "src/dl"]);
+        }
 
         fs::remove_file(case.root().join("src/new")).unwrap();
         let again = run(&case, key, script, &[]);
@@ -875,15 +907,8 @@ fn linking_a_read_file_without_changing_its_content_still_records() {
     let out = run(&case, key, "cat src/a >/dev/null && ln src/a src/b", &[]);
     assert_recorded(&out, &case, key);
     let stored = proof(&case, key);
-    let expected = format!("f:{}", blake3::hash(b"good\n").to_hex());
-    for (field, path) in [("inputs", "src/a"), ("outputs", "src/b")] {
-        let entries = stored[field].as_array().unwrap();
-        let item = entries
-            .iter()
-            .find(|entry| entry["path"] == path)
-            .unwrap_or_else(|| panic!("missing {path} from {field}: {entries:?}"));
-        assert_eq!(item["id"].as_str(), Some(expected.as_str()), "{item}");
-    }
+    assert_file_entry(&stored, "inputs", "src/a", b"good\n");
+    assert_file_entry(&stored, "outputs", "src/b", b"good\n");
 }
 
 #[test]
@@ -1161,21 +1186,26 @@ fn reading_through_a_created_link_tracks_the_target_and_reruns_after_a_change() 
     age();
     let script = "ln -sf a src/l && cat src/l >/dev/null";
     let first = run(&case, key, script, &[]);
-    assert_recorded(&first, &case, key);
-    let stored = proof(&case, key);
-    let inputs = stored["inputs"].as_array().unwrap();
-    let input = inputs
-        .iter()
-        .find(|entry| entry["path"] == "src/a")
-        .unwrap_or_else(|| panic!("missing target in {inputs:?}"));
-    let expected = format!("f:{}", blake3::hash(b"first\n").to_hex());
-    assert_eq!(input["id"].as_str(), Some(expected.as_str()), "{input}");
-    let unchanged = run(&case, key, script, &[]);
-    assert!(
-        stderr(&unchanged).contains("stoop: skip"),
-        "{}",
-        stderr(&unchanged)
-    );
+    // Either refuse the unprovable write/read ordering or retain the actual target as an input.
+    if stderr(&first).contains("stoop: recorded ") {
+        assert_recorded(&first, &case, key);
+        let stored = proof(&case, key);
+        let inputs = stored["inputs"].as_array().unwrap();
+        let input = inputs
+            .iter()
+            .find(|entry| entry["path"] == "src/a")
+            .unwrap_or_else(|| panic!("missing target in {inputs:?}"));
+        let expected = format!("f:{}", blake3::hash(b"first\n").to_hex());
+        assert_eq!(input["id"].as_str(), Some(expected.as_str()), "{input}");
+        let unchanged = run(&case, key, script, &[]);
+        assert!(
+            stderr(&unchanged).contains("stoop: skip"),
+            "{}",
+            stderr(&unchanged)
+        );
+    } else {
+        assert_refused_for(&first, &case, key, &["src/a", "src/l"]);
+    }
     fs::write(target, b"second\n").unwrap();
     let again = run(&case, key, script, &[]);
     let err = stderr(&again);
@@ -1239,4 +1269,152 @@ fn an_open_alias_descriptor_keeps_its_original_destination_after_retargeting() {
     } else {
         assert_refused_for(&out, &case, key, &["alias", "a/out", hop.to_str().unwrap()]);
     }
+}
+
+#[test]
+fn a_non_idempotent_in_place_rewrite_runs_again_against_its_previous_output() {
+    let key = "rewrite-non-idempotent";
+    let case = Case::new(key);
+    let file = case.file("src/a", b"one\n");
+    age();
+    let script = "sed -i 's/^/x/' src/a";
+
+    let first = run(&case, key, script, &[]);
+    assert_recorded(&first, &case, key);
+    assert_eq!(fs::read(&file).unwrap(), b"xone\n");
+    let stored = proof(&case, key);
+    assert_file_entry(&stored, "inputs", "src/a", b"one\n");
+    assert_file_entry(&stored, "priors", "src/a", b"one\n");
+    assert_file_entry(&stored, "outputs", "src/a", b"xone\n");
+
+    let second = run(&case, key, script, &[]);
+    let err = stderr(&second);
+    assert!(
+        err.contains("stoop: run ") && !err.contains("stoop: skip"),
+        "{err}"
+    );
+    assert_recorded(&second, &case, key);
+    assert_eq!(fs::read(&file).unwrap(), b"xxone\n");
+    let stored = proof(&case, key);
+    assert_file_entry(&stored, "inputs", "src/a", b"xone\n");
+    assert_file_entry(&stored, "priors", "src/a", b"xone\n");
+    assert_file_entry(&stored, "outputs", "src/a", b"xxone\n");
+}
+
+#[test]
+fn an_idempotent_in_place_rewrite_skips_only_after_input_and_output_converge() {
+    let key = "rewrite-idempotent";
+    let case = Case::new(key);
+    let file = case.file("src/a", b"one\n");
+    age();
+    let script = "sed -i 's/^one$/done/' src/a";
+
+    let first = run(&case, key, script, &[]);
+    assert_recorded(&first, &case, key);
+    assert_eq!(fs::read(&file).unwrap(), b"done\n");
+    let stored = proof(&case, key);
+    assert_file_entry(&stored, "inputs", "src/a", b"one\n");
+    assert_file_entry(&stored, "priors", "src/a", b"one\n");
+    assert_file_entry(&stored, "outputs", "src/a", b"done\n");
+
+    let second = run(&case, key, script, &[]);
+    let err = stderr(&second);
+    assert!(
+        err.contains("stoop: run ") && !err.contains("stoop: skip"),
+        "{err}"
+    );
+    assert_recorded(&second, &case, key);
+    assert_eq!(fs::read(&file).unwrap(), b"done\n");
+    let stored = proof(&case, key);
+    assert_file_entry(&stored, "inputs", "src/a", b"done\n");
+    assert_file_entry(&stored, "priors", "src/a", b"done\n");
+    assert_file_entry(&stored, "outputs", "src/a", b"done\n");
+
+    let third = run(&case, key, script, &[]);
+    let err = stderr(&third);
+    assert!(
+        third.status.success() && err.contains("stoop: skip "),
+        "{err}"
+    );
+    assert_eq!(fs::read(&file).unwrap(), b"done\n");
+}
+
+#[test]
+fn foreign_restore_after_a_hard_link_append_cannot_create_a_skippable_proof() {
+    let key = "hard-link-foreign-restore";
+    let case = Case::new(key);
+    let source = case.file("src/a", b"good\n");
+    let alias = case.root().join("src/b");
+    fs::hard_link(&source, &alias).unwrap();
+    age();
+    let fifo = case.fifo("hard-link-restore.fifo");
+    let script = "grep -qx good src/a && printf 'added\\n' >> src/b && cat \"$FIFO\" >/dev/null";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    assert_eq!(fs::read(&alias).unwrap(), b"good\nadded\n");
+    fs::write(&source, b"good\n").unwrap();
+    drop(release);
+    let first = child.wait_with_output().unwrap();
+    assert_eq!(fs::read(&alias).unwrap(), b"good\n");
+    assert_refused_for(&first, &case, key, &["src/a", "src/b"]);
+
+    let mut retry = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet_if_running(&fifo, &mut retry);
+    let reached_fifo = release.is_some();
+    drop(release);
+    let again = retry.wait_with_output().unwrap();
+    let err = stderr(&again);
+    assert!(reached_fifo, "retry never reached the FIFO:\n{err}");
+    assert!(
+        again.status.success() && !err.contains("stoop: skip"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&alias).unwrap(), b"good\nadded\n");
+}
+
+#[test]
+fn a_converged_direct_write_refuses_and_never_skips() {
+    let key = "direct-write-converged";
+    let case = Case::new(key);
+    let file = case.file("src/a", b"done\n");
+    age();
+    let script = "cat src/a >/dev/null; printf 'done\\n' > src/a";
+
+    for _ in 0..2 {
+        let out = run(&case, key, script, &[]);
+        assert_refused_for(&out, &case, key, &["src/a"]);
+        assert!(!stderr(&out).contains("stoop: skip"), "{}", stderr(&out));
+        assert_eq!(fs::read(&file).unwrap(), b"done\n");
+    }
+}
+
+#[test]
+fn a_foreign_restore_after_a_direct_write_cannot_create_a_skippable_proof() {
+    let key = "direct-write-foreign-restore";
+    let case = Case::new(key);
+    let file = case.file("src/a", b"original\n");
+    age();
+    let fifo = case.fifo("direct-restore.fifo");
+    let script = "cat src/a >/dev/null; printf 'changed\\n' > src/a; cat \"$FIFO\" >/dev/null";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    assert_eq!(fs::read(&file).unwrap(), b"changed\n");
+    fs::write(&file, b"original\n").unwrap();
+    drop(release);
+    let first = child.wait_with_output().unwrap();
+    assert_eq!(fs::read(&file).unwrap(), b"original\n");
+    assert_refused_for(&first, &case, key, &["src/a"]);
+
+    let mut retry = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet_if_running(&fifo, &mut retry);
+    let reached_fifo = release.is_some();
+    drop(release);
+    let again = retry.wait_with_output().unwrap();
+    let err = stderr(&again);
+    assert!(reached_fifo, "retry never reached the FIFO:\n{err}");
+    assert!(
+        again.status.success() && !err.contains("stoop: skip"),
+        "{err}"
+    );
+    assert_eq!(fs::read(&file).unwrap(), b"changed\n");
 }

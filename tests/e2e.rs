@@ -173,15 +173,24 @@ fn a_failed_run_leaves_no_proof() {
 }
 
 #[test]
-fn a_file_the_run_wrote_is_not_an_input() {
+fn a_file_the_run_wrote_and_read_back_is_not_recorded() {
+    // A read-back may contain bytes from a foreign writer rather than this command.
     let w = Ws::new("outputs");
     let script = "cat in.txt > out.txt; cat out.txt > /dev/null";
-    w.sh(script);
-    let (_, e) = w.sh(script);
-    assert!(
-        skipped(&e),
-        "a generated file that is still there must not block the skip: {e}"
-    );
+    let store = w.root.with_file_name(format!(
+        "{}-store",
+        w.root.file_name().unwrap().to_string_lossy()
+    ));
+    for _ in 0..2 {
+        let (code, err) = w.sh(script);
+        assert_eq!(code, 0, "{err}");
+        assert!(
+            err.contains("stoop: not recorded:") && err.contains("out.txt"),
+            "{err}"
+        );
+        assert!(!skipped(&err), "{err}");
+        assert!(!store.join("proofs/t.json").exists(), "{err}");
+    }
 }
 
 #[test]
