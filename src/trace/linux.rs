@@ -2885,10 +2885,11 @@ impl Tracer<'_> {
                     }
                 }
                 Op::LinkSource { dirfd, path, flags } => {
-                    if self.rec.is_some() {
+                    let by_fd = flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0);
+                    if by_fd && self.rec.is_some() {
+                        // The source is named by a descriptor, which is not classified here.
                         note_symlink_write(&mut self.t, true, self.live_tasks.len());
                     }
-                    let by_fd = flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0);
                     if let Some(p) = self.resolve(pid, &args, dirfd, path, Access::Modify) {
                         if self.rec.is_some() {
                             let follows = flags
@@ -2898,6 +2899,13 @@ impl Tracer<'_> {
                             } else {
                                 fs::symlink_metadata(&p)
                             };
+                            // A symlink source can redirect a write that another task has
+                            // routed. A regular file's link lands on its own inode, which the
+                            // footprint records below.
+                            match &metadata {
+                                Ok(source) if !source.file_type().is_symlink() => {}
+                                _ => note_symlink_write(&mut self.t, true, self.live_tasks.len()),
+                            }
                             footprint_inode(&mut self.t, metadata);
                         }
                         self.touch(p.clone(), true, false);

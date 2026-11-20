@@ -418,10 +418,7 @@ pub fn skip(
     }
     if footprint.access_changed
         && matches!(post, Post::Unreadable)
-        && matches!(
-            observation.seen,
-            Seen::File(..) | Seen::Dir(..) | Seen::Absent
-        )
+        && !matches!(observation.seen, Seen::Unreadable)
     {
         return Some(Skip::OwnAccess);
     }
