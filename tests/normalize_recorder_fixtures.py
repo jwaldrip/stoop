@@ -53,7 +53,7 @@ def main():
             raise SystemExit(f"{case}: non-environment differences exceed version, creation, scope, and sed temp names")
         target = output_dir / case / "proof.json"
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(json.dumps(normalized, separators=(",", ":")) + "\n")
+        target.write_text(json.dumps(normalized, separators=(",", ":")))
         print(f"{case}: env restored {','.join(sorted(changed))}; remaining differences allowed")
 
 
