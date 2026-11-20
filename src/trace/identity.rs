@@ -567,6 +567,12 @@ mod tests {
             Some(Skip::OwnPath)
         );
         footprint.entries.clear();
+        footprint.entries.insert(path.to_path_buf());
+        assert_eq!(
+            skip(&footprint, Some(&first), path, false, &post),
+            Some(Skip::OwnPath)
+        );
+        footprint.entries.clear();
         footprint.entries.insert(path.join("out"));
         assert_eq!(
             skip(&footprint, Some(&first), path, true, &post),
