@@ -2509,6 +2509,44 @@ mod read_identity_tests {
     }
 
     #[test]
+    fn unlisted_candidate_does_not_compare_a_saved_directory_listing() {
+        use crate::trace::identity::{DirSeen, ListSeen};
+
+        let path = Path::new("/work/d");
+        let before = DirSeen {
+            dev: 1,
+            ino: 2,
+            mtime_ns: 3,
+            ctime_ns: 4,
+        };
+        let mut after = before;
+        after.mtime_ns += 1;
+        let mut trace = Trace {
+            seen: Some(HashMap::from([(
+                path.to_path_buf(),
+                Observation {
+                    seen: Seen::Dir(before),
+                    route_physical: true,
+                    appeared: false,
+                },
+            )])),
+            ..Trace::default()
+        };
+        trace.listings.insert(
+            path.to_path_buf(),
+            ListSeen {
+                stat: before,
+                names: None,
+            },
+        );
+        let post = Post::Dir {
+            stat: after,
+            names: None,
+        };
+        assert_eq!(compare_candidate(&trace, path, false, &post), Ok(None));
+        assert_eq!(compare_candidate(&trace, path, true, &post), Err(()));
+    }
+    #[test]
     fn not_recorded_preserves_existing_and_changed_error_text() {
         assert_eq!(
             NotRecorded::Changed {

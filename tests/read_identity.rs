@@ -1030,3 +1030,82 @@ fn read_only_proc_cwd_alias_does_not_hide_an_external_edit() {
         "src/a changed while the command ran",
     );
 }
+#[test]
+fn inherited_readonly_unlinked_descriptor_excludes_its_inode() {
+    let case = Case::new("review-inherited-readonly");
+    let a = case.file("a", b"before\n");
+    let b = case.root().join("b");
+    fs::hard_link(&a, &b).unwrap();
+    let fd = OpenOptions::new().read(true).open(&a).unwrap();
+    fs::remove_file(a).unwrap();
+    let source = fd.as_raw_fd();
+    let fifo = case.fifo("inherited-readonly.fifo");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_stoop"));
+    clean(&mut command);
+    command
+        .args(["run", "--root"])
+        .arg(case.root())
+        .args(["--key", "review-inherited-readonly", "--", "sh", "-c"])
+        .arg("cat b >/dev/null; cat \"$FIFO\" >/dev/null")
+        .current_dir(case.root())
+        .env("FIFO", &fifo)
+        .env("STOOP_DEBUG", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(source, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command.spawn().unwrap();
+    let release = meet(&fifo);
+    fs::write(b, b"changed externally\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_recorded(&out, &case, "review-inherited-readonly");
+    assert!(stderr(&out).contains("stoop: debug: not compared b: OwnInode"));
+}
+
+#[test]
+fn writable_proc_reopen_of_descriptor_unlinked_after_start_excludes_inode() {
+    let case = Case::new("review-late-unlinked-fd");
+    let a = case.file("a", b"before\n");
+    fs::hard_link(&a, case.root().join("b")).unwrap();
+    let fifo = case.fifo("late-unlinked-fd.fifo");
+    let child = spawn(
+        &case,
+        "review-late-unlinked-fd",
+        "exec 3<a; cat b >/dev/null; cat \"$FIFO\" >/dev/null; : > /proc/self/fd/3",
+        &[("FIFO", &fifo), ("STOOP_DEBUG", Path::new("1"))],
+    );
+    let release = meet(&fifo);
+    fs::remove_file(a).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_recorded(&out, &case, "review-late-unlinked-fd");
+    assert!(stderr(&out).contains("stoop: debug: not compared b: OwnInode"));
+}
+
+#[test]
+fn listed_directory_alias_candidates_both_exclude_own_entries() {
+    let case = Case::new("review-listing-alias-debug");
+    case.file("d/old", b"old\n");
+    symlink("d", case.root().join("l")).unwrap();
+    let out = run(
+        &case,
+        "review-listing-alias-debug",
+        "ls l >/dev/null; echo x > d/new",
+        &[("STOOP_DEBUG", Path::new("1"))],
+    );
+    assert_recorded(&out, &case, "review-listing-alias-debug");
+    let log = stderr(&out);
+    assert!(
+        log.matches("stoop: debug: not compared d: OwnEntries")
+            .count()
+            >= 2,
+        "{log}"
+    );
+}
