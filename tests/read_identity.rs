@@ -1249,3 +1249,69 @@ fn hard_link_of_a_regular_file_with_a_live_task_keeps_comparison() {
         "input changed while the command ran",
     );
 }
+
+#[test]
+fn a_directory_rename_without_a_hard_link_keeps_comparison() {
+    let case = Case::new("review-rename-only");
+    let input = case.file("input", b"before\n");
+    case.file("d/x", b"x\n");
+    let fifo = case.fifo("rename-only.fifo");
+    let child = spawn(
+        &case,
+        "review-rename-only",
+        "cat input >/dev/null; mv d e; cat \"$FIFO\" >/dev/null",
+        &[("FIFO", &fifo)],
+    );
+    let release = meet(&fifo);
+    fs::write(input, b"changed externally\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_not_recorded(
+        &out,
+        &case,
+        "review-rename-only",
+        "input changed while the command ran",
+    );
+}
+
+#[test]
+fn a_directory_rename_and_a_hard_link_in_one_run_skip_comparison() {
+    let case = Case::new("review-rename-link");
+    case.file("input", b"before\n");
+    case.file("d/x", b"x\n");
+    case.file("source", b"source\n");
+    let out = run(
+        &case,
+        "review-rename-link",
+        "cat input >/dev/null; sleep 1 & ln source other; mv d e; wait",
+        &[("STOOP_DEBUG", Path::new("1"))],
+    );
+    assert_recorded(&out, &case, "review-rename-link");
+    assert!(
+        stderr(&out).contains("stoop: debug: not compared input: Unknown"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn a_directory_exchange_and_a_hard_link_in_one_run_skip_comparison() {
+    let case = Case::new("review-exchange-link");
+    case.file("input", b"before\n");
+    case.file("left/x", b"x\n");
+    case.file("right/y", b"y\n");
+    case.file("source", b"source\n");
+    let exchange = "python3 -c 'import ctypes; libc = ctypes.CDLL(None, use_errno=True); raise SystemExit(libc.renameat2(-100, b\"left\", -100, b\"right\", 2))'";
+    let out = run(
+        &case,
+        "review-exchange-link",
+        &format!("cat input >/dev/null; sleep 1 & ln source other; {exchange}; wait"),
+        &[("STOOP_DEBUG", Path::new("1"))],
+    );
+    assert_recorded(&out, &case, "review-exchange-link");
+    assert!(
+        stderr(&out).contains("stoop: debug: not compared input: Unknown"),
+        "{}",
+        stderr(&out)
+    );
+}
