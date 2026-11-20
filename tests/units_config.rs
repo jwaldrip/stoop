@@ -168,33 +168,23 @@ fn configured_erased_hooks_with_different_full_forms_are_refused() {
     f.config(
         r#"[[units.suite]]
 id = "one"
-match = ["./runner", "--files=base{changed}", "--label", "tag", "{changed-inputs}"]
-options = [{ names = ["--label"], values = 1 }]
+match = ["./runner", "--files={changed}", "{changed-inputs}", "--label"]
+options = [{ names = ["--files"], values = "many" }, { names = ["--label"], values = 0 }]
 [[units.suite]]
 id = "many"
-match = ["./runner", "--files=base{changed}", "--label", "{changed-inputs}", "tag"]
-options = [{ names = ["--label"], values = "many" }]
+match = ["./runner", "--files={changed}", "--label", "{changed-inputs}"]
+options = [{ names = ["--files"], values = "many" }, { names = ["--label"], values = 1 }]
 "#,
     );
-    let a = f.off(&[
-        "--files=base{changed}",
-        "--label",
-        "tag",
-        "{changed-inputs}",
-    ]);
-    let b = f.off(&[
-        "--files=base{changed}",
-        "--label",
-        "{changed-inputs}",
-        "tag",
-    ]);
+    let a = f.off(&["--files={changed}", "{changed-inputs}", "--label"]);
+    let b = f.off(&["--files={changed}", "--label", "{changed-inputs}"]);
     assert!(
         a.status.success() && b.status.success(),
         "{} {}",
         stderr(&a),
         stderr(&b)
     );
-    let erased = f.off(&["--files=base", "--label", "tag"]);
+    let erased = f.off(&["--files=", "--label"]);
     assert_eq!(erased.status.code(), Some(2), "{}", stderr(&erased));
     assert!(erased.stdout.is_empty());
 }
@@ -233,8 +223,43 @@ independent = false
 fn undeclared_single_dash_options_keep_their_exact_spelling() {
     let f = Fixture::new();
     let out = f.off(&["-v=debug", "-vv", "{changed}"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn undeclared_options_survive_when_placeholder_is_after_terminator() {
+    let f = Fixture::new();
+    let out = f.off(&["-v=debug", "-vv", "--", "{changed}"]);
     assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(out.stdout, b"run <-v=debug>\n");
+    assert_eq!(out.stdout, b"run <-v=debug> <-vv>\n");
+}
+
+#[test]
+fn unsupported_or_undeclared_carriers_refuse_without_launching() {
+    let f = Fixture::new();
+    for args in [
+        vec!["--files", "{changed}"],
+        vec!["-files=old", "-files", "{changed}"],
+        vec!["--files={changed}"],
+    ] {
+        let out = f.off(&args);
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
+        assert!(out.stdout.is_empty());
+        assert!(stderr(&out)
+            .trim_end()
+            .ends_with("or declare the option in .stoop.toml"));
+    }
+    f.config(
+        r#"[[units.suite]]
+id = "short"
+match = ["./runner", "*", "*"]
+options = [{ names = ["-f"], values = "many" }]
+"#,
+    );
+    let out = f.off(&["-fVALUE", "{changed}"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(out.stdout.is_empty());
 }
 
 #[test]
@@ -271,6 +296,16 @@ options = [{ names = ["--files"], values = "many" }]
 }
 
 #[test]
+fn invalid_configuration_never_recovers_an_erased_hook() {
+    let f = Fixture::new();
+    f.config("[units]\nunknown = true\n");
+    assert_ran(&f.off(&["{changed}"]));
+    let erased = f.off(&[]);
+    assert_eq!(erased.status.code(), Some(2), "{}", stderr(&erased));
+    assert!(erased.stdout.is_empty());
+}
+
+#[test]
 fn placeholder_words_after_end_of_options_are_positional() {
     let f = Fixture::new();
     f.config(
@@ -281,8 +316,8 @@ options = [{ names = ["--files"], values = "many" }]
 "#,
     );
     let out = f.off(&["--", "--files={changed}", "keep"]);
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(out.stdout, b"run <--> <keep>\n");
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(out.stdout.is_empty());
 }
 
 #[test]
@@ -295,7 +330,9 @@ match = ["./runner", "-foo{changed}", "tail"]
 options = [{ names = ["-foo"], values = "many" }]
 "#,
     );
-    assert_ran(&f.off(&["-foo{changed}", "tail"]));
+    let out = f.off(&["-foo{changed}", "tail"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(out.stdout.is_empty());
 }
 
 #[test]
@@ -557,10 +594,9 @@ options = [{ names = ["--files"], values = "many" }]
     mcp.finish();
 }
 
-// Reference grammar: the first `--` ends option parsing; known options own zero, one,
-// or many operands; attached values belong to the longest matching option. A removed
-// carrier also removes the other occurrences of that same declared option.
-fn oracle_full(args: &[&str]) -> Vec<String> {
+// Independent reference grammar: exact declared words and long `--name=value` only.
+// `--` ends option parsing; unknown ownership and all other embedded forms refuse.
+fn oracle_full(args: &[&str]) -> Result<Vec<String>, ()> {
     let definitions = [
         ("--many", "many", 2),
         ("--zero", "zero", 0),
@@ -568,6 +604,21 @@ fn oracle_full(args: &[&str]) -> Vec<String> {
         ("-foo", "foo", 1),
         ("-m", "many", 2),
     ];
+    let end = args
+        .iter()
+        .position(|word| *word == "--")
+        .unwrap_or(args.len());
+    for (i, word) in args.iter().enumerate() {
+        if word.contains("{changed}")
+            && *word != "{changed}"
+            && !(i < end
+                && definitions.iter().any(|(name, _, _)| {
+                    name.starts_with("--") && *word == format!("{name}={{changed}}")
+                }))
+        {
+            return Err(());
+        }
+    }
     let mut removed: Vec<bool> = args.iter().map(|word| word.contains("{changed}")).collect();
     let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
     let mut selected = std::collections::HashSet::new();
@@ -577,16 +628,23 @@ fn oracle_full(args: &[&str]) -> Vec<String> {
         let found = definitions.iter().find_map(|&(name, id, arity)| {
             if word == name {
                 Some((id, arity, false))
-            } else if word.strip_prefix(name).is_some_and(|tail| {
-                !tail.is_empty()
-                    && (name.starts_with('-') && !name.starts_with("--") || tail.starts_with('='))
-            }) {
+            } else if name.starts_with("--")
+                && word
+                    .strip_prefix(name)
+                    .is_some_and(|tail| tail.starts_with('='))
+            {
                 Some((id, arity, true))
             } else {
                 None
             }
         });
         let Some((id, arity, attached)) = found else {
+            if definitions
+                .iter()
+                .any(|(name, _, _)| word.starts_with(name) && word != *name)
+            {
+                return Err(());
+            }
             i += 1;
             continue;
         };
@@ -625,7 +683,7 @@ fn oracle_full(args: &[&str]) -> Vec<String> {
     if result.last().is_some_and(|word| word == "--") {
         result.pop();
     }
-    result
+    Ok(result)
 }
 
 #[test]
@@ -680,24 +738,37 @@ fn generated_declared_argv_matches_independent_removal_grammar() {
                     .output()
                     .unwrap();
                 let expected = oracle_full(&args);
-                let text = format!(
-                    "run{}\n",
-                    expected
-                        .iter()
-                        .map(|word| format!(" <{word}>"))
-                        .collect::<String>()
-                );
-                assert!(
-                    out.status.success(),
-                    "argv={args:?} stderr={}",
-                    stderr(&out)
-                );
-                assert_eq!(
-                    String::from_utf8_lossy(&out.stdout),
-                    text,
-                    "argv={args:?} stderr={}",
-                    stderr(&out)
-                );
+                match expected {
+                    Ok(expected) => {
+                        let text = format!(
+                            "run{}\n",
+                            expected
+                                .iter()
+                                .map(|word| format!(" <{word}>"))
+                                .collect::<String>()
+                        );
+                        assert!(
+                            out.status.success(),
+                            "argv={args:?} stderr={}",
+                            stderr(&out)
+                        );
+                        assert_eq!(
+                            String::from_utf8_lossy(&out.stdout),
+                            text,
+                            "argv={args:?} stderr={}",
+                            stderr(&out)
+                        );
+                    }
+                    Err(()) => {
+                        assert_eq!(
+                            out.status.code(),
+                            Some(2),
+                            "argv={args:?} stderr={}",
+                            stderr(&out)
+                        );
+                        assert!(out.stdout.is_empty(), "argv={args:?}");
+                    }
+                }
                 checked += 1;
             }
         }
