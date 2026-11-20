@@ -589,6 +589,8 @@ fn decode(r: &libc::user_regs_struct) -> (i64, [u64; 6]) {
 /// content has been read so far.
 struct Rec<'a> {
     phys: Physical,
+    /// Capture uses its own path cache so it cannot change v9 path resolution.
+    footprint_phys: Physical,
     ignore: &'a Ignore,
     /// The root as the user spelled it; keys in reasons are relative to it.
     root: PathBuf,
@@ -678,6 +680,7 @@ pub fn run<'a>(
         execs: observe_execs.then(|| ExecObserver::new(pid)),
         rec: scope.map(|s| Rec {
             phys: Physical::new(s.root, &s.real_root),
+            footprint_phys: Physical::new(s.root, &s.real_root),
             ignore: s.ignore,
             root: s.root.to_path_buf(),
             oid_epoch: s.oid_epoch.clone(),
@@ -1409,7 +1412,8 @@ fn harmless_null(path: &Path, metadata: &fs::Metadata) -> bool {
 }
 
 fn is_harmless_null(path: &Path) -> bool {
-    fs::metadata(path).is_ok_and(|metadata| harmless_null(path, &metadata))
+    path == Path::new("/dev/null")
+        && fs::metadata(path).is_ok_and(|metadata| harmless_null(path, &metadata))
 }
 
 fn footprint_inode(t: &mut Trace, metadata: io::Result<fs::Metadata>) {
@@ -1859,7 +1863,8 @@ impl Tracer<'_> {
         if follows && is_harmless_null(raw) {
             return;
         }
-        match rec.phys.locate(raw) {
+        rec.footprint_phys.clear();
+        match rec.footprint_phys.locate(raw) {
             Some(location) => {
                 self.t.footprint.entries.insert(location.path);
             }
@@ -2919,6 +2924,7 @@ mod tests {
             crate::oid_attrs::build_watch(&git_dir, &[base.join("home/.gitconfig")]).unwrap();
         let mut rec = Rec {
             phys: Physical::new(&root, &root),
+            footprint_phys: Physical::new(&root, &root),
             ignore: &ignore,
             root: root.clone(),
             hashed: 0,
