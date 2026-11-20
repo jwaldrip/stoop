@@ -1416,7 +1416,14 @@ match = ["./runner", "*"]
         };
         assert_ran(&run());
         assert_skipped(&run());
-        f.event(r#"{"repository":{"default_branch":"main"}}"#);
-        assert_ran(&run());
+        for payload in [
+            r#"{"repository":{"default_branch":"main"}}"#,
+            r#"{"pull_request":{"head":{"ref":"feature"},"base":{"ref":"main"}},"repository":{"default_branch":"main"}}"#,
+            r#"{"pull_request":{"number":42,"base":{"ref":"main"}},"repository":{"default_branch":"main"}}"#,
+            r#"{"pull_request":{"number":42,"head":{"ref":"feature"}},"repository":{"default_branch":"main"}}"#,
+        ] {
+            f.event(payload);
+            assert_ran(&run());
+        }
     }
 }
