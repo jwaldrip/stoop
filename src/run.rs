@@ -5,7 +5,7 @@ mod units;
 pub(crate) use units::hook::safe;
 
 use crate::ignore::Ignore;
-use crate::input::{identify, identify_recorded, par_map, verify, Input};
+use crate::input::{identify, identify_post, par_map, verify, Input};
 use crate::pathutil::{absolutize, cwd_key, is_git_name, to_key, Physical};
 use crate::proof::{now, sanitize, Proof, Store};
 use crate::sync::Remote;
@@ -1548,6 +1548,60 @@ fn merge_reasons(first: &[String], more: Vec<String>) -> Vec<String> {
     out
 }
 
+/// A changed candidate or an existing recorder refusal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NotRecorded {
+    Changed { key: String },
+    Other(String),
+}
+
+impl std::fmt::Display for NotRecorded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Changed { key } => write!(formatter, "{key} changed while the command ran"),
+            Self::Other(reason) => formatter.write_str(reason),
+        }
+    }
+}
+
+impl From<String> for NotRecorded {
+    fn from(reason: String) -> Self {
+        Self::Other(reason)
+    }
+}
+
+impl From<&str> for NotRecorded {
+    fn from(reason: &str) -> Self {
+        Self::Other(reason.to_owned())
+    }
+}
+
+/// `Ok(Some(reason))` leaves the candidate at its v9 outcome; `Err` means it changed.
+fn compare_candidate(
+    trace: &Trace,
+    path: &Path,
+    listed: bool,
+    post: &trace::identity::Post,
+) -> Result<Option<trace::identity::Skip>, ()> {
+    let Some(seen) = &trace.seen else {
+        return Ok(None);
+    };
+    let observation = seen.get(path);
+    if let Some(reason) = trace::identity::skip(&trace.footprint, observation, path, listed, post) {
+        return Ok(Some(reason));
+    }
+    let observation = observation.expect("skip rejects missing observations");
+    let listing = trace.listings.get(path);
+    if listed && matches!(observation.seen, trace::identity::Seen::Dir(_)) && listing.is_none() {
+        return Ok(Some(trace::identity::Skip::NotObserved));
+    }
+    if trace::identity::matches(observation, post, listing) {
+        Ok(None)
+    } else {
+        Err(())
+    }
+}
+
 /// What the run read, as comparable inputs, or why it cannot be trusted. A read of a path the
 /// run wrote is not an input: it reads the run's own output. A read through a link or a
 /// symlinked directory is also recorded under the key of the file it reached, so a change to
@@ -1558,9 +1612,9 @@ pub fn build_inputs(
     trace: &Trace,
     ignore: &Ignore,
     written: &BTreeSet<String>,
-) -> Result<(Vec<Input>, Vec<String>), String> {
+) -> Result<(Vec<Input>, Vec<String>), NotRecorded> {
     if let Some(u) = trace.unsound.first() {
-        return Err(u.clone());
+        return Err(u.clone().into());
     }
     let paths = trace
         .touched
@@ -1763,18 +1817,36 @@ pub fn build_inputs(
         // another spelling (a directory alias) keeps its evidence but claims no OID.
         let names_tree_path = physical_key.as_deref() == Some(key.as_str());
         let with_oid = names_tree_path && basis.is_some_and(|basis| basis.allows_oid());
-        identify_recorded(path, *inside, *listed, with_oid).map(|(id, oid)| {
+        let need_names = trace
+            .listings
+            .get(path)
+            .is_some_and(|listing| listing.names.is_some());
+        let (id, post) = identify_post(path, *inside, *listed, with_oid, need_names);
+        let id = id.map(|(id, oid)| {
             // Evidence describes a file's attributes even when conversion or a
             // length-changing read prevents a raw Git OID from being emitted.
             let oid_basis = (id.starts_with("f:") || id.starts_with("x:"))
                 .then(|| basis.cloned())
                 .flatten();
             (id, oid, oid_basis)
-        })
+        });
+        (id, post)
     });
     let mut out: Vec<Input> = Vec::with_capacity(cands.len());
     let mut seen: HashSet<String> = HashSet::new();
-    for ((_, key, _, _, _), id) in cands.iter().zip(ids) {
+    let debug = std::env::var_os("STOOP_DEBUG").is_some();
+    let mut skipped = Vec::new();
+    let mut changed: Option<&str> = None;
+    for ((path, key, _, listed, _), (id, post)) in cands.iter().zip(ids) {
+        match compare_candidate(trace, path, *listed, &post) {
+            Ok(Some(reason)) if debug => skipped.push((key.as_str(), reason)),
+            Ok(_) => {}
+            Err(()) => {
+                if changed.is_none_or(|first| key.as_str() < first) {
+                    changed = Some(key);
+                }
+            }
+        }
         if let Some((id, oid, oid_basis)) = id {
             if seen.insert(key.clone()) {
                 out.push(Input {
@@ -1785,6 +1857,18 @@ pub fn build_inputs(
                 });
             }
         }
+    }
+    if debug {
+        skipped
+            .sort_by(|(a, _), (b, _)| a.starts_with('/').cmp(&b.starts_with('/')).then(a.cmp(b)));
+        for (key, reason) in skipped.into_iter().take(32) {
+            eprintln!("stoop: debug: not compared {key}: {reason:?}");
+        }
+    }
+    if let Some(key) = changed {
+        return Err(NotRecorded::Changed {
+            key: key.to_owned(),
+        });
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok((out, reasons))
@@ -2371,5 +2455,60 @@ mod diagnostic_how_tests {
         assert!(matches!(diagnostic_how(0), How::Unrecorded(_)));
         assert!(matches!(diagnostic_how(3), How::Failed));
         assert!(matches!(diagnostic_how(-1), How::Failed));
+    }
+}
+
+#[cfg(test)]
+mod read_identity_tests {
+    use super::*;
+    use crate::trace::identity::{Observation, Post, Seen, Skip};
+    use std::collections::HashMap;
+
+    #[test]
+    fn synthetic_missing_and_unknown_observations_keep_v9_outcomes() {
+        let path = Path::new("/work/input");
+        let mut trace = Trace::default();
+        assert_eq!(
+            compare_candidate(&trace, path, false, &Post::Absent),
+            Ok(None)
+        );
+        trace.seen = Some(HashMap::new());
+        assert_eq!(
+            compare_candidate(&trace, path, false, &Post::Absent),
+            Ok(Some(Skip::NotObserved))
+        );
+        trace.seen.as_mut().unwrap().insert(
+            path.to_path_buf(),
+            Observation {
+                seen: Seen::Absent,
+                route_physical: true,
+                appeared: false,
+            },
+        );
+        trace.footprint.unknown = true;
+        assert_eq!(
+            compare_candidate(&trace, path, false, &Post::Special),
+            Ok(Some(Skip::Unknown))
+        );
+        trace.footprint.unknown = false;
+        assert_eq!(
+            compare_candidate(&trace, path, false, &Post::Special),
+            Err(())
+        );
+    }
+
+    #[test]
+    fn not_recorded_preserves_existing_and_changed_error_text() {
+        assert_eq!(
+            NotRecorded::Changed {
+                key: "src/a".into()
+            }
+            .to_string(),
+            "src/a changed while the command ran"
+        );
+        assert_eq!(
+            NotRecorded::Other("existing reason".into()).to_string(),
+            "existing reason"
+        );
     }
 }

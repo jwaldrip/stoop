@@ -2011,7 +2011,10 @@ mod tests {
             &ignore,
             &std::collections::BTreeSet::new(),
         ) {
-            Err(reason) => assert!(reason.contains("diagnostic backend"), "{reason}"),
+            Err(reason) => assert!(
+                reason.to_string().contains("diagnostic backend"),
+                "{reason}"
+            ),
             Ok(_) => panic!("the recorder accepted a diagnostic trace"),
         }
     }

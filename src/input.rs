@@ -9,6 +9,7 @@
 //! - `l:<text>`  symbolic link (its target is recorded as a separate input)
 
 use crate::pathutil::from_key;
+use crate::trace::identity::{self, Post};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{self, Read};
@@ -54,40 +55,71 @@ pub fn identify_recorded(
     listed: bool,
     oids: bool,
 ) -> Option<(String, Option<String>)> {
-    match fs::symlink_metadata(path) {
-        Err(e) => {
-            let id = match e.kind() {
-                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => "a",
-                _ => "u",
+    identify_post(path, inside, listed, oids, false).0
+}
+
+/// Return the unchanged proof id and the identity taken after hashing the opened file.
+pub fn identify_post(
+    path: &Path,
+    inside: bool,
+    listed: bool,
+    oids: bool,
+    need_names: bool,
+) -> (Option<(String, Option<String>)>, Post) {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            let (id, post) = match error.kind() {
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory => ("a", Post::Absent),
+                _ => ("u", Post::Unreadable),
             };
-            inside.then(|| (id.to_owned(), None))
+            return (inside.then(|| (id.to_owned(), None)), post);
         }
-        Ok(m) => {
-            let ft = m.file_type();
-            if ft.is_symlink() {
-                let t = fs::read_link(path).ok()?;
-                Some((format!("l:{}", t.to_string_lossy()), None))
-            } else if ft.is_dir() {
-                let id = if listed {
-                    format!("dl:{}", list_hash(path)?)
-                } else {
-                    "d".to_owned()
-                };
-                Some((id, None))
-            } else if ft.is_file() {
-                let hash = if inside && oids {
-                    hash_file_with_oid(path)
-                } else {
-                    hash_file(path).map(|hash| (hash, None))
-                };
-                match hash {
-                    Ok((hash, oid)) => Some((file_id(executable(&m), &hash), oid)),
-                    Err(_) => inside.then(|| ("u".to_owned(), None)),
-                }
-            } else {
-                None
-            }
+    };
+    if metadata.file_type().is_symlink() {
+        return match fs::read_link(path) {
+            Ok(target) => (
+                Some((format!("l:{}", target.to_string_lossy()), None)),
+                Post::Symlink(identity::link_stat(&metadata, target.into_os_string())),
+            ),
+            Err(_) => (None, Post::Unreadable),
+        };
+    }
+    if metadata.is_dir() {
+        let id = if listed {
+            let Some(hash) = list_hash(path) else {
+                return (None, Post::Unreadable);
+            };
+            format!("dl:{hash}")
+        } else {
+            "d".to_owned()
+        };
+        let names = need_names
+            .then(|| identity::read_names_capped(path, identity::MAX_LISTED_NAMES))
+            .flatten();
+        return (
+            Some((id, None)),
+            Post::Dir {
+                stat: identity::dir_stat(&metadata),
+                names,
+            },
+        );
+    }
+    if !metadata.is_file() {
+        return (None, Post::Special);
+    }
+    match hash_observed(path, inside && oids) {
+        Ok((hash, oid, after)) => {
+            let id = file_id(executable(&metadata), &hash);
+            (
+                Some((id, oid)),
+                Post::File {
+                    stat: identity::file_stat(&after),
+                    hash,
+                },
+            )
         }
+        Err(_) => (inside.then(|| ("u".to_owned(), None)), Post::Unreadable),
     }
 }
 
@@ -124,6 +156,7 @@ fn list_hash(dir: &Path) -> Option<String> {
 }
 
 /// Every byte counts, whatever the file is: source, binary, archive, model weights.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn hash_file(path: &Path) -> io::Result<String> {
     let (mut f, _) = open_regular_file(path)?;
     let mut h = blake3::Hasher::new();
@@ -212,11 +245,41 @@ fn hash_reader_with_oid(mut reader: impl Read, len: u64) -> io::Result<(String, 
     Ok((blake.finalize().to_hex().to_string(), oid))
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn hash_file_with_oid(path: &Path) -> io::Result<(String, Option<String>)> {
     let (file, metadata) = open_regular_file(path)?;
     let len = metadata.len();
     hash_reader_with_oid(file, len)
 }
+
+fn hash_observed(path: &Path, oids: bool) -> io::Result<(String, Option<String>, fs::Metadata)> {
+    let (mut file, before) = open_regular_file(path)?;
+    let (hash, oid) = if oids {
+        hash_reader_with_oid(&mut file, before.len())?
+    } else {
+        let mut blake = blake3::Hasher::new();
+        blake.update_reader(&mut file)?;
+        (blake.finalize().to_hex().to_string(), None)
+    };
+    after_hash();
+    Ok((hash, oid, file.metadata()?))
+}
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_HASH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn after_hash() {
+    if let Some(hook) = AFTER_HASH.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(not(test))]
+fn after_hash() {}
 
 /// Run `f` over `items` on all cores, preserving order.
 pub fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
@@ -656,5 +719,35 @@ mod tests {
     fn proc_file_never_gets_an_oid() {
         let result = identify_recorded(Path::new("/proc/self/status"), false, false, true);
         assert!(matches!(result, Some((_, None))));
+    }
+}
+
+#[cfg(test)]
+mod post_hash_tests {
+    use super::*;
+    use crate::trace::identity::{Observation, ReadHash, Seen};
+
+    #[test]
+    fn a_write_between_the_hash_and_post_hash_stat_is_seen() {
+        let dir =
+            std::env::temp_dir().join(format!("stoop-post-hash-core3a-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bytes");
+        fs::write(&path, b"abc").unwrap();
+        let first = identity::file_stat(&fs::symlink_metadata(&path).unwrap());
+        let writer = path.clone();
+        AFTER_HASH.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                fs::write(&writer, b"abcdef").unwrap();
+            }))
+        });
+        let (_, post) = identify_post(&path, true, false, false, false);
+        let observation = Observation {
+            seen: Seen::File(first, ReadHash::NotNeeded),
+            route_physical: true,
+            appeared: false,
+        };
+        assert!(!identity::matches(&observation, &post, None));
+        fs::remove_dir_all(dir).unwrap();
     }
 }

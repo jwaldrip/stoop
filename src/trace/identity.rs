@@ -1,6 +1,6 @@
 //! Read-time identity for the candidate inputs of a recorded run.
 
-#![allow(dead_code)] // Removed when the capture and comparison are connected.
+#![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
 use std::collections::{BTreeSet, HashSet};
 use std::ffi::OsString;
