@@ -688,6 +688,8 @@ struct PendingPath {
     absent: bool,
     /// The name existed at a watched mkdir entry, so its OID effect depends on the exit result.
     deferred_mkdir_oid: bool,
+    /// A successful namespace mutation would change this previously observed parent.
+    read_parent: Option<PathBuf>,
     read_priors: Vec<PathBuf>,
     rename_before: Option<Seen>,
     confirmed_after: Option<FileIdentity>,
@@ -3093,14 +3095,14 @@ impl Tracer<'_> {
         }
         self.touch(raw.to_path_buf(), Use::Name);
         self.invalidate_settled(expected.as_deref(), before);
+        let mut read_parent = None;
         if let Some(destination) = &expected {
             if kind.changes_entry(absent) {
                 self.note_entry_change(destination);
-                if let Some(parent) = destination.parent() {
-                    if self.read_files.contains(parent) {
-                        self.t.read_write_conflicts.insert(parent.to_path_buf());
-                    }
-                }
+                read_parent = destination
+                    .parent()
+                    .filter(|parent| self.read_files.contains(*parent))
+                    .map(Path::to_path_buf);
             }
             if self
                 .t
@@ -3170,6 +3172,7 @@ impl Tracer<'_> {
             before,
             absent,
             deferred_mkdir_oid,
+            read_parent,
             read_priors,
             confirmed_after: None,
             rename_before: None,
@@ -3354,6 +3357,9 @@ impl Tracer<'_> {
             self.flag("it could not confirm where its change landed");
             return;
         };
+        if let Some(parent) = path.read_parent {
+            self.t.read_write_conflicts.insert(parent);
+        }
         self.t.read_before_write.extend(path.read_priors);
         self.t.landed.insert(destination.clone());
         // An overlapping in-flight write may have entered before this removal landed, so its
@@ -4304,6 +4310,7 @@ mod tests {
             before: Some((3, 9)),
             absent: false,
             deferred_mkdir_oid: false,
+            read_parent: None,
             read_priors: Vec::new(),
             rename_before: None,
             confirmed_after: None,
@@ -4386,6 +4393,7 @@ mod tests {
                     before: Some(own),
                     absent: false,
                     deferred_mkdir_oid: false,
+                    read_parent: None,
                     read_priors: Vec::new(),
                     rename_before: None,
                     confirmed_after: None,

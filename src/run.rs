@@ -1804,6 +1804,25 @@ pub fn build_inputs(
                 )));
                 continue;
             }
+            Some(Some(Seen::Symlink {
+                target: original,
+                followed,
+                resolved: None,
+            })) if !touch.content
+                && matches!(followed.as_ref(), Seen::Absent)
+                && std::fs::read_link(lex)
+                    .is_ok_and(|target| target.as_os_str() == original.as_os_str())
+                && now.as_deref().is_some_and(|target| {
+                    trace.landed.contains(target)
+                        && trace.keys.contains_key(target)
+                        && (!trace.touched.get(target).is_some_and(|touch| touch.read)
+                            || trace.read_before_write.contains(target))
+                }) =>
+            {
+                // The dangling target was the verified output of this run. The link text is
+                // checked as an input, and any earlier target lookup is kept as its prior input.
+                continue;
+            }
             Some(Some(Seen::Symlink { resolved, .. })) if *resolved == now => {}
             Some(Some(_)) => {
                 refusals.push(NotRecorded::Changed {

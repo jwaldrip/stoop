@@ -44,6 +44,7 @@ stoop: skip sh-c98f8f9c8fef6d65: 71 inputs unchanged since 0s ago (100ms)</code>
 
 <h2 id="metadata">Metadata</h2>
 <p>Only a file's bytes and its executable bit are compared. Modification times, owners and the other permission bits are not, so a tool that decides by timestamp is outside what a proof can show. A hard link to a repository file is not detected: a write through the link changes the file without the proof naming it.</p>
+<p>If a command reads a file and then creates a hard link to it, stoop refuses to record that run. It cannot yet prove both the link's prior absence and the source inode's metadata change as one safe input state.</p>
 
 <h2 id="names">Names that are not UTF-8</h2>
 <p>A run that accesses a repository path whose name is not valid UTF-8 is not recorded. This prevents a later skip from relying on a path the proof cannot represent faithfully.</p>

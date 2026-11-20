@@ -657,6 +657,28 @@ fn a_write_through_a_dangling_link_records_the_target_as_output() {
 }
 
 #[test]
+fn a_dangling_output_link_retargeted_by_an_outside_writer_refuses() {
+    let key = "dangling-output-retarget";
+    let case = Case::new(key);
+    case.file("src/other", b"outside\n");
+    let link = case.root().join("src/dl");
+    symlink("new", &link).unwrap();
+    let fifo = case.fifo("dangling-retarget.fifo");
+    let child = spawn(
+        &case,
+        key,
+        "echo made > src/dl; cat \"$FIFO\" >/dev/null",
+        &[("FIFO", &fifo)],
+    );
+    let release = meet(&fifo);
+    fs::remove_file(&link).unwrap();
+    symlink("other", &link).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_refused_for(&out, &case, key, &["src/dl"]);
+}
+
+#[test]
 fn a_dangling_link_target_another_process_creates_is_not_recorded() {
     let case = Case::new("t18-outside-dangling");
     case.file("src/keep", b"keep\n");
@@ -675,6 +697,26 @@ fn a_dangling_link_target_another_process_creates_is_not_recorded() {
         "t18-outside-dangling",
         "src/new changed while the command ran",
     );
+}
+
+#[test]
+fn a_dangling_link_resolved_by_an_outside_creator_refuses() {
+    let key = "dangling-link-outside-create";
+    let case = Case::new(key);
+    case.file("src/keep", b"keep\n");
+    symlink("new", case.root().join("src/dl")).unwrap();
+    let fifo = case.fifo("outside-create.fifo");
+    let child = spawn(
+        &case,
+        key,
+        "test -e src/dl || :; cat \"$FIFO\" >/dev/null",
+        &[("FIFO", &fifo)],
+    );
+    let release = meet(&fifo);
+    fs::write(case.root().join("src/new"), b"outside\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_refused_for(&out, &case, key, &["src/dl"]);
 }
 
 #[test]
@@ -1086,16 +1128,15 @@ fn an_own_write_open_does_not_hide_a_foreign_hard_link_rewrite() {
 }
 
 #[test]
-fn linking_a_read_file_without_changing_its_content_still_records() {
+fn linking_a_read_file_fails_closed_without_a_verified_link_prior() {
+    // The new name's prior absence must be a runtime input, and the source's ctime change must be
+    // attributable to this link. Until both are proven, recording could skip a later EEXIST.
     let key = "hard-link-metadata-only";
     let case = Case::new(key);
     case.file("src/a", b"good\n");
     age();
     let out = run(&case, key, "cat src/a >/dev/null && ln src/a src/b", &[]);
-    assert_recorded(&out, &case, key);
-    let stored = proof(&case, key);
-    assert_file_entry(&stored, "inputs", "src/a", b"good\n");
-    assert_file_entry(&stored, "outputs", "src/b", b"good\n");
+    assert_refused_for(&out, &case, key, &["src/a", "src/b"]);
 }
 
 #[test]
@@ -1309,6 +1350,17 @@ fn a_failed_namespace_change_does_not_own_a_later_foreign_deletion() {
     drop(release);
     let out = child.wait_with_output().unwrap();
     assert_refused_for(&out, &case, key, &["d changed", "d/marker"]);
+}
+
+#[test]
+fn a_failed_namespace_attempt_without_an_outside_change_still_records() {
+    let key = "failed-link-no-change";
+    let case = Case::new(key);
+    case.file("d/marker", b"present\n");
+    age();
+    let script = "ls d | grep -qx marker || exit 9; if ln -s target d/marker 2>/dev/null; then exit 7; fi; test -f d/marker";
+    let out = run(&case, key, script, &[]);
+    assert_recorded(&out, &case, key);
 }
 
 #[test]
