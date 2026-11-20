@@ -163,6 +163,101 @@ options = [{ names = ["--files"], values = "many" }]
 }
 
 #[test]
+fn configured_erased_hooks_with_different_full_forms_are_refused() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "one"
+match = ["./runner", "--files=base{changed}", "--label", "tag", "{changed-inputs}"]
+options = [{ names = ["--label"], values = 1 }]
+[[units.suite]]
+id = "many"
+match = ["./runner", "--files=base{changed}", "--label", "{changed-inputs}", "tag"]
+options = [{ names = ["--label"], values = "many" }]
+"#,
+    );
+    let a = f.off(&[
+        "--files=base{changed}",
+        "--label",
+        "tag",
+        "{changed-inputs}",
+    ]);
+    let b = f.off(&[
+        "--files=base{changed}",
+        "--label",
+        "{changed-inputs}",
+        "tag",
+    ]);
+    assert!(
+        a.status.success() && b.status.success(),
+        "{} {}",
+        stderr(&a),
+        stderr(&b)
+    );
+    let erased = f.off(&["--files=base", "--label", "tag"]);
+    assert_eq!(erased.status.code(), Some(2), "{}", stderr(&erased));
+    assert!(erased.stdout.is_empty());
+}
+
+#[test]
+fn changed_declarations_cannot_change_a_recorded_full_form() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "many"
+match = ["./runner", "--files", "{changed}", "tail"]
+options = [{ names = ["--files"], values = "many" }]
+"#,
+    );
+    assert_ran(&f.off(&["--files", "{changed}", "tail"]));
+    f.config("[units]\n");
+    let erased = f.off(&["--files", "tail"]);
+    assert_eq!(erased.status.code(), Some(2), "{}", stderr(&erased));
+    assert!(erased.stdout.is_empty());
+}
+
+#[test]
+fn placeholder_words_after_end_of_options_are_positional() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "files"
+match = ["./runner", "--", "--files={changed}", "keep"]
+options = [{ names = ["--files"], values = "many" }]
+"#,
+    );
+    let out = f.off(&["--", "--files={changed}", "keep"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"run <--> <keep>\n");
+}
+
+#[test]
+fn attached_placeholder_uses_the_longest_declared_alias() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "files"
+match = ["./runner", "-foo{changed}", "tail"]
+options = [{ names = ["-foo"], values = "many" }]
+"#,
+    );
+    assert_ran(&f.off(&["-foo{changed}", "tail"]));
+}
+
+#[test]
+fn declared_one_consumes_an_option_looking_operand() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "files"
+match = ["./runner", "--files", "-old", "--files", "{changed}"]
+options = [{ names = ["--files"], values = 1 }]
+"#,
+    );
+    assert_ran(&f.off(&["--files", "-old", "--files", "{changed}"]));
+}
+
+#[test]
 fn attached_many_placeholder_removes_following_values() {
     let f = Fixture::new();
     f.config(
@@ -406,6 +501,154 @@ options = [{ names = ["--files"], values = "many" }]
     assert_eq!(outcome["exit_code"], 2, "{refused}");
     assert_eq!(outcome["stderr"]["text"], stderr(&cli));
     mcp.finish();
+}
+
+// Reference grammar: the first `--` ends option parsing; known options own zero, one,
+// or many operands; attached values belong to the longest matching option. A removed
+// carrier also removes the other occurrences of that same declared option.
+fn oracle_full(args: &[&str]) -> Vec<String> {
+    let definitions = [
+        ("--many", "many", 2),
+        ("--zero", "zero", 0),
+        ("--one", "one", 1),
+        ("-foo", "foo", 1),
+        ("-m", "many", 2),
+    ];
+    let mut removed: Vec<bool> = args.iter().map(|word| word.contains("{changed}")).collect();
+    let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
+    let mut selected = std::collections::HashSet::new();
+    let mut i = 0;
+    while i < args.len() && args[i] != "--" {
+        let word = args[i];
+        let found = definitions.iter().find_map(|&(name, id, arity)| {
+            if word == name {
+                Some((id, arity, false))
+            } else if word.strip_prefix(name).is_some_and(|tail| {
+                !tail.is_empty()
+                    && (name.starts_with('-') && !name.starts_with("--") || tail.starts_with('='))
+            }) {
+                Some((id, arity, true))
+            } else {
+                None
+            }
+        });
+        let Some((id, arity, attached)) = found else {
+            i += 1;
+            continue;
+        };
+        let mut owned = vec![i];
+        i += 1;
+        if arity == 1 && !attached && i < args.len() && args[i] != "--" {
+            owned.push(i);
+            i += 1;
+        } else if arity == 2 {
+            while i < args.len()
+                && args[i] != "--"
+                && !(args[i].starts_with('-') && args[i].len() > 1)
+            {
+                owned.push(i);
+                i += 1;
+            }
+        }
+        if owned.iter().any(|&at| args[at].contains("{changed}")) {
+            selected.insert(id);
+        }
+        groups.push((id, owned));
+    }
+    for (id, owned) in groups {
+        if selected.contains(id) {
+            for at in owned {
+                removed[at] = true;
+            }
+        }
+    }
+    let mut result: Vec<String> = args
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| !removed[*i])
+        .map(|(_, word)| (*word).to_string())
+        .collect();
+    if result.last().is_some_and(|word| word == "--") {
+        result.pop();
+    }
+    result
+}
+
+#[test]
+fn generated_declared_argv_matches_independent_removal_grammar() {
+    let f = Fixture::new();
+    let prefixes: &[&[&str]] = &[
+        &[],
+        &["--zero"],
+        &["--one", "v"],
+        &["--one", "-old"],
+        &["--many", "v"],
+        &["--many", "v", "v"],
+        &["--"],
+        &["v"],
+        &["-foo", "v"],
+    ];
+    let forms: &[&[&str]] = &[
+        &["{changed}"],
+        &["--one", "{changed}"],
+        &["--many", "{changed}"],
+        &["--many={changed}"],
+        &["-m{changed}"],
+        &["--", "--many={changed}"],
+    ];
+    let suffixes: &[&[&str]] = &[
+        &[],
+        &["tail"],
+        &["--zero"],
+        &["--", "tail"],
+        &["--one", "v"],
+        &["--many", "v"],
+    ];
+    let mut checked = 0;
+    for prefix in prefixes {
+        for form in forms {
+            for suffix in suffixes {
+                let args: Vec<&str> = prefix.iter().chain(*form).chain(*suffix).copied().collect();
+                let matches = std::iter::repeat_n("\"*\"", args.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                f.config(&format!(
+                    "[[units.suite]]\nid = 'generated'\nmatch = [\"./runner\", {matches}]\noptions = [{{ names = [\"--zero\"], values = 0 }}, {{ names = [\"--one\"], values = 1 }}, {{ names = [\"--many\", \"-m\"], values = \"many\" }}, {{ names = [\"-foo\"], values = 1 }}]\n"
+                ));
+                let out = Command::new(env!("CARGO_BIN_EXE_stoop"))
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("HOME", &f.root)
+                    .env("STOOP_OFF", "1")
+                    .current_dir(&f.root)
+                    .args(["run", "--no-record", "--", "./runner"])
+                    .args(&args)
+                    .output()
+                    .unwrap();
+                let expected = oracle_full(&args);
+                let text = format!(
+                    "run{}\n",
+                    expected
+                        .iter()
+                        .map(|word| format!(" <{word}>"))
+                        .collect::<String>()
+                );
+                assert!(
+                    out.status.success(),
+                    "argv={args:?} stderr={}",
+                    stderr(&out)
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout),
+                    text,
+                    "argv={args:?} stderr={}",
+                    stderr(&out)
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 324);
 }
 
 #[cfg(target_os = "linux")]
@@ -786,6 +1029,36 @@ match = ["./runner", "*"]
         assert_skipped(&run().output().unwrap());
         let out = run().env("GITHUB_REF_TYPE", "tag").output().unwrap();
         assert_ran(&out);
+    }
+
+    #[test]
+    fn pull_request_payload_disagreements_force_full() {
+        let f = Fixture::repo();
+        let event = |number, head, base| {
+            format!(
+            "{{\"number\":{number},\"pull_request\":{{\"number\":{number},\"head\":{{\"ref\":\"{head}\"}},\"base\":{{\"ref\":\"{base}\"}}}},\"repository\":{{\"default_branch\":\"main\"}}}}"
+        )
+        };
+        f.event(&event(42, "real-head", "real-base"));
+        let run = || {
+            f.github("pull_request", "refs/pull/42/merge")
+                .env("GITHUB_REF_NAME", "42/merge")
+                .env("GITHUB_REF_TYPE", "branch")
+                .env("GITHUB_HEAD_REF", "real-head")
+                .env("GITHUB_BASE_REF", "real-base")
+                .output()
+                .unwrap()
+        };
+        assert_ran(&run());
+        assert_skipped(&run());
+        for payload in [
+            event(43, "real-head", "real-base"),
+            event(42, "other", "real-base"),
+            event(42, "real-head", "other"),
+        ] {
+            f.event(&payload);
+            assert_ran(&run());
+        }
     }
 
     #[test]
