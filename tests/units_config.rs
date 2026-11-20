@@ -6,10 +6,12 @@ mod common;
 use serde_json::json;
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
-use std::path::PathBuf;
-use std::process::{Command, Output};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -90,6 +92,150 @@ fn assert_ran(output: &Output) {
         !stderr(output).contains("stoop: skip"),
         "{}",
         stderr(output)
+    );
+}
+
+fn fifo(path: &Path) {
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+}
+
+fn bounded(mut command: Command) -> Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("command blocked on a special file: {}", stderr(&output));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn erased_hook_recovers_the_declared_many_full_form() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "files"
+match = ["./runner", "--files", "base", "more", "{changed}"]
+options = [{ names = ["--files"], values = "many" }]
+"#,
+    );
+    assert_ran(&f.off(&["--files", "base", "more", "{changed}"]));
+    let erased = f.off(&["--files", "base", "more"]);
+    assert_ran(&erased);
+    assert!(
+        stderr(&erased).contains("shell expanded"),
+        "{}",
+        stderr(&erased)
+    );
+}
+
+#[test]
+fn erased_hook_without_the_needed_declaration_refuses_instead_of_running_restricted() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "files"
+match = ["./runner", "--files", "base", "more", "{changed}"]
+options = [{ names = ["--files"], values = "many" }]
+"#,
+    );
+    assert_ran(&f.off(&["--files", "base", "more", "{changed}"]));
+    f.config("[units]\n");
+    let erased = f.off(&["--files", "base", "more"]);
+    assert_eq!(erased.status.code(), Some(2), "{}", stderr(&erased));
+    assert!(erased.stdout.is_empty(), "{}", stderr(&erased));
+    assert!(
+        stderr(&erased).contains("cannot tell where"),
+        "{}",
+        stderr(&erased)
+    );
+}
+
+#[test]
+fn attached_many_placeholder_removes_following_values() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "files"
+match = ["./runner", "--files={changed}", "tail"]
+options = [{ names = ["--files"], values = "many" }]
+"#,
+    );
+    assert_ran(&f.off(&["--files={changed}", "tail"]));
+}
+
+#[test]
+fn many_alias_removal_stops_at_the_end_of_options() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "files"
+match = ["./runner", "--files", "{changed}", "--", "-f", "positional"]
+options = [{ names = ["--files", "-f"], values = "many" }]
+"#,
+    );
+    let out = f.off(&["--files", "{changed}", "--", "-f", "positional"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"run <--> <-f> <positional>\n");
+}
+
+#[test]
+fn many_short_alias_does_not_remove_a_distinct_longer_declared_option() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "files"
+match = ["./runner", "-f", "{changed}", "-foo", "labels"]
+options = [{ names = ["-f"], values = "many" }, { names = ["-foo"], values = 1 }]
+"#,
+    );
+    let out = f.off(&["-f", "{changed}", "-foo", "labels"]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"run <-foo> <labels>\n");
+}
+
+#[test]
+fn config_fifo_symlink_is_rejected_without_blocking() {
+    let f = Fixture::new();
+    let pipe = f.root.join("config-fifo");
+    fifo(&pipe);
+    symlink(&pipe, f.root.join(".stoop.toml")).unwrap();
+    let mut command = f.command(&["{changed}"]);
+    command.env("STOOP_OFF", "1");
+    let out = bounded(command);
+    assert_ran(&out);
+    assert_eq!(
+        stderr(&out)
+            .matches("ignoring the unit configuration")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn oversized_config_is_rejected_without_a_skip() {
+    let f = Fixture::new();
+    let mut config = "[units]\n".to_string();
+    config.push_str(&" ".repeat(8 * 1024 * 1024));
+    f.config(&config);
+    let out = f.off(&["{changed}"]);
+    assert_ran(&out);
+    assert_eq!(
+        stderr(&out)
+            .matches("ignoring the unit configuration")
+            .count(),
+        1
     );
 }
 
@@ -591,6 +737,76 @@ match = ["./runner", "*"]
         oversized.push_str(&" ".repeat(8 * 1024 * 1024));
         f.event(&oversized);
         let out = run();
+        assert_ran(&out);
+    }
+    #[test]
+    fn configured_default_cannot_cancel_the_remote_default() {
+        let f = Fixture::repo();
+        f.hit();
+        f.branch("main");
+        f.config("[units]\ndefault_branch = 'other'\n");
+        let out = f.hook();
+        assert_ran(&out);
+        assert!(stderr(&out).contains("default branch main"));
+    }
+
+    #[test]
+    fn env_default_cannot_cancel_the_remote_default() {
+        let f = Fixture::repo();
+        f.hit();
+        f.branch("main");
+        let out = f
+            .command(&["{changed}"])
+            .env("STOOP_DEFAULT_BRANCH", "other")
+            .output()
+            .unwrap();
+        assert_ran(&out);
+        assert!(stderr(&out).contains("default branch main"));
+    }
+
+    #[test]
+    fn pull_request_ref_name_disagreement_forces_full() {
+        let f = Fixture::repo();
+        f.event(valid_event());
+        let run = || f.github("pull_request", "refs/pull/42/merge");
+        assert_ran(&run().output().unwrap());
+        assert_skipped(&run().output().unwrap());
+        let out = run().env("GITHUB_REF_NAME", "main").output().unwrap();
+        assert_ran(&out);
+    }
+
+    #[test]
+    fn pull_request_ref_type_disagreement_forces_full() {
+        let f = Fixture::repo();
+        f.event(valid_event());
+        let run = || f.github("pull_request", "refs/pull/42/merge");
+        assert_ran(&run().output().unwrap());
+        assert_skipped(&run().output().unwrap());
+        let out = run().env("GITHUB_REF_TYPE", "tag").output().unwrap();
+        assert_ran(&out);
+    }
+
+    #[test]
+    fn duplicate_github_default_branch_forces_full() {
+        let f = Fixture::repo();
+        f.event(valid_event());
+        let run = || f.github("push", "refs/heads/feature").output().unwrap();
+        assert_ran(&run());
+        assert_skipped(&run());
+        f.event(r#"{"repository":{"default_branch":"feature","default_branch":"main"}}"#);
+        assert_ran(&run());
+    }
+
+    #[test]
+    fn github_event_fifo_is_rejected_without_blocking() {
+        let f = Fixture::repo();
+        f.event(valid_event());
+        let run = || f.github("push", "refs/heads/feature");
+        assert_ran(&run().output().unwrap());
+        assert_skipped(&run().output().unwrap());
+        fs::remove_file(f.root.join("event.json")).unwrap();
+        fifo(&f.root.join("event.json"));
+        let out = bounded(run());
         assert_ran(&out);
     }
 }
