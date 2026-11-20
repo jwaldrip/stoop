@@ -249,11 +249,13 @@ fn default_key(argv: &[std::ffi::OsString], rel_cwd: &str, scope: Option<&str>) 
     format!("{}-{}", sanitize(&base), &h.finalize().to_hex()[..16])
 }
 
-fn hook_key(
+fn hook_key_with_config(
     hook: &units::hook::Hook,
     label: Option<&str>,
     cwd: &str,
     scope: Option<&str>,
+    config_source: Option<&[u8]>,
+    config_invalid: bool,
 ) -> String {
     let mut hash = blake3::Hasher::new();
     hash.update(b"stoop-hook-v1\0");
@@ -269,6 +271,13 @@ fn hook_key(
         hash.update(&(value.len() as u64).to_le_bytes());
         hash.update(value.as_bytes());
     }
+    if config_invalid {
+        hash.update(b"\0stoop-config-invalid\0");
+    } else if let Some(source) = config_source {
+        hash.update(b"\0stoop-config-v1\0");
+        hash.update(&(source.len() as u64).to_le_bytes());
+        hash.update(source);
+    }
     let base = label.unwrap_or_else(|| {
         Path::new(&hook.original[0])
             .file_name()
@@ -280,6 +289,16 @@ fn hook_key(
         sanitize(base),
         &hash.finalize().to_hex()[..16]
     )
+}
+
+#[cfg(all(test, unix))]
+fn hook_key(
+    hook: &units::hook::Hook,
+    label: Option<&str>,
+    cwd: &str,
+    scope: Option<&str>,
+) -> String {
+    hook_key_with_config(hook, label, cwd, scope, None, false)
 }
 
 /// The environment counts as an input, because a variable read never shows up in
@@ -604,9 +623,127 @@ pub fn run_observed(o: Opts) -> Outcome {
     run_internal(o, false, true)
 }
 
+fn hook_max_age(o: &Opts) -> u64 {
+    o.max_age
+        .or_else(|| {
+            std::env::var("STOOP_MAX_AGE")
+                .ok()
+                .and_then(|v| parse_age(&v).ok())
+        })
+        .unwrap_or(DEFAULT_MAX_AGE)
+}
+
+type RecoveredHooks = Vec<(units::hook::Hook, String)>;
+
+fn recover_hooks(
+    o: &Opts,
+    root: &Path,
+    cwd: &str,
+    store: &Path,
+    scope: Option<&str>,
+    max_age: u64,
+) -> (Vec<String>, Result<RecoveredHooks, String>) {
+    let mut warnings = Vec::new();
+    let records = match units::hook_store::records(store, now(), max_age) {
+        Ok(records) => records,
+        Err(warning) => {
+            if !o.quiet {
+                warnings.push(warning);
+            }
+            return (warnings, Ok(Vec::new()));
+        }
+    };
+    let mut found: Vec<(units::hook::Hook, String)> = Vec::new();
+    let mut configured = false;
+    for record in records.into_iter().filter(|record| {
+        record.cwd == cwd && record.scope.as_deref() == scope && record.label == o.key
+    }) {
+        let words: Vec<OsString> = record.argv.into_iter().map(OsString::from).collect();
+        let Ok(Some(parsed)) = units::hook::parse(&words) else {
+            continue;
+        };
+        if !parsed.expanded_matches(&o.argv) {
+            continue;
+        }
+        let (warning, prepared) = units::config::finish(root, cwd, &words, parsed);
+        if let Some(warning) = warning {
+            if !warnings.contains(&warning) {
+                warnings.push(warning);
+            }
+        }
+        match prepared {
+            Ok(prepared) => {
+                configured |= prepared.config.key_source().is_some();
+                if prepared.invalid {
+                    return (warnings, Err("the recorded hook has invalid configuration; quote the placeholder or use --literal".into()));
+                }
+                if let Some(candidate) = prepared.hook {
+                    if hook_key_with_config(
+                        &candidate,
+                        record.label.as_deref(),
+                        cwd,
+                        scope,
+                        prepared.config.key_source(),
+                        prepared.invalid,
+                    ) != record.key
+                    {
+                        return (warnings, Err("the recorded hook's full form changed; quote the placeholder or use --literal".into()));
+                    }
+                    if !found.iter().any(|(known, _)| known.argv == candidate.argv) {
+                        found.push((candidate, record.key));
+                    }
+                }
+            }
+            Err(error) => return (warnings, Err(error)),
+        }
+    }
+    if configured && found.len() > 1 {
+        return (
+            warnings,
+            Err(
+                "recorded hooks have different full forms; quote the placeholder or use --literal"
+                    .into(),
+            ),
+        );
+    }
+    (warnings, Ok(found))
+}
+
 /// The error that stops a placeholder argv before anything runs, if there is one.
-pub fn hook_refusal(argv: &[OsString]) -> Option<String> {
-    units::hook::prepare(argv).err()
+pub fn hook_refusal(o: &Opts) -> Option<String> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = root_for(o, &cwd);
+    let rel_cwd = cwd_key(&root, &cwd);
+    let (warning, prepared) = units::config::prepare(&root, &rel_cwd, &o.argv, o.literal);
+    match prepared {
+        Err(error) => {
+            if let Some(warning) = warning {
+                eprintln!("{warning}");
+            }
+            Some(error)
+        }
+        Ok(prepared) if prepared.hook.is_none() && !o.literal => {
+            let store = store_for(o, &cwd, &root);
+            let scope = shared_scope(&root, &store);
+            let (warnings, recovered) = recover_hooks(
+                o,
+                &root,
+                &rel_cwd,
+                &store,
+                scope.as_deref(),
+                hook_max_age(o),
+            );
+            if let Err(error) = recovered {
+                for warning in warnings {
+                    eprintln!("{warning}");
+                }
+                Some(error)
+            } else {
+                None
+            }
+        }
+        Ok(_) => None,
+    }
 }
 
 /// The variables that carry a placeholder's value (spec section 4.7). Stoop owns them for each run.
@@ -716,12 +853,51 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             how: How::Unrecorded("OIDC request credentials passed".into()),
         };
     }
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let root = root_for(&o, &cwd);
+    let rel_cwd = cwd_key(&root, &cwd);
+    let store_path = store_for(&o, &cwd, &root);
+    let scope = shared_scope(&root, &store_path);
     let literal = o.literal || !observe_runners;
-    let mut hook = if literal {
-        None
-    } else {
-        match units::hook::prepare(&o.argv) {
-            Ok(hook) => hook,
+    let (warning, prepared) = units::config::prepare(&root, &rel_cwd, &o.argv, literal);
+    if let Some(warning) = warning {
+        eprintln!("{warning}");
+    }
+    let units::config::Prepared {
+        mut hook,
+        config,
+        invalid: config_invalid,
+        independent_false,
+    } = match prepared {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            eprintln!("stoop: {error}");
+            return Outcome {
+                status: 2,
+                key: initial_key,
+                how: How::Untraced,
+            };
+        }
+    };
+    // A placeholder that reached stoop intact: the shell expanded nothing into it.
+    let intact = hook.is_some();
+    if let Some(h) = &hook {
+        o.argv.clone_from(&h.argv);
+    }
+    let max_age = hook_max_age(&o);
+    // An erased hook runs its recorded full form and never skips. Configured conflicting
+    // forms, invalid configuration, or changed configuration identity are refused.
+    let mut expanded = false;
+    let mut recovered_key = None;
+    let mut matches = 0;
+    if !literal && hook.is_none() {
+        let (warnings, recovered) =
+            recover_hooks(&o, &root, &rel_cwd, &store_path, scope.as_deref(), max_age);
+        for warning in warnings {
+            eprintln!("{warning}");
+        }
+        let mut found = match recovered {
+            Ok(found) => found,
             Err(error) => {
                 eprintln!("stoop: {error}");
                 return Outcome {
@@ -730,63 +906,11 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                     how: How::Untraced,
                 };
             }
-        }
-    };
-    // A placeholder that reached stoop intact: the shell expanded nothing into it.
-    let intact = hook.is_some();
-    if let Some(h) = &hook {
-        o.argv.clone_from(&h.argv);
-    }
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let root = root_for(&o, &cwd);
-    let rel_cwd = cwd_key(&root, &cwd);
-    let store_path = store_for(&o, &cwd, &root);
-    let scope = shared_scope(&root, &store_path);
-    let max_age = o
-        .max_age
-        .or_else(|| {
-            std::env::var("STOOP_MAX_AGE")
-                .ok()
-                .and_then(|v| parse_age(&v).ok())
-        })
-        .unwrap_or(DEFAULT_MAX_AGE);
-    // An argv without a placeholder may be an expanded shape of a recorded hook. A single full
-    // form runs and never skips. Two different full forms cannot be told apart, so the command
-    // runs as typed and never skips either.
-    let mut expanded = false;
-    let mut matches = 0;
-    if !literal && hook.is_none() {
-        let records = match units::hook_store::records(&store_path, now(), max_age) {
-            Ok(records) => records,
-            Err(warning) => {
-                if !o.quiet {
-                    eprintln!("{warning}");
-                }
-                Vec::new()
-            }
         };
-        let mut found: Vec<units::hook::Hook> = Vec::new();
-        for record in records
-            .into_iter()
-            .filter(|r| r.cwd == rel_cwd && r.scope == scope && r.label == o.key)
-        {
-            let words: Vec<std::ffi::OsString> = record
-                .argv
-                .iter()
-                .cloned()
-                .map(std::ffi::OsString::from)
-                .collect();
-            if let Ok(Some(candidate)) = units::hook::prepare(&words) {
-                if units::hook::expanded_matches(&candidate, &o.argv)
-                    && !found.iter().any(|known| known.argv == candidate.argv)
-                {
-                    found.push(candidate);
-                }
-            }
-        }
         matches = found.len();
         if matches == 1 {
-            let candidate = found.swap_remove(0);
+            let (candidate, key) = found.swap_remove(0);
+            recovered_key = Some(key);
             o.argv.clone_from(&candidate.argv);
             hook = Some(candidate);
             expanded = true;
@@ -798,9 +922,19 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     if !literal {
         clear_hook_env(hook.is_some(), !intact);
     }
-    let key = hook
-        .as_ref()
-        .map(|h| hook_key(h, o.key.as_deref(), &rel_cwd, scope.as_deref()))
+    let key = recovered_key
+        .or_else(|| {
+            hook.as_ref().map(|h| {
+                hook_key_with_config(
+                    h,
+                    o.key.as_deref(),
+                    &rel_cwd,
+                    scope.as_deref(),
+                    config.key_source(),
+                    config_invalid,
+                )
+            })
+        })
         .unwrap_or_else(|| {
             o.key
                 .as_deref()
@@ -930,7 +1064,23 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             how: How::Untraced,
         };
     }
-    let full = env_switch("STOOP_FULL", true);
+    let full_reason = if env_switch("STOOP_FULL", true) {
+        Some("STOOP_FULL is set".to_string())
+    } else if hook.is_some() && config_invalid {
+        Some("invalid unit configuration".to_string())
+    } else if hook.is_some() && independent_false {
+        Some("suite is not independent".to_string())
+    } else if hook.is_some() {
+        let sync = o.sync.clone().or_else(|| env_str("STOOP_SYNC"));
+        units::policy::forced_reason(
+            &root,
+            &config,
+            sync.as_deref(),
+            o.sync_write || env_flag("STOOP_SYNC_WRITE"),
+        )
+    } else {
+        None
+    };
     let max_age = o
         .max_age
         .or_else(|| {
@@ -1108,7 +1258,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     }
     let hit: Option<&Proof> = hit_idx.map(|i| &proofs[i]);
     if let Some(p) = hit {
-        if !full {
+        if full_reason.is_none() {
             if !o.quiet {
                 eprintln!(
                     "stoop: skip {key}: {} inputs unchanged since {} ({}ms)",
@@ -1123,7 +1273,12 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 how: How::Skipped { proof: p.digest() },
             };
         }
-        why = "STOOP_FULL is set".into();
+        why = full_reason.clone().unwrap_or_else(|| why.clone());
+    }
+    if hook.is_some() {
+        if let Some(reason) = &full_reason {
+            why.clone_from(reason);
+        }
     }
     if explain {
         match &hook {

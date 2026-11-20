@@ -78,9 +78,11 @@ Install stoop in an earlier step with the one-line installer. Pull request runs 
 
 ## The changed-files placeholder
 
-A test command can take only the test files that changed. Write `'{changed}'` where the files go, and filter with a pattern when needed: `'{changed:*.test.ts}'`. Always single-quote the placeholder. Unquoted, the shell expands commas, wildcards or pipes before stoop sees them, and stoop refuses the shapes it can detect with exit 2. The environment spelling `'$STOOP_CHANGED'` works the same way.
+Write `'{changed}'` where a test command takes test files. Always single-quote it. Unquoted, the shell expands commas, wildcards or pipes before stoop sees them, and stoop refuses the shapes it can detect with exit 2. The environment spelling `'$STOOP_CHANGED'` works the same way.
 
-For now a placeholder runs the full command. Stoop removes the placeholder and the option in front of it, so the command runs every test. An unchanged tree still skips through the whole-command proof.
+For now a placeholder runs the full command. Stoop removes the placeholder and its owning option under the declared or legacy 2a rules; ambiguous ownership is refused with exit 2. An unchanged tree can still skip through the whole-command proof. Default-branch pushes, sync writers, and configured verification runs do not skip.
+
+Optional `.stoop.toml` at the root declares hook suites, option arities, and `verify_every`. See https://stoop.build/docs/cli.html#configuration. It does not enable partial test execution.
 
 ## What a skip means
 

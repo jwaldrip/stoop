@@ -152,9 +152,9 @@ pub(crate) fn records(store: &Path, now: u64, max_age: u64) -> Result<Vec<Record
     }
 }
 
-/// Save one template before the command runs, whatever its outcome. The write replaces only this
-/// key's record and keeps the newest 128; other commands' templates expire by their own age on
-/// read. Any failure is a warning, and the caller runs the full form without recording it.
+/// Save one template before the command runs, whatever its outcome. A new template supersedes
+/// older records for the same original argv, cwd, scope and label. Other templates expire by
+/// their own age on read. Any failure warns and runs the full form without recording it.
 pub(crate) fn record(store: &Path, record: Record) -> Result<(), String> {
     if record.argv.len() > 128
         || serde_json::to_vec(&record)
@@ -191,7 +191,13 @@ pub(crate) fn record(store: &Path, record: Record) -> Result<(), String> {
             ));
         }
     };
-    catalog.records.retain(|old| old.key != record.key);
+    catalog.records.retain(|old| {
+        old.key != record.key
+            && (old.argv != record.argv
+                || old.cwd != record.cwd
+                || old.scope != record.scope
+                || old.label != record.label)
+    });
     catalog.records.push(record);
     while catalog.records.len() > MAX_RECORDS {
         catalog.records.remove(0);
@@ -274,6 +280,36 @@ mod tests {
         }
     }
 
+    #[test]
+    fn refreshed_template_replaces_only_its_exact_context() {
+        let path = store("refresh-context");
+        let original = template("old", 0);
+        record(&path, original.clone()).unwrap();
+
+        let mut different_argv = template("argv", 0);
+        different_argv.argv.push("different".into());
+        record(&path, different_argv).unwrap();
+        let mut different_cwd = template("cwd", 0);
+        different_cwd.cwd = "elsewhere".into();
+        record(&path, different_cwd).unwrap();
+        let mut different_scope = template("scope", 0);
+        different_scope.scope = Some("other-scope".into());
+        record(&path, different_scope).unwrap();
+        let mut different_label = template("label", 0);
+        different_label.label = Some("other-label".into());
+        record(&path, different_label).unwrap();
+
+        let mut refreshed = original;
+        refreshed.key = "new".into();
+        record(&path, refreshed).unwrap();
+        let keys: Vec<String> = records(&path, 0, 0)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        assert_eq!(keys, ["argv", "cwd", "scope", "label", "new"]);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_read_only_store_warns_that_the_full_command_runs() {
@@ -289,7 +325,9 @@ mod tests {
     fn the_catalog_keeps_at_most_128_records() {
         let path = store("cap");
         for i in 0..130 {
-            record(&path, template(&format!("k{i}"), 0)).unwrap();
+            let mut entry = template(&format!("k{i}"), 0);
+            entry.argv.push(i.to_string());
+            record(&path, entry).unwrap();
         }
         let keys: Vec<String> = read_catalog(&path)
             .ok()

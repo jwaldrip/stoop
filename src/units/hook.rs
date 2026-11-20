@@ -8,7 +8,6 @@ pub(crate) struct Hook {
     pub original: Vec<OsString>,
     pub argv: Vec<OsString>,
     pub removed: Vec<OsString>,
-    pub spans: Vec<Vec<(usize, usize)>>,
     pub placeholder: String,
 }
 
@@ -310,31 +309,78 @@ fn mangled(word: &str) -> bool {
     })
 }
 
-fn carrier(word: &str, first: usize) -> Option<String> {
+fn legacy_carrier(word: &str, first: usize) -> Option<&str> {
     if word.starts_with("--") {
-        return word[..first]
-            .split_once('=')
-            .map(|(name, _)| name.to_string());
+        return word[..first].split_once('=').map(|(name, _)| name);
     }
     if word.starts_with('-') && word.len() > 2 && first >= 2 {
-        return word.get(..2).map(str::to_string);
+        return word.get(..2);
     }
     None
 }
 
-fn same_option(word: &str, name: &str) -> bool {
+fn legacy_same_option(word: &str, name: &str) -> bool {
     word == name
         || word.strip_prefix(name).is_some_and(|tail| {
             tail.starts_with('=') || (!name.starts_with("--") && !tail.is_empty())
         })
 }
 
-fn ambiguous(name: &str) -> String {
-    let name = safe(&lossy_shadow(name));
-    format!("cannot tell where the values for {name} end; attach the placeholder with =, put it right after {name} or after --, or declare the option (declarations arrive with the configuration slice)")
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Arity {
+    Zero,
+    One,
+    Many,
 }
 
-pub(crate) fn prepare(exact: &[OsString]) -> Result<Option<Hook>, String> {
+#[derive(Clone, Debug)]
+pub(crate) struct OptionDeclaration {
+    pub names: Vec<String>,
+    pub arity: Arity,
+}
+
+fn declared_word<'a>(
+    options: &'a [OptionDeclaration],
+    word: &str,
+) -> Option<(&'a OptionDeclaration, &'a str)> {
+    options.iter().find_map(|item| {
+        item.names
+            .iter()
+            .find(|name| {
+                word == name.as_str()
+                    || (name.starts_with("--")
+                        && word
+                            .strip_prefix(name.as_str())
+                            .is_some_and(|tail| tail.starts_with('=')))
+            })
+            .map(|name| (item, name.as_str()))
+    })
+}
+
+fn touches_declared(word: &str, name: &str) -> bool {
+    word == name
+        || word.strip_prefix(name).is_some_and(|tail| {
+            !tail.is_empty() && (!name.starts_with("--") || tail.starts_with('='))
+        })
+}
+
+fn valid_attachment(arity: Arity, attached: bool) -> bool {
+    !attached || arity != Arity::Zero
+}
+
+fn ambiguous(name: &str) -> String {
+    let name = safe(&lossy_shadow(name));
+    format!("cannot tell where the values for {name} end; attach the placeholder with =, put it right after {name} or after --, or declare the option in .stoop.toml")
+}
+
+pub(crate) struct ParsedHook {
+    argv: Vec<String>,
+    spans: Vec<Vec<(usize, usize)>>,
+    placeholder: String,
+    start: usize,
+}
+
+pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
     let argv = shadows(exact);
     let shell = shell_code(&argv);
     let mut all = Vec::with_capacity(argv.len());
@@ -390,64 +436,173 @@ pub(crate) fn prepare(exact: &[OsString]) -> Result<Option<Hook>, String> {
         return Ok(None);
     }
     let start = shell.and_then(|(_, zero)| zero).map_or(1, |zero| zero + 1);
-    let mut remove = vec![false; argv.len()];
-    let mut carriers = Vec::new();
-    for (i, parts) in all.iter().enumerate().skip(1) {
-        if parts.is_empty() {
+    Ok(Some(ParsedHook {
+        argv,
+        spans: all,
+        placeholder,
+        start,
+    }))
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn prepare(exact: &[OsString]) -> Result<Option<Hook>, String> {
+    parse(exact)?
+        .map(|parsed| parsed.finish(exact, &[]))
+        .transpose()
+}
+
+/// Before the first `--`, declared options use their arity and aliases. Undeclared
+/// options retain 2a's adjacent-placeholder and carrier rules, including ambiguity
+/// refusals. After `--`, words are positional and cannot own a placeholder.
+fn removals(
+    argv: &[String],
+    spans: &[Vec<(usize, usize)>],
+    start: usize,
+    options: &[OptionDeclaration],
+) -> Result<Vec<bool>, String> {
+    struct Occurrence<'a> {
+        name: &'a str,
+        declaration: Option<usize>,
+        start: usize,
+        end: usize,
+        attached: bool,
+        selected: bool,
+    }
+    let end = (start..argv.len())
+        .find(|&i| argv[i] == "--")
+        .unwrap_or(argv.len());
+    let mut remove: Vec<bool> = spans.iter().map(|parts| !parts.is_empty()).collect();
+    for i in start..argv.len() {
+        if spans[i].is_empty() {
             continue;
         }
-        remove[i] = true;
-        let whole = parts.len() == 1 && parts[0] == (0, argv[i].len());
-        if !whole {
-            if let Some(name) = carrier(&argv[i], parts[0].0) {
-                carriers.push(name);
-            }
-        } else if i > start && option(&argv[i - 1]) && !argv[i - 1].contains('=') && !remove[i - 1]
+        let bare = spans[i].len() == 1 && spans[i][0] == (0, argv[i].len());
+        let attached = i < end
+            && declared_word(options, &argv[i]).is_some_and(|(item, name)| {
+                name.starts_with("--")
+                    && valid_attachment(item.arity, true)
+                    && spans[i].len() == 1
+                    && spans[i][0] == (name.len() + 1, argv[i].len())
+            });
+        let touches_declared = i < end
+            && options
+                .iter()
+                .flat_map(|item| &item.names)
+                .any(|name| touches_declared(&argv[i], name));
+        if touches_declared && !bare && !attached {
+            return Err(ambiguous(&argv[i]));
+        }
+    }
+    let mut owned = vec![false; argv.len()];
+    let mut occurrences = Vec::new();
+    let mut i = start;
+    while i < end {
+        let word = &argv[i];
+        if !option(word) {
+            i += 1;
+            continue;
+        }
+        let declared = declared_word(options, word);
+        if declared.is_none()
+            && options
+                .iter()
+                .flat_map(|item| &item.names)
+                .any(|name| touches_declared(word, name) && word != name)
         {
-            remove[i - 1] = true;
-            carriers.push(argv[i - 1].clone());
-        } else if i > start && argv[i - 1] != "--" {
-            for j in (start..i).rev() {
-                if argv[j] == "--" {
-                    break;
+            return Err(ambiguous(word));
+        }
+        let (name, declaration, attached) = if let Some((item, name)) = declared {
+            if !valid_attachment(item.arity, word != name) {
+                return Err(ambiguous(word));
+            }
+            let index = options
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, item))
+                .unwrap();
+            (name, Some(index), word != name)
+        } else if let Some(&(first, _)) = spans[i].first() {
+            let name = legacy_carrier(word, first).unwrap_or(word);
+            (name, None, name != word)
+        } else {
+            (word.as_str(), None, word.contains('='))
+        };
+        let first = i;
+        i += 1;
+        match declaration.map(|index| options[index].arity) {
+            Some(Arity::One) if !attached && i < end => i += 1,
+            Some(Arity::Many) => {
+                while i < end && !option(&argv[i]) {
+                    i += 1;
                 }
-                if option(&argv[j]) && !remove[j] {
-                    if !argv[j].contains('=') {
-                        return Err(ambiguous(&argv[j]));
-                    }
-                    break;
-                }
+            }
+            None if !attached
+                && i < end
+                && spans[i].len() == 1
+                && spans[i][0] == (0, argv[i].len()) =>
+            {
+                i += 1
+            }
+            _ => {}
+        }
+        for used in &mut owned[first..i] {
+            *used = true;
+        }
+        let selected = spans[first..i].iter().any(|parts| !parts.is_empty());
+        occurrences.push(Occurrence {
+            name,
+            declaration,
+            start: first,
+            end: i,
+            attached,
+            selected,
+        });
+    }
+    for at in start..end {
+        if spans[at].len() != 1 || spans[at][0] != (0, argv[at].len()) || owned[at] {
+            continue;
+        }
+        if let Some(occurrence) = occurrences
+            .iter()
+            .rev()
+            .find(|item| item.start < at && item.end <= at && !item.selected)
+        {
+            if occurrence.declaration.is_none() && !argv[occurrence.start].contains('=') {
+                return Err(ambiguous(occurrence.name));
             }
         }
     }
-    for name in &carriers {
-        let mut i = start;
-        while i < argv.len() {
-            if !remove[i] && same_option(&argv[i], name) {
-                if argv[i] == *name {
-                    remove[i] = true;
-                    if i + 1 < argv.len()
-                        && !remove[i + 1]
-                        && argv[i + 1] != "--"
-                        && !option(&argv[i + 1])
-                    {
-                        if i + 2 < argv.len()
-                            && !remove[i + 2]
-                            && argv[i + 2] != "--"
-                            && !option(&argv[i + 2])
-                        {
-                            return Err(ambiguous(name));
-                        }
-                        remove[i + 1] = true;
-                        i += 1;
-                    }
-                } else if !name.starts_with("--") && !argv[i].starts_with(&format!("{name}=")) {
-                    return Err(ambiguous(name));
-                } else {
-                    remove[i] = true;
+    for occurrence in &occurrences {
+        let selected = occurrences.iter().find(|other| {
+            other.selected
+                && match (occurrence.declaration, other.declaration) {
+                    (Some(a), Some(b)) => a == b,
+                    (None, None) => legacy_same_option(&argv[occurrence.start], other.name),
+                    _ => false,
                 }
+        });
+        let Some(selected) = selected else { continue };
+        if occurrence.declaration.is_none()
+            && !occurrence.selected
+            && !selected.name.starts_with("--")
+            && argv[occurrence.start] != selected.name
+            && !argv[occurrence.start].starts_with(&format!("{}=", selected.name))
+        {
+            return Err(ambiguous(selected.name));
+        }
+        for used in &mut remove[occurrence.start..occurrence.end] {
+            *used = true;
+        }
+        if occurrence.declaration.is_none()
+            && !occurrence.attached
+            && occurrence.end == occurrence.start + 1
+        {
+            let value = occurrence.end;
+            if value < end && !option(&argv[value]) && !remove[value] {
+                if value + 1 < end && !option(&argv[value + 1]) && !remove[value + 1] {
+                    return Err(ambiguous(occurrence.name));
+                }
+                remove[value] = true;
             }
-            i += 1;
         }
     }
     if let Some(i) = (1..argv.len()).rev().find(|&i| !remove[i]) {
@@ -455,31 +610,99 @@ pub(crate) fn prepare(exact: &[OsString]) -> Result<Option<Hook>, String> {
             remove[i] = true;
         }
     }
-    let mut exec = Vec::with_capacity(exact.len());
-    let mut removed = Vec::new();
-    for (i, word) in exact.iter().enumerate() {
-        if remove[i] {
-            removed.push(word.clone());
-        } else {
-            exec.push(word.clone());
-        }
+    Ok(remove)
+}
+
+impl ParsedHook {
+    /// Match an erased shell shape before option arities are known.
+    pub(crate) fn expanded_matches(&self, exact: &[OsString]) -> bool {
+        expanded_matches_parts(&self.argv, &self.spans, exact)
     }
-    Ok(Some(Hook {
-        original: exact.to_vec(),
-        argv: exec,
-        removed,
-        spans: all,
-        placeholder,
-    }))
+
+    pub(crate) fn finish(
+        self,
+        exact: &[OsString],
+        options: &[OptionDeclaration],
+    ) -> Result<Hook, String> {
+        let Self {
+            argv,
+            spans: all,
+            placeholder,
+            start,
+        } = self;
+        let remove = removals(&argv, &all, start, options)?;
+        let mut exec = Vec::with_capacity(exact.len());
+        let mut removed = Vec::new();
+        for (i, word) in exact.iter().enumerate() {
+            if remove[i] {
+                removed.push(word.clone());
+            } else {
+                exec.push(word.clone());
+            }
+        }
+        Ok(Hook {
+            original: exact.to_vec(),
+            argv: exec,
+            removed,
+            placeholder,
+        })
+    }
+}
+
+/// Normalize aliases and environment spellings while preserving every modifier and filter.
+pub(crate) fn normalize(word: &str) -> Result<String, String> {
+    let parts = spans(word)?;
+    let mut result = String::with_capacity(word.len());
+    let mut cursor = 0;
+    for (start, end) in parts {
+        result.push_str(&word[cursor..start]);
+        let token = &word[start..end];
+        let mut normalized = None;
+        for &(name, env) in CHANGED {
+            let primary = if name == "units" { "changed" } else { name };
+            let brace = format!("{{{name}");
+            if let Some(suffix) = token.strip_prefix(&brace) {
+                normalized = Some(format!("{{{primary}{suffix}"));
+                break;
+            }
+            if let Some(env) = env {
+                let braced = format!("${{{env}");
+                let plain = format!("${env}");
+                if let Some(suffix) = token.strip_prefix(&braced) {
+                    normalized = Some(format!("{{{primary}{suffix}"));
+                    break;
+                }
+                if token == plain {
+                    normalized = Some(format!("{{{primary}}}"));
+                    break;
+                }
+            }
+        }
+        result.push_str(normalized.as_deref().unwrap_or(token));
+        cursor = end;
+    }
+    result.push_str(&word[cursor..]);
+    Ok(result)
+}
+
+#[cfg(all(test, unix))]
+fn expanded_matches(hook: &Hook, exact: &[OsString]) -> bool {
+    parse(&hook.original)
+        .ok()
+        .flatten()
+        .is_some_and(|parsed| parsed.expanded_matches(exact))
 }
 
 /// Does this argv equal a shell-expanded form of the recorded hook?
-pub(crate) fn expanded_matches(hook: &Hook, exact: &[OsString]) -> bool {
-    let original = shadows(&hook.original);
+fn expanded_matches_parts(
+    original: &[String],
+    all: &[Vec<(usize, usize)>],
+    exact: &[OsString],
+) -> bool {
     let incoming = shadows(exact);
     let n = original.len();
     let m = incoming.len();
-    if !hook.spans.iter().any(|s| !s.is_empty()) || n > 128 || m > 2048 {
+    if !all.iter().any(|s| !s.is_empty()) || n > 128 || m > 2048 {
         return false;
     }
     let mut reachable = vec![false; (n + 1) * (m + 1)];
@@ -487,7 +710,7 @@ pub(crate) fn expanded_matches(hook: &Hook, exact: &[OsString]) -> bool {
     reachable[0] = true;
     for i in 0..n {
         let word = &original[i];
-        let spans = &hook.spans[i];
+        let spans = &all[i];
         let mut erased = String::new();
         let mut cursor = 0;
         for &(start, end) in spans {
@@ -526,7 +749,7 @@ pub(crate) fn expanded_matches(hook: &Hook, exact: &[OsString]) -> bool {
                     reachable[(i + 1) * stride + j + 1] = true;
                 }
                 if i + 1 < n && j < m && option(word) {
-                    let next = &hook.spans[i + 1];
+                    let next = &all[i + 1];
                     if next.len() == 1
                         && next[0] == (0, original[i + 1].len())
                         && incoming[j] == format!("{word}=")
@@ -640,7 +863,7 @@ pub(crate) fn expanded_explain(hook: &Hook) -> String {
     )
 }
 
-/// The line for placeholder-free argv that matches more than one recorded full command.
+/// The 2a diagnostic for an unconfigured argv matching different full commands.
 pub(crate) fn ambiguous_line(argv: &[OsString], matches: usize, explain: bool) -> String {
     let typed = render(argv);
     if explain {
