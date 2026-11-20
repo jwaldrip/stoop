@@ -255,6 +255,16 @@ fn legacy_undeclared_attached_placeholders_remain_supported() {
 }
 
 #[test]
+fn undeclared_partial_attached_forms_keep_2a_behavior() {
+    for carrier in ["-foo{changed}", "--files=base{changed}"] {
+        let f = Fixture::new();
+        let out = f.off(&[carrier, "tail"]);
+        assert!(out.status.success(), "{carrier}: {}", stderr(&out));
+        assert_eq!(out.stdout, b"run <tail>\n", "{carrier}");
+    }
+}
+
+#[test]
 fn legacy_attached_carrier_removes_prior_occurrences() {
     let f = Fixture::new();
     assert_ran(&f.off(&["-f", "base", "-f{changed}"]));
@@ -266,11 +276,11 @@ fn declared_long_partial_placeholder_is_refused() {
     f.config(
         r#"[[units.suite]]
 id = "files"
-match = ["./runner", "--files=base{changed}"]
+match = ["./runner", "--files=base{changed}", "tail"]
 options = [{ names = ["--files"], values = "many" }]
 "#,
     );
-    let out = f.off(&["--files=base{changed}"]);
+    let out = f.off(&["--files=base{changed}", "tail"]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert!(out.stdout.is_empty());
 }
