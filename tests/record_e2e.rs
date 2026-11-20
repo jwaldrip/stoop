@@ -2821,7 +2821,7 @@ fn mount_api_and_namespace_clone_attempts_are_not_recorded() {
 }
 
 #[test]
-fn pinned_concurrent_retarget_has_no_stale_output_after_changer_sleeps_or_exits() {
+fn concurrent_retarget_during_in_flight_writes_is_refused_after_changer_sleeps_or_exits() {
     use std::os::unix::fs::symlink;
     for variant in ["sleep", "exit"] {
         for trial in 0..40 {
@@ -2850,13 +2850,13 @@ fn pinned_concurrent_retarget_has_no_stale_output_after_changer_sleeps_or_exits(
             );
             let (status, err) = w.sh_with_affinity(&script, &w.root, true);
             assert_eq!(status, 0, "{variant} trial {trial}: {err}");
-            assert!(err.contains("recorded"), "{variant} trial {trial}: {err}");
-            let p = w.proof();
             assert!(
-                pairs(&p, "outputs").iter().any(|(key, _)| key == "sub/g"),
-                "{variant} trial {trial}: {:?}; removed {:?}",
-                pairs(&p, "outputs"),
-                removed(&p)
+                err.contains("stoop: not recorded: it replaced the link"),
+                "{variant} trial {trial}: {err}"
+            );
+            assert!(
+                !err.contains("stoop: recorded"),
+                "{variant} trial {trial}: {err}"
             );
             let _ = fs::remove_dir_all(outside);
         }
