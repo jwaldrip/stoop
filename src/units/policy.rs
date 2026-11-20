@@ -28,6 +28,8 @@ struct EventPolicy {
     repository: EventRepository,
     #[serde(rename = "ref")]
     reference: Option<String>,
+    number: Option<u64>,
+    pull_request: Option<EventPullRequest>,
 }
 
 #[derive(Deserialize)]
@@ -35,12 +37,24 @@ struct EventRepository {
     default_branch: String,
 }
 
-fn event_context() -> Option<(String, Option<String>)> {
+#[derive(Deserialize)]
+struct EventPullRequest {
+    number: Option<u64>,
+    head: Option<EventRef>,
+    base: Option<EventRef>,
+}
+
+#[derive(Deserialize)]
+struct EventRef {
+    #[serde(rename = "ref")]
+    name: String,
+}
+
+fn event_context() -> Option<EventPolicy> {
     let path = std::env::var_os("GITHUB_EVENT_PATH")?;
     let bytes = super::config::read_regular_bounded(Path::new(&path), MAX_EVENT_BYTES).ok()?;
     let event: EventPolicy = serde_json::from_slice(&bytes).ok()?;
-    valid_branch(&event.repository.default_branch)
-        .then_some((event.repository.default_branch, event.reference))
+    valid_branch(&event.repository.default_branch).then_some(event)
 }
 
 fn positive(text: &str) -> Option<u64> {
@@ -157,7 +171,15 @@ pub(crate) fn forced_reason(
         None
     };
     if github {
-        let Some((default, payload_ref)) = event_context() else {
+        let Some(EventPolicy {
+            repository: EventRepository {
+                default_branch: default,
+            },
+            reference: payload_ref,
+            number: payload_number,
+            pull_request: pull,
+        }) = event_context()
+        else {
             return Some("unknown GitHub branch context".into());
         };
         if configured.as_ref().is_some_and(|branch| branch != &default)
@@ -203,6 +225,30 @@ pub(crate) fn forced_reason(
                 if pull_ref(reference) =>
             {
                 let name = reference.strip_prefix("refs/pull/").unwrap_or_default();
+                let number = name
+                    .split_once('/')
+                    .and_then(|(number, _)| positive(number));
+                if payload_number.is_some_and(|value| Some(value) != number)
+                    || pull
+                        .as_ref()
+                        .and_then(|p| p.number)
+                        .is_some_and(|value| Some(value) != number)
+                    || (std::env::var_os("GITHUB_HEAD_REF").is_some()
+                        && pull.as_ref().and_then(|p| p.head.as_ref()).is_none())
+                    || (std::env::var_os("GITHUB_BASE_REF").is_some()
+                        && pull.as_ref().and_then(|p| p.base.as_ref()).is_none())
+                    || pull.as_ref().is_some_and(|p| {
+                        p.head.as_ref().is_some_and(|head| {
+                            !valid_branch(&head.name)
+                                || !agrees_if_present("GITHUB_HEAD_REF", &head.name)
+                        }) || p.base.as_ref().is_some_and(|base| {
+                            !valid_branch(&base.name)
+                                || !agrees_if_present("GITHUB_BASE_REF", &base.name)
+                        })
+                    })
+                {
+                    return Some("conflicting GitHub pull request context".into());
+                }
                 if !agrees_if_present("GITHUB_REF_NAME", name)
                     || !agrees_if_present("GITHUB_REF_TYPE", "branch")
                 {

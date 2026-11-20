@@ -633,6 +633,7 @@ fn recover_hooks(
         }
     };
     let mut found: Vec<units::hook::Hook> = Vec::new();
+    let mut configured = false;
     for record in records.into_iter().filter(|record| {
         record.cwd == cwd && record.scope.as_deref() == scope && record.label == o.key
     }) {
@@ -651,7 +652,11 @@ fn recover_hooks(
         }
         match prepared {
             Ok(prepared) => {
+                configured |= prepared.configured;
                 if let Some(candidate) = prepared.hook {
+                    if hook_key(&candidate, record.label.as_deref(), cwd, scope) != record.key {
+                        return (warnings, Err("the recorded hook's full form changed; quote the placeholder or use --literal".into()));
+                    }
                     if !found.iter().any(|known| known.argv == candidate.argv) {
                         found.push(candidate);
                     }
@@ -659,6 +664,15 @@ fn recover_hooks(
             }
             Err(error) => return (warnings, Err(error)),
         }
+    }
+    if configured && found.len() > 1 {
+        return (
+            warnings,
+            Err(
+                "recorded hooks have different full forms; quote the placeholder or use --literal"
+                    .into(),
+            ),
+        );
     }
     (warnings, Ok(found))
 }
@@ -822,6 +836,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         config,
         invalid: config_invalid,
         independent_false,
+        configured: _,
     } = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
