@@ -12,11 +12,14 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::symlink;
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
+use std::time::Instant;
 
 /// A repository root and the scratch space around it, under the test's temporary directory.
 /// Removed when the test ends.
@@ -123,6 +126,30 @@ fn meet(fifo: &Path) -> File {
         .expect("open the FIFO for writing")
 }
 
+/// Release a retry if it reaches the FIFO; a skipped command never opens the FIFO.
+fn meet_if_running(fifo: &Path, child: &mut Child) -> Option<File> {
+    let started = Instant::now();
+    loop {
+        match OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(fifo)
+        {
+            Ok(file) => return Some(file),
+            Err(err) if err.raw_os_error() == Some(libc::ENXIO) => {}
+            Err(err) => panic!("opening retry FIFO: {err}"),
+        }
+        if child.try_wait().unwrap().is_some() {
+            return None;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(60),
+            "retry neither exited nor reached the FIFO"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// Sleep past git's racy window so a file written now is not racy when the command reads it.
 fn age() {
     thread::sleep(Duration::from_millis(2_200));
@@ -151,6 +178,25 @@ fn assert_recorded(out: &Output, case: &Case, key: &str) {
     assert!(out.status.success(), "{err}");
     assert!(err.contains("stoop: recorded "), "{err}");
     assert!(case.proof(key).exists(), "no proof written:\n{err}");
+}
+
+fn assert_refused_for(out: &Output, case: &Case, key: &str, paths: &[&str]) {
+    let err = stderr(out);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("stoop: not recorded:"), "{err}");
+    assert!(
+        paths.iter().any(|path| err.contains(path)),
+        "expected one of {paths:?} in:\n{err}"
+    );
+    assert!(
+        !case.proof(key).exists(),
+        "a refused run wrote a proof:\n{err}"
+    );
+}
+
+fn proof(case: &Case, key: &str) -> Value {
+    let value: Value = serde_json::from_slice(&fs::read(case.proof(key)).unwrap()).unwrap();
+    value["proofs"][0].clone()
 }
 
 fn touch_ahead(path: &Path) {
@@ -710,4 +756,487 @@ fn a_directory_link_retargeted_mid_run_is_refused_for_the_link_read_through_it()
         "t22-outside-dir-link",
         "src/dl changed while the command ran",
     );
+}
+
+#[test]
+fn dangling_link_writes_record_the_actual_target_and_rerun_if_it_disappears() {
+    for (key, two_hops) in [
+        ("dangling-output-one", false),
+        ("dangling-output-two", true),
+    ] {
+        let case = Case::new(key);
+        case.file("src/keep", b"keep\n");
+        if two_hops {
+            symlink("dl2", case.root().join("src/dl")).unwrap();
+            symlink("new", case.root().join("src/dl2")).unwrap();
+        } else {
+            symlink("new", case.root().join("src/dl")).unwrap();
+        }
+        let script = "test -e src/new; printf 'made\\n' > src/dl";
+        let first = run(&case, key, script, &[]);
+        assert_recorded(&first, &case, key);
+        let stored = proof(&case, key);
+        let outputs = stored["outputs"].as_array().unwrap();
+        let target = outputs
+            .iter()
+            .find(|entry| entry["path"] == "src/new")
+            .unwrap_or_else(|| panic!("missing created target in {outputs:?}"));
+        let expected = format!("f:{}", blake3::hash(b"made\n").to_hex());
+        assert_eq!(target["id"].as_str(), Some(expected.as_str()), "{target}");
+        assert!(
+            !outputs.iter().any(|entry| entry["path"] == "src/dl2"),
+            "{outputs:?}"
+        );
+
+        fs::remove_file(case.root().join("src/new")).unwrap();
+        let again = run(&case, key, script, &[]);
+        let err = stderr(&again);
+        assert!(again.status.success(), "{err}");
+        assert!(
+            err.contains("stoop: run ") && !err.contains("stoop: skip"),
+            "{err}"
+        );
+        assert_eq!(fs::read(case.root().join("src/new")).unwrap(), b"made\n");
+    }
+}
+
+#[test]
+fn foreign_bytes_read_back_after_an_own_write_refuse_and_the_retry_fails() {
+    let key = "foreign-read-back";
+    let case = Case::new(key);
+    let file = case.file("src/f", b"original\n");
+    symlink("f", case.root().join("src/link")).unwrap();
+    age();
+    let fifo = case.fifo("read-back.fifo");
+    let script = "printf 'bad\\n' > src/f; cat \"$FIFO\" >/dev/null; grep -qx good src/link";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::write(&file, b"good\n").unwrap();
+    drop(release);
+    let first = child.wait_with_output().unwrap();
+
+    let mut retry = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet_if_running(&fifo, &mut retry);
+    let reached_fifo = release.is_some();
+    drop(release);
+    let again = retry.wait_with_output().unwrap();
+    assert_refused_for(&first, &case, key, &["src/f", "src/link"]);
+    let err = stderr(&again);
+    assert!(reached_fifo, "retry never reached the FIFO:\n{err}");
+    assert_eq!(again.status.code(), Some(1), "{err}");
+    assert!(!err.contains("stoop: skip"), "{err}");
+    assert!(!case.proof(key).exists(), "retry wrote a proof:\n{err}");
+}
+
+#[test]
+fn replacing_a_hard_link_source_after_the_link_refuses_the_record() {
+    let key = "hard-link-replaced-source";
+    let case = Case::new(key);
+    let source = case.file("src/a", b"good\n");
+    let replacement = case.outside("replacement", b"bad\n");
+    age();
+    let fifo = case.fifo("hard-link.fifo");
+    let script = "grep -qx good src/a && ln src/a src/b && cat \"$FIFO\" >/dev/null";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::rename(&replacement, &source).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(fs::read(case.root().join("src/b")).unwrap(), b"good\n");
+    assert_eq!(fs::read(&source).unwrap(), b"bad\n");
+    assert_refused_for(&out, &case, key, &["src/a", "src/b"]);
+}
+
+#[test]
+fn an_own_write_open_does_not_hide_a_foreign_hard_link_rewrite() {
+    let key = "hard-link-open-foreign-write";
+    let case = Case::new(key);
+    let source = case.file("src/a", b"good\n");
+    let alias = case.root().join("src/b");
+    fs::hard_link(&source, &alias).unwrap();
+    age();
+    let fifo = case.fifo("hard-link-open.fifo");
+    let script = "grep -qx good src/a && : >> src/b && cat \"$FIFO\" >/dev/null";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::write(&alias, b"evil\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(fs::read(&source).unwrap(), b"evil\n");
+    assert_refused_for(&out, &case, key, &["src/a", "src/b"]);
+}
+
+#[test]
+fn linking_a_read_file_without_changing_its_content_still_records() {
+    let key = "hard-link-metadata-only";
+    let case = Case::new(key);
+    case.file("src/a", b"good\n");
+    age();
+    let out = run(&case, key, "cat src/a >/dev/null && ln src/a src/b", &[]);
+    assert_recorded(&out, &case, key);
+    let stored = proof(&case, key);
+    let expected = format!("f:{}", blake3::hash(b"good\n").to_hex());
+    for (field, path) in [("inputs", "src/a"), ("outputs", "src/b")] {
+        let entries = stored[field].as_array().unwrap();
+        let item = entries
+            .iter()
+            .find(|entry| entry["path"] == path)
+            .unwrap_or_else(|| panic!("missing {path} from {field}: {entries:?}"));
+        assert_eq!(item["id"].as_str(), Some(expected.as_str()), "{item}");
+    }
+}
+
+#[test]
+fn writing_a_hard_link_after_reading_its_other_name_refuses_the_record() {
+    let key = "hard-link-content-write";
+    let case = Case::new(key);
+    let source = case.file("src/a", b"good\n");
+    fs::hard_link(&source, case.root().join("src/b")).unwrap();
+    age();
+    let out = run(
+        &case,
+        key,
+        "cat src/a >/dev/null && printf 'bad\\n' > src/b",
+        &[],
+    );
+    assert_refused_for(&out, &case, key, &["src/a", "src/b"]);
+}
+
+#[test]
+fn replacing_an_own_rewritten_link_hop_from_outside_refuses_the_read_route() {
+    let key = "own-hop-then-foreign";
+    let case = Case::new(key);
+    case.file("src/a", b"alpha\n");
+    case.file("src/b", b"bravo\n");
+    case.file("src/c", b"charlie\n");
+    symlink("a", case.root().join("src/link2")).unwrap();
+    symlink("link2", case.root().join("src/link1")).unwrap();
+    let replacement = case.outside("next-link", b"");
+    fs::remove_file(&replacement).unwrap();
+    symlink("c", &replacement).unwrap();
+    age();
+    let fifo = case.fifo("hop.fifo");
+    let script =
+        "cat src/link1 > result && rm src/link2 && ln -s b src/link2 && cat \"$FIFO\" >/dev/null";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    assert_eq!(
+        fs::read_link(case.root().join("src/link2")).unwrap(),
+        Path::new("b")
+    );
+    fs::rename(&replacement, case.root().join("src/link2")).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(fs::read(case.root().join("result")).unwrap(), b"alpha\n");
+    assert_refused_for(&out, &case, key, &["src/link1", "src/link2"]);
+}
+
+#[test]
+fn retargeting_an_external_directory_hop_refuses_the_in_root_read_route() {
+    let key = "external-directory-hop";
+    let case = Case::new(key);
+    case.file("src/keep", b"keep\n");
+    let old = case.outside("a/data", b"alpha\n");
+    case.outside("b/data", b"bravo\n");
+    let hop = case.dir.join("outside/hop");
+    symlink("a", &hop).unwrap();
+    symlink(hop.join("data"), case.root().join("src/link")).unwrap();
+    let next = case.dir.join("outside/next-hop");
+    symlink("b", &next).unwrap();
+    age();
+    let fifo = case.fifo("external-hop.fifo");
+    let child = spawn(
+        &case,
+        key,
+        "cat src/link > result && cat \"$FIFO\" >/dev/null",
+        &[("FIFO", &fifo)],
+    );
+    let release = meet(&fifo);
+    fs::rename(&next, &hop).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(fs::read(&old).unwrap(), b"alpha\n");
+    assert_eq!(fs::read(case.root().join("result")).unwrap(), b"alpha\n");
+    assert_refused_for(
+        &out,
+        &case,
+        key,
+        &["src/link", hop.to_str().unwrap(), old.to_str().unwrap()],
+    );
+}
+
+#[test]
+fn a_racy_open_restored_after_the_descriptor_read_refuses_the_record() {
+    let key = "racy-descriptor-restored";
+    let case = Case::new(key);
+    let file = case.file("src/a", b"bad!\n");
+    touch_ahead(&file);
+    let original = fs::metadata(&file).unwrap();
+    let first = case.fifo("racy-first.fifo");
+    let second = case.fifo("racy-second.fifo");
+    let script = "exec 3< src/a || exit; cat \"$FIRST\" >/dev/null || exit; grep -qx good <&3 || exit; cat \"$SECOND\" >/dev/null";
+    let child = spawn(
+        &case,
+        key,
+        script,
+        &[("FIRST", &first), ("SECOND", &second)],
+    );
+    let release = meet(&first);
+    thread::sleep(Duration::from_millis(10));
+    fs::write(&file, b"good\n").unwrap();
+    drop(release);
+    let release = meet(&second);
+    thread::sleep(Duration::from_millis(10));
+    fs::write(&file, b"bad!\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(fs::read(&file).unwrap(), b"bad!\n");
+    let restored = fs::metadata(&file).unwrap();
+    assert_eq!(
+        (
+            original.dev(),
+            original.ino(),
+            original.mode(),
+            original.size()
+        ),
+        (
+            restored.dev(),
+            restored.ino(),
+            restored.mode(),
+            restored.size()
+        )
+    );
+    assert_ne!(
+        (original.mtime(), original.mtime_nsec()),
+        (restored.mtime(), restored.mtime_nsec())
+    );
+    assert_refused_for(&out, &case, key, &["src/a"]);
+}
+
+#[test]
+fn a_foreign_retarget_before_an_alias_write_cannot_record_the_wrong_output() {
+    let key = "alias-retarget-before-open";
+    let case = Case::new(key);
+    case.file("a/keep", b"keep\n");
+    case.file("b/keep", b"keep\n");
+    let outside = case.dir.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let hop = outside.join("hop");
+    let next = outside.join("next-hop");
+    symlink(case.root().join("a"), &hop).unwrap();
+    symlink(case.root().join("b"), &next).unwrap();
+    symlink(&hop, case.root().join("alias")).unwrap();
+    let fifo = case.fifo("alias-write.fifo");
+    let script = "cat \"$FIFO\" >/dev/null; printf 'written\\n' > alias/out";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::rename(&next, &hop).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(fs::read(case.root().join("b/out")).unwrap(), b"written\n");
+    assert!(!case.root().join("a/out").exists());
+    if err.contains("stoop: recorded ") {
+        let stored = proof(&case, key);
+        let outputs = stored["outputs"].as_array().unwrap();
+        let output = outputs
+            .iter()
+            .find(|entry| entry["path"] == "b/out")
+            .unwrap_or_else(|| panic!("missing kernel destination in {outputs:?}"));
+        let expected = format!("f:{}", blake3::hash(b"written\n").to_hex());
+        assert_eq!(output["id"].as_str(), Some(expected.as_str()), "{output}");
+        assert!(
+            !outputs.iter().any(|entry| entry["path"] == "a/out"),
+            "{outputs:?}"
+        );
+
+        fs::remove_file(case.root().join("b/out")).unwrap();
+        let mut retry = spawn(&case, key, script, &[("FIFO", &fifo)]);
+        let release = meet_if_running(&fifo, &mut retry);
+        let reached_fifo = release.is_some();
+        drop(release);
+        let again = retry.wait_with_output().unwrap();
+        let err = stderr(&again);
+        assert!(reached_fifo, "retry never reached the FIFO:\n{err}");
+        assert!(again.status.success(), "{err}");
+        assert!(!err.contains("stoop: skip"), "{err}");
+        assert_eq!(fs::read(case.root().join("b/out")).unwrap(), b"written\n");
+    } else {
+        assert_refused_for(&out, &case, key, &["alias", "b/out", hop.to_str().unwrap()]);
+    }
+}
+
+#[test]
+fn opening_an_existing_file_for_writing_does_not_own_its_directory_entry() {
+    let key = "write-open-foreign-delete";
+    let case = Case::new(key);
+    let marker = case.file("d/marker", b"present\n");
+    age();
+    let fifo = case.fifo("write-open.fifo");
+    let script = "ls d | grep -qx marker && python3 -c 'import os; fd = os.open(\"d/marker\", os.O_WRONLY); os.close(fd)' && cat \"$FIFO\" >/dev/null";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::remove_file(&marker).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_refused_for(&out, &case, key, &["d changed", "d/marker"]);
+}
+
+#[test]
+fn a_failed_namespace_change_does_not_own_a_later_foreign_deletion() {
+    let key = "failed-link-foreign-delete";
+    let case = Case::new(key);
+    let marker = case.file("d/marker", b"present\n");
+    age();
+    let fifo = case.fifo("failed-link.fifo");
+    let script = "ls d | grep -qx marker || exit 9; if ln -s target d/marker 2>/dev/null; then exit 7; fi; test -f d/marker || exit 8; cat \"$FIFO\" >/dev/null";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::remove_file(&marker).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_refused_for(&out, &case, key, &["d changed", "d/marker"]);
+}
+
+#[test]
+fn a_changed_ignored_regular_path_does_not_refuse_an_otherwise_recordable_run() {
+    let key = "ignored-path-appears";
+    let case = Case::new(key);
+    case.file(".stoopignore", b"scratch/\n");
+    case.file("src/keep", b"keep\n");
+    fs::create_dir(case.root().join("scratch")).unwrap();
+    let fifo = case.fifo("ignored-path.fifo");
+    let script = "cat src/keep >/dev/null; test -e scratch/flag || :; cat \"$FIFO\" >/dev/null; cat scratch/flag >/dev/null";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::write(case.root().join("scratch/flag"), b"appeared\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_recorded(&out, &case, key);
+}
+
+#[test]
+fn an_ignored_alias_does_not_hide_a_foreign_rewrite_of_its_tracked_target() {
+    let key = "ignored-alias-tracked-target";
+    let case = Case::new(key);
+    case.file(".stoopignore", b"scratch/\n");
+    let target = case.file("src/a", b"alpha\n");
+    fs::create_dir(case.root().join("scratch")).unwrap();
+    symlink("../src/a", case.root().join("scratch/al")).unwrap();
+    age();
+    let fifo = case.fifo("ignored-alias.fifo");
+    let script = "cat scratch/al >/dev/null; cat \"$FIFO\" >/dev/null; grep -qx bravo scratch/al";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::write(&target, b"bravo\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_refused_for(&out, &case, key, &["src/a", "scratch/al"]);
+}
+
+#[test]
+fn a_foreign_replacement_between_reading_and_own_writing_refuses_the_record() {
+    let key = "foreign-before-own-write";
+    let case = Case::new(key);
+    let target = case.file("src/f", b"first\n");
+    let replacement = case.outside("next-file", b"foreign\n");
+    age();
+    let fifo = case.fifo("before-own-write.fifo");
+    let script = "cat src/f >/dev/null; cat \"$FIFO\" >/dev/null; printf 'own\\n' >> src/f";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::rename(&replacement, &target).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(fs::read(&target).unwrap(), b"foreign\nown\n");
+    assert_refused_for(&out, &case, key, &["src/f"]);
+}
+
+#[test]
+fn reading_through_a_created_link_tracks_the_target_and_reruns_after_a_change() {
+    let key = "created-link-target-input";
+    let case = Case::new(key);
+    let target = case.file("src/a", b"first\n");
+    age();
+    let script = "ln -sf a src/l && cat src/l >/dev/null";
+    let first = run(&case, key, script, &[]);
+    assert_recorded(&first, &case, key);
+    let stored = proof(&case, key);
+    let inputs = stored["inputs"].as_array().unwrap();
+    let input = inputs
+        .iter()
+        .find(|entry| entry["path"] == "src/a")
+        .unwrap_or_else(|| panic!("missing target in {inputs:?}"));
+    let expected = format!("f:{}", blake3::hash(b"first\n").to_hex());
+    assert_eq!(input["id"].as_str(), Some(expected.as_str()), "{input}");
+    let unchanged = run(&case, key, script, &[]);
+    assert!(
+        stderr(&unchanged).contains("stoop: skip"),
+        "{}",
+        stderr(&unchanged)
+    );
+    fs::write(target, b"second\n").unwrap();
+    let again = run(&case, key, script, &[]);
+    let err = stderr(&again);
+    assert!(again.status.success(), "{err}");
+    assert!(
+        err.contains("stoop: run ") && !err.contains("stoop: skip"),
+        "{err}"
+    );
+}
+
+#[test]
+fn an_open_alias_descriptor_keeps_its_original_destination_after_retargeting() {
+    let key = "alias-retarget-after-open";
+    let case = Case::new(key);
+    case.file("a/keep", b"keep\n");
+    case.file("b/keep", b"keep\n");
+    let outside = case.dir.join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    let hop = outside.join("hop");
+    let next = outside.join("next-hop");
+    symlink(case.root().join("a"), &hop).unwrap();
+    symlink(case.root().join("b"), &next).unwrap();
+    symlink(&hop, case.root().join("alias")).unwrap();
+    let fifo = case.fifo("alias-descriptor.fifo");
+    let script = "exec 3> alias/out && cat \"$FIFO\" >/dev/null && printf 'written\\n' >&3";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    assert_eq!(fs::read(case.root().join("a/out")).unwrap(), b"");
+    fs::rename(&next, &hop).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    let err = stderr(&out);
+    assert!(out.status.success(), "{err}");
+    assert_eq!(fs::read(case.root().join("a/out")).unwrap(), b"written\n");
+    assert!(!case.root().join("b/out").exists());
+    if err.contains("stoop: recorded ") {
+        let stored = proof(&case, key);
+        let outputs = stored["outputs"].as_array().unwrap();
+        let output = outputs
+            .iter()
+            .find(|entry| entry["path"] == "a/out")
+            .unwrap_or_else(|| panic!("missing descriptor destination in {outputs:?}"));
+        let expected = format!("f:{}", blake3::hash(b"written\n").to_hex());
+        assert_eq!(output["id"].as_str(), Some(expected.as_str()), "{output}");
+        assert!(
+            !outputs.iter().any(|entry| entry["path"] == "b/out"),
+            "{outputs:?}"
+        );
+
+        fs::remove_file(case.root().join("a/out")).unwrap();
+        let mut retry = spawn(&case, key, script, &[("FIFO", &fifo)]);
+        let release = meet_if_running(&fifo, &mut retry);
+        let reached_fifo = release.is_some();
+        drop(release);
+        let again = retry.wait_with_output().unwrap();
+        let err = stderr(&again);
+        assert!(reached_fifo, "retry never reached the FIFO:\n{err}");
+        assert!(again.status.success(), "{err}");
+        assert!(!err.contains("stoop: skip"), "{err}");
+        assert_eq!(fs::read(case.root().join("b/out")).unwrap(), b"written\n");
+    } else {
+        assert_refused_for(&out, &case, key, &["alias", "a/out", hop.to_str().unwrap()]);
+    }
 }
