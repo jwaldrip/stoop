@@ -1364,22 +1364,30 @@ fn build_outputs(
             let path = real_root.join(key);
             if trace.read_before_write.contains(&path) {
                 let prior = trace.priors.get(key);
-                if id
-                    .as_deref()
-                    .is_none_or(|value| value == "a" || value == "u")
-                {
-                    return Err(NotRecorded::Other(format!(
-                        "it could not verify the last write to {key}"
-                    )));
-                }
-                if id.as_ref() == prior {
-                    let settled = trace.settled_outputs.get(&path);
-                    if !matches!(settled, Some(Seen::File(_)))
-                        || !settled.is_some_and(|seen| identity::compare(seen, &post, None).is_ok())
+                // An absent prior can also be the final state when a verified own removal
+                // explains it. The prior is recorded as a runtime input below.
+                let own_absence = id.as_deref() == Some("a")
+                    && prior.map(String::as_str) == Some("a")
+                    && trace.removal_explains_absence(&path);
+                if !own_absence {
+                    if id
+                        .as_deref()
+                        .is_none_or(|value| value == "a" || value == "u")
                     {
                         return Err(NotRecorded::Other(format!(
                             "it could not verify the last write to {key}"
                         )));
+                    }
+                    if id.as_ref() == prior {
+                        let settled = trace.settled_outputs.get(&path);
+                        if !matches!(settled, Some(Seen::File(_)))
+                            || !settled
+                                .is_some_and(|seen| identity::compare(seen, &post, None).is_ok())
+                        {
+                            return Err(NotRecorded::Other(format!(
+                                "it could not verify the last write to {key}"
+                            )));
+                        }
                     }
                 }
             }
@@ -1961,6 +1969,11 @@ pub fn build_inputs(
                 "it could not verify what {key} held before writing it"
             )));
         };
+        if trace.absent_after_removal.contains(path)
+            && !matches!(identity::observe(path, false), Seen::Absent)
+        {
+            return Err(NotRecorded::Changed { key });
+        }
         keys.insert(key.clone());
         out.push(Input {
             path: key,
@@ -3095,6 +3108,119 @@ mod read_identity_refusals {
         assert!(outputs
             .iter()
             .any(|output| output.path == "file" && output.id != prior));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn absent_prior_and_output_require_a_verified_removal() {
+        use crate::trace::Removal;
+
+        let root = std::env::temp_dir().join(format!(
+            "stoop-removed-absent-output-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let parent = root.join("old");
+        let child = parent.join("child");
+        let mut trace = Trace::default();
+        trace.read_before_write.insert(parent.clone());
+        trace.read_before_write.insert(child.clone());
+        trace.priors.insert("old".to_owned(), "a".to_owned());
+        trace.priors.insert("old/child".to_owned(), "a".to_owned());
+        let written = BTreeSet::from(["old".to_owned(), "old/child".to_owned()]);
+
+        assert!(build_outputs(&root, &written, &trace).is_err());
+        trace
+            .removed_by_run
+            .insert(parent.clone(), Removal::Unlinked);
+        // Removing a name alone does not explain a vanished child.
+        assert!(build_outputs(&root, &written, &trace).is_err());
+        trace
+            .removed_by_run
+            .insert(parent.clone(), Removal::MovedAway);
+        let (outputs, removed, _) = build_outputs(&root, &written, &trace).unwrap();
+        assert!(outputs.is_empty());
+        assert_eq!(removed, vec!["old".to_owned(), "old/child".to_owned()]);
+
+        trace
+            .priors
+            .insert("old/child".to_owned(), "f:prior".to_owned());
+        assert!(build_outputs(&root, &written, &trace).is_err());
+        trace.priors.insert("old/child".to_owned(), "a".to_owned());
+        trace.removed_by_run.clear();
+        trace.removed_by_run.insert(child, Removal::Unlinked);
+        let child_written = BTreeSet::from(["old/child".to_owned()]);
+        let (_, removed, _) = build_outputs(&root, &child_written, &trace).unwrap();
+        assert_eq!(removed, vec!["old/child".to_owned()]);
+        trace.removed_by_run.clear();
+        assert!(build_outputs(&root, &child_written, &trace).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn after_removal_absence_is_rechecked_before_recording() {
+        use crate::trace::Removal;
+
+        let root = std::env::temp_dir().join(format!(
+            "stoop-recheck-removed-absence-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        let root = std::fs::canonicalize(&root).unwrap();
+        let path = root.join("nested/path");
+        let mut trace = Trace::default();
+        trace.read_before_write.insert(path.clone());
+        trace.absent_after_removal.insert(path.clone());
+        trace.removed_by_run.insert(path.clone(), Removal::Unlinked);
+        trace
+            .priors
+            .insert("nested/path".to_owned(), "a".to_owned());
+        let written = BTreeSet::from(["nested/path".to_owned()]);
+        let ignore = Ignore::new(&[], None, &[]);
+        let mut phys = Physical::new(&root, &root);
+
+        let (inputs, _) = build_inputs(&root, &mut phys, &trace, &ignore, &written).unwrap();
+        assert!(inputs
+            .iter()
+            .any(|input| input.path == "nested/path" && input.id == "a"));
+
+        // A foreign create after the absence lookup must refuse even without a later own write.
+        std::fs::write(&path, b"foreign").unwrap();
+        assert_eq!(
+            build_inputs(&root, &mut phys, &trace, &ignore, &written).unwrap_err(),
+            NotRecorded::Changed {
+                key: "nested/path".to_owned()
+            }
+        );
+        let ignored = Ignore::new(&["nested/path".to_owned()], None, &[]);
+        let (inputs, _) = build_inputs(&root, &mut phys, &trace, &ignored, &written).unwrap();
+        assert!(inputs.is_empty());
+
+        // Ignoring this owned absence does not suppress other inputs.
+        let source = root.join("source");
+        std::fs::write(&source, b"before").unwrap();
+        trace.seen = Some(HashMap::from([(
+            source.clone(),
+            identity::observe(&source, true),
+        )]));
+        trace.touched.insert(
+            source.clone(),
+            Touch {
+                read: true,
+                content: true,
+                ..Touch::default()
+            },
+        );
+        std::fs::write(&source, b"changed content").unwrap();
+        assert_eq!(
+            build_inputs(&root, &mut phys, &trace, &ignored, &written).unwrap_err(),
+            NotRecorded::Changed {
+                key: "source".to_owned()
+            }
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 

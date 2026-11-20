@@ -119,7 +119,7 @@
   <dt>stoop: not recorded: KEY changed while the command ran</dt>
   <dd>Something the command read, listed or looked for changed after the command first looked at it, so the proof could not describe what it read. Nothing is recorded. See <a href="blind-spots.html#edits-while-running">edits while a command runs</a>.</dd>
   <dt>stoop: not recorded: it read KEY and also wrote it</dt>
-  <dd>The command both read and wrote the path, so the recorded final bytes cannot establish what the read saw. The command still ran; no proof is saved.</dd>
+  <dd>The command read and wrote the path in an order stoop could not verify. The command still ran; no proof is saved.</dd>
   <dt>stoop: not recorded: it could not verify the last write to KEY</dt>
   <dd>The command read and then wrote the same file, but stoop could not establish the final write. A direct-writing formatter that leaves the same bytes can hit this limit and run every time. An atomic replacement can be recorded when its final rename is verified.</dd>
   <dt>stoop: not recorded: KEY changed less than 2 s before it was read and is too large to check (read-time hashing is capped at 1 GiB per run)</dt>
@@ -129,3 +129,5 @@
   <dt>stoop: not recorded: it replaced the link LINK while it wrote through it</dt>
   <dd>Another process replaced or removed a symbolic link while the command was writing through it, so where the write landed is not known from what stoop saw. Nothing is recorded. See <a href="blind-spots.html#edits-while-running">edits while a command runs</a>.</dd>
 </dl>
+
+<p>When the command observes an in-root name absent after its own verified removal, stoop can record that absence as an input. It checks the name again before saving the proof and before a skip. Absences outside the root are not recorded.</p>

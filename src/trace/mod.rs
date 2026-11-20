@@ -84,6 +84,16 @@ pub struct ExecEvent {
     pub cwd: PathBuf,
 }
 
+/// How a verified change by the run removed a name.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Removal {
+    /// An unlink or rmdir removed this exact name.
+    Unlinked,
+    /// A non-exchange rename moved this name and its descendants away.
+    MovedAway,
+}
+
 #[derive(Default)]
 pub struct Trace {
     /// Every path the process tree looked at, lexically resolved.
@@ -127,8 +137,13 @@ pub struct Trace {
     pub changed_during: BTreeSet<PathBuf>,
     /// Read or look dependencies that cannot be safely separated from the run's own writes.
     pub read_write_conflicts: BTreeSet<PathBuf>,
-    /// Paths read before their first verified own write, whose prior must also be a runtime input.
+    /// Physical paths read before their first verified own write, or looked at while absent after
+    /// their own removal, whose prior must also be a runtime input.
     pub read_before_write: BTreeSet<PathBuf>,
+    /// Recordable physical names whose most recent related write attempt was a verified removal.
+    pub removed_by_run: BTreeMap<PathBuf, Removal>,
+    /// Recordable physical names looked at while absent after the run removed them.
+    pub absent_after_removal: BTreeSet<PathBuf>,
     /// Last observed destination identity after a verified atomic-replace syscall.
     pub settled_outputs: HashMap<PathBuf, identity::Seen>,
     /// Physical paths whose mutation was verified at a successful syscall exit.
@@ -147,6 +162,15 @@ impl Trace {
         self.written.contains(p)
             || self.keys.contains_key(p)
             || self.created_dirs.iter().any(|d| p.starts_with(d))
+    }
+
+    /// A verified removal explains this exact absence, or a moved-away ancestor explains it.
+    pub fn removal_explains_absence(&self, path: &Path) -> bool {
+        self.removed_by_run.contains_key(path)
+            || path
+                .ancestors()
+                .skip(1)
+                .any(|ancestor| self.removed_by_run.get(ancestor) == Some(&Removal::MovedAway))
     }
 }
 

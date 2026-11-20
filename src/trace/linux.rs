@@ -10,7 +10,7 @@
 //! same stop, because the write is about to change it.
 
 use super::identity::{self, ListSeen, Seen};
-use super::{ExecEvent, Scope, Trace};
+use super::{ExecEvent, Removal, Scope, Trace};
 use crate::ignore::Ignore;
 use crate::input::{file_id, hash_file, hash_file_with_oid};
 use crate::oid_attrs::is_absent;
@@ -639,6 +639,41 @@ impl WriteKind {
     }
 }
 
+fn removal(kind: &WriteKind) -> Option<Removal> {
+    match kind {
+        WriteKind::Remove => Some(Removal::Unlinked),
+        WriteKind::Rename {
+            source: true,
+            exchange: false,
+            ..
+        } => Some(Removal::MovedAway),
+        _ => None,
+    }
+}
+
+/// A write at a name invalidates removal evidence at, above and below it.
+fn forget_removals(removed: &mut BTreeMap<PathBuf, Removal>, path: &Path) {
+    if removed.is_empty() {
+        return;
+    }
+    for ancestor in path.ancestors() {
+        removed.remove(ancestor);
+    }
+    let descendants: Vec<PathBuf> = removed
+        .range(path.to_path_buf()..)
+        .take_while(|(name, _)| name.starts_with(path))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for descendant in descendants {
+        removed.remove(&descendant);
+    }
+}
+
+/// A removed name is excluded from metadata-only inode joins only while still absent.
+fn removed_and_absent(removed: &BTreeMap<PathBuf, Removal>, path: &Path) -> bool {
+    removed.contains_key(path) && matches!(identity::observe(path, false), Seen::Absent)
+}
+
 struct PendingPath {
     raw: PathBuf,
     expected: Option<PathBuf>,
@@ -684,6 +719,8 @@ struct Tracer<'a> {
     read_files: HashSet<PathBuf>,
     read_inodes: HashMap<FileIdentity, HashSet<PathBuf>>,
     read_routes: HashMap<PathBuf, PathBuf>,
+    /// Own-removal absence looks to recheck at the next write at or below the name.
+    own_absence_looks: HashSet<PathBuf>,
     written_files: HashMap<FileIdentity, HashSet<PathBuf>>,
     /// Last inode confirmed at each successfully landed destination.
     landed_inodes: HashMap<PathBuf, FileIdentity>,
@@ -944,15 +981,7 @@ fn verified_path_mutation(path: &PendingPath, all: &[PendingPath]) -> Option<Opt
         return None;
     }
     // A successful remove or rename source does not create the object now at that name.
-    let removed = matches!(
-        &path.kind,
-        WriteKind::Remove
-            | WriteKind::Rename {
-                source: true,
-                exchange: false,
-                ..
-            }
-    );
+    let removed = removal(&path.kind).is_some();
     Some(if removed { None } else { after_id })
 }
 
@@ -1040,6 +1069,7 @@ pub fn run<'a>(
         read_files: HashSet::new(),
         read_inodes: HashMap::new(),
         read_routes: HashMap::new(),
+        own_absence_looks: HashSet::new(),
         written_files: HashMap::new(),
         landed_inodes: HashMap::new(),
         uncertain_paths: HashSet::new(),
@@ -2371,6 +2401,41 @@ impl Tracer<'_> {
         {
             return false;
         }
+        // Unlike a content read of an output, a metadata look at a verified removed name can
+        // depend on its original absence. Keep that absence as an input and check it again later.
+        if how == Use::Look
+            && self.t.removed_by_run.contains_key(&physical)
+            && matches!(identity::observe(raw, false), Seen::Absent)
+            && (physical == raw || matches!(identity::observe(&physical, false), Seen::Absent))
+            && !self.pending_writes.values().any(|pending| {
+                pending.paths.iter().any(|path| {
+                    path.expected.as_deref().is_none_or(|destination| {
+                        destination.starts_with(&physical) || physical.starts_with(destination)
+                    })
+                })
+            })
+            && !self.t.read_write_conflicts.contains(&physical)
+            && [raw, physical.as_path()].into_iter().all(|name| {
+                !self.t.touched.get(name).is_some_and(|touch| touch.content)
+                    || (self.t.read_before_write.contains(&physical)
+                        && self
+                            .t
+                            .seen
+                            .as_ref()
+                            .and_then(|seen| seen.get(name))
+                            .is_some_and(|seen| matches!(seen, Seen::Absent)))
+            })
+            && self
+                .rec
+                .as_ref()
+                .and_then(|rec| rec.key_of(&physical, &mut self.t))
+                .is_some_and(|key| self.t.priors.get(&key).map(String::as_str) == Some("a"))
+        {
+            self.t.read_before_write.insert(physical.clone());
+            self.t.absent_after_removal.insert(physical.clone());
+            self.own_absence_looks.insert(physical);
+            return false;
+        }
         if new_route {
             self.read_routes.insert(raw.to_path_buf(), physical.clone());
         }
@@ -2388,7 +2453,13 @@ impl Tracer<'_> {
         if already_written {
             self.t.read_write_conflicts.insert(physical.clone());
             if let Some(written) = inode.and_then(|id| self.written_files.get(&id)) {
-                self.t.read_write_conflicts.extend(written.iter().cloned());
+                let removed = &self.t.removed_by_run;
+                self.t.read_write_conflicts.extend(
+                    written
+                        .iter()
+                        .filter(|path| how != Use::Look || !removed_and_absent(removed, path))
+                        .cloned(),
+                );
             }
             for pending in self.pending_writes.values() {
                 for path in &pending.paths {
@@ -2444,7 +2515,13 @@ impl Tracer<'_> {
             return;
         }
         if let Some(written) = inode.and_then(|id| self.written_files.get(&id)) {
-            self.t.read_write_conflicts.extend(written.iter().cloned());
+            let removed = &self.t.removed_by_run;
+            self.t.read_write_conflicts.extend(
+                written
+                    .iter()
+                    .filter(|path| !removed_and_absent(removed, path))
+                    .cloned(),
+            );
         }
         for pending in self.pending_writes.values() {
             for pending_path in &pending.paths {
@@ -2953,6 +3030,28 @@ impl Tracer<'_> {
         if expected.as_deref().is_some_and(is_dynamic) {
             return None;
         }
+        if !self.t.removed_by_run.is_empty() || !self.own_absence_looks.is_empty() {
+            // Even a failed attempt invalidates removal evidence. For a missing parent, resolve
+            // the longest available prefix so the attempt still invalidates the affected name.
+            let unresolved = if expected.is_none() {
+                raw.ancestors().skip(1).find_map(|ancestor| {
+                    let prefix = write_destination(ancestor, true)?;
+                    Some(prefix.join(raw.strip_prefix(ancestor).ok()?))
+                })
+            } else {
+                None
+            };
+            if let Some(destination) = expected.as_ref().or(unresolved.as_ref()) {
+                for name in destination.ancestors() {
+                    if self.own_absence_looks.remove(name)
+                        && !matches!(identity::observe(name, false), Seen::Absent)
+                    {
+                        push_changed(&mut self.t, name);
+                    }
+                }
+                forget_removals(&mut self.t.removed_by_run, destination);
+            }
+        }
         let metadata = expected.as_deref().map(fs::symlink_metadata);
         if metadata
             .as_ref()
@@ -3237,6 +3336,19 @@ impl Tracer<'_> {
         };
         self.t.read_before_write.extend(path.read_priors);
         self.t.landed.insert(destination.clone());
+        // An overlapping in-flight write may have entered before this removal landed, so its
+        // entry could not invalidate the new evidence. Do not create that evidence in the overlap.
+        if let Some(removal) = path.key.as_ref().and_then(|_| removal(&path.kind)) {
+            if !self.pending_writes.values().any(|pending| {
+                pending.paths.iter().any(|other| {
+                    other.expected.as_deref().is_none_or(|other| {
+                        other.starts_with(&destination) || destination.starts_with(other)
+                    })
+                })
+            }) {
+                self.t.removed_by_run.insert(destination.clone(), removal);
+            }
+        }
         if let Some(id) = path.confirmed_after {
             self.landed_inodes.insert(destination.clone(), id);
         } else {
@@ -3246,13 +3358,8 @@ impl Tracer<'_> {
         if let Some(key) = path.key {
             self.t.keys.insert(destination.clone(), key);
         }
-        if path.kind.changes_entry(path.absent) {
-            if mark_name {
-                self.mark_entry_change(&destination);
-            }
-            if let Some(parent) = destination.parent() {
-                self.uncertain_paths.insert(parent.to_path_buf());
-            }
+        if path.kind.changes_entry(path.absent) && mark_name {
+            self.mark_entry_change(&destination);
         }
         for id in [path.before, after].into_iter().flatten() {
             self.written_files
@@ -4065,6 +4172,66 @@ mod tests {
         fs::remove_dir_all(base).unwrap();
     }
 
+    #[test]
+    fn forget_removals_clears_ancestors_name_and_descendants_on_component_boundaries() {
+        let mut removed = BTreeMap::from([
+            (PathBuf::from("/r/a"), Removal::MovedAway),
+            (PathBuf::from("/r/a/b"), Removal::Unlinked),
+            (PathBuf::from("/r/a/b/c"), Removal::MovedAway),
+            (PathBuf::from("/r/a/bc"), Removal::Unlinked),
+            (PathBuf::from("/r/x"), Removal::Unlinked),
+        ]);
+
+        forget_removals(&mut removed, Path::new("/r/a/b"));
+
+        assert_eq!(
+            removed,
+            BTreeMap::from([
+                (PathBuf::from("/r/a/bc"), Removal::Unlinked),
+                (PathBuf::from("/r/x"), Removal::Unlinked),
+            ])
+        );
+    }
+
+    #[test]
+    fn only_moved_away_ancestors_explain_descendant_absence() {
+        let mut trace = Trace::default();
+        trace
+            .removed_by_run
+            .insert(PathBuf::from("/r/unlinked"), Removal::Unlinked);
+        trace
+            .removed_by_run
+            .insert(PathBuf::from("/r/moved"), Removal::MovedAway);
+
+        assert!(trace.removal_explains_absence(Path::new("/r/unlinked")));
+        assert!(!trace.removal_explains_absence(Path::new("/r/unlinked/child")));
+        assert!(trace.removal_explains_absence(Path::new("/r/moved/child")));
+        assert!(!trace.removal_explains_absence(Path::new("/r/moved-other/child")));
+    }
+
+    #[test]
+    fn removed_name_is_omitted_from_metadata_join_only_while_truly_absent() {
+        let base = std::env::temp_dir().join(format!(
+            "stoop-removal-join-{}-{}",
+            std::process::id(),
+            identity::now_ns()
+        ));
+        fs::create_dir(&base).unwrap();
+        let name = base.join("name");
+        let mut removed = BTreeMap::new();
+        assert!(!removed_and_absent(&removed, &name));
+        removed.insert(name.clone(), Removal::MovedAway);
+        assert!(removed_and_absent(&removed, &name));
+
+        fs::write(&name, b"outside").unwrap();
+        assert!(!removed_and_absent(&removed, &name));
+        fs::remove_file(&name).unwrap();
+        std::os::unix::fs::symlink("missing", &name).unwrap();
+        assert!(!removed_and_absent(&removed, &name));
+
+        fs::remove_dir_all(base).unwrap();
+    }
+
     fn empty_tracer() -> Tracer<'static> {
         Tracer {
             ops: HashMap::new(),
@@ -4076,6 +4243,7 @@ mod tests {
             read_files: HashSet::new(),
             read_inodes: HashMap::new(),
             read_routes: HashMap::new(),
+            own_absence_looks: HashSet::new(),
             written_files: HashMap::new(),
             landed_inodes: HashMap::new(),
             uncertain_paths: HashSet::new(),
@@ -4090,6 +4258,49 @@ mod tests {
             execs: None,
             t: Trace::default(),
         }
+    }
+
+    #[test]
+    fn overlapping_in_flight_write_prevents_new_removal_evidence() {
+        let mut tracer = empty_tracer();
+        let output = PathBuf::from("/repo/output");
+        let path = |name: PathBuf, kind, key| PendingPath {
+            raw: name.clone(),
+            expected: Some(name),
+            follows: false,
+            key,
+            before: Some((3, 9)),
+            absent: false,
+            read_priors: Vec::new(),
+            rename_before: None,
+            confirmed_after: None,
+            kind,
+        };
+        tracer.pending_writes.insert(
+            1,
+            PendingWrite {
+                syscall: 0,
+                paths: vec![path(output.join("child"), WriteKind::Modify, None)],
+            },
+        );
+        tracer.land_write(
+            path(output.clone(), WriteKind::Remove, Some("output".into())),
+            None,
+            true,
+        );
+        assert!(!tracer.t.removed_by_run.contains_key(&output));
+
+        tracer.pending_writes.get_mut(&1).unwrap().paths[0].expected =
+            Some(PathBuf::from("/repo/other"));
+        tracer.land_write(
+            path(output.clone(), WriteKind::Remove, Some("output".into())),
+            None,
+            true,
+        );
+        assert_eq!(
+            tracer.t.removed_by_run.get(&output),
+            Some(&Removal::Unlinked)
+        );
     }
 
     #[test]

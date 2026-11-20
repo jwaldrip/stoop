@@ -1605,3 +1605,274 @@ fn a_foreign_restore_after_a_direct_write_cannot_create_a_skippable_proof() {
     );
     assert_eq!(fs::read(&file).unwrap(), b"changed\n");
 }
+
+fn assert_ran_with_zero_status(out: &Output, key: &str) {
+    let err = stderr(out);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains(&format!("stoop: run {key}:")), "{err}");
+    assert!(!err.contains(&format!("stoop: skip {key}:")), "{err}");
+}
+
+fn assert_unrecorded_run(out: &Output, case: &Case, key: &str) {
+    assert_ran_with_zero_status(out, key);
+    let err = stderr(out);
+    assert!(err.contains("stoop: not recorded:"), "{err}");
+    assert!(!case.proof(key).exists(), "unexpected proof:\n{err}");
+}
+
+fn assert_skipped_with_zero_status(out: &Output, key: &str) {
+    let err = stderr(out);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    assert!(err.contains(&format!("stoop: skip {key}:")), "{err}");
+    assert!(out.stdout.is_empty(), "skipped command produced output");
+}
+
+fn assert_removed_name_is_an_input(
+    case: &Case,
+    key: &str,
+    script: &str,
+    directory: bool,
+    child_input: Option<&str>,
+) {
+    let first = run(case, key, script, &[]);
+    assert_ran_with_zero_status(&first, key);
+    assert_recorded(&first, case, key);
+    let stored = proof(case, key);
+    assert_entry_id(&stored, "inputs", "stage", "a");
+    if let Some(path) = child_input {
+        assert_entry_id(&stored, "inputs", path, "a");
+    }
+
+    let second = run(case, key, script, &[]);
+    assert_skipped_with_zero_status(&second, key);
+
+    let stage = case.root().join("stage");
+    if directory {
+        fs::create_dir(&stage).unwrap();
+    } else {
+        fs::write(&stage, b"foreign\n").unwrap();
+    }
+    let third = run(case, key, script, &[]);
+    assert_ran_with_zero_status(&third, key);
+    assert_eq!(third.stdout, b"replacement observed\n");
+}
+
+#[test]
+fn metadata_look_after_removing_a_new_file_records_an_absence_input() {
+    let key = "removed-file-absence-input";
+    let case = Case::new(key);
+    let script = concat!(
+        "python3 -c 'import os, sys\n",
+        "try:\n",
+        "    fd = os.open(\"stage\", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n",
+        "except FileExistsError:\n",
+        "    print(\"replacement observed\")\n",
+        "    sys.exit(0)\n",
+        "os.write(fd, b\"own\")\n",
+        "os.close(fd)\n",
+        "os.unlink(\"stage\")\n",
+        "if os.path.exists(\"stage\"): sys.exit(21)'",
+    );
+    assert_removed_name_is_an_input(&case, key, script, false, None);
+}
+
+#[test]
+fn metadata_look_after_removing_a_new_directory_records_an_absence_input() {
+    let key = "removed-directory-absence-input";
+    let case = Case::new(key);
+    let script = concat!(
+        "python3 -c 'import os, sys\n",
+        "try:\n",
+        "    os.mkdir(\"stage\")\n",
+        "except FileExistsError:\n",
+        "    print(\"replacement observed\")\n",
+        "    sys.exit(0)\n",
+        "os.rmdir(\"stage\")\n",
+        "if os.path.lexists(\"stage\"): sys.exit(21)'",
+    );
+    assert_removed_name_is_an_input(&case, key, script, true, None);
+}
+
+#[test]
+fn metadata_look_after_moving_a_new_directory_records_its_old_name() {
+    let key = "moved-directory-absence-input";
+    let case = Case::new(key);
+    case.file(".stoopignore", b"parked/\n");
+    let script = concat!(
+        "python3 -c 'import os, sys\n",
+        "try:\n",
+        "    os.mkdir(\"stage\")\n",
+        "except FileExistsError:\n",
+        "    print(\"replacement observed\")\n",
+        "    sys.exit(0)\n",
+        "if os.path.exists(\"stage/tag\"): sys.exit(21)\n",
+        "fd = os.open(\"stage/tag\", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n",
+        "os.write(fd, b\"tag\")\n",
+        "os.close(fd)\n",
+        "os.rename(\"stage\", \"parked\")\n",
+        "if os.path.lexists(\"stage\"): sys.exit(22)\n",
+        "os.mkdir(\"parked/child\")\n",
+        "os.stat(\"parked\")\n",
+        "fd = os.open(\"parked\", os.O_RDONLY | os.O_DIRECTORY)\n",
+        "os.fstat(fd)\n",
+        "os.close(fd)'",
+    );
+    assert_removed_name_is_an_input(&case, key, script, true, Some("stage/tag"));
+}
+
+#[test]
+fn replacement_before_the_absence_look_refuses_even_if_removed_before_exit() {
+    let key = "recreated-before-absence-look";
+    let case = Case::new(key);
+    let before = case.fifo("before-look.fifo");
+    let after = case.fifo("after-look.fifo");
+    let env = [("BEFORE", before.as_path()), ("AFTER", after.as_path())];
+    let script = concat!(
+        "python3 -c 'import os, sys\n",
+        "os.mkdir(\"stage\")\n",
+        "os.rmdir(\"stage\")\n",
+        "open(os.environ[\"BEFORE\"]).read()\n",
+        "if not os.path.isdir(\"stage\"): sys.exit(21)\n",
+        "print(\"observed replacement\")\n",
+        "open(os.environ[\"AFTER\"]).read()'",
+    );
+    let stage = case.root().join("stage");
+
+    for _ in 0..2 {
+        let mut child = spawn(&case, key, script, &env);
+        let release = meet_if_running(&before, &mut child).expect("command did not reach look");
+        assert!(!stage.exists());
+        fs::create_dir(&stage).unwrap();
+        drop(release);
+        let release = meet_if_running(&after, &mut child).expect("command did not see replacement");
+        fs::remove_dir(&stage).unwrap();
+        drop(release);
+        let out = child.wait_with_output().unwrap();
+        assert_eq!(out.stdout, b"observed replacement\n");
+        assert_unrecorded_run(&out, &case, key);
+    }
+}
+
+#[test]
+fn replacement_after_the_absence_look_refuses_at_record_time() {
+    let key = "recreated-after-absence-look";
+    let case = Case::new(key);
+    let fifo = case.fifo("after-look.fifo");
+    let env = [("FIFO", fifo.as_path())];
+    let script = concat!(
+        "python3 -c 'import os, sys\n",
+        "os.mkdir(\"stage\")\n",
+        "os.rmdir(\"stage\")\n",
+        "if os.path.lexists(\"stage\"): sys.exit(21)\n",
+        "print(\"observed absence\")\n",
+        "open(os.environ[\"FIFO\"]).read()'",
+    );
+    let stage = case.root().join("stage");
+    let mut child = spawn(&case, key, script, &env);
+    let release = meet_if_running(&fifo, &mut child).expect("command did not reach FIFO");
+    assert!(!stage.exists());
+    fs::create_dir(&stage).unwrap();
+    drop(release);
+    let first = child.wait_with_output().unwrap();
+    assert_eq!(first.stdout, b"observed absence\n");
+    assert!(stage.is_dir());
+    assert_unrecorded_run(&first, &case, key);
+
+    fs::remove_dir(&stage).unwrap();
+    let mut retry = spawn(&case, key, script, &env);
+    let release = meet_if_running(&fifo, &mut retry).expect("unrecorded command skipped");
+    drop(release);
+    let second = retry.wait_with_output().unwrap();
+    assert_eq!(second.stdout, b"observed absence\n");
+    assert_ran_with_zero_status(&second, key);
+    assert_recorded(&second, &case, key);
+    assert_entry_id(&proof(&case, key), "inputs", "stage", "a");
+
+    let mut retry = spawn(&case, key, script, &env);
+    let release = meet_if_running(&fifo, &mut retry);
+    let reached_fifo = release.is_some();
+    drop(release);
+    let third = retry.wait_with_output().unwrap();
+    assert!(!reached_fifo, "recorded command reached the FIFO");
+    assert_skipped_with_zero_status(&third, key);
+}
+
+#[test]
+fn a_content_open_of_the_removed_name_is_not_an_absence_look() {
+    let key = "removed-name-content-open";
+    let case = Case::new(key);
+    let script = concat!(
+        "python3 -c 'import os, sys\n",
+        "fd = os.open(\"stage\", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n",
+        "os.write(fd, b\"own\")\n",
+        "os.close(fd)\n",
+        "os.unlink(\"stage\")\n",
+        "try:\n",
+        "    fd = os.open(\"stage\", os.O_RDONLY)\n",
+        "except FileNotFoundError:\n",
+        "    print(\"content open failed\")\n",
+        "else:\n",
+        "    os.close(fd)\n",
+        "    sys.exit(21)'",
+    );
+    for _ in 0..2 {
+        let out = run(&case, key, script, &[]);
+        assert_eq!(out.stdout, b"content open failed\n");
+        assert_unrecorded_run(&out, &case, key);
+    }
+}
+
+#[test]
+fn reading_a_moved_outputs_content_still_refuses_the_record() {
+    let key = "moved-output-content-read";
+    let case = Case::new(key);
+    case.file(".stoopignore", b"parked\n");
+    let script = concat!(
+        "python3 -c 'import os, sys\n",
+        "fd = os.open(\"stage\", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)\n",
+        "os.write(fd, b\"own\")\n",
+        "os.close(fd)\n",
+        "os.rename(\"stage\", \"parked\")\n",
+        "fd = os.open(\"parked\", os.O_RDONLY)\n",
+        "data = os.read(fd, 16)\n",
+        "os.close(fd)\n",
+        "if data != b\"own\": sys.exit(21)\n",
+        "if os.path.lexists(\"stage\"): sys.exit(22)\n",
+        "print(\"read moved content\")'",
+    );
+    for _ in 0..2 {
+        let out = run(&case, key, script, &[]);
+        assert_eq!(out.stdout, b"read moved content\n");
+        assert_unrecorded_run(&out, &case, key);
+    }
+}
+
+#[test]
+fn an_absent_name_outside_the_root_remains_untracked() {
+    let key = "outside-absence-untracked";
+    let case = Case::new(key);
+    let outside = case.dir.join("outside-name");
+    let env = [("OUTSIDE", outside.as_path())];
+    let script = concat!(
+        "python3 -c 'import os\n",
+        "if os.path.lexists(os.environ[\"OUTSIDE\"]): print(\"outside present\")'",
+    );
+
+    let first = run(&case, key, script, &env);
+    assert_ran_with_zero_status(&first, key);
+    assert_recorded(&first, &case, key);
+    let stored = proof(&case, key);
+    let inputs = stored["inputs"].as_array().unwrap();
+    assert!(
+        !inputs
+            .iter()
+            .any(|input| { input["path"].as_str() == outside.to_str() && input["id"] == "a" }),
+        "outside absence was recorded: {inputs:?}"
+    );
+
+    let second = run(&case, key, script, &env);
+    assert_skipped_with_zero_status(&second, key);
+    fs::write(&outside, b"foreign\n").unwrap();
+    let third = run(&case, key, script, &env);
+    assert_skipped_with_zero_status(&third, key);
+}

@@ -34,7 +34,7 @@ stoop: skip sh-c98f8f9c8fef6d65: 71 inputs unchanged since 0s ago (100ms)</code>
 <h2 id="outputs">Output outside the repository</h2>
 <p>stoop checks that what a run wrote inside the repository is still there. It doesn't track output written elsewhere. A step whose whole job is to produce files outside the repository (publishing, deploying, filling a shared cache) shouldn't be wrapped.</p>
 <p>When a command both reads and writes a file outside the repository, such as a lock file or cache, that file is treated as an untracked output. Changes to it may not prevent a skip.</p>
-<p>Removed paths are listed in the proof for planning. A runtime skip does not check that those paths remain absent, so a command whose result depends on keeping a removed file absent needs another check or should run without skipping.</p>
+<p>Removed paths are listed in the proof for planning, but a runtime skip does not check that removal list. If the command looks up an in-root path after its own verified removal and sees it absent, stoop can record that absence as a separate input and check it before a skip. Otherwise, a step that depends on keeping a removed file absent needs another check or should run without skipping.</p>
 
 <h2 id="git">Reading .git</h2>
 <p>A command that reads <code>.git</code> could depend on history, which a working-tree comparison can't see. Such runs aren't recorded. If the read can't change the result, add <code>.git</code> to <a href="stoopignore.html"><code>.stoopignore</code></a>.</p>
