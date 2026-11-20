@@ -227,7 +227,7 @@ pub(crate) fn forced_reason(
         }
         match (event.as_deref(), reference.as_deref()) {
             (Some("push"), Some(reference)) => {
-                if payload_number.present || pull.present {
+                if !payload_ref.present || payload_number.present || pull.present {
                     return Some("conflicting GitHub event kind".into());
                 }
                 let Some(branch) = reference
@@ -253,7 +253,7 @@ pub(crate) fn forced_reason(
                 let number = name
                     .split_once('/')
                     .and_then(|(number, _)| positive(number));
-                if pull.present && pull.value.is_none() {
+                if !pull.present || pull.value.is_none() {
                     return Some("conflicting GitHub pull request context".into());
                 }
                 let pull = pull.value.as_ref();

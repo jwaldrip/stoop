@@ -357,6 +357,17 @@ fn declared_word<'a>(
     })
 }
 
+fn touches_declared(word: &str, name: &str) -> bool {
+    word == name
+        || word.strip_prefix(name).is_some_and(|tail| {
+            !tail.is_empty() && (!name.starts_with("--") || tail.starts_with('='))
+        })
+}
+
+fn valid_attachment(arity: Arity, attached: bool) -> bool {
+    !attached || arity != Arity::Zero
+}
+
 fn ambiguous(name: &str) -> String {
     let name = safe(&lossy_shadow(name));
     format!("cannot tell where the values for {name} end; attach the placeholder with =, put it right after {name} or after --, or declare the option in .stoop.toml")
@@ -467,8 +478,9 @@ fn removals(
         }
         let bare = spans[i].len() == 1 && spans[i][0] == (0, argv[i].len());
         let attached = i < end
-            && declared_word(options, &argv[i]).is_some_and(|(_, name)| {
+            && declared_word(options, &argv[i]).is_some_and(|(item, name)| {
                 name.starts_with("--")
+                    && valid_attachment(item.arity, true)
                     && spans[i].len() == 1
                     && spans[i][0] == (name.len() + 1, argv[i].len())
             });
@@ -476,7 +488,7 @@ fn removals(
             && options
                 .iter()
                 .flat_map(|item| &item.names)
-                .any(|name| argv[i].starts_with(name));
+                .any(|name| touches_declared(&argv[i], name));
         if touches_declared && !bare && !attached {
             return Err(ambiguous(&argv[i]));
         }
@@ -495,11 +507,14 @@ fn removals(
             && options
                 .iter()
                 .flat_map(|item| &item.names)
-                .any(|name| word.starts_with(name) && word != name)
+                .any(|name| touches_declared(word, name) && word != name)
         {
             return Err(ambiguous(word));
         }
         let (name, declaration, attached) = if let Some((item, name)) = declared {
+            if !valid_attachment(item.arity, word != name) {
+                return Err(ambiguous(word));
+            }
             let index = options
                 .iter()
                 .position(|candidate| std::ptr::eq(candidate, item))
@@ -549,7 +564,7 @@ fn removals(
         if let Some(occurrence) = occurrences
             .iter()
             .rev()
-            .find(|item| item.start < at && item.end <= at)
+            .find(|item| item.start < at && item.end <= at && !item.selected)
         {
             if occurrence.declaration.is_none() && !argv[occurrence.start].contains('=') {
                 return Err(ambiguous(occurrence.name));

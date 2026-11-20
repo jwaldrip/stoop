@@ -721,6 +721,12 @@ fn oracle_full(args: &[&str]) -> Result<Vec<String>, ()> {
         ("-foo", "foo", 1),
         ("-m", "many", 2),
     ];
+    let touches = |word: &str, name: &str| {
+        word == name
+            || word.strip_prefix(name).is_some_and(|tail| {
+                !tail.is_empty() && (!name.starts_with("--") || tail.starts_with('='))
+            })
+    };
     let end = args
         .iter()
         .position(|word| *word == "--")
@@ -729,11 +735,9 @@ fn oracle_full(args: &[&str]) -> Result<Vec<String>, ()> {
         if i < end
             && word.contains("{changed}")
             && *word != "{changed}"
-            && definitions
-                .iter()
-                .any(|(name, _, _)| word.starts_with(name))
-            && !definitions.iter().any(|(name, _, _)| {
-                name.starts_with("--") && *word == format!("{name}={{changed}}")
+            && definitions.iter().any(|(name, _, _)| touches(word, name))
+            && !definitions.iter().any(|(name, _, arity)| {
+                *arity != 0 && name.starts_with("--") && *word == format!("{name}={{changed}}")
             })
         {
             return Err(());
@@ -762,7 +766,7 @@ fn oracle_full(args: &[&str]) -> Result<Vec<String>, ()> {
         let Some((id, arity, attached)) = found else {
             if definitions
                 .iter()
-                .any(|(name, _, _)| word.starts_with(name) && word != *name)
+                .any(|(name, _, _)| touches(word, name) && word != *name)
             {
                 return Err(());
             }
@@ -795,6 +799,9 @@ fn oracle_full(args: &[&str]) -> Result<Vec<String>, ()> {
             }
             continue;
         };
+        if arity == 0 && attached {
+            return Err(());
+        }
         unknown_before = None;
         let mut owned = vec![i];
         i += 1;
@@ -859,6 +866,9 @@ fn generated_declared_argv_matches_independent_removal_grammar() {
         &["-q=debug", "-qq", "{changed}"],
         &["--other={changed}"],
         &["@{changed}"],
+        &["--many-extra", "keep", "--many", "{changed}"],
+        &["--many-extra={changed}"],
+        &["--zero={changed}", "--zero", "keep"],
     ];
     let suffixes: &[&[&str]] = &[
         &[],
@@ -925,7 +935,7 @@ fn generated_declared_argv_matches_independent_removal_grammar() {
             }
         }
     }
-    assert_eq!(checked, 540);
+    assert_eq!(checked, 702);
 }
 
 #[cfg(target_os = "linux")]
@@ -993,7 +1003,11 @@ mod traced {
     }
 
     fn valid_event() -> &'static str {
-        r#"{"repository":{"default_branch":"main"}}"#
+        r#"{"ref":"refs/heads/feature","repository":{"default_branch":"main"}}"#
+    }
+
+    fn pull_event() -> &'static str {
+        r#"{"number":42,"pull_request":{"number":42,"head":{"ref":"feature"},"base":{"ref":"main"}},"repository":{"default_branch":"main"}}"#
     }
 
     #[test]
@@ -1088,6 +1102,7 @@ mod traced {
         let run = |reference| f.github("push", reference).output().unwrap();
         assert_ran(&run("refs/heads/feature"));
         assert_skipped(&run("refs/heads/feature"));
+        f.event(r#"{"ref":"refs/heads/main","repository":{"default_branch":"main"}}"#);
         let main = run("refs/heads/main");
         assert_ran(&main);
         assert!(stderr(&main).contains("default branch main"));
@@ -1096,7 +1111,7 @@ mod traced {
     #[test]
     fn a_pull_request_is_not_a_default_branch_push() {
         let f = Fixture::repo();
-        f.event(valid_event());
+        f.event(pull_event());
         let run = || {
             f.github("pull_request", "refs/pull/42/merge")
                 .output()
@@ -1289,7 +1304,7 @@ match = ["./runner", "*"]
     #[test]
     fn pull_request_ref_name_disagreement_forces_full() {
         let f = Fixture::repo();
-        f.event(valid_event());
+        f.event(pull_event());
         let run = || f.github("pull_request", "refs/pull/42/merge");
         assert_ran(&run().output().unwrap());
         assert_skipped(&run().output().unwrap());
@@ -1300,7 +1315,7 @@ match = ["./runner", "*"]
     #[test]
     fn pull_request_ref_type_disagreement_forces_full() {
         let f = Fixture::repo();
-        f.event(valid_event());
+        f.event(pull_event());
         let run = || f.github("pull_request", "refs/pull/42/merge");
         assert_ran(&run().output().unwrap());
         assert_skipped(&run().output().unwrap());
@@ -1345,7 +1360,7 @@ match = ["./runner", "*"]
         let run = || f.github("push", "refs/heads/feature").output().unwrap();
         assert_ran(&run());
         assert_skipped(&run());
-        f.event(r#"{"repository":{"default_branch":"feature","default_branch":"main"}}"#);
+        f.event(r#"{"ref":"refs/heads/feature","repository":{"default_branch":"feature","default_branch":"main"}}"#);
         assert_ran(&run());
     }
 
@@ -1368,11 +1383,11 @@ match = ["./runner", "*"]
         let run = || f.github("push", "refs/heads/feature").output().unwrap();
         assert_ran(&run());
         assert_skipped(&run());
-        f.event(r#"{"number":42,"pull_request":{"number":42,"head":{"ref":"feature"},"base":{"ref":"main"}},"repository":{"default_branch":"main"}}"#);
+        f.event(r#"{"ref":"refs/heads/feature","number":42,"pull_request":{"number":42,"head":{"ref":"feature"},"base":{"ref":"main"}},"repository":{"default_branch":"main"}}"#);
         assert_ran(&run());
         for payload in [
-            r#"{"number":null,"repository":{"default_branch":"main"}}"#,
-            r#"{"pull_request":null,"repository":{"default_branch":"main"}}"#,
+            r#"{"ref":"refs/heads/feature","number":null,"repository":{"default_branch":"main"}}"#,
+            r#"{"ref":"refs/heads/feature","pull_request":null,"repository":{"default_branch":"main"}}"#,
             r#"{"ref":null,"repository":{"default_branch":"main"}}"#,
         ] {
             f.event(payload);
@@ -1386,7 +1401,7 @@ match = ["./runner", "*"]
         let run = || f.github("push", "refs/heads/feature").output().unwrap();
         assert_ran(&run());
         assert_skipped(&run());
-        f.event(valid_event());
+        f.event(r#"{"repository":{"default_branch":"main"}}"#);
         assert_ran(&run());
     }
 
@@ -1401,7 +1416,7 @@ match = ["./runner", "*"]
         };
         assert_ran(&run());
         assert_skipped(&run());
-        f.event(valid_event());
+        f.event(r#"{"repository":{"default_branch":"main"}}"#);
         assert_ran(&run());
     }
 }
