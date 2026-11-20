@@ -122,6 +122,6 @@
   <dd>The command read a file that changed in the last two seconds, and the run had no read budget left to hash it when it read it.</dd>
   <dt>stoop: not recorded: it listed more than 1048576 directory entries</dt>
   <dd>The command listed directories with more entries in total than stoop snapshots in one run.</dd>
-  <dt>stoop: not recorded: it wrote through the link LINK and replaced or removed the link OTHER</dt>
-  <dd>The command wrote through a symbolic link and also replaced or removed a symbolic link while it ran. Where the write landed is not known from what stoop saw, so nothing is recorded. See <a href="blind-spots.html#edits-while-running">edits while a command runs</a>.</dd>
+  <dt>stoop: not recorded: it replaced the link LINK while it wrote through it</dt>
+  <dd>Another process replaced or removed a symbolic link while the command was writing through it, so where the write landed is not known from what stoop saw. Nothing is recorded. See <a href="blind-spots.html#edits-while-running">edits while a command runs</a>.</dd>
 </dl>

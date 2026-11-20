@@ -130,14 +130,10 @@ pub struct Trace {
     /// Directory entries snapshotted so far, counted against `identity::MAX_LISTED_NAMES`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub listed_names: usize,
-    /// The first symbolic link the run replaced or removed, as the run named it. A run that also
-    /// wrote through a link is refused, because where that write landed is not known from the view
-    /// the tracer took when the call was entered.
+    /// Inodes (device and number) the run changed itself, through any name: written, linked, renamed
+    /// or re-moded. A path that still holds one of them was changed by the run, not by anything else.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub link_replaced: Option<PathBuf>,
-    /// The first symbolic link the run wrote through, as the run named it.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub link_crossed: Option<PathBuf>,
+    pub own_inodes: HashSet<(u64, u64)>,
 }
 
 impl Trace {

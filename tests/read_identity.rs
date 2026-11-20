@@ -644,21 +644,16 @@ fn a_file_another_process_creates_at_an_alias_target_is_not_recorded() {
 }
 
 #[test]
-fn a_hard_link_name_the_command_writes_changes_the_name_it_read() {
-    // The command reads src/a, then writes src/b, which is the same inode. The read name changed
-    // under the command, so the record is refused.
+fn a_hard_link_name_the_command_writes_is_recorded() {
+    // The command reads src/a, then writes src/b, which is the same inode. The write is the
+    // command's own change, so the record stands.
     let case = Case::new("t20-hard-link");
     let a = case.file("src/a", b"alpha-one\n");
     fs::hard_link(&a, case.root().join("src/b")).unwrap();
     age();
     let script = "cat src/a >/dev/null; printf 'bravo-two\\n' > src/b";
     let out = run(&case, "t20-hard-link", script, &[]);
-    assert_not_recorded(
-        &out,
-        &case,
-        "t20-hard-link",
-        "src/a changed while the command ran",
-    );
+    assert_recorded(&out, &case, "t20-hard-link");
 }
 
 #[test]

@@ -606,6 +606,11 @@ struct Tracer<'a> {
     magic_epoch: u64,
     magic_cache: HashMap<PathBuf, (u64, bool)>,
     pending_topology: HashSet<i32>,
+    /// Writes in flight, by pid: the physical links each pending write went through. Another process
+    /// replacing one of them while the write is in flight refuses the record.
+    writing: HashMap<i32, Vec<PathBuf>>,
+    /// The pid whose stop is being handled.
+    current: i32,
     syscall: i64,
     allow_network: bool,
     /// Present when priors are recorded (not with `--no-record`).
@@ -668,6 +673,11 @@ fn observe(rec: Option<&mut Rec<'_>>, t: &mut Trace, lex: PathBuf, how: Use) {
                 t.seen.as_ref().and_then(|seen| seen.get(&lex)),
                 Some(Seen::Symlink { resolved: Some(target), .. }) if t.is_output(target)
             ));
+    // A file whose inode the run changed itself is not a change from outside.
+    let own_inode = matches!(
+        t.seen.as_ref().and_then(|seen| seen.get(&lex)),
+        Some(Seen::File(file)) if t.own_inodes.contains(&(file.stat.dev, file.stat.ino))
+    );
     let Some(seen) = t.seen.as_mut() else { return };
     let mut changed = false;
     match seen.get_mut(&lex) {
@@ -682,7 +692,9 @@ fn observe(rec: Option<&mut Rec<'_>>, t: &mut Trace, lex: PathBuf, how: Use) {
             // Something absent may appear later. A path the run created is its own output.
             changed = !created_here && !matches!(identity::observe(&lex, resolve), Seen::Absent);
         }
-        Some(before) if how == Use::Content && !output && !matches!(before, Seen::Dir(_)) => {
+        Some(before)
+            if how == Use::Content && !output && !own_inode && !matches!(before, Seen::Dir(_)) =>
+        {
             if identity::same_identity(before, &identity::observe(&lex, resolve)) {
                 if hash {
                     rec.read_hash(before, &lex, now);
@@ -709,54 +721,46 @@ fn push_changed(t: &mut Trace, path: &Path) {
     }
 }
 
-/// The first symbolic link on the way to `raw` that the root does not sit under, when the write
-/// goes through one. A link the root itself sits under (a system alias for a temporary directory,
-/// say) cannot be retargeted from inside the repository, so it does not count.
-fn crossed_link(root: &Path, raw: &Path, follows: bool) -> Option<PathBuf> {
-    let root = fs::canonicalize(root).ok()?;
+/// The physical paths of the symbolic links on the way to `raw`, when the write goes through one.
+/// A link that is an ancestor of the root (a system alias for a temporary directory, say) cannot be
+/// retargeted from inside the repository, so it does not count.
+fn crossed_links(root: &Path, raw: &Path, follows: bool) -> Vec<PathBuf> {
+    let Ok(root) = fs::canonicalize(root) else {
+        return Vec::new();
+    };
     let mut hops: Vec<&Path> = raw.ancestors().skip(1).collect();
     if follows {
         hops.insert(0, raw);
     }
-    hops.into_iter().find_map(|hop| {
-        let is_link = fs::symlink_metadata(hop).is_ok_and(|m| m.file_type().is_symlink());
-        let over_root = fs::canonicalize(hop).is_ok_and(|target| root.starts_with(target));
-        (is_link && !over_root).then(|| hop.to_path_buf())
-    })
+    hops.into_iter()
+        .filter(|hop| fs::symlink_metadata(hop).is_ok_and(|m| m.file_type().is_symlink()))
+        .filter(|hop| {
+            !fs::canonicalize(hop).is_ok_and(|target| target != root && root.starts_with(&target))
+        })
+        .filter_map(phys_link_path)
+        .collect()
 }
 
-/// The run wrote through a link. Its own replacement or removal of a link can retarget that write,
-/// because the tracer resolves a call when it is entered and the kernel resolves it after the call
-/// resumes. A run with both is refused, whichever happened first.
-fn note_link_crossed(t: &mut Trace, link: PathBuf) {
-    if t.link_crossed.is_none() {
-        let replaced = t.link_replaced.clone();
-        t.link_crossed = Some(link.clone());
-        if let Some(replaced) = replaced {
-            link_race(t, &link, &replaced);
+/// The physical path of a symbolic link: its parent resolved, then its own name.
+fn phys_link_path(link: &Path) -> Option<PathBuf> {
+    let name = link.file_name()?;
+    let parent = fs::canonicalize(link.parent()?).ok()?;
+    Some(parent.join(name))
+}
+
+/// Record the inode a call is about to change, through the name it uses, so that the run's own
+/// change to it is not taken for a change from outside.
+fn note_inode(t: &mut Trace, path: &Path, follows: bool) {
+    let metadata = if follows {
+        fs::metadata(path)
+    } else {
+        fs::symlink_metadata(path)
+    };
+    if let Ok(metadata) = metadata {
+        if metadata.is_file() {
+            t.own_inodes.insert((metadata.dev(), metadata.ino()));
         }
     }
-}
-
-/// The run replaced or removed a symbolic link. See `note_link_crossed`.
-fn note_link_replaced(t: &mut Trace, link: &Path) {
-    if t.link_replaced.is_none() {
-        t.link_replaced = Some(link.to_path_buf());
-        if let Some(crossed) = t.link_crossed.clone() {
-            link_race(t, &crossed, link);
-        }
-    }
-}
-
-fn link_race(t: &mut Trace, crossed: &Path, replaced: &Path) {
-    push_unsound(
-        t,
-        format!(
-            "it wrote through the link {} and replaced or removed the link {}",
-            crossed.display(),
-            replaced.display()
-        ),
-    );
 }
 
 /// Names that describe the process reading them (proc, sys and dev). They are never resolved here
@@ -839,6 +843,8 @@ pub fn run<'a>(
         magic_epoch: 0,
         magic_cache: HashMap::new(),
         pending_topology: HashSet::new(),
+        writing: HashMap::new(),
+        current: 0,
         syscall: 0,
         execs: observe_execs.then(|| ExecObserver::new(pid)),
         rec: scope.map(|s| Rec {
@@ -949,8 +955,10 @@ pub fn run<'a>(
         // Topology syscalls resume with PTRACE_SYSCALL, so their next syscall
         // stop occurs after the kernel has applied or rejected the mutation.
         let syscall_exit = libc::WIFSTOPPED(st) && libc::WSTOPSIG(st) == (libc::SIGTRAP | 0x80);
+        tr.current = p;
         if syscall_exit || libc::WIFEXITED(st) || libc::WIFSIGNALED(st) {
             tr.after_topology_stop(p);
+            tr.after_write_stop(p);
         }
         if libc::WIFEXITED(st) {
             if p == pid {
@@ -997,11 +1005,19 @@ pub fn run<'a>(
                 } else {
                     sig
                 };
-                resume(p, pass, tr.pending_topology.contains(&p));
+                resume(
+                    p,
+                    pass,
+                    tr.pending_topology.contains(&p) || tr.writing.contains_key(&p),
+                );
             }
             e if e == libc::PTRACE_EVENT_SECCOMP => {
                 tr.on_syscall(p);
-                resume(p, 0, tr.pending_topology.contains(&p));
+                resume(
+                    p,
+                    0,
+                    tr.pending_topology.contains(&p) || tr.writing.contains_key(&p),
+                );
             }
             libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
                 if let Some(execs) = &mut tr.execs {
@@ -2334,6 +2350,7 @@ impl Tracer<'_> {
         // A write through a link changes what the link points to, not the link itself.
         let through_link =
             follows && fs::symlink_metadata(raw).is_ok_and(|m| m.file_type().is_symlink());
+        note_inode(&mut self.t, raw, follows);
         if !through_link {
             self.t.written.insert(raw.to_path_buf());
         } else {
@@ -2348,8 +2365,9 @@ impl Tracer<'_> {
         }
         let rec = self.rec.as_mut()?;
         let key = rec.write(&mut self.t, raw, follows)?;
-        if let Some(link) = crossed_link(&rec.root, raw, follows) {
-            note_link_crossed(&mut self.t, link);
+        let crossed = crossed_links(&rec.root, raw, follows);
+        if !crossed.is_empty() {
+            self.writing.insert(self.current, crossed);
         }
         if rec.redirected_reads.contains(&key) {
             push_reason(
@@ -2367,6 +2385,32 @@ impl Tracer<'_> {
             rec.phys.clear();
             rec.link_walks.clear();
         }
+    }
+
+    /// A link another process replaces or removes while a write through it is in flight refuses the
+    /// record: where that write lands is not known from the tracer's view of the link.
+    fn note_link_replaced(&mut self, pid: i32, link: &Path) {
+        let Some(phys) = phys_link_path(link) else {
+            return;
+        };
+        let racing = self
+            .writing
+            .iter()
+            .any(|(writer, links)| *writer != pid && links.contains(&phys));
+        if racing {
+            push_unsound(
+                &mut self.t,
+                format!(
+                    "it replaced the link {} while it wrote through it",
+                    phys.display()
+                ),
+            );
+        }
+    }
+
+    /// The write has landed, so it is no longer in flight.
+    fn after_write_stop(&mut self, pid: i32) {
+        self.writing.remove(&pid);
     }
 
     fn topology_changed(&mut self, pid: i32) {
@@ -2530,7 +2574,7 @@ impl Tracer<'_> {
                 self.topology_changed(pid);
             }
             if metadata.file_type().is_symlink() {
-                note_link_replaced(&mut self.t, &p);
+                self.note_link_replaced(pid, &p);
             }
         }
         // Read the directory's contents before the call, while they are still there.
@@ -2584,10 +2628,10 @@ impl Tracer<'_> {
             self.topology_changed(pid);
         }
         if exchange && a_meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
-            note_link_replaced(&mut self.t, &a);
+            self.note_link_replaced(pid, &a);
         }
         if b_meta.as_ref().is_some_and(|m| m.file_type().is_symlink()) {
-            note_link_replaced(&mut self.t, &b);
+            self.note_link_replaced(pid, &b);
         }
         let ka = self.write(&a, false);
         let kb = self.write(&b, false);
@@ -2846,6 +2890,7 @@ impl Tracer<'_> {
                 Op::LinkSource { dirfd, path, flags } => {
                     let by_fd = flags.is_some_and(|i| args[i] as i32 & AT_EMPTY_PATH != 0);
                     if let Some(p) = self.resolve(pid, &args, dirfd, path) {
+                        note_inode(&mut self.t, &p, false);
                         self.touch(p.clone(), Use::Look);
                         if self.oid_sensitive(&p, true) {
                             self.t.oid_attrs_changed = true;
@@ -2985,6 +3030,8 @@ mod tests {
             magic_epoch: 0,
             magic_cache: HashMap::new(),
             pending_topology: HashSet::new(),
+            writing: HashMap::new(),
+            current: 0,
             syscall: 0,
             allow_network: false,
             rec: None,

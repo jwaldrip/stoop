@@ -2891,7 +2891,7 @@ fn concurrent_alias_retargets_are_refused_with_a_named_reason() {
         let _ = fs::remove_dir_all(outside);
         assert_eq!(code, 0, "trial {trial}: {err}");
         assert!(
-            err.contains("stoop: not recorded: it wrote through the link"),
+            err.contains("stoop: not recorded: it replaced the link"),
             "trial {trial}: {err}"
         );
         assert!(!err.contains("stoop: recorded"), "trial {trial}: {err}");
