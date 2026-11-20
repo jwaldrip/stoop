@@ -756,3 +756,219 @@ fn received_descriptor_uncertainty_skips_comparison() {
         stderr(&out)
     );
 }
+
+#[test]
+fn listing_through_a_symlink_then_creating_an_entry_still_records() {
+    let case = Case::new("review-listing-alias");
+    case.file("d/old", b"old\n");
+    symlink("d", case.root().join("l")).unwrap();
+    let out = run(
+        &case,
+        "review-listing-alias",
+        "ls l >/dev/null; echo x > d/new",
+        &[],
+    );
+    assert_recorded(&out, &case, "review-listing-alias");
+}
+
+#[test]
+fn chmod_of_a_directory_does_not_refuse_an_earlier_descendant_read() {
+    use std::os::unix::fs::PermissionsExt;
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "this test requires an unprivileged user"
+    );
+    let case = Case::new("review-chmod-directory");
+    case.file("d/f", b"input\n");
+    let out = run(
+        &case,
+        "review-chmod-directory",
+        "cat d/f >/dev/null; chmod 000 d",
+        &[],
+    );
+    fs::set_permissions(case.root().join("d"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_recorded(&out, &case, "review-chmod-directory");
+}
+
+#[test]
+fn unchanged_stat_visible_unreadable_file_still_records() {
+    use std::os::unix::fs::PermissionsExt;
+    assert_ne!(
+        unsafe { libc::geteuid() },
+        0,
+        "this test requires an unprivileged user"
+    );
+    let case = Case::new("review-unreadable");
+    let file = case.file("secret", b"private\n");
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+    let out = run(&case, "review-unreadable", "stat secret >/dev/null", &[]);
+    fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_recorded(&out, &case, "review-unreadable");
+    assert_entry_id(&proof(&case, "review-unreadable"), "inputs", "secret", "u");
+}
+
+fn set_old_atime(path: &Path) -> i128 {
+    use std::os::unix::fs::MetadataExt;
+    use std::time::{Duration, UNIX_EPOCH};
+    let file = File::open(path).unwrap();
+    file.set_times(
+        fs::FileTimes::new().set_accessed(UNIX_EPOCH + Duration::from_secs(1_000_000_000)),
+    )
+    .unwrap();
+    let metadata = file.metadata().unwrap();
+    i128::from(metadata.atime()) * 1_000_000_000 + i128::from(metadata.atime_nsec())
+}
+
+#[test]
+fn read_probe_does_not_change_the_atime_seen_by_the_tracee() {
+    let case = Case::new("review-file-atime");
+    let file = case.file("src/a", b"payload\n");
+    let before = set_old_atime(&file);
+    let out = run(
+        &case,
+        "review-file-atime",
+        "python3 -c 'import os; fd=os.open(\"src/a\",os.O_RDONLY); print(os.fstat(fd).st_atime_ns)' > seen",
+        &[],
+    );
+    assert_recorded(&out, &case, "review-file-atime");
+    let observed = fs::read_to_string(case.root().join("seen")).unwrap();
+    assert_eq!(observed.trim(), before.to_string());
+}
+
+#[test]
+fn listing_probe_does_not_change_directory_atime_seen_by_the_tracee() {
+    let case = Case::new("review-directory-atime");
+    case.file("d/x", b"x\n");
+    let before = set_old_atime(&case.root().join("d"));
+    let out = run(
+        &case,
+        "review-directory-atime",
+        "python3 -c 'import os; fd=os.open(\"d\",os.O_RDONLY|os.O_DIRECTORY|os.O_NOATIME); os.listdir(fd); print(os.fstat(fd).st_atime_ns)' > seen",
+        &[],
+    );
+    assert_recorded(&out, &case, "review-directory-atime");
+    let observed = fs::read_to_string(case.root().join("seen")).unwrap();
+    assert_eq!(observed.trim(), before.to_string());
+}
+
+#[test]
+fn read_only_proc_descriptor_reopen_does_not_hide_an_external_edit() {
+    let case = Case::new("review-proc-readonly");
+    let file = case.file("src/a", b"old\n");
+    age();
+    let fifo = case.fifo("review-proc-readonly.fifo");
+    let child = spawn(
+        &case,
+        "review-proc-readonly",
+        "exec 3<src/a; cat /proc/self/fd/3 >/dev/null; cat \"$FIFO\" >/dev/null",
+        &[("FIFO", &fifo)],
+    );
+    let release = meet(&fifo);
+    fs::write(file, b"new and longer\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_not_recorded(
+        &out,
+        &case,
+        "review-proc-readonly",
+        "src/a changed while the command ran",
+    );
+}
+
+#[test]
+fn writable_reopen_of_an_inherited_unlinked_descriptor_keeps_v9_recording() {
+    let case = Case::new("review-unlinked-fd");
+    let a = case.file("a", b"before\n");
+    fs::hard_link(&a, case.root().join("b")).unwrap();
+    let fd = OpenOptions::new().read(true).open(&a).unwrap();
+    fs::remove_file(a).unwrap();
+    let source = fd.as_raw_fd();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_stoop"));
+    clean(&mut command);
+    command
+        .args(["run", "--root"])
+        .arg(case.root())
+        .args([
+            "--key",
+            "review-unlinked-fd",
+            "--",
+            "sh",
+            "-c",
+            "cat b >/dev/null; : > /proc/self/fd/3",
+        ])
+        .current_dir(case.root())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(source, 3) < 0 || libc::fcntl(3, libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let out = command.output().unwrap();
+    assert_recorded(&out, &case, "review-unlinked-fd");
+}
+
+#[test]
+#[ignore = "requires sudo mount --bind on an isolated Linux CI runner"]
+fn bind_mount_entry_change_does_not_refuse_the_original_listing() {
+    struct Mount(PathBuf);
+    impl Drop for Mount {
+        fn drop(&mut self) {
+            let _ = Command::new("sudo").arg("umount").arg(&self.0).status();
+        }
+    }
+    let case = Case::new("review-bind-mount");
+    case.file("d/old", b"old\n");
+    let alias = case.dir.join("alias");
+    fs::create_dir(&alias).unwrap();
+    assert!(Command::new("sudo")
+        .args(["mount", "--bind"])
+        .arg(case.root().join("d"))
+        .arg(&alias)
+        .status()
+        .unwrap()
+        .success());
+    let mount = Mount(alias.clone());
+    let out = run(
+        &case,
+        "review-bind-mount",
+        "ls d >/dev/null; echo x > \"$ALIAS/new\"",
+        &[("ALIAS", &alias)],
+    );
+    drop(mount);
+    assert_recorded(&out, &case, "review-bind-mount");
+}
+
+#[test]
+fn overlapping_symlink_retarget_and_blocked_write_skip_comparison() {
+    let case = Case::new("review-overlap");
+    case.file("src/b", b"before\n");
+    let blocked = case.fifo("review-blocked.fifo");
+    let sync = case.fifo("review-sync.fifo");
+    symlink(&blocked, case.root().join("src/link")).unwrap();
+    let child = spawn(
+        &case,
+        "review-overlap",
+        "cat src/b >/dev/null; (exec 4>src/link) & sleep 1; ln -sfn b src/link; cat \"$SYNC\" >/dev/null; wait",
+        &[("SYNC", &sync), ("STOOP_DEBUG", Path::new("1"))],
+    );
+    let release = meet(&sync);
+    let reader = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&blocked)
+        .unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    drop(reader);
+    assert_recorded(&out, &case, "review-overlap");
+    assert!(
+        stderr(&out).contains("stoop: debug: not compared src/b: Unknown"),
+        "{}",
+        stderr(&out)
+    );
+}
