@@ -2821,7 +2821,7 @@ fn mount_api_and_namespace_clone_attempts_are_not_recorded() {
 }
 
 #[test]
-fn concurrent_retarget_during_in_flight_writes_is_refused_after_changer_sleeps_or_exits() {
+fn concurrent_retarget_during_in_flight_writes_is_refused_or_records_the_new_output() {
     use std::os::unix::fs::symlink;
     for variant in ["sleep", "exit"] {
         for trial in 0..40 {
@@ -2850,24 +2850,29 @@ fn concurrent_retarget_during_in_flight_writes_is_refused_after_changer_sleeps_o
             );
             let (status, err) = w.sh_with_affinity(&script, &w.root, true);
             assert_eq!(status, 0, "{variant} trial {trial}: {err}");
+            let refused = err.contains("stoop: not recorded: it replaced the link");
             assert!(
-                err.contains("stoop: not recorded: it replaced the link"),
+                refused || err.contains("stoop: recorded"),
                 "{variant} trial {trial}: {err}"
             );
-            assert!(
-                !err.contains("stoop: recorded"),
-                "{variant} trial {trial}: {err}"
-            );
+            if !refused {
+                let p = w.proof();
+                assert!(
+                    pairs(&p, "outputs").iter().any(|(key, _)| key == "sub/g"),
+                    "{variant} trial {trial}: {:?}",
+                    pairs(&p, "outputs")
+                );
+            }
             let _ = fs::remove_dir_all(outside);
         }
     }
 }
 
 #[test]
-fn concurrent_alias_retargets_are_refused_with_a_named_reason() {
+fn concurrent_alias_retargets_are_refused_or_record_the_final_output() {
     // The child writes through `x`, which leads to `y/alias`, while the parent keeps replacing
-    // `y/alias`. The run writes through a link it also replaces, so the record is refused: where a
-    // write landed is not known from the tracer's view of the link.
+    // `y/alias`. A replacement that lands while a write is in flight through it is refused by name;
+    // a run where no write overlapped a replacement records, and then its output is the final one.
     for trial in 0..6 {
         let w = Ws::new(&format!("topology-race-{trial}"));
         w.write("sub/keep", "keep");
@@ -2890,11 +2895,21 @@ fn concurrent_alias_retargets_are_refused_with_a_named_reason() {
         let (code, err) = w.sh(&script);
         let _ = fs::remove_dir_all(outside);
         assert_eq!(code, 0, "trial {trial}: {err}");
+        let refused = err.contains("stoop: not recorded: it replaced the link");
         assert!(
-            err.contains("stoop: not recorded: it replaced the link"),
+            refused || err.contains("stoop: recorded"),
             "trial {trial}: {err}"
         );
-        assert!(!err.contains("stoop: recorded"), "trial {trial}: {err}");
+        if !refused {
+            let p = w.proof();
+            assert!(
+                pairs(&p, "outputs")
+                    .iter()
+                    .any(|(key, _)| key == "sub/final"),
+                "trial {trial}: {:?}",
+                pairs(&p, "outputs")
+            );
+        }
     }
 }
 
