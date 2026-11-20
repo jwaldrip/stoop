@@ -972,3 +972,61 @@ fn overlapping_symlink_retarget_and_blocked_write_skip_comparison() {
         stderr(&out)
     );
 }
+
+#[test]
+fn fchmod_of_a_directory_does_not_refuse_an_earlier_descendant_read() {
+    use std::os::unix::fs::PermissionsExt;
+    assert_ne!(unsafe { libc::geteuid() }, 0);
+    let case = Case::new("review-fchmod-directory");
+    case.file("d/f", b"input\n");
+    let out = run(
+        &case,
+        "review-fchmod-directory",
+        "cat d/f >/dev/null; python3 -c 'import os; fd=os.open(\"d\",os.O_RDONLY|os.O_DIRECTORY); os.fchmod(fd,0)'",
+        &[],
+    );
+    fs::set_permissions(case.root().join("d"), fs::Permissions::from_mode(0o700)).unwrap();
+    assert_recorded(&out, &case, "review-fchmod-directory");
+}
+
+#[test]
+fn owner_change_of_a_directory_excludes_descendants() {
+    let case = Case::new("review-owner-directory");
+    case.file("d/f", b"input\n");
+    let out = run(
+        &case,
+        "review-owner-directory",
+        "cat d/f >/dev/null; python3 -c 'import os; fd=os.open(\"d\",os.O_RDONLY|os.O_DIRECTORY); os.fchown(fd,os.getuid(),os.getgid())'",
+        &[("STOOP_DEBUG", Path::new("1"))],
+    );
+    assert_recorded(&out, &case, "review-owner-directory");
+    assert!(
+        stderr(&out).contains("stoop: debug: not compared d/f: OwnPath"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn read_only_proc_cwd_alias_does_not_hide_an_external_edit() {
+    let case = Case::new("review-proc-cwd");
+    let file = case.file("src/a", b"old\n");
+    age();
+    let fifo = case.fifo("review-proc-cwd.fifo");
+    let child = spawn(
+        &case,
+        "review-proc-cwd",
+        "cat src/a >/dev/null; cat /proc/self/cwd/src/a >/dev/null; cat \"$FIFO\" >/dev/null",
+        &[("FIFO", &fifo)],
+    );
+    let release = meet(&fifo);
+    fs::write(file, b"new and longer\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_not_recorded(
+        &out,
+        &case,
+        "review-proc-cwd",
+        "src/a changed while the command ran",
+    );
+}

@@ -78,6 +78,8 @@ pub struct ListSeen {
 #[derive(Default)]
 pub struct Footprint {
     pub entries: HashSet<PathBuf>,
+    /// Directory inodes containing names the command may have changed.
+    pub parent_inodes: HashSet<(u64, u64)>,
     pub inodes: HashSet<(u64, u64)>,
     pub unknown: bool,
 }
@@ -87,8 +89,16 @@ pub enum Post {
     Absent,
     Unreadable,
     Special,
-    File { stat: FileStat, hash: String },
-    Dir { stat: DirSeen, names: Option<Names> },
+    File {
+        stat: FileStat,
+        hash: String,
+    },
+    /// The file can be stated, but its contents cannot be read.
+    FileStat(FileStat),
+    Dir {
+        stat: DirSeen,
+        names: Option<Names>,
+    },
     Symlink(LinkSeen),
 }
 
@@ -180,6 +190,68 @@ pub fn read_names_capped(dir: &Path, cap: usize) -> Option<Names> {
     )
 }
 
+/// Snapshot a directory without advancing its access time. Any failure falls back to stat-only.
+#[cfg(target_os = "linux")]
+pub fn read_names_quiet(dir: &Path, expected: &DirSeen, cap: usize) -> Option<Names> {
+    use std::ffi::CStr;
+    use std::os::fd::{FromRawFd, IntoRawFd};
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true).custom_flags(
+        libc::O_DIRECTORY | libc::O_NOATIME | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+    );
+    let file = options.open(dir).ok()?;
+    if !file
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_dir() && dir_stat(&metadata) == *expected)
+    {
+        return None;
+    }
+    let fd = file.into_raw_fd();
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        unsafe { libc::close(fd) };
+        return None;
+    }
+    struct Stream(*mut libc::DIR);
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            unsafe { libc::closedir(self.0) };
+        }
+    }
+    let stream = Stream(stream);
+    let mut names = Names::new();
+    let mut count = 0;
+    loop {
+        unsafe { *libc::__errno_location() = 0 };
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            if unsafe { *libc::__errno_location() } != 0 {
+                return None;
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name == b"." || name == b".." {
+            continue;
+        }
+        if count == cap {
+            return None;
+        }
+        count += 1;
+        names.insert(name.into());
+    }
+    let borrowed =
+        std::mem::ManuallyDrop::new(unsafe { fs::File::from_raw_fd(libc::dirfd(stream.0)) });
+    if !borrowed
+        .metadata()
+        .is_ok_and(|metadata| metadata.is_dir() && dir_stat(&metadata) == *expected)
+    {
+        return None;
+    }
+    Some(names)
+}
+
 fn take_names<I>(entries: I, cap: usize) -> Option<Names>
 where
     I: IntoIterator<Item = io::Result<OsString>>,
@@ -216,7 +288,9 @@ pub fn hash_bound(path: &Path, expected: &FileStat, budget: &mut ReadBudget) -> 
     }
     let mut options = fs::OpenOptions::new();
     options.read(true);
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOATIME);
+    #[cfg(all(unix, not(target_os = "linux")))]
     options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     #[cfg(windows)]
     options.custom_flags(0x0020_0000);
@@ -290,6 +364,7 @@ fn seen_inode(seen: &Seen) -> Option<(u64, u64)> {
 fn post_inode(post: &Post) -> Option<(u64, u64)> {
     match post {
         Post::File { stat, .. } => Some((stat.dev, stat.ino)),
+        Post::FileStat(stat) => Some((stat.dev, stat.ino)),
         Post::Dir { stat, .. } => Some((stat.dev, stat.ino)),
         Post::Symlink(stat) => Some((stat.dev, stat.ino)),
         _ => None,
@@ -320,10 +395,14 @@ pub fn skip(
         return Some(Skip::OwnPath);
     }
     if listed
-        && footprint
+        && (footprint
             .entries
             .iter()
             .any(|entry| entry.parent() == Some(path))
+            || [seen_inode(&observation.seen), post_inode(post)]
+                .into_iter()
+                .flatten()
+                .any(|inode| footprint.parent_inodes.contains(&inode)))
     {
         return Some(Skip::OwnEntries);
     }
@@ -342,6 +421,7 @@ pub fn matches(observation: &Observation, post: &Post, listing: Option<&ListSeen
     match (&observation.seen, post) {
         (Seen::Absent, Post::Absent) => !observation.appeared,
         (Seen::Unreadable, Post::Unreadable) | (Seen::Special, Post::Special) => true,
+        (Seen::File(first, _), Post::FileStat(last)) => first == last,
         (
             Seen::File(first, hash),
             Post::File {

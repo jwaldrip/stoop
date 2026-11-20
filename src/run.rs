@@ -1587,11 +1587,22 @@ fn compare_candidate(
         return Ok(None);
     };
     let observation = seen.get(path);
-    if let Some(reason) = trace::identity::skip(&trace.footprint, observation, path, listed, post) {
+    let was_listed = trace.listings.contains_key(path);
+    if let Some(reason) = trace::identity::skip(
+        &trace.footprint,
+        observation,
+        path,
+        listed || was_listed,
+        post,
+    ) {
         return Ok(Some(reason));
     }
     let observation = observation.expect("skip rejects missing observations");
-    let listing = trace.listings.get(path);
+    let listing = if listed {
+        trace.listings.get(path)
+    } else {
+        None
+    };
     if listed && matches!(observation.seen, trace::identity::Seen::Dir(_)) && listing.is_none() {
         return Ok(Some(trace::identity::Skip::NotObserved));
     }

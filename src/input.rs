@@ -119,6 +119,13 @@ pub fn identify_post(
                 },
             )
         }
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            let post = match fs::symlink_metadata(path) {
+                Ok(current) if current.is_file() => Post::FileStat(identity::file_stat(&current)),
+                _ => Post::Unreadable,
+            };
+            (inside.then(|| ("u".to_owned(), None)), post)
+        }
         Err(_) => (inside.then(|| ("u".to_owned(), None)), Post::Unreadable),
     }
 }
