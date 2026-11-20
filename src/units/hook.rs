@@ -309,23 +309,6 @@ fn mangled(word: &str) -> bool {
     })
 }
 
-fn carrier(word: &str, first: usize) -> Option<&str> {
-    if word.starts_with("--") {
-        return word[..first].split_once('=').map(|(name, _)| name);
-    }
-    if word.starts_with('-') && word.len() > 2 && first >= 2 {
-        return word.get(..2);
-    }
-    None
-}
-
-fn same_option(word: &str, name: &str) -> bool {
-    word == name
-        || word.strip_prefix(name).is_some_and(|tail| {
-            tail.starts_with('=') || (!name.starts_with("--") && !tail.is_empty())
-        })
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Arity {
     Zero,
@@ -343,16 +326,23 @@ fn declared_word<'a>(
     options: &'a [OptionDeclaration],
     word: &str,
 ) -> Option<(&'a OptionDeclaration, &'a str)> {
-    options
-        .iter()
-        .flat_map(|item| item.names.iter().map(move |name| (item, name.as_str())))
-        .filter(|(_, name)| same_option(word, name))
-        .max_by_key(|(_, name)| name.len())
+    options.iter().find_map(|item| {
+        item.names
+            .iter()
+            .find(|name| {
+                word == name.as_str()
+                    || (name.starts_with("--")
+                        && word
+                            .strip_prefix(name.as_str())
+                            .is_some_and(|tail| tail.starts_with('=')))
+            })
+            .map(|name| (item, name.as_str()))
+    })
 }
 
 fn ambiguous(name: &str) -> String {
     let name = safe(&lossy_shadow(name));
-    format!("cannot tell where the values for {name} end; attach the placeholder with =, put it right after {name} or after --, or declare the option in .stoop.toml")
+    format!("cannot tell where the values for {name} end; put the placeholder after -- or declare the option in .stoop.toml")
 }
 
 pub(crate) struct ParsedHook {
@@ -433,9 +423,10 @@ pub(crate) fn prepare(exact: &[OsString]) -> Result<Option<Hook>, String> {
         .transpose()
 }
 
-/// The first `--` ends option parsing. Before it, the longest declaration owns its
-/// attached value or declared operands. Selected carriers remove all their aliases.
-/// Ambiguous undeclared extents are refused; later placeholder words are positional.
+/// Before the first `--`, declarations match whole option words or long `--name=value`.
+/// Arity is zero, one, or many; selected declared options remove their aliases and operands.
+/// A bare placeholder is positional unless a declared option owns it. Unknown ownership,
+/// attached short values, and placeholders embedded in any other word are refused.
 fn removals(
     argv: &[String],
     spans: &[Vec<(usize, usize)>],
@@ -447,13 +438,27 @@ fn removals(
         declaration: Option<usize>,
         start: usize,
         end: usize,
-        attached: bool,
         selected: bool,
     }
     let end = (start..argv.len())
         .find(|&i| argv[i] == "--")
         .unwrap_or(argv.len());
     let mut remove: Vec<bool> = spans.iter().map(|parts| !parts.is_empty()).collect();
+    for i in start..argv.len() {
+        if spans[i].is_empty() {
+            continue;
+        }
+        let bare = spans[i].len() == 1 && spans[i][0] == (0, argv[i].len());
+        let attached = i < end
+            && declared_word(options, &argv[i]).is_some_and(|(_, name)| {
+                name.starts_with("--")
+                    && spans[i].len() == 1
+                    && spans[i][0] == (name.len() + 1, argv[i].len())
+            });
+        if !bare && !attached {
+            return Err(ambiguous(&argv[i]));
+        }
+    }
     let mut owned = vec![false; argv.len()];
     let mut occurrences = Vec::new();
     let mut i = start;
@@ -464,6 +469,14 @@ fn removals(
             continue;
         }
         let declared = declared_word(options, word);
+        if declared.is_none()
+            && options
+                .iter()
+                .flat_map(|item| &item.names)
+                .any(|name| word.starts_with(name) && word != name)
+        {
+            return Err(ambiguous(word));
+        }
         let (name, declaration, attached) = if let Some((item, name)) = declared {
             let index = options
                 .iter()
@@ -471,16 +484,7 @@ fn removals(
                 .unwrap();
             (name, Some(index), word != name)
         } else {
-            let name = if let Some(&(first, _)) = spans[i].first() {
-                carrier(word, first).unwrap_or(word)
-            } else if word.starts_with("--") {
-                word.split_once('=').map_or(word.as_str(), |(name, _)| name)
-            } else if word.len() > 2 {
-                word.get(..2).unwrap_or(word)
-            } else {
-                word
-            };
-            (name, None, word != name)
+            (word.as_str(), None, word.contains('='))
         };
         let first = i;
         i += 1;
@@ -490,13 +494,6 @@ fn removals(
                 while i < end && !option(&argv[i]) {
                     i += 1;
                 }
-            }
-            None if !attached
-                && i < end
-                && spans[i].len() == 1
-                && spans[i][0] == (0, argv[i].len()) =>
-            {
-                i += 1
             }
             _ => {}
         }
@@ -509,59 +506,33 @@ fn removals(
             declaration,
             start: first,
             end: i,
-            attached,
             selected,
         });
     }
-    // A positional placeholder after an undeclared option with intervening words
-    // has unknown ownership. Declarations and attached values make it positional.
     for at in start..end {
         if spans[at].is_empty() || owned[at] {
             continue;
         }
-        for occurrence in occurrences.iter().rev().filter(|item| item.start < at) {
-            if occurrence.end > at {
-                continue;
-            }
+        if let Some(occurrence) = occurrences
+            .iter()
+            .rev()
+            .find(|item| item.start < at && item.end <= at)
+        {
             if occurrence.declaration.is_none() && !argv[occurrence.start].contains('=') {
                 return Err(ambiguous(occurrence.name));
             }
-            break;
         }
     }
     for occurrence in &occurrences {
-        let selected = occurrences.iter().any(|other| {
-            other.selected
-                && match (occurrence.declaration, other.declaration) {
-                    (Some(a), Some(b)) => a == b,
-                    (None, None) => occurrence.name == other.name,
-                    _ => false,
-                }
-        });
-        if !selected {
+        let Some(declaration) = occurrence.declaration else {
             continue;
-        }
-        if occurrence.declaration.is_none()
-            && occurrence.attached
-            && !argv[occurrence.start].starts_with("--")
-            && !argv[occurrence.start].starts_with(&format!("{}=", occurrence.name))
-            && spans[occurrence.start].is_empty()
+        };
+        if occurrences
+            .iter()
+            .any(|other| other.selected && other.declaration == Some(declaration))
         {
-            return Err(ambiguous(occurrence.name));
-        }
-        for used in &mut remove[occurrence.start..occurrence.end] {
-            *used = true;
-        }
-        if occurrence.declaration.is_none()
-            && !occurrence.attached
-            && occurrence.end == occurrence.start + 1
-        {
-            let value = occurrence.end;
-            if value < end && !option(&argv[value]) && !remove[value] {
-                if value + 1 < end && !option(&argv[value + 1]) && !remove[value + 1] {
-                    return Err(ambiguous(occurrence.name));
-                }
-                remove[value] = true;
+            for used in &mut remove[occurrence.start..occurrence.end] {
+                *used = true;
             }
         }
     }
@@ -809,20 +780,6 @@ pub(crate) fn expanded_explain(hook: &Hook) -> String {
         render(&hook.original),
         render(&hook.argv)
     )
-}
-
-/// The line for placeholder-free argv that matches more than one recorded full command.
-pub(crate) fn ambiguous_line(argv: &[OsString], matches: usize, explain: bool) -> String {
-    let typed = render(argv);
-    if explain {
-        format!(
-            "stoop: would run as typed: {typed} matches {matches} recorded hooks with different full commands; quote the placeholder or use --literal"
-        )
-    } else {
-        format!(
-            "stoop: {typed} matches {matches} recorded hooks with different full commands; running it as typed; quote the placeholder or use --literal"
-        )
-    }
 }
 
 /// The option or argument that holds the first empty value, made safe to print.

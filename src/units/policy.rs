@@ -23,13 +23,38 @@ pub(crate) fn valid_branch(name: &str) -> bool {
             .any(|byte| byte <= b' ' || byte == 0x7f || b"~^:?*[\\".contains(&byte))
 }
 
+struct Field<T> {
+    present: bool,
+    value: Option<T>,
+}
+
+impl<T> Default for Field<T> {
+    fn default() -> Self {
+        Self {
+            present: false,
+            value: None,
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Field<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Self {
+            present: true,
+            value: Option::<T>::deserialize(deserializer)?,
+        })
+    }
+}
+
 #[derive(Deserialize)]
 struct EventPolicy {
     repository: EventRepository,
-    #[serde(rename = "ref")]
-    reference: Option<String>,
-    number: Option<u64>,
-    pull_request: Option<EventPullRequest>,
+    #[serde(rename = "ref", default)]
+    reference: Field<String>,
+    #[serde(default)]
+    number: Field<u64>,
+    #[serde(default)]
+    pull_request: Field<EventPullRequest>,
 }
 
 #[derive(Deserialize)]
@@ -197,14 +222,14 @@ pub(crate) fn forced_reason(
         }
         let event = std::env::var("GITHUB_EVENT_NAME").ok();
         let reference = std::env::var("GITHUB_REF").ok();
-        if payload_ref
-            .as_deref()
-            .is_some_and(|payload| Some(payload) != reference.as_deref())
-        {
+        if payload_ref.present && payload_ref.value.as_deref() != reference.as_deref() {
             return Some("conflicting GitHub branch context".into());
         }
         match (event.as_deref(), reference.as_deref()) {
             (Some("push"), Some(reference)) => {
+                if payload_number.present || pull.present {
+                    return Some("conflicting GitHub event kind".into());
+                }
                 let Some(branch) = reference
                     .strip_prefix("refs/heads/")
                     .filter(|name| valid_branch(name))
@@ -228,16 +253,22 @@ pub(crate) fn forced_reason(
                 let number = name
                     .split_once('/')
                     .and_then(|(number, _)| positive(number));
-                if payload_number.is_some_and(|value| Some(value) != number)
+                if pull.present && pull.value.is_none() {
+                    return Some("conflicting GitHub pull request context".into());
+                }
+                let pull = pull.value.as_ref();
+                if (payload_number.present && payload_number.value != number)
                     || pull
-                        .as_ref()
                         .and_then(|p| p.number)
                         .is_some_and(|value| Some(value) != number)
                     || (std::env::var_os("GITHUB_HEAD_REF").is_some()
-                        && pull.as_ref().and_then(|p| p.head.as_ref()).is_none())
+                        && pull.and_then(|p| p.head.as_ref()).is_none())
                     || (std::env::var_os("GITHUB_BASE_REF").is_some()
-                        && pull.as_ref().and_then(|p| p.base.as_ref()).is_none())
-                    || pull.as_ref().is_some_and(|p| {
+                        && pull.and_then(|p| p.base.as_ref()).is_none())
+                    || pull.is_some_and(|p| {
+                        if p.number.is_none() || p.head.is_none() || p.base.is_none() {
+                            return true;
+                        }
                         p.head.as_ref().is_some_and(|head| {
                             !valid_branch(&head.name)
                                 || !agrees_if_present("GITHUB_HEAD_REF", &head.name)

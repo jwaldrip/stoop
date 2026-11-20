@@ -64,6 +64,7 @@ pub(crate) struct Config {
     pub verify_every: Option<u64>,
     suites: Vec<Suite>,
     source: String,
+    present: bool,
 }
 
 pub(crate) struct ConfigError {
@@ -311,10 +312,15 @@ pub(crate) fn load(root: &Path) -> Result<Config, ConfigError> {
         verify_every: document.units.verify_every,
         suites,
         source,
+        present: true,
     })
 }
 
 impl Config {
+    pub(crate) fn key_source(&self) -> Option<&[u8]> {
+        self.present.then_some(self.source.as_bytes())
+    }
+
     pub(crate) fn select(
         &self,
         argv: &[OsString],
@@ -354,7 +360,6 @@ pub(crate) struct Prepared {
     pub config: Config,
     pub invalid: bool,
     pub independent_false: bool,
-    pub configured: bool,
 }
 
 /// Shared by the CLI and MCP preflight. The caller emits the warning only once.
@@ -380,7 +385,6 @@ pub(crate) fn prepare(
                 config: Config::default(),
                 invalid: false,
                 independent_false: false,
-                configured: false,
             }),
         );
     };
@@ -415,7 +419,6 @@ pub(crate) fn finish(
             }
         }
     };
-    let configured = suite.is_some();
     let independent_false = suite.is_some_and(|suite| suite.independent == Some(false));
     let hook = parsed.finish(argv, suite.map_or(&[], |suite| &suite.options));
     (
@@ -425,7 +428,6 @@ pub(crate) fn finish(
             config,
             invalid,
             independent_false,
-            configured,
         }),
     )
 }

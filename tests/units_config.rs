@@ -260,6 +260,16 @@ options = [{ names = ["-f"], values = "many" }]
     let out = f.off(&["-fVALUE", "{changed}"]);
     assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
     assert!(out.stdout.is_empty());
+    f.config(
+        r#"[[units.suite]]
+id = "short-before-terminator"
+match = ["./runner", "*", "*", "*"]
+options = [{ names = ["-f"], values = "many" }]
+"#,
+    );
+    let out = f.off(&["-fVALUE", "--", "{changed}"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(out.stdout.is_empty());
 }
 
 #[test]
@@ -1218,5 +1228,13 @@ match = ["./runner", "*"]
         assert_skipped(&run());
         f.event(r#"{"number":42,"pull_request":{"number":42,"head":{"ref":"feature"},"base":{"ref":"main"}},"repository":{"default_branch":"main"}}"#);
         assert_ran(&run());
+        for payload in [
+            r#"{"number":null,"repository":{"default_branch":"main"}}"#,
+            r#"{"pull_request":null,"repository":{"default_branch":"main"}}"#,
+            r#"{"ref":null,"repository":{"default_branch":"main"}}"#,
+        ] {
+            f.event(payload);
+            assert_ran(&run());
+        }
     }
 }

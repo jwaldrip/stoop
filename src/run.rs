@@ -254,6 +254,8 @@ fn hook_key(
     label: Option<&str>,
     cwd: &str,
     scope: Option<&str>,
+    config_source: Option<&[u8]>,
+    config_invalid: bool,
 ) -> String {
     let mut hash = blake3::Hasher::new();
     hash.update(b"stoop-hook-v1\0");
@@ -268,6 +270,13 @@ fn hook_key(
     for value in [cwd, scope.unwrap_or(""), label.unwrap_or("")] {
         hash.update(&(value.len() as u64).to_le_bytes());
         hash.update(value.as_bytes());
+    }
+    if config_invalid {
+        hash.update(b"\0stoop-config-invalid\0");
+    } else if let Some(source) = config_source {
+        hash.update(b"\0stoop-config-v1\0");
+        hash.update(&(source.len() as u64).to_le_bytes());
+        hash.update(source);
     }
     let base = label.unwrap_or_else(|| {
         Path::new(&hook.original[0])
@@ -614,6 +623,8 @@ fn hook_max_age(o: &Opts) -> u64 {
         .unwrap_or(DEFAULT_MAX_AGE)
 }
 
+type RecoveredHooks = Vec<(units::hook::Hook, String)>;
+
 fn recover_hooks(
     o: &Opts,
     root: &Path,
@@ -621,7 +632,7 @@ fn recover_hooks(
     store: &Path,
     scope: Option<&str>,
     max_age: u64,
-) -> (Vec<String>, Result<Vec<units::hook::Hook>, String>) {
+) -> (Vec<String>, Result<RecoveredHooks, String>) {
     let mut warnings = Vec::new();
     let records = match units::hook_store::records(store, now(), max_age) {
         Ok(records) => records,
@@ -632,8 +643,7 @@ fn recover_hooks(
             return (warnings, Ok(Vec::new()));
         }
     };
-    let mut found: Vec<units::hook::Hook> = Vec::new();
-    let mut configured = false;
+    let mut found: Vec<(units::hook::Hook, String)> = Vec::new();
     for record in records.into_iter().filter(|record| {
         record.cwd == cwd && record.scope.as_deref() == scope && record.label == o.key
     }) {
@@ -652,20 +662,30 @@ fn recover_hooks(
         }
         match prepared {
             Ok(prepared) => {
-                configured |= prepared.configured;
+                if prepared.invalid {
+                    return (warnings, Err("the recorded hook has invalid configuration; quote the placeholder or use --literal".into()));
+                }
                 if let Some(candidate) = prepared.hook {
-                    if hook_key(&candidate, record.label.as_deref(), cwd, scope) != record.key {
+                    if hook_key(
+                        &candidate,
+                        record.label.as_deref(),
+                        cwd,
+                        scope,
+                        prepared.config.key_source(),
+                        prepared.invalid,
+                    ) != record.key
+                    {
                         return (warnings, Err("the recorded hook's full form changed; quote the placeholder or use --literal".into()));
                     }
-                    if !found.iter().any(|known| known.argv == candidate.argv) {
-                        found.push(candidate);
+                    if !found.iter().any(|(known, _)| known.argv == candidate.argv) {
+                        found.push((candidate, record.key));
                     }
                 }
             }
             Err(error) => return (warnings, Err(error)),
         }
     }
-    if configured && found.len() > 1 {
+    if found.len() > 1 {
         return (
             warnings,
             Err(
@@ -836,7 +856,6 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         config,
         invalid: config_invalid,
         independent_false,
-        configured: _,
     } = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
@@ -854,11 +873,10 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         o.argv.clone_from(&h.argv);
     }
     let max_age = hook_max_age(&o);
-    // An argv without a placeholder may be an expanded shape of a recorded hook. A single full
-    // form runs and never skips. Two different full forms cannot be told apart, so the command
-    // runs as typed and never skips either.
+    // An erased hook runs its recorded full form and never skips. Conflicting full forms,
+    // invalid configuration, or a changed configuration identity are refused.
     let mut expanded = false;
-    let mut matches = 0;
+    let mut recovered_key = None;
     if !literal && hook.is_none() {
         let (warnings, recovered) =
             recover_hooks(&o, &root, &rel_cwd, &store_path, scope.as_deref(), max_age);
@@ -876,23 +894,32 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 };
             }
         };
-        matches = found.len();
-        if matches == 1 {
-            let candidate = found.swap_remove(0);
+        if let Some((candidate, key)) = found.pop() {
+            recovered_key = Some(key);
             o.argv.clone_from(&candidate.argv);
             hook = Some(candidate);
             expanded = true;
         }
     }
-    let bypass = expanded || matches > 1;
+    let bypass = expanded;
     // Stoop owns the hook variables for its child. A hook exports them empty. Any other run
     // replaces an inherited value and names it, unless a placeholder reached stoop intact.
     if !literal {
         clear_hook_env(hook.is_some(), !intact);
     }
-    let key = hook
-        .as_ref()
-        .map(|h| hook_key(h, o.key.as_deref(), &rel_cwd, scope.as_deref()))
+    let key = recovered_key
+        .or_else(|| {
+            hook.as_ref().map(|h| {
+                hook_key(
+                    h,
+                    o.key.as_deref(),
+                    &rel_cwd,
+                    scope.as_deref(),
+                    config.key_source(),
+                    config_invalid,
+                )
+            })
+        })
         .unwrap_or_else(|| {
             o.key
                 .as_deref()
@@ -915,8 +942,6 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 units::hook::expanded_line(h)
             }
         })
-    } else if matches > 1 {
-        Some(units::hook::ambiguous_line(&o.argv, matches, explain))
     } else if !literal && hook.is_none() {
         units::hook::empty_value_line(&o.argv, explain)
     } else {
@@ -2309,7 +2334,7 @@ mod hook_key_tests {
             OsString::from_vec(word.to_vec()),
         ];
         let hook = units::hook::prepare(&words).unwrap().unwrap();
-        hook_key(&hook, None, "", None)
+        hook_key(&hook, None, "", None, None, false)
     }
 
     #[test]
