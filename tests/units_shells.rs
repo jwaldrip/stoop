@@ -33,16 +33,6 @@ impl Dir {
         fs::set_permissions(root.join("runner"), fs::Permissions::from_mode(0o755)).unwrap();
         fs::write(root.join("a.t"), "").unwrap();
         fs::write(root.join("b.t"), "").unwrap();
-        let mut config = String::new();
-        for len in 1..=12 {
-            let words = std::iter::repeat_n("\"*\"", len)
-                .collect::<Vec<_>>()
-                .join(", ");
-            config.push_str(&format!(
-                "[[units.suite]]\nid = 'arity-{len}'\nmatch = [{words}]\noptions = [{{ names = ['--files'], values = 1 }}, {{ names = ['-c'], values = 1 }}]\n"
-            ));
-        }
-        fs::write(root.join(".stoop.toml"), config).unwrap();
         Self { root }
     }
 

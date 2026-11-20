@@ -32,19 +32,6 @@ impl Fixture {
         Self { root, runner }
     }
 
-    fn declare(&self) {
-        let mut config = String::new();
-        for len in 1..=12 {
-            let words = std::iter::repeat_n("\"*\"", len)
-                .collect::<Vec<_>>()
-                .join(", ");
-            config.push_str(&format!(
-                "[[units.suite]]\nid = 'arity-{len}'\nmatch = [{words}]\noptions = [{{ names = ['--files', '-f'], values = 1 }}, {{ names = ['--only'], values = 1 }}, {{ names = ['-y'], values = 1 }}, {{ names = ['-x'], values = 1 }}]\n"
-            ));
-        }
-        fs::write(self.root.join(".stoop.toml"), config).unwrap();
-    }
-
     fn command(&self, off: bool) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_stoop"));
         command
@@ -102,20 +89,9 @@ fn full_form_removes_the_placeholder_and_its_option() {
         vec!["@{changed:file}"],
     ] {
         let f = Fixture::new();
-        f.declare();
         let out = f.invoke(&[], &args, true);
-        if matches!(args[0], "-f={changed}" | "-f{changed}" | "@{changed:file}") {
-            assert_eq!(
-                out.status.code(),
-                Some(2),
-                "args={args:?} stderr={}",
-                err(&out)
-            );
-            assert!(!f.root.join("log").exists());
-        } else {
-            assert!(out.status.success(), "args={args:?} stderr={}", err(&out));
-            assert_eq!(f.log(), "changed=<>\n", "args={args:?}");
-        }
+        assert!(out.status.success(), "args={args:?} stderr={}", err(&out));
+        assert_eq!(f.log(), "changed=<>\n", "args={args:?}");
     }
 }
 
@@ -173,7 +149,6 @@ fn a_placeholder_embedded_in_a_word_with_spaces_is_refused_before_launch() {
 #[test]
 fn a_hook_run_prints_the_words_it_removed_without_tracing() {
     let f = Fixture::new();
-    f.declare();
     let out = f.invoke(&[], &["--files", "{changed}"], false);
     assert!(out.status.success(), "{}", err(&out));
     assert!(
@@ -260,7 +235,6 @@ fn failed_hook_still_detects_erased_forms_without_skipping() {
         (vec!["--files={changed:*.t}"], vec!["--files="]),
     ] {
         let f = Fixture::new();
-        f.declare();
         let before = f.invoke(&[], &erased, false);
         assert!(before.status.success(), "{}", err(&before));
         let before_log = f.log();
@@ -290,7 +264,6 @@ fn failed_hook_still_detects_erased_forms_without_skipping() {
 #[test]
 fn explicit_keys_cannot_share_hook_and_ordinary_proofs() {
     let f = Fixture::new();
-    f.declare();
     let first = f.invoke(&["--key", "same"], &["--files", "one.t"], false);
     assert!(first.status.success(), "{}", err(&first));
     let hook = f.invoke(&["--key", "same"], &["--files", "{changed}"], false);
@@ -322,7 +295,6 @@ fn a_placeholder_takes_only_one_filter() {
 #[test]
 fn a_first_sighting_records_the_template_before_the_run_outcome() {
     let f = Fixture::new();
-    f.declare();
     let failed = f
         .command(false)
         .env("FAIL", "1")
@@ -344,7 +316,7 @@ fn several_values_before_the_placeholder_are_refused_with_the_documented_fix() {
         text.contains("cannot tell where the values for --files end"),
         "{text}"
     );
-    assert!(text.contains("declare the option in .stoop.toml"), "{text}");
+    assert!(text.contains("attach the placeholder with ="), "{text}");
     assert!(text.contains("after --"), "{text}");
     assert!(!text.contains("=VALUE"), "{text}");
     assert!(!f.root.join("log").exists());
@@ -475,7 +447,6 @@ fn an_argument_hint_cannot_start_a_workflow_command_line() {
 #[test]
 fn a_removed_word_cannot_carry_a_workflow_command_prefix() {
     let f = Fixture::new();
-    f.declare();
     let out = f.invoke(&[], &["--files", "{changed:##[error]x}"], false);
     assert!(out.status.success(), "{}", err(&out));
     assert!(!err(&out).contains("##["), "{}", err(&out));
@@ -507,7 +478,6 @@ fn a_refusal_carrying_a_newline_stays_on_one_line() {
 #[test]
 fn a_recorded_template_expires_on_read() {
     let f = Fixture::new();
-    f.declare();
     let out = f.invoke(&[], &["--files", "{changed}"], false);
     assert!(out.status.success(), "{}", err(&out));
     set_created(&f, 0);
@@ -526,7 +496,6 @@ fn a_recorded_template_expires_on_read() {
 #[test]
 fn a_run_with_a_short_max_age_keeps_other_commands_templates() {
     let f = Fixture::new();
-    f.declare();
     let out = f.invoke(&[], &["--files", "{changed}"], false);
     assert!(out.status.success(), "{}", err(&out));
     set_created(&f, 0);
@@ -560,7 +529,6 @@ fn set_created(f: &Fixture, created: u64) {
 #[test]
 fn explain_names_the_expanded_hook_and_the_argv_it_would_run() {
     let f = Fixture::new();
-    f.declare();
     let out = f.invoke(&[], &["--files", "{changed}"], false);
     assert!(out.status.success(), "{}", err(&out));
     fs::remove_file(f.root.join("log")).unwrap();
@@ -617,7 +585,6 @@ fn stoop_off_still_prints_the_empty_value_hint() {
 #[test]
 fn stoop_off_runs_an_expanded_shape_as_its_full_form() {
     let f = Fixture::new();
-    f.declare();
     let out = f.invoke(&[], &["--files", "{changed}"], false);
     assert!(out.status.success(), "{}", err(&out));
     let out = f.invoke(&[], &["--files", ""], true);
@@ -629,7 +596,6 @@ fn stoop_off_runs_an_expanded_shape_as_its_full_form() {
 #[test]
 fn an_expanded_line_names_the_option_the_full_command_drops() {
     let f = Fixture::new();
-    f.declare();
     let out = f.invoke(&[], &["-y", "{changed}"], false);
     assert!(out.status.success(), "{}", err(&out));
     let out = f.invoke(&[], &["-y"], false);
@@ -642,12 +608,16 @@ fn an_expanded_line_names_the_option_the_full_command_drops() {
 #[test]
 fn several_recorded_full_forms_do_not_refuse_a_plain_command() {
     let f = Fixture::new();
-    f.declare();
     assert!(f.invoke(&[], &["{changed}", "-x"], false).status.success());
     assert!(f.invoke(&[], &["-x", "{changed}"], false).status.success());
     let out = f.invoke(&[], &["-x"], false);
-    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
-    assert!(err(&out).contains("different full forms"), "{}", err(&out));
+    assert!(out.status.success(), "{}", err(&out));
+    assert!(
+        err(&out).contains("matches 2 recorded hooks"),
+        "{}",
+        err(&out)
+    );
+    assert_eq!(f.log(), "arg=<-x>\nchanged=<UNSET>\n");
 }
 
 #[test]
@@ -680,20 +650,18 @@ fn explain_never_launches_and_no_split_is_refused() {
 #[test]
 fn an_ambiguous_plain_command_never_skips_on_a_stored_proof() {
     let f = Fixture::new();
-    f.declare();
     assert!(f.invoke(&[], &["{changed}", "-x"], false).status.success());
     assert!(f.invoke(&[], &["-x", "{changed}"], false).status.success());
     let first = f.invoke(&[], &["-x"], false);
-    assert_eq!(first.status.code(), Some(2), "{}", err(&first));
+    assert!(first.status.success(), "{}", err(&first));
     let second = f.invoke(&[], &["-x"], false);
-    assert_eq!(second.status.code(), Some(2), "{}", err(&second));
+    assert!(second.status.success(), "{}", err(&second));
     assert!(!err(&second).contains("stoop: skip"), "{}", err(&second));
 }
 
 #[test]
 fn a_removed_word_cannot_carry_a_raw_control_character() {
     let f = Fixture::new();
-    f.declare();
     let out = f.invoke(&[], &["--files", "{changed:\u{1b}x}"], false);
     assert!(out.status.success(), "{}", err(&out));
     assert!(!err(&out).contains('\u{1b}'), "{:?}", err(&out));
@@ -704,7 +672,6 @@ fn a_removed_word_cannot_carry_a_raw_control_character() {
 #[test]
 fn two_recorded_forms_with_one_full_command_still_expand_to_it() {
     let f = Fixture::new();
-    f.declare();
     let out = f.invoke(&[], &["--files", "{changed}"], false);
     assert!(out.status.success(), "{}", err(&out));
     let out = f.invoke(&[], &["--files", "{changed:*.t}"], false);
@@ -723,7 +690,6 @@ fn two_recorded_forms_with_one_full_command_still_expand_to_it() {
 #[test]
 fn three_identical_hook_runs_leave_one_record() {
     let f = Fixture::new();
-    f.declare();
     for _ in 0..3 {
         let out = f.invoke(&[], &["--files", "{changed}"], false);
         assert!(out.status.success(), "{}", err(&out));
@@ -736,7 +702,6 @@ fn three_identical_hook_runs_leave_one_record() {
 #[test]
 fn a_removed_word_with_bidi_formatting_prints_as_text() {
     let f = Fixture::new();
-    f.declare();
     let out = f.invoke(&[], &["--files", "{changed:\u{202e}x}"], false);
     assert!(out.status.success(), "{}", err(&out));
     assert!(!err(&out).contains('\u{202e}'), "{:?}", err(&out));

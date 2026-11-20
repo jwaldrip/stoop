@@ -309,6 +309,23 @@ fn mangled(word: &str) -> bool {
     })
 }
 
+fn legacy_carrier(word: &str, first: usize) -> Option<&str> {
+    if word.starts_with("--") {
+        return word[..first].split_once('=').map(|(name, _)| name);
+    }
+    if word.starts_with('-') && word.len() > 2 && first >= 2 {
+        return word.get(..2);
+    }
+    None
+}
+
+fn legacy_same_option(word: &str, name: &str) -> bool {
+    word == name
+        || word.strip_prefix(name).is_some_and(|tail| {
+            tail.starts_with('=') || (!name.starts_with("--") && !tail.is_empty())
+        })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Arity {
     Zero,
@@ -342,7 +359,7 @@ fn declared_word<'a>(
 
 fn ambiguous(name: &str) -> String {
     let name = safe(&lossy_shadow(name));
-    format!("cannot tell where the values for {name} end; put the placeholder after -- or declare the option in .stoop.toml")
+    format!("cannot tell where the values for {name} end; attach the placeholder with =, put it right after {name} or after --, or declare the option in .stoop.toml")
 }
 
 pub(crate) struct ParsedHook {
@@ -423,10 +440,9 @@ pub(crate) fn prepare(exact: &[OsString]) -> Result<Option<Hook>, String> {
         .transpose()
 }
 
-/// Before the first `--`, declarations match whole option words or long `--name=value`.
-/// Arity is zero, one, or many; selected declared options remove their aliases and operands.
-/// A bare placeholder is positional unless a declared option owns it. Unknown ownership,
-/// attached short values, and placeholders embedded in any other word are refused.
+/// Before the first `--`, declared options use their arity and aliases. Undeclared
+/// options retain 2a's adjacent-placeholder and carrier rules, including ambiguity
+/// refusals. After `--`, words are positional and cannot own a placeholder.
 fn removals(
     argv: &[String],
     spans: &[Vec<(usize, usize)>],
@@ -438,6 +454,7 @@ fn removals(
         declaration: Option<usize>,
         start: usize,
         end: usize,
+        attached: bool,
         selected: bool,
     }
     let end = (start..argv.len())
@@ -455,7 +472,12 @@ fn removals(
                     && spans[i].len() == 1
                     && spans[i][0] == (name.len() + 1, argv[i].len())
             });
-        if !bare && !attached {
+        let touches_declared = i < end
+            && options
+                .iter()
+                .flat_map(|item| &item.names)
+                .any(|name| argv[i].starts_with(name));
+        if touches_declared && !bare && !attached {
             return Err(ambiguous(&argv[i]));
         }
     }
@@ -483,6 +505,9 @@ fn removals(
                 .position(|candidate| std::ptr::eq(candidate, item))
                 .unwrap();
             (name, Some(index), word != name)
+        } else if let Some(&(first, _)) = spans[i].first() {
+            let name = legacy_carrier(word, first).unwrap_or(word);
+            (name, None, name != word)
         } else {
             (word.as_str(), None, word.contains('='))
         };
@@ -495,6 +520,13 @@ fn removals(
                     i += 1;
                 }
             }
+            None if !attached
+                && i < end
+                && spans[i].len() == 1
+                && spans[i][0] == (0, argv[i].len()) =>
+            {
+                i += 1
+            }
             _ => {}
         }
         for used in &mut owned[first..i] {
@@ -506,11 +538,12 @@ fn removals(
             declaration,
             start: first,
             end: i,
+            attached,
             selected,
         });
     }
     for at in start..end {
-        if spans[at].is_empty() || owned[at] {
+        if spans[at].len() != 1 || spans[at][0] != (0, argv[at].len()) || owned[at] {
             continue;
         }
         if let Some(occurrence) = occurrences
@@ -524,15 +557,36 @@ fn removals(
         }
     }
     for occurrence in &occurrences {
-        let Some(declaration) = occurrence.declaration else {
-            continue;
-        };
-        if occurrences
-            .iter()
-            .any(|other| other.selected && other.declaration == Some(declaration))
+        let selected = occurrences.iter().find(|other| {
+            other.selected
+                && match (occurrence.declaration, other.declaration) {
+                    (Some(a), Some(b)) => a == b,
+                    (None, None) => legacy_same_option(&argv[occurrence.start], other.name),
+                    _ => false,
+                }
+        });
+        let Some(selected) = selected else { continue };
+        if occurrence.declaration.is_none()
+            && !occurrence.selected
+            && !selected.name.starts_with("--")
+            && argv[occurrence.start] != selected.name
+            && !argv[occurrence.start].starts_with(&format!("{}=", selected.name))
         {
-            for used in &mut remove[occurrence.start..occurrence.end] {
-                *used = true;
+            return Err(ambiguous(selected.name));
+        }
+        for used in &mut remove[occurrence.start..occurrence.end] {
+            *used = true;
+        }
+        if occurrence.declaration.is_none()
+            && !occurrence.attached
+            && occurrence.end == occurrence.start + 1
+        {
+            let value = occurrence.end;
+            if value < end && !option(&argv[value]) && !remove[value] {
+                if value + 1 < end && !option(&argv[value + 1]) && !remove[value + 1] {
+                    return Err(ambiguous(occurrence.name));
+                }
+                remove[value] = true;
             }
         }
     }
@@ -614,6 +668,14 @@ pub(crate) fn normalize(word: &str) -> Result<String, String> {
     }
     result.push_str(&word[cursor..]);
     Ok(result)
+}
+
+#[cfg(all(test, unix))]
+fn expanded_matches(hook: &Hook, exact: &[OsString]) -> bool {
+    parse(&hook.original)
+        .ok()
+        .flatten()
+        .is_some_and(|parsed| parsed.expanded_matches(exact))
 }
 
 /// Does this argv equal a shell-expanded form of the recorded hook?
@@ -782,6 +844,20 @@ pub(crate) fn expanded_explain(hook: &Hook) -> String {
     )
 }
 
+/// The 2a diagnostic for an unconfigured argv matching different full commands.
+pub(crate) fn ambiguous_line(argv: &[OsString], matches: usize, explain: bool) -> String {
+    let typed = render(argv);
+    if explain {
+        format!(
+            "stoop: would run as typed: {typed} matches {matches} recorded hooks with different full commands; quote the placeholder or use --literal"
+        )
+    } else {
+        format!(
+            "stoop: {typed} matches {matches} recorded hooks with different full commands; running it as typed; quote the placeholder or use --literal"
+        )
+    }
+}
+
 /// The option or argument that holds the first empty value, made safe to print.
 fn empty_label(argv: &[OsString]) -> Option<String> {
     let words = shadows(argv);
@@ -872,18 +948,18 @@ mod incoming_words_tests {
             OsString::from("--files"),
             OsString::from("{changed}"),
         ];
-        let hook = parse(&recorded).unwrap().unwrap();
+        let hook = prepare(&recorded).unwrap().unwrap();
         let typed = [
             OsString::from("./t"),
             OsString::from_vec(b"\xff".to_vec()),
             OsString::from("--files"),
         ];
-        assert!(!hook.expanded_matches(&typed));
+        assert!(!expanded_matches(&hook, &typed));
         let utf8 = [
             OsString::from("./t"),
             OsString::from("\u{fffd}"),
             OsString::from("--files"),
         ];
-        assert!(hook.expanded_matches(&utf8));
+        assert!(expanded_matches(&hook, &utf8));
     }
 }

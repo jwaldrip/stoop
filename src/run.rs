@@ -291,6 +291,16 @@ fn hook_key(
     )
 }
 
+#[cfg(all(test, unix))]
+fn hook_key(
+    hook: &units::hook::Hook,
+    label: Option<&str>,
+    cwd: &str,
+    scope: Option<&str>,
+) -> String {
+    hook_key_with_config(hook, label, cwd, scope, None, false)
+}
+
 /// The environment counts as an input, because a variable read never shows up in
 /// a file trace. The runner's own per-run bookkeeping is exempt unless the command
 /// text names it, as are variables that differ on every start of the same machine.
@@ -644,6 +654,7 @@ fn recover_hooks(
         }
     };
     let mut found: Vec<(units::hook::Hook, String)> = Vec::new();
+    let mut configured = false;
     for record in records.into_iter().filter(|record| {
         record.cwd == cwd && record.scope.as_deref() == scope && record.label == o.key
     }) {
@@ -662,6 +673,7 @@ fn recover_hooks(
         }
         match prepared {
             Ok(prepared) => {
+                configured |= prepared.config.key_source().is_some();
                 if prepared.invalid {
                     return (warnings, Err("the recorded hook has invalid configuration; quote the placeholder or use --literal".into()));
                 }
@@ -685,7 +697,7 @@ fn recover_hooks(
             Err(error) => return (warnings, Err(error)),
         }
     }
-    if found.len() > 1 {
+    if configured && found.len() > 1 {
         return (
             warnings,
             Err(
@@ -873,10 +885,11 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         o.argv.clone_from(&h.argv);
     }
     let max_age = hook_max_age(&o);
-    // An erased hook runs its recorded full form and never skips. Conflicting full forms,
-    // invalid configuration, or a changed configuration identity are refused.
+    // An erased hook runs its recorded full form and never skips. Configured conflicting
+    // forms, invalid configuration, or changed configuration identity are refused.
     let mut expanded = false;
     let mut recovered_key = None;
+    let mut matches = 0;
     if !literal && hook.is_none() {
         let (warnings, recovered) =
             recover_hooks(&o, &root, &rel_cwd, &store_path, scope.as_deref(), max_age);
@@ -894,14 +907,16 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 };
             }
         };
-        if let Some((candidate, key)) = found.pop() {
+        matches = found.len();
+        if matches == 1 {
+            let (candidate, key) = found.swap_remove(0);
             recovered_key = Some(key);
             o.argv.clone_from(&candidate.argv);
             hook = Some(candidate);
             expanded = true;
         }
     }
-    let bypass = expanded;
+    let bypass = expanded || matches > 1;
     // Stoop owns the hook variables for its child. A hook exports them empty. Any other run
     // replaces an inherited value and names it, unless a placeholder reached stoop intact.
     if !literal {
@@ -942,6 +957,8 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 units::hook::expanded_line(h)
             }
         })
+    } else if matches > 1 {
+        Some(units::hook::ambiguous_line(&o.argv, matches, explain))
     } else if !literal && hook.is_none() {
         units::hook::empty_value_line(&o.argv, explain)
     } else {

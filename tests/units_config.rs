@@ -223,8 +223,8 @@ independent = false
 fn undeclared_single_dash_options_keep_their_exact_spelling() {
     let f = Fixture::new();
     let out = f.off(&["-v=debug", "-vv", "{changed}"]);
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
-    assert!(out.stdout.is_empty());
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"run <-v=debug>\n");
 }
 
 #[test]
@@ -255,6 +255,27 @@ fn legacy_undeclared_attached_placeholders_remain_supported() {
 }
 
 #[test]
+fn legacy_attached_carrier_removes_prior_occurrences() {
+    let f = Fixture::new();
+    assert_ran(&f.off(&["-f", "base", "-f{changed}"]));
+}
+
+#[test]
+fn declared_long_partial_placeholder_is_refused() {
+    let f = Fixture::new();
+    f.config(
+        r#"[[units.suite]]
+id = "files"
+match = ["./runner", "--files=base{changed}"]
+options = [{ names = ["--files"], values = "many" }]
+"#,
+    );
+    let out = f.off(&["--files=base{changed}"]);
+    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
 fn legacy_carrier_does_not_remove_identical_option_after_terminator() {
     let f = Fixture::new();
     let out = f.off(&["--files", "{changed}", "--", "--files", "positional"]);
@@ -280,20 +301,8 @@ fn undeclared_options_survive_when_placeholder_is_after_terminator() {
 }
 
 #[test]
-fn unsupported_or_undeclared_carriers_refuse_without_launching() {
+fn declared_short_attached_values_are_refused() {
     let f = Fixture::new();
-    for args in [
-        vec!["--files", "{changed}"],
-        vec!["-files=old", "-files", "{changed}"],
-        vec!["--files={changed}"],
-    ] {
-        let out = f.off(&args);
-        assert_eq!(out.status.code(), Some(2), "{args:?}: {}", stderr(&out));
-        assert!(out.stdout.is_empty());
-        assert!(stderr(&out)
-            .trim_end()
-            .ends_with("or declare the option in .stoop.toml"));
-    }
     f.config(
         r#"[[units.suite]]
 id = "short"
@@ -370,8 +379,8 @@ options = [{ names = ["--files"], values = "many" }]
 "#,
     );
     let out = f.off(&["--", "--files={changed}", "keep"]);
-    assert_eq!(out.status.code(), Some(2), "{}", stderr(&out));
-    assert!(out.stdout.is_empty());
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(out.stdout, b"run <--> <keep>\n");
 }
 
 #[test]
@@ -649,7 +658,7 @@ options = [{ names = ["--files"], values = "many" }]
 }
 
 // Independent reference grammar: exact declared words and long `--name=value` only.
-// `--` ends option parsing; unknown ownership and all other embedded forms refuse.
+// `--` ends option parsing; undeclared adjacent carriers retain the 2a rule.
 fn oracle_full(args: &[&str]) -> Result<Vec<String>, ()> {
     let definitions = [
         ("--many", "many", 2),
@@ -663,12 +672,15 @@ fn oracle_full(args: &[&str]) -> Result<Vec<String>, ()> {
         .position(|word| *word == "--")
         .unwrap_or(args.len());
     for (i, word) in args.iter().enumerate() {
-        if word.contains("{changed}")
+        if i < end
+            && word.contains("{changed}")
             && *word != "{changed}"
-            && !(i < end
-                && definitions.iter().any(|(name, _, _)| {
-                    name.starts_with("--") && *word == format!("{name}={{changed}}")
-                }))
+            && definitions
+                .iter()
+                .any(|(name, _, _)| word.starts_with(name))
+            && !definitions.iter().any(|(name, _, _)| {
+                name.starts_with("--") && *word == format!("{name}={{changed}}")
+            })
         {
             return Err(());
         }
@@ -676,6 +688,7 @@ fn oracle_full(args: &[&str]) -> Result<Vec<String>, ()> {
     let mut removed: Vec<bool> = args.iter().map(|word| word.contains("{changed}")).collect();
     let mut groups: Vec<(&str, Vec<usize>)> = Vec::new();
     let mut selected = std::collections::HashSet::new();
+    let mut unknown_before: Option<&str> = None;
     let mut i = 0;
     while i < args.len() && args[i] != "--" {
         let word = args[i];
@@ -699,9 +712,36 @@ fn oracle_full(args: &[&str]) -> Result<Vec<String>, ()> {
             {
                 return Err(());
             }
-            i += 1;
+            if word.starts_with('-') && word.len() > 1 {
+                let name = if word.contains("{changed}") && !word.starts_with("--") {
+                    &word[..2]
+                } else {
+                    word.split_once('=').map_or(word, |(name, _)| name)
+                };
+                let mut owned = vec![i];
+                i += 1;
+                let attached = word.contains('=') || word.contains("{changed}");
+                let adjacent = !attached && i < end && args[i] == "{changed}";
+                if adjacent {
+                    owned.push(i);
+                    i += 1;
+                }
+                if adjacent || word.contains("{changed}") {
+                    selected.insert(name);
+                    unknown_before = None;
+                } else {
+                    unknown_before = (!attached).then_some(name);
+                }
+                groups.push((name, owned));
+            } else {
+                if word == "{changed}" && unknown_before.is_some() {
+                    return Err(());
+                }
+                i += 1;
+            }
             continue;
         };
+        unknown_before = None;
         let mut owned = vec![i];
         i += 1;
         if arity == 1 && !attached && i < args.len() && args[i] != "--" {
@@ -761,6 +801,10 @@ fn generated_declared_argv_matches_independent_removal_grammar() {
         &["--many={changed}"],
         &["-m{changed}"],
         &["--", "--many={changed}"],
+        &["--other", "{changed}"],
+        &["-q=debug", "-qq", "{changed}"],
+        &["--other={changed}"],
+        &["@{changed}"],
     ];
     let suffixes: &[&[&str]] = &[
         &[],
@@ -827,7 +871,7 @@ fn generated_declared_argv_matches_independent_removal_grammar() {
             }
         }
     }
-    assert_eq!(checked, 324);
+    assert_eq!(checked, 540);
 }
 
 #[cfg(target_os = "linux")]
