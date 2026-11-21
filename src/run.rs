@@ -1018,6 +1018,32 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     if explain && !o.quiet {
         let dir = if rel_cwd.is_empty() { "." } else { &rel_cwd };
         eprintln!("stoop: dir {dir:?}");
+        if let Some(hook) = &hook {
+            let suite = config.select(&hook.original, &rel_cwd).ok().flatten();
+            let configured = suite.and_then(|suite| {
+                suite.units.as_ref().map(|patterns| {
+                    (
+                        units::filter::Filter::configured(patterns),
+                        suite.id.as_str(),
+                    )
+                })
+            });
+            let inline = hook
+                .placeholders
+                .iter()
+                .flatten()
+                .find_map(|placeholder| placeholder.filter.as_ref());
+            let ignore = Ignore::new(&o.ignore, Some(&root.join(".stoopignore")), &o.transient);
+            eprintln!(
+                "{}",
+                units::universe::explain(
+                    &root,
+                    &ignore,
+                    inline,
+                    configured.as_ref().map(|(filter, id)| (filter, *id)),
+                )
+            );
+        }
     }
     if !trace::supported() {
         if explain {
