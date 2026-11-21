@@ -21,6 +21,22 @@ use std::time::{Duration, Instant};
 
 const DEADLINE: Duration = Duration::from_secs(3);
 const CHUNK: usize = 64 * 1024;
+const UNIT_FILES: &[&str] = &[
+    "ls-files",
+    "-z",
+    "--cached",
+    "--others",
+    "--exclude-standard",
+];
+const IGNORED_UNIT_DIRS: &[&str] = &[
+    "ls-files",
+    "-z",
+    "--others",
+    "--ignored",
+    "--exclude-standard",
+    "--directory",
+];
+const MAX_UNIT_FILES_BYTES: usize = 64 * 1024 * 1024;
 
 // The only invocations a probe may run, matched exactly. None runs a hook,
 // filter, pager, shell or transport. Adding one needs the same review.
@@ -41,6 +57,8 @@ const ALLOWED: &[&[&str]] = &[
         "--show-origin",
     ],
     &["ls-files", "--stage", "-z"],
+    UNIT_FILES,
+    IGNORED_UNIT_DIRS,
     &["var", "-l"],
     &["check-attr", "--all", "-z", "--stdin"],
 ];
@@ -104,6 +122,15 @@ pub fn remote_head_branch(root: &Path, remote: &str) -> Option<String> {
     let bytes = output(root, &["symbolic-ref", "-q", &reference], &[], 16 * 1024)?;
     branch_name(&bytes, &format!("refs/remotes/{remote}/"))
 }
+/// Enumerate tracked and unignored untracked files without accepting pathspecs or stdin.
+pub(crate) fn unit_files(root: &Path) -> Option<Vec<u8>> {
+    output(root, UNIT_FILES, &[], MAX_UNIT_FILES_BYTES)
+}
+
+/// Enumerate ignored entries, with wholly ignored directories collapsed.
+pub(crate) fn ignored_unit_dirs(root: &Path) -> Option<Vec<u8>> {
+    output(root, IGNORED_UNIT_DIRS, &[], MAX_UNIT_FILES_BYTES)
+}
 
 /// Runs `git -C root <args>` with `input` on stdin. Returns stdout only when
 /// Git exits zero within the deadline and writes at most `max_bytes`. Every
@@ -113,7 +140,7 @@ pub fn remote_head_branch(root: &Path, remote: &str) -> Option<String> {
 /// This bounds how Git runs. It does not establish that the repository's
 /// configuration and attribute sources are safe; the caller must do that first.
 pub fn output(root: &Path, args: &[&str], input: &[u8], max_bytes: usize) -> Option<Vec<u8>> {
-    if !allowed(args) {
+    if !allowed(args) || ((args == UNIT_FILES || args == IGNORED_UNIT_DIRS) && !input.is_empty()) {
         return None;
     }
     let root = root.canonicalize().ok()?;
@@ -579,6 +606,71 @@ mod tests {
         assert!(!allowed(&["config", "--edit"]));
         assert!(!allowed(&["-c", "alias.x=!sh", "x"]));
         assert!(!allowed(&["status"]));
+    }
+
+    #[test]
+    fn unit_file_probe_is_exact_bounded_and_requires_a_worktree() {
+        let dir = repo();
+        fs::write(dir.0.join("test.t"), b"x").unwrap();
+        assert!(allowed(UNIT_FILES));
+        assert!(!allowed(&[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+            "."
+        ]));
+        assert!(!allowed(&[
+            "ls-files",
+            "-z",
+            "--others",
+            "--exclude-standard"
+        ]));
+        assert_eq!(output(&dir.0, UNIT_FILES, b"unexpected", 64), None);
+        assert_eq!(output(&dir.0, UNIT_FILES, &[], 6), None);
+        assert_eq!(unit_files(&dir.0), Some(b"test.t\0".to_vec()));
+        assert_eq!(unit_files(&Dir::new().0), None);
+    }
+
+    #[test]
+    fn ignored_directory_probe_is_exact_bounded_and_requires_a_worktree() {
+        let dir = repo();
+        fs::write(dir.0.join(".gitignore"), b"ignored/\n").unwrap();
+        fs::create_dir(dir.0.join("ignored")).unwrap();
+        fs::write(dir.0.join("ignored/file.t"), b"x").unwrap();
+        assert!(allowed(IGNORED_UNIT_DIRS));
+        assert!(!allowed(&[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "."
+        ]));
+        assert!(!allowed(&[
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard"
+        ]));
+        assert_eq!(output(&dir.0, IGNORED_UNIT_DIRS, b"unexpected", 64), None);
+        assert_eq!(output(&dir.0, IGNORED_UNIT_DIRS, &[], 4), None);
+        assert_eq!(ignored_unit_dirs(&dir.0), Some(b"ignored/\0".to_vec()));
+        assert_eq!(ignored_unit_dirs(&Dir::new().0), None);
+    }
+
+    #[test]
+    fn unit_inventory_over_64_mib_returns_no_bytes() {
+        let output = run(
+            sh("head -c 67108865 /dev/zero"),
+            b"",
+            MAX_UNIT_FILES_BYTES,
+            Duration::from_secs(10),
+        );
+        assert_eq!(output, None);
     }
 
     #[test]
