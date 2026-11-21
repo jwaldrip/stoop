@@ -1168,9 +1168,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         for (i, p) in proofs.iter().enumerate() {
             // A proof whose recorded reason says the run read a path it also wrote, or read a file it
             // then removed, cannot justify a skip: the change was observed but cannot be replayed.
-            if p.unplannable.iter().any(|reason| {
-                reason.ends_with("and also wrote it") || reason.ends_with("and then removed it")
-            }) {
+            if p.unplannable.iter().any(|reason| is_skip_veto(reason)) {
                 continue;
             }
             let expired = max_age > 0 && now().saturating_sub(p.created) > max_age;
@@ -1605,13 +1603,30 @@ pub fn build_priors(trace: &Trace) -> Vec<Input> {
         .collect()
 }
 
-/// The proof's reasons: the tracer's first, then the rest, deduplicated and capped at 16.
+/// Whether a stored reason forbids a skip: the run read a path it also wrote, or read a file it
+/// then removed. Such a record is kept for diagnosis and is never reused.
+pub fn is_skip_veto(reason: &str) -> bool {
+    reason.ends_with("and also wrote it") || reason.ends_with("and then removed it")
+}
+
+/// The proof's reasons: the tracer's first, then the rest, deduplicated and capped at 16. A full
+/// list keeps one reason that vetoes a skip, so diagnostics cannot push it out.
 fn merge_reasons(first: &[String], more: Vec<String>) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
+    let mut veto: Option<String> = None;
     for why in first.iter().cloned().chain(more) {
+        if veto.is_none() && is_skip_veto(&why) {
+            veto = Some(why.clone());
+        }
         if out.len() < 16 && !out.contains(&why) {
             out.push(why);
         }
+    }
+    if let Some(veto) = veto.filter(|_| !out.iter().any(|why| is_skip_veto(why))) {
+        if out.len() >= 16 {
+            out.pop();
+        }
+        out.push(veto);
     }
     out
 }
@@ -1795,7 +1810,7 @@ pub fn build_inputs(
             )));
         }
     }
-    let reasons: Vec<String> = Vec::new();
+    let mut reasons: Vec<String> = Vec::new();
     let mut reads_git = false;
     // Refusals found while checking the record. The reported one is the first in key order, so
     // the message does not depend on the order the tracer's hash map happens to hold paths in.
@@ -1888,7 +1903,12 @@ pub fn build_inputs(
                 .map_or(inside || lex.starts_with(&real_root), |path| {
                     path.starts_with(&real_root)
                 });
-            if tracked_output && trace.seen.is_some() && touch.read && !verified_before_write {
+            if tracked_output
+                && trace.seen.is_some()
+                && touch.read
+                && !verified_before_write
+                && !trace.alias_read_targets.contains(lex)
+            {
                 refusals.push(NotRecorded::Other(format!(
                     "it read {key} and also wrote it"
                 )));
@@ -2038,9 +2058,14 @@ pub fn build_inputs(
                 }
                 if written.contains(&tkey) {
                     if trace.seen.is_some() && touch.read {
-                        refusals.push(NotRecorded::Other(format!(
-                            "it read {tkey} through {link_key} and also wrote it"
-                        )));
+                        let why = format!("it read {tkey} through {link_key} and also wrote it");
+                        if trace.alias_readbacks.contains(lex) {
+                            // Stored, not refused: the run read what it wrote through a name it does
+                            // not own. The record is unplannable, and no skip reuses it.
+                            reasons.push(why);
+                        } else {
+                            refusals.push(NotRecorded::Other(why));
+                        }
                     }
                     continue;
                 }
@@ -3449,5 +3474,35 @@ mod read_identity_refusals {
             .unwrap();
         assert!(build_outputs(&root, &written, &trace).is_err());
         std::fs::remove_dir_all(&root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod merge_reasons_tests {
+    use super::{is_skip_veto, merge_reasons};
+
+    #[test]
+    fn a_full_list_still_keeps_one_skip_veto() {
+        let first: Vec<String> = (0..16).map(|i| format!("diagnostic {i}")).collect();
+        let veto = "it read in.txt through a.txt and also wrote it".to_string();
+        let out = merge_reasons(&first, vec![veto.clone()]);
+        assert_eq!(out.len(), 16, "{out:?}");
+        assert!(out.contains(&veto), "{out:?}");
+        assert!(out.iter().any(|reason| is_skip_veto(reason)), "{out:?}");
+    }
+
+    #[test]
+    fn a_short_list_keeps_every_reason_in_order() {
+        let out = merge_reasons(
+            &["diagnostic".to_string()],
+            vec!["it read in.txt and also wrote it".to_string()],
+        );
+        assert_eq!(
+            out,
+            vec![
+                "diagnostic".to_string(),
+                "it read in.txt and also wrote it".to_string(),
+            ]
+        );
     }
 }

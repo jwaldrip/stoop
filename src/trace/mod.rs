@@ -155,6 +155,11 @@ pub struct Trace {
     /// Directory entries snapshotted so far, counted against `identity::MAX_LISTED_NAMES`.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub listed_names: usize,
+    /// Outside names the run read a repository file through after it had also written that file.
+    /// Each such record is stored as unplannable, and no skip may reuse it.
+    pub alias_readbacks: BTreeSet<PathBuf>,
+    /// The repository files those reads reached. Their write is not a second conflict.
+    pub alias_read_targets: BTreeSet<PathBuf>,
 }
 
 impl Trace {

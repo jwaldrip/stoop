@@ -56,6 +56,9 @@ const MAX_RUN_BYTES: u64 = 256 << 20;
 /// Same cap as the tracer's other reasons.
 const MAX_REASONS: usize = 16;
 
+/// The largest file an owner change rehashes to confirm that its bytes did not change.
+const OWNER_REHASH_LIMIT: u64 = 16 << 20;
+
 // Observation is informational, so an unreadable or oversized chain is discarded without
 // affecting the legacy trace or the command. Bounds include live tasks as well as execs.
 const MAX_EXEC_EVENTS: usize = 1024;
@@ -628,6 +631,8 @@ enum WriteKind {
         supported: bool,
     },
     Modify,
+    /// An owner change. It writes neither bytes nor a name, so it lands no entry.
+    Owner,
 }
 
 impl WriteKind {
@@ -639,7 +644,7 @@ impl WriteKind {
             | Self::Link { .. }
             | Self::Remove
             | Self::Rename { .. } => true,
-            Self::Modify => false,
+            Self::Modify | Self::Owner => false,
         }
     }
 }
@@ -981,7 +986,7 @@ fn verified_path_mutation(path: &PendingPath, all: &[PendingPath]) -> Option<Opt
             };
             destination_matches && source_matches
         }
-        WriteKind::Modify => path.before.is_some_and(|before| {
+        WriteKind::Modify | WriteKind::Owner => path.before.is_some_and(|before| {
             after
                 .as_ref()
                 .is_ok_and(|metadata| file_identity(metadata) == before)
@@ -1818,8 +1823,25 @@ fn proc_magic_link(path: &Path) -> bool {
 
 /// A reason the planner cannot replay the run. The first one also stops content hashing.
 fn push_reason(t: &mut Trace, why: String) {
-    if t.unplannable.len() < MAX_REASONS && !t.unplannable.contains(&why) {
+    if t.unplannable.contains(&why) {
+        return;
+    }
+    if t.unplannable.len() < MAX_REASONS {
         t.unplannable.push(why);
+    } else if crate::run::is_skip_veto(&why)
+        && !t
+            .unplannable
+            .iter()
+            .any(|reason| crate::run::is_skip_veto(reason))
+    {
+        // A full list keeps one reason that vetoes a skip, so a diagnostic never displaces it.
+        if let Some(slot) = t
+            .unplannable
+            .iter()
+            .rposition(|reason| !crate::run::is_skip_veto(reason))
+        {
+            t.unplannable[slot] = why;
+        }
     }
 }
 
@@ -2518,18 +2540,41 @@ impl Tracer<'_> {
         if new_route {
             self.read_routes.insert(raw.to_path_buf(), physical.clone());
         }
+        let pending_hit = self.pending_writes.values().any(|pending| {
+            pending.paths.iter().any(|path| {
+                path.expected.as_ref() == Some(&physical)
+                    || inode.is_some_and(|id| path.before == Some(id))
+            })
+        });
         let already_written = self.t.landed.contains(&physical)
             || self.uncertain_paths.contains(&physical)
             || inode.is_some_and(|id| {
                 self.written_files.contains_key(&id) || self.uncertain_inodes.contains(&id)
             })
-            || self.pending_writes.values().any(|pending| {
-                pending.paths.iter().any(|path| {
-                    path.expected.as_ref() == Some(&physical)
-                        || inode.is_some_and(|id| path.before == Some(id))
-                })
-            });
-        if already_written {
+            || pending_hit;
+        // An outside name read back a repository file that this run wrote and landed, with no
+        // pending or uncertain landing on it. That read is not an independent conflict. It is
+        // stored on the alias as an unplannable reason, which no skip may reuse.
+        let alias_readback = already_written
+            && how == Use::Content
+            && physical != raw
+            && !pending_hit
+            && !self.uncertain_paths.contains(&physical)
+            && inode.is_some_and(|id| {
+                !self.uncertain_inodes.contains(&id)
+                    && self
+                        .written_files
+                        .get(&id)
+                        .is_some_and(|paths| paths.contains(&physical))
+            })
+            && self
+                .rec
+                .as_mut()
+                .is_some_and(|rec| !rec.in_repo(raw) && rec.in_repo(&physical));
+        if alias_readback {
+            self.t.alias_readbacks.insert(raw.to_path_buf());
+            self.t.alias_read_targets.insert(physical.clone());
+        } else if already_written {
             self.t.read_write_conflicts.insert(physical.clone());
             if let Some(written) = inode.and_then(|id| self.written_files.get(&id)) {
                 let removed = &self.t.removed_by_run;
@@ -3245,7 +3290,8 @@ impl Tracer<'_> {
                 self.read_files.insert(destination.to_path_buf());
             }
         }
-        let read_priors = if mkdir_existing {
+        let owner = matches!(&kind, WriteKind::Owner);
+        let read_priors = if mkdir_existing || owner {
             Vec::new()
         } else {
             expected
@@ -3254,7 +3300,8 @@ impl Tracer<'_> {
                 .unwrap_or_default()
         };
         let rec = self.rec.as_mut()?;
-        let key = if mkdir_existing {
+        // An owner change records no prior and no write, so its entry is only looked up.
+        let key = if mkdir_existing || owner {
             // The observed existing name is an input, not a write prior. If it vanishes and the
             // mkdir succeeds, path verification fails closed because it was not absent at entry.
             expected
@@ -3400,6 +3447,13 @@ impl Tracer<'_> {
             };
             for path in pending.paths {
                 if verified {
+                    if matches!(path.kind, WriteKind::Owner) {
+                        if !self.settle_owner(&path) {
+                            self.uncertain_write(&path);
+                            self.refuse_landing(&path);
+                        }
+                        continue;
+                    }
                     let after = path
                         .expected
                         .as_deref()
@@ -3463,6 +3517,51 @@ impl Tracer<'_> {
             // the output destination, but not who created the name or the captured absent prior.
             path.confirmed_after = actual_identity;
             self.land_write(path, actual_identity, may_have_created && exclusive);
+        }
+    }
+
+    /// An owner change writes neither bytes nor a name. The command's read of the file still holds
+    /// only when it is the same object with the same size, mode and mtime, and its bytes still hash
+    /// the same wherever they were hashed at the first look. The observation then takes the new
+    /// ctime. Anything else grants no exemption.
+    fn settle_owner(&mut self, path: &PendingPath) -> bool {
+        let Some(expected) = path.expected.as_deref() else {
+            return false;
+        };
+        let Ok(metadata) = fs::symlink_metadata(expected) else {
+            return false;
+        };
+        let now = identity::file_stat(&metadata);
+        let Some(seen) = self.t.seen.as_mut() else {
+            return true;
+        };
+        match seen.get_mut(expected) {
+            None => true,
+            Some(Seen::Symlink { .. }) => metadata.file_type().is_symlink(),
+            Some(Seen::File(file)) => {
+                if !metadata.file_type().is_file()
+                    || file.stat.dev != now.dev
+                    || file.stat.ino != now.ino
+                    || file.stat.size != now.size
+                    || file.stat.mode != now.mode
+                    || file.stat.mtime_ns != now.mtime_ns
+                {
+                    return false;
+                }
+                let same_bytes = match &file.read_hash {
+                    identity::ReadHash::NotNeeded => true,
+                    identity::ReadHash::Hashed(hash) => {
+                        now.size <= OWNER_REHASH_LIMIT
+                            && crate::input::hash_file(expected).is_ok_and(|a| a == *hash)
+                    }
+                    _ => false,
+                };
+                if same_bytes {
+                    file.stat.ctime_ns = now.ctime_ns;
+                }
+                same_bytes
+            }
+            Some(_) => false,
         }
     }
 
@@ -3935,7 +4034,7 @@ impl Tracer<'_> {
             self.t.oid_attrs_changed = true;
         }
         self.note_listed_change(&p);
-        self.write(&p, !nofollow, WriteKind::Modify);
+        self.write(&p, !nofollow, WriteKind::Owner);
     }
 
     /// fchown. The descriptor's name decides when it has one. A descriptor whose file is deleted
@@ -3964,7 +4063,7 @@ impl Tracer<'_> {
         }
         if mutate {
             if let Some(path) = named {
-                self.write(&path, false, WriteKind::Modify);
+                self.write(&path, false, WriteKind::Owner);
             } else {
                 self.flag("it changed an unkeyable file descriptor");
             }
