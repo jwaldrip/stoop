@@ -95,6 +95,12 @@ class SingleTraceeSed(unittest.TestCase):
                     self.normalize(changed)
                 self.assertFalse((self.out / "sed-exec" / "proof.json").exists())
 
+    def test_missing_environment_key_is_a_difference(self):
+        self.assertEqual(normalizer.environment_changes({}, {"EXTRA": "value"}), {"EXTRA"})
+        self.assertEqual(normalizer.environment_changes({"EXTRA": "value"}, {}), {"EXTRA"})
+        with self.assertRaisesRegex(SystemExit, "environment"):
+            normalizer.environment_changes({}, {"EXTRA": None})
+
 
 if __name__ == "__main__":
     unittest.main()

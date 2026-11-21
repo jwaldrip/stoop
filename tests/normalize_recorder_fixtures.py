@@ -17,6 +17,20 @@ TEMP_NAME = re.compile(r"^sed[A-Za-z0-9]{6}$")
 CONTENT_ID = re.compile(r"^[fx]:[0-9a-f]{64}$")
 
 
+def environment_changes(before, after):
+    if not all(
+        isinstance(env, dict) and all(isinstance(key, str) and isinstance(value, str)
+                                      for key, value in env.items())
+        for env in (before, after)
+    ):
+        raise SystemExit("environment keys and values must be strings")
+    missing = object()
+    return {
+        key for key in before.keys() | after.keys()
+        if before.get(key, missing) != after.get(key, missing)
+    }
+
+
 def runner_system_file(item):
     path = item["path"]
     return path.startswith(("/etc/", "/usr/", "/lib")) and bool(CONTENT_ID.fullmatch(item["id"]))
@@ -73,10 +87,7 @@ def single_tracee_sed(old_dir, raw_dir, output_dir):
         raise SystemExit(f"{NEW_CASE}: expected recorder version 11")
     if generated["argv"] != ["sh", "-c", "exec sed -i s/foo/bar/ config.txt"]:
         raise SystemExit(f"{NEW_CASE}: the recording is not the single-tracee exec form")
-    changed = {
-        key for key in reference["env"].keys() | generated["env"].keys()
-        if reference["env"].get(key) != generated["env"].get(key)
-    }
+    changed = environment_changes(reference["env"], generated["env"])
     if not changed <= ENV_CHANGES:
         raise SystemExit(f"{NEW_CASE}: unexpected environment deltas: {sorted(changed - ENV_CHANGES)}")
     prior = [item for item in generated["priors"] if item["path"] == "config.txt"]
@@ -136,7 +147,7 @@ def main():
         if before["provenance"]["version"] != 10 or generated["provenance"]["version"] != 11:
             raise SystemExit(f"{case}: expected recorder versions 10 and 11")
         old_env, new_env = before["env"], generated["env"]
-        changed = {key for key in old_env.keys() | new_env.keys() if old_env.get(key) != new_env.get(key)}
+        changed = environment_changes(old_env, new_env)
         if not changed <= ENV_CHANGES:
             raise SystemExit(f"{case}: unexpected environment deltas: {sorted(changed - ENV_CHANGES)}")
         normalized = copy.deepcopy(raw)
