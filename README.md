@@ -124,13 +124,13 @@ command continues unchanged.
 
 ## Changed-unit hook
 
-Put `'{changed}'` where a test command takes test files, and name which files are tests:
+Mark where a test command accepts test files, and optionally identify those files:
 
 ```sh
 stoop run -- npx jest '{changed:*.test.ts}'
 ```
 
-Always single-quote the placeholder. Stoop refuses the shell-mangled forms before anything runs. In this release the placeholder runs the full command, with the placeholder and its option removed, so it never runs a subset. When it runs the command, stoop prints the words it removed. The [CLI reference](https://stoop.build/docs/cli.html#changed-hook) has the quoting table, the option rules and the premise.
+Always single-quote the placeholder. Stoop refuses the shell-mangled forms before anything runs. The command still runs in full, with the placeholder and its option removed; stoop does not yet run a subset. On Linux and macOS, `stoop explain` counts files matching the filter without launching the command or saving per-unit proofs. Windows reports an unknown unit universe. The [CLI reference](https://stoop.build/docs/cli.html#changed-hook) covers filters, quoting and option rules.
 
 ## What it sees, and what it can't
 
