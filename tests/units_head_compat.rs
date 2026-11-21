@@ -153,6 +153,14 @@ fn origin_main_and_head_agree_on_native_shell_expansions() {
         "${STOOP_CHANGED#head}",
         "${STOOP_CHANGED##head}",
         "${STOOP_CHANGED:1}",
+        "${STOOP_CHANGED:3}",
+        "${STOOP_CHANGED:foo}",
+        "${STOOP_CHANGED:foo:2}",
+        "${STOOP_CHANGED: -1}",
+        "${STOOP_CHANGED:1*2}",
+        "${STOOP_CHANGED:foo/bar}",
+        "${STOOP_CHANGED:!foo}",
+        r"\${STOOP_CHANGED:*.t}",
         "${STOOP_CHANGED/a/b}",
         "$(printf command)",
         "$((1+2))",
@@ -179,5 +187,5 @@ fn origin_main_and_head_agree_on_native_shell_expansions() {
             }
         }
     }
-    assert_eq!(checked, 216);
+    assert_eq!(checked, 312);
 }

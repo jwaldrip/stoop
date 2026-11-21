@@ -1065,6 +1065,44 @@ mod tests {
         );
         assert_eq!(hook.argv, argv[..4]);
     }
+
+    #[test]
+    fn shell_filter_classification_preserves_native_expansions() {
+        for (expression, expected) in [
+            ("${STOOP_CHANGED:-x}", None),
+            ("${STOOP_CHANGED:=x}", None),
+            ("${STOOP_CHANGED:+x}", None),
+            ("${STOOP_CHANGED:?x}", None),
+            ("${STOOP_CHANGED#x}", None),
+            ("${STOOP_CHANGED:3}", None),
+            ("${STOOP_CHANGED:foo}", None),
+            ("${STOOP_CHANGED: -1}", None),
+            ("${STOOP_CHANGED:1*2}", None),
+            ("${STOOP_CHANGED:foo/bar}", None),
+            ("$(printf x)", None),
+            ("$((1+2))", None),
+            ("{a,b}", None),
+            (r"\${STOOP_CHANGED:*.t}", None),
+            ("${STOOP_CHANGED:*.t}", Some("*.t")),
+            ("${STOOP_CHANGED:/foo}", Some("/foo")),
+        ] {
+            let code = format!("echo $STOOP_CHANGED {expression}");
+            let argv: Vec<OsString> = ["sh", "-c", code.as_str(), "zero"]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
+            let hook = parse(&argv)
+                .unwrap()
+                .unwrap()
+                .finish(&argv, &[], false)
+                .unwrap();
+            let actual = hook
+                .environment_placeholders
+                .iter()
+                .find_map(|p| p.filter.as_ref().map(Filter::text));
+            assert_eq!(actual, expected, "{expression}");
+        }
+    }
 }
 
 #[cfg(all(test, unix))]

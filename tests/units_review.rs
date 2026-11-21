@@ -155,6 +155,66 @@ fn native_shell_fallback_is_not_a_conflicting_unit_filter() {
 }
 
 #[test]
+fn explain_uses_config_for_native_shell_fallback_and_names_the_ambiguity() {
+    let f = Fixture::new();
+    f.file("a.t", b"");
+    f.file(
+        ".stoop.toml",
+        b"[[units.suite]]\nid = 'shell'\nmatch = ['sh', '-c', '*', 'zero']\nunits = ['*.t']\n",
+    );
+    let out = f
+        .command(
+            "explain",
+            &[
+                "sh",
+                "-c",
+                "printf '%s\\n' \"${STOOP_CHANGED:-fallback}\"",
+                "zero",
+            ],
+        )
+        .output()
+        .unwrap();
+    let text = err(&out);
+    assert!(
+        text.contains("tracked 1 units; filter '*.t' (.stoop.toml suite shell)"),
+        "{text}"
+    );
+    assert!(text.contains("native shell"), "{text}");
+    assert!(text.contains("{changed:/foo}"), "{text}");
+}
+
+#[test]
+fn explain_rejects_distinct_real_shell_filters() {
+    let f = Fixture::new();
+    let out = f
+        .command(
+            "explain",
+            &[
+                "sh",
+                "-c",
+                "echo ${STOOP_CHANGED:*.u} ${STOOP_CHANGED:*.t}",
+                "zero",
+            ],
+        )
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+}
+
+#[test]
+fn rooted_exact_name_filter_selects_only_the_top_level_file() {
+    let f = Fixture::new();
+    f.file("foo", b"");
+    f.file("sub/foo", b"");
+    let out = f.explain("{changed:/foo}");
+    assert!(
+        err(&out).contains("tracked 1 units; filter '/foo'"),
+        "{}",
+        err(&out)
+    );
+}
+
+#[test]
 fn mixed_leading_exclusion_starts_from_the_configured_universe() {
     let f = Fixture::new();
     f.file("tests/fast.t", b"");
