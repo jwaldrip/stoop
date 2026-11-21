@@ -5,7 +5,7 @@ mod units;
 pub(crate) use units::hook::safe;
 
 use crate::ignore::Ignore;
-use crate::input::{identify, identify_post, par_map, verify, Input};
+use crate::input::{identify_post, par_map, verify, Input};
 use crate::pathutil::{absolutize, cwd_key, is_git_name, to_key, Physical};
 use crate::proof::{now, sanitize, Proof, Store};
 use crate::sync::Remote;
@@ -1395,9 +1395,26 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     let mut phys = Physical::new(&root, &real_root);
     let written: BTreeSet<String> = trace.keys.values().cloned().collect();
     match build_inputs(&root, &mut phys, &trace, &ignore, &written) {
-        Ok((inputs, read_reasons)) => {
+        Ok((mut inputs, read_reasons)) => {
+            let (outputs, removed, write_reasons, verified) =
+                build_outputs(&real_root, &written, &trace);
+            let priors = build_priors(&trace);
+            if !verified.is_empty() {
+                let original_len = inputs.len();
+                for key in verified {
+                    if inputs[..original_len]
+                        .binary_search_by(|input| input.path.cmp(&key))
+                        .is_ok()
+                    {
+                        continue;
+                    }
+                    if let Ok(index) = priors.binary_search_by(|prior| prior.path.cmp(&key)) {
+                        inputs.push(priors[index].clone());
+                    }
+                }
+                inputs.sort_by(|a, b| a.path.cmp(&b.path));
+            }
             let n = inputs.len();
-            let (outputs, removed, write_reasons) = build_outputs(&real_root, &written);
             let proof = Proof {
                 created: now(),
                 argv: o
@@ -1415,7 +1432,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 probes,
                 removed,
                 ignore: Some(ignore.patterns()),
-                priors: Some(build_priors(&trace)),
+                priors: Some(priors),
                 unplannable: merge_reasons(
                     &trace.unplannable,
                     read_reasons.into_iter().chain(write_reasons).collect(),
@@ -1484,19 +1501,30 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
 /// What the run left behind inside the repository, read once it finished: one entry for each
 /// in-scope path it wrote. Still there is an output. Gone again is removed, and the planner
 /// removes it with the step. Unreadable or special is a reason the planner cannot replay.
-pub fn build_outputs(
+fn build_outputs(
     real_root: &Path,
     written: &BTreeSet<String>,
-) -> (Vec<Input>, Vec<String>, Vec<String>) {
+    trace: &Trace,
+) -> (Vec<Input>, Vec<String>, Vec<String>, Vec<String>) {
     let keys: Vec<&String> = written.iter().collect();
     let ids = par_map(&keys, |k| {
-        identify(&real_root.join(k.as_str()), true, false)
+        identify_post(&real_root.join(k.as_str()), true, false, false, false)
     });
     let mut outputs = Vec::new();
     let mut removed = Vec::new();
     let mut reasons = Vec::new();
-    for (key, id) in keys.into_iter().zip(ids) {
-        match id {
+    let mut verified = Vec::new();
+    for (key, (id, post)) in keys.into_iter().zip(ids) {
+        if !trace.footprint.unknown
+            && !trace::identity::link_route_unknown(&trace.footprint)
+            && trace.atomic_landings.get(key).is_some_and(|landing| {
+                matches!(&post, trace::identity::Post::File { stat, hash }
+                    if *stat == landing.stat && *hash == landing.hash)
+            })
+        {
+            verified.push(key.clone());
+        }
+        match id.map(|(id, _)| id) {
             None => reasons.push(format!("it left {key} unreadable")),
             Some(id) if id == "u" => reasons.push(format!("it left {key} unreadable")),
             Some(id) if id == "a" => removed.push(key.clone()),
@@ -1511,7 +1539,7 @@ pub fn build_outputs(
     if written.contains(".stoopignore") {
         reasons.push("it wrote .stoopignore, which the proof's ignore set was read from".into());
     }
-    (outputs, removed, reasons)
+    (outputs, removed, reasons, verified)
 }
 
 /// The state of each in-scope path before the run first wrote it, sorted by path.

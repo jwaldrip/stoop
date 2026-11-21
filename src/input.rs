@@ -259,6 +259,49 @@ pub fn hash_file_with_oid(path: &Path) -> io::Result<(String, Option<String>)> {
     hash_reader_with_oid(file, len)
 }
 
+/// Hash the ordinary prior stream while retaining the opened descriptor's identity and length.
+#[cfg(target_os = "linux")]
+pub fn hash_file_with_identity(
+    path: &Path,
+    oids: bool,
+) -> io::Result<(String, Option<String>, Option<identity::BoundRead>)> {
+    struct Counted<'a> {
+        file: &'a mut fs::File,
+        bytes: u64,
+    }
+    impl Read for Counted<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            let n = self.file.read(buffer)?;
+            self.bytes = self.bytes.saturating_add(n as u64);
+            Ok(n)
+        }
+    }
+
+    let (mut file, before) = open_regular_file(path)?;
+    let mut counted = Counted {
+        file: &mut file,
+        bytes: 0,
+    };
+    let (hash, oid) = if oids {
+        hash_reader_with_oid(&mut counted, before.len())?
+    } else {
+        let mut hash = blake3::Hasher::new();
+        hash.update_reader(&mut counted)?;
+        (hash.finalize().to_hex().to_string(), None)
+    };
+    let bytes = counted.bytes;
+    let bound = file
+        .metadata()
+        .ok()
+        .filter(|m| m.is_file())
+        .map(|after| identity::BoundRead {
+            before: identity::file_stat(&before),
+            after: identity::file_stat(&after),
+            bytes,
+        });
+    Ok((hash, oid, bound))
+}
+
 fn hash_observed(path: &Path, oids: bool) -> io::Result<(String, Option<String>, fs::Metadata)> {
     let (mut file, before) = open_regular_file(path)?;
     let (hash, oid) = if oids {

@@ -41,16 +41,26 @@ def main():
         if len(old["proofs"]) != 1 or len(raw["proofs"]) != 1:
             raise SystemExit(f"{case}: expected exactly one proof")
         before, generated = old["proofs"][0], raw["proofs"][0]
-        if before["provenance"]["version"] != 9 or generated["provenance"]["version"] != 10:
-            raise SystemExit(f"{case}: expected recorder versions 9 and 10")
+        if before["provenance"]["version"] != 10 or generated["provenance"]["version"] != 11:
+            raise SystemExit(f"{case}: expected recorder versions 10 and 11")
         old_env, new_env = before["env"], generated["env"]
         changed = {key for key in old_env.keys() | new_env.keys() if old_env.get(key) != new_env.get(key)}
         if not changed <= ENV_CHANGES:
             raise SystemExit(f"{case}: unexpected environment deltas: {sorted(changed - ENV_CHANGES)}")
         normalized = copy.deepcopy(raw)
         normalized["proofs"][0]["env"] = copy.deepcopy(old_env)
-        if comparable(old, case) != comparable(normalized, case):
-            raise SystemExit(f"{case}: non-environment differences exceed version, creation, scope, and sed temp names")
+        comparison = copy.deepcopy(normalized)
+        if case == "sed":
+            old_prior = [item for item in before["priors"] if item["path"] == "config.txt"]
+            new_prior = [item for item in generated["priors"] if item["path"] == "config.txt"]
+            promoted = [item for item in generated["inputs"] if item["path"] == "config.txt"]
+            if len(old_prior) != 1 or promoted != old_prior or new_prior != old_prior:
+                raise SystemExit("sed: the one added config.txt input must equal its prior")
+            comparison["proofs"][0]["inputs"] = [
+                item for item in comparison["proofs"][0]["inputs"] if item["path"] != "config.txt"
+            ]
+        if comparable(old, case) != comparable(comparison, case):
+            raise SystemExit(f"{case}: differences exceed version, creation, scope, sed temp names, and the exact sed prior input")
         target = output_dir / case / "proof.json"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text(json.dumps(normalized, separators=(",", ":")))
