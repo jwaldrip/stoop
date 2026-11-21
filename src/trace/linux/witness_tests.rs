@@ -301,6 +301,7 @@ fn a_rename_witness_names_only_ordinary_operands() {
     );
     let ignore = Ignore::new(&[], None, &[]);
     let mut tracer = tracer_for(rec_for(&root, &ignore));
+    tracer.initial_pid_namespace = true;
     let pid = std::process::id() as i32;
     tracer.live_tasks.insert(pid);
     tracer.t.keys.insert(temp.clone(), "t".into());
@@ -408,6 +409,7 @@ fn an_oversized_lock_table_withholds_the_witness() {
 #[test]
 fn an_over_budget_source_is_not_scanned_or_opened() {
     with_ordinary_rename("budget-limit", |tracer, pid, args, temp, target, metas| {
+        tracer.initial_pid_namespace = true;
         let used = identity::READ_HASH_BUDGET - 3;
         tracer.rec.as_mut().unwrap().rewrite_budget.hashed = used;
         let scans_before = LOCK_TABLE_SCANS.with(|scans| scans.get());

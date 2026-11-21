@@ -9,6 +9,12 @@
 //! except for priors: what a path held before the run first wrote it is read at the
 //! same stop, because the write is about to change it.
 
+mod namespace;
+
+use namespace::is_initial_pid_namespace;
+#[cfg(test)]
+use namespace::PROC_PID_INIT_INO;
+
 use super::identity::{self, Observation, ReadBudget, Seen};
 use super::{AtomicLanding, ExecEvent, Scope, Trace};
 use crate::ignore::Ignore;
@@ -39,8 +45,6 @@ const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const NT_PRSTATUS: usize = 1;
 const AT_FDCWD: i32 = -100;
 const PATH_MAX: usize = 4096;
-/// The initial PID namespace inode, from Linux `include/linux/proc_ns.h`.
-const PROC_PID_INIT_INO: u64 = 0xEFFF_FFFC;
 /// Bound work and memory while the tracee is stopped at rename entry.
 const LOCK_TABLE_CAP: u64 = 1 << 20;
 
@@ -2098,18 +2102,6 @@ fn plain_route(real: &Path, lexical: &Path) -> bool {
         }
     }
     true
-}
-
-fn is_initial_pid_namespace(link: io::Result<PathBuf>) -> bool {
-    let Ok(link) = link else {
-        return false;
-    };
-    link.to_str()
-        .and_then(|name| name.strip_prefix("pid:["))
-        .and_then(|name| name.strip_suffix(']'))
-        .filter(|number| number.len() == 10)
-        .and_then(|number| number.parse::<u64>().ok())
-        == Some(PROC_PID_INIT_INO)
 }
 
 #[cfg(test)]
