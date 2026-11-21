@@ -244,6 +244,18 @@ fn explain_with_fake_git(f: &Fixture, script: &str) -> Output {
 }
 
 #[test]
+fn git_case_and_unicode_spelling_mismatches_fail_closed() {
+    for (walked, reported) in [("Sample.t", "sample.t"), ("cafe\u{301}.t", "café.t")] {
+        let f = Fixture::new();
+        f.file(walked, b"");
+        let script = format!(
+            "case \" $* \" in *' --cached '*) printf '%s\\000' '{reported}' ;; esac\nexit 0"
+        );
+        unknown(&explain_with_fake_git(&f, &script));
+    }
+}
+
+#[test]
 fn unclassified_git_file_makes_the_universe_unknown() {
     let f = Fixture::new();
     f.file("a.t", b"");
