@@ -148,7 +148,7 @@ pub fn records_oids(root: &Path) -> bool {
     crate::oid_attrs::snapshot(root).is_some()
 }
 
-fn list_hash(dir: &Path) -> Option<String> {
+pub(crate) fn list_hash(dir: &Path) -> Option<String> {
     let mut names: Vec<Vec<u8>> = Vec::new();
     for e in fs::read_dir(dir).ok()? {
         names.push(e.ok()?.file_name().as_encoded_bytes().to_vec());
