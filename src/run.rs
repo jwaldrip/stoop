@@ -1019,11 +1019,8 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         let dir = if rel_cwd.is_empty() { "." } else { &rel_cwd };
         eprintln!("stoop: dir {dir:?}");
         if let Some(hook) = &hook {
-            if hook.shell_unmodeled {
-                eprintln!("stoop: unsupported shell syntax; shell-operand filters are not used");
-            }
-            if !hook.native_shell_placeholders.is_empty() {
-                eprintln!("stoop: native shell expansion is not a unit filter; pass an exact top-level filter such as '{{changed:/foo}}' in argv");
+            if hook.shell_env_code {
+                eprintln!("stoop: shell-operand filters are unavailable; use a quoted argv placeholder such as '{{changed:/foo}}'");
             }
             let suite = config.select(&hook.original, &rel_cwd).ok().flatten();
             let configured = suite.and_then(|suite| {
@@ -1038,7 +1035,6 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 .placeholders
                 .iter()
                 .flatten()
-                .chain(&hook.environment_placeholders)
                 .find_map(|placeholder| placeholder.filter.as_ref());
             match units::universe::catalog_ignore(&root, &o.ignore, &o.transient) {
                 Ok(ignore) => eprintln!(

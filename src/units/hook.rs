@@ -12,9 +12,7 @@ pub(crate) struct Hook {
     #[allow(dead_code)]
     pub spans: Vec<Vec<(usize, usize)>>,
     pub placeholders: Vec<Vec<Placeholder>>,
-    pub environment_placeholders: Vec<Placeholder>,
-    pub native_shell_placeholders: Vec<Placeholder>,
-    pub shell_unmodeled: bool,
+    pub shell_env_code: bool,
     pub placeholder: String,
 }
 
@@ -367,97 +365,6 @@ fn spans(word: &str) -> Result<Vec<(usize, usize, Placeholder)>, String> {
     Ok(out)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum ShellPlaceholder {
-    Unit,
-    Native,
-    Escaped,
-}
-
-/// Find literal placeholder spans using the supported POSIX shell quoting subset.
-/// Any construct outside that subset leaves the entire operand on the legacy path.
-fn shell_literal_spans(word: &str, spans: &[(usize, usize)]) -> Option<Vec<bool>> {
-    let bytes = word.as_bytes();
-    let mut literal = Vec::with_capacity(spans.len());
-    let (mut single, mut double, mut escaped) = (false, false, false);
-    let (mut i, mut next) = (0usize, 0usize);
-    while i < bytes.len() {
-        if let Some(&(start, end)) = spans.get(next) {
-            if i == start {
-                let token = &bytes[start..end];
-                if !single && token.windows(2).any(|pair| pair == b"$(") {
-                    return None;
-                }
-                literal.push(single || escaped);
-                escaped = false;
-                i = end;
-                next += 1;
-                continue;
-            }
-        }
-        let byte = bytes[i];
-        if escaped {
-            escaped = false;
-            i += 1;
-            continue;
-        }
-        if single {
-            if byte == b'\'' {
-                single = false;
-            }
-            i += 1;
-            continue;
-        }
-        if byte == b'\\' {
-            escaped = true;
-        } else if byte == b'\'' && !double {
-            single = true;
-        } else if byte == b'"' {
-            double = !double;
-        } else if byte == b'`'
-            || (byte == b'$' && bytes.get(i + 1) == Some(&b'('))
-            || (!double && byte == b'$' && bytes.get(i + 1) == Some(&b'\''))
-            || (!double && byte == b'<' && bytes.get(i + 1) == Some(&b'<'))
-            || (!double
-                && byte == b'#'
-                && (i == 0
-                    || bytes[i - 1].is_ascii_whitespace()
-                    || b";|&()".contains(&bytes[i - 1])))
-        {
-            return None;
-        }
-        i += 1;
-    }
-    (!single && !double && !escaped).then_some(literal)
-}
-
-/// Only unambiguous leading glob or root-path forms are filters in shell code.
-fn shell_placeholder_kind(word: &str, start: usize, end: usize, literal: bool) -> ShellPlaceholder {
-    if literal {
-        return ShellPlaceholder::Escaped;
-    }
-    let token = &word[start..end];
-    if !token.starts_with("${") {
-        return ShellPlaceholder::Unit;
-    }
-    let Some(colon) = token.find(':') else {
-        return ShellPlaceholder::Unit;
-    };
-    let suffix = &token[colon + 1..token.len() - 1];
-    if suffix.starts_with(['-', '=', '?', '+']) {
-        return ShellPlaceholder::Native;
-    }
-    if suffix
-        .as_bytes()
-        .first()
-        .is_some_and(|byte| b"*[\\/".contains(byte))
-    {
-        ShellPlaceholder::Unit
-    } else {
-        ShellPlaceholder::Native
-    }
-}
-
 fn mangled(word: &str) -> bool {
     if word.contains('{') {
         return false;
@@ -545,9 +452,7 @@ pub(crate) struct ParsedHook {
     argv: Vec<String>,
     spans: Vec<Vec<(usize, usize)>>,
     placeholders: Vec<Vec<Placeholder>>,
-    environment_placeholders: Vec<Placeholder>,
-    native_shell_placeholders: Vec<Placeholder>,
-    shell_unmodeled: bool,
+    shell_env_code: bool,
     legacy_shell_exclusion_only: bool,
     placeholder: String,
     start: usize,
@@ -558,9 +463,6 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
     let shell = shell_code(&argv);
     let mut all = Vec::with_capacity(argv.len());
     let mut placeholders = Vec::with_capacity(argv.len());
-    let mut environment_placeholders = Vec::new();
-    let mut native_shell_placeholders = Vec::new();
-    let mut shell_unmodeled = false;
     let mut legacy_shell_exclusion_only = false;
     let mut found = false;
     let mut env_code = false;
@@ -591,19 +493,7 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
                     .iter()
                     .filter_map(|item| item.filter.as_ref())
                     .any(Filter::exclusion_only);
-                if let Some(literals) = shell_literal_spans(word, &parts) {
-                    for (((start, end), item), literal) in
-                        parts.iter().copied().zip(parsed).zip(literals)
-                    {
-                        match shell_placeholder_kind(word, start, end, literal) {
-                            ShellPlaceholder::Unit => environment_placeholders.push(item),
-                            ShellPlaceholder::Native => native_shell_placeholders.push(item),
-                            ShellPlaceholder::Escaped => {}
-                        }
-                    }
-                } else {
-                    shell_unmodeled = true;
-                }
+                // Shell code keeps the 2a environment-only behavior. W4 filters belong in argv.
                 placeholders.push(Vec::new());
                 continue;
             }
@@ -642,9 +532,7 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
         argv,
         spans: all,
         placeholders,
-        environment_placeholders,
-        native_shell_placeholders,
-        shell_unmodeled,
+        shell_env_code: env_code,
         legacy_shell_exclusion_only,
         placeholder,
         start,
@@ -836,9 +724,7 @@ impl ParsedHook {
             argv,
             spans: all,
             placeholders,
-            environment_placeholders,
-            native_shell_placeholders,
-            shell_unmodeled,
+            shell_env_code,
             legacy_shell_exclusion_only,
             placeholder,
             start,
@@ -847,7 +733,6 @@ impl ParsedHook {
         for filter in placeholders
             .iter()
             .flatten()
-            .chain(&environment_placeholders)
             .filter_map(|p| p.filter.as_ref())
         {
             if inline.is_some_and(|prior| prior != filter) {
@@ -877,9 +762,7 @@ impl ParsedHook {
             removed,
             spans: all,
             placeholders,
-            environment_placeholders,
-            native_shell_placeholders,
-            shell_unmodeled,
+            shell_env_code,
             placeholder,
         })
     }
@@ -1174,41 +1057,25 @@ mod tests {
         for (spans, placeholders) in hook.spans.iter().zip(&hook.placeholders) {
             assert_eq!(spans.len(), placeholders.len());
         }
-        assert_eq!(hook.environment_placeholders.len(), 1);
-        assert_eq!(
-            hook.environment_placeholders[0]
-                .filter
-                .as_ref()
-                .unwrap()
-                .text(),
-            "*.t"
-        );
+        assert!(hook.shell_env_code);
         assert_eq!(hook.argv, argv[..4]);
     }
 
     #[test]
-    fn shell_filter_classification_preserves_native_expansions() {
-        for (expression, expected) in [
-            ("${STOOP_CHANGED:-x}", None),
-            ("${STOOP_CHANGED:=x}", None),
-            ("${STOOP_CHANGED:+x}", None),
-            ("${STOOP_CHANGED:?x}", None),
-            ("${STOOP_CHANGED#x}", None),
-            ("${STOOP_CHANGED:3}", None),
-            ("${STOOP_CHANGED:foo}", None),
-            ("${STOOP_CHANGED: -1}", None),
-            ("${STOOP_CHANGED:1*2}", None),
-            ("${STOOP_CHANGED:foo/bar}", None),
-            ("$(printf x)", None),
-            ("$((1+2))", None),
-            ("{a,b}", None),
-            (r"\${STOOP_CHANGED:*.t}", None),
-            ("'${STOOP_CHANGED:*.t}'", None),
-            ("\"${STOOP_CHANGED:*.t}\"", Some("*.t")),
-            ("pre'${STOOP_CHANGED:*.t}'post", None),
-            ("'pre'\"${STOOP_CHANGED:*.t}\"", Some("*.t")),
-            ("${STOOP_CHANGED:*.t}", Some("*.t")),
-            ("${STOOP_CHANGED:/foo}", Some("/foo")),
+    fn shell_operand_never_contributes_unit_filters() {
+        for expression in [
+            "${STOOP_CHANGED:-x}",
+            "${STOOP_CHANGED:3}",
+            "${STOOP_CHANGED:foo}",
+            "${STOOP_CHANGED:1*2}",
+            "${STOOP_CHANGED:foo/bar}",
+            "$(printf x)",
+            "$((1+2))",
+            "{a,b}",
+            r"\${STOOP_CHANGED:*.t}",
+            "'${STOOP_CHANGED:*.t}'",
+            "\"${STOOP_CHANGED:*.t}\"",
+            "${STOOP_CHANGED:/foo}",
         ] {
             let code = format!("echo $STOOP_CHANGED {expression}");
             let argv: Vec<OsString> = ["sh", "-c", code.as_str(), "zero"]
@@ -1220,11 +1087,15 @@ mod tests {
                 .unwrap()
                 .finish(&argv, &[], false)
                 .unwrap();
-            let actual = hook
-                .environment_placeholders
-                .iter()
-                .find_map(|p| p.filter.as_ref().map(Filter::text));
-            assert_eq!(actual, expected, "{expression}");
+            assert!(hook.shell_env_code, "{expression}");
+            assert!(
+                hook.placeholders
+                    .iter()
+                    .flatten()
+                    .all(|item| item.filter.is_none()),
+                "{expression}"
+            );
+            assert_eq!(hook.argv, argv);
         }
     }
 }

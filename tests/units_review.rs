@@ -311,7 +311,7 @@ fn unmodeled_shell_operand_uses_config_and_reports_the_fallback() {
             "{code:?}: {text}"
         );
         assert!(
-            text.contains("unsupported shell syntax"),
+            text.contains("shell-operand filters are unavailable"),
             "{code:?}: {text}"
         );
     }
@@ -342,12 +342,15 @@ fn explain_uses_config_for_native_shell_fallback_and_names_the_ambiguity() {
         text.contains("tracked 1 units; filter '*.t' (.stoop.toml suite shell)"),
         "{text}"
     );
-    assert!(text.contains("native shell"), "{text}");
+    assert!(
+        text.contains("shell-operand filters are unavailable"),
+        "{text}"
+    );
     assert!(text.contains("{changed:/foo}"), "{text}");
 }
 
 #[test]
-fn explain_rejects_distinct_real_shell_filters() {
+fn explain_does_not_compare_shell_operand_filters() {
     let f = Fixture::new();
     let out = f
         .command(
@@ -361,7 +364,12 @@ fn explain_rejects_distinct_real_shell_filters() {
         )
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(2), "{}", err(&out));
+    assert_eq!(out.status.code(), Some(1), "{}", err(&out));
+    assert!(
+        err(&out).contains("shell-operand filters are unavailable"),
+        "{}",
+        err(&out)
+    );
 }
 
 #[test]
