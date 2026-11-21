@@ -256,6 +256,13 @@ mod tests {
     }
 
     #[test]
+    fn question_mark_matches_one_byte_but_not_a_slash() {
+        let f = Filter::inline("a/tests?x.t");
+        assert!(f.matches("a/testsXx.t", false));
+        assert!(!f.matches("a/tests/x.t", false));
+    }
+
+    #[test]
     fn slash_anchors_at_root_but_basename_patterns_match_any_depth() {
         assert!(!Filter::inline("tests/*.t").matches("sub/tests/a.t", false));
         assert!(Filter::inline("*.t").matches("sub/tests/a.t", false));
