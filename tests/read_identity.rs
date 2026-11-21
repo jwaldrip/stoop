@@ -1334,3 +1334,276 @@ fn a_hard_link_from_an_explicit_directory_descriptor_with_a_live_task_skips_comp
         stderr(&out)
     );
 }
+
+fn assert_no_input(stored: &Value, path: &str) {
+    assert!(
+        stored["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["path"] != path),
+        "unexpected input for {path}: {}",
+        stored["inputs"]
+    );
+}
+
+#[test]
+fn atomic_sed_records_the_preimage_then_runs_to_a_fixed_point() {
+    let case = Case::new("atomic-sed-fixed-point");
+    case.file("f", b"one\n");
+    age();
+    let script = "exec sed -i 's/^one$/done/' f";
+
+    let first = run(&case, "atomic-sed", script, &[]);
+    assert_recorded(&first, &case, "atomic-sed");
+    let stored = proof(&case, "atomic-sed");
+    assert_file_entry(&stored, "inputs", "f", b"one\n");
+    assert_file_entry(&stored, "priors", "f", b"one\n");
+    assert_file_entry(&stored, "outputs", "f", b"done\n");
+    let input = stored["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["path"] == "f");
+    let prior = stored["priors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["path"] == "f");
+    assert_eq!(input, prior);
+    let temp = stored["removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|name| name.starts_with("sed"))
+        .expect("the temporary source remains a removal");
+    assert_entry_id(&stored, "priors", temp, "a");
+
+    let second = run(&case, "atomic-sed", script, &[]);
+    assert_recorded(&second, &case, "atomic-sed");
+    assert!(
+        stderr(&second).contains("stoop: run "),
+        "{}",
+        stderr(&second)
+    );
+    let stored = proof(&case, "atomic-sed");
+    for field in ["inputs", "priors", "outputs"] {
+        assert_file_entry(&stored, field, "f", b"done\n");
+    }
+    let third = run(&case, "atomic-sed", script, &[]);
+    assert!(third.status.success(), "{}", stderr(&third));
+    assert!(
+        stderr(&third).contains("stoop: skip "),
+        "{}",
+        stderr(&third)
+    );
+    assert_eq!(fs::read(case.root().join("f")).unwrap(), b"done\n");
+}
+
+#[test]
+fn atomic_sed_that_always_changes_its_input_never_skips() {
+    let case = Case::new("atomic-sed-changing");
+    case.file("f", b"one\n");
+    age();
+    let script = "exec sed -i 's/^/x/' f";
+    for (before, after) in [
+        (b"one\n".as_slice(), b"xone\n".as_slice()),
+        (b"xone\n".as_slice(), b"xxone\n".as_slice()),
+        (b"xxone\n".as_slice(), b"xxxone\n".as_slice()),
+    ] {
+        let out = run(&case, "atomic-changing", script, &[]);
+        assert_recorded(&out, &case, "atomic-changing");
+        assert!(stderr(&out).contains("stoop: run "), "{}", stderr(&out));
+        let stored = proof(&case, "atomic-changing");
+        assert_file_entry(&stored, "inputs", "f", before);
+        assert_file_entry(&stored, "priors", "f", before);
+        assert_file_entry(&stored, "outputs", "f", after);
+        assert_eq!(fs::read(case.root().join("f")).unwrap(), after);
+    }
+}
+
+#[test]
+fn atomic_replace_after_a_foreign_preimage_change_keeps_legacy_prior() {
+    let case = Case::new("atomic-before-foreign-edit");
+    let file = case.file("f", b"original\n");
+    age();
+    let fifo = case.fifo("atomic-before.fifo");
+    let script = "exec python3 -c 'import os; open(\"f\").read(); open(\"tmp\", \"w\").write(\"done\\n\"); open(os.environ[\"FIFO\"]).read(); os.replace(\"tmp\", \"f\")'";
+    let child = spawn(&case, "atomic-before", script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::write(file, b"foreign\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_recorded(&out, &case, "atomic-before");
+    let stored = proof(&case, "atomic-before");
+    assert_no_input(&stored, "f");
+    assert_file_entry(&stored, "priors", "f", b"foreign\n");
+    assert_file_entry(&stored, "outputs", "f", b"done\n");
+}
+
+#[test]
+fn foreign_changes_after_atomic_landing_do_not_gain_an_input() {
+    for (key, replace_inode, bytes) in [
+        ("atomic-after-bytes", false, b"foreign\n".as_slice()),
+        ("atomic-after-inode", true, b"foreign\n".as_slice()),
+        ("atomic-after-same-bytes", true, b"done\n".as_slice()),
+    ] {
+        let case = Case::new(key);
+        let file = case.file("f", b"original\n");
+        age();
+        let fifo = case.fifo("atomic-after.fifo");
+        let script = "exec python3 -c 'import os; open(\"f\").read(); open(\"tmp\", \"w\").write(\"done\\n\"); os.replace(\"tmp\", \"f\"); open(os.environ[\"FIFO\"]).read()'";
+        let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+        let release = meet(&fifo);
+        if replace_inode {
+            let foreign = case.outside("replacement", bytes);
+            fs::rename(foreign, &file).unwrap();
+        } else {
+            fs::write(&file, bytes).unwrap();
+        }
+        drop(release);
+        let out = child.wait_with_output().unwrap();
+        assert_recorded(&out, &case, key);
+        let stored = proof(&case, key);
+        assert_no_input(&stored, "f");
+        assert_file_entry(&stored, "priors", "f", b"original\n");
+        assert_file_entry(&stored, "outputs", "f", bytes);
+    }
+}
+
+#[test]
+fn failed_rename_keeps_legacy_recording_without_an_input() {
+    let case = Case::new("atomic-failed-rename");
+    case.file("f", b"original\n");
+    age();
+    let script = "exec python3 -c 'import os; open(\"f\").read(); exec(\"try:\\n os.rename(\\\"missing\\\", \\\"f\\\")\\nexcept FileNotFoundError:\\n pass\")'";
+    let out = run(&case, "atomic-failed", script, &[]);
+    assert_recorded(&out, &case, "atomic-failed");
+    let stored = proof(&case, "atomic-failed");
+    assert_no_input(&stored, "f");
+    assert_file_entry(&stored, "priors", "f", b"original\n");
+    assert_file_entry(&stored, "outputs", "f", b"original\n");
+}
+
+#[test]
+fn same_inode_rename_keeps_legacy_recording_without_an_input() {
+    let case = Case::new("atomic-same-inode");
+    case.file("f", b"original\n");
+    age();
+    let script = "exec python3 -c 'import os; open(\"f\").read(); os.link(\"f\", \"tmp\"); os.replace(\"tmp\", \"f\")'";
+    let out = run(&case, "atomic-same-inode", script, &[]);
+    assert_recorded(&out, &case, "atomic-same-inode");
+    let stored = proof(&case, "atomic-same-inode");
+    assert_no_input(&stored, "f");
+    assert_file_entry(&stored, "priors", "f", b"original\n");
+    assert_file_entry(&stored, "outputs", "f", b"original\n");
+}
+
+#[test]
+fn an_attempted_write_before_the_read_keeps_legacy_atomic_recording() {
+    let case = Case::new("atomic-write-before-read");
+    case.file("f", b"original\n");
+    age();
+    let script = "exec python3 -c 'import os; exec(\"try:\\n os.rename(\\\"missing\\\", \\\"f\\\")\\nexcept FileNotFoundError:\\n pass\"); open(\"f\").read(); open(\"tmp\", \"w\").write(\"done\\n\"); os.replace(\"tmp\", \"f\")'";
+    let out = run(&case, "atomic-write-before-read", script, &[]);
+    assert_recorded(&out, &case, "atomic-write-before-read");
+    let stored = proof(&case, "atomic-write-before-read");
+    assert_no_input(&stored, "f");
+    assert_file_entry(&stored, "priors", "f", b"original\n");
+    assert_file_entry(&stored, "outputs", "f", b"done\n");
+}
+
+#[test]
+fn an_attempted_write_after_atomic_landing_withdraws_the_witness() {
+    let case = Case::new("atomic-write-after-landing");
+    case.file("f", b"original\n");
+    age();
+    let script = "exec python3 -c 'import os; open(\"f\").read(); open(\"tmp\", \"w\").write(\"done\\n\"); os.replace(\"tmp\", \"f\"); exec(\"try:\\n os.rename(\\\"missing\\\", \\\"f\\\")\\nexcept FileNotFoundError:\\n pass\")'";
+    let out = run(&case, "atomic-write-after-landing", script, &[]);
+    assert_recorded(&out, &case, "atomic-write-after-landing");
+    let stored = proof(&case, "atomic-write-after-landing");
+    assert_no_input(&stored, "f");
+    assert_file_entry(&stored, "priors", "f", b"original\n");
+    assert_file_entry(&stored, "outputs", "f", b"done\n");
+}
+
+#[test]
+fn an_inode_metadata_attempt_before_rename_keeps_legacy_recording() {
+    let case = Case::new("atomic-inode-footprint");
+    case.file("f", b"original\n");
+    age();
+    let script = "exec python3 -c 'import os; fd = os.open(\"f\", os.O_PATH); exec(\"try:\\n os.fchown(fd, -1, -1)\\nexcept OSError:\\n pass\"); os.close(fd); open(\"f\").read(); open(\"tmp\", \"w\").write(\"done\\n\"); os.replace(\"tmp\", \"f\")'";
+    let out = run(&case, "atomic-inode-footprint", script, &[]);
+    assert_recorded(&out, &case, "atomic-inode-footprint");
+    let stored = proof(&case, "atomic-inode-footprint");
+    assert_no_input(&stored, "f");
+    assert_file_entry(&stored, "priors", "f", b"original\n");
+    assert_file_entry(&stored, "outputs", "f", b"done\n");
+}
+
+/// Finding P1-1: a single-process editor holds a write lease on its temporary file and renames
+/// the file over one the command already read. The recorder must not open the leased file to hash
+/// it, because that open breaks the lease and the kernel signals the editor. The rename must
+/// finish, and the lease table must list the lease the editor took.
+#[test]
+fn a_write_lease_on_the_rename_source_is_not_broken_by_the_recorder() {
+    let case = Case::new("lease");
+    let target = case.file("f", b"old contents\n");
+    age();
+    let table_out = case.dir.join("locks.txt");
+    // `exec` makes the editor the only traced task. Without it the shell forks python3, the
+    // recorder sees two live tasks, and the rename witness never opens the leased file.
+    let script = r#"exec python3 -c '
+import fcntl, os
+with open("f", "rb") as read:
+    read.read()
+fd = os.open("t", os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
+fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_WRLCK)
+fcntl.fcntl(fd, fcntl.F_SETOWN, os.getpid())
+fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_ASYNC)
+with open("/proc/locks") as table, open(os.environ["LOCKS"], "w") as out:
+    out.write("".join(line for line in table if "LEASE" in line))
+os.write(fd, b"new contents\n")
+os.rename("t", "f")
+os.close(fd)
+'"#;
+    let out = run(&case, "lease", script, &[("LOCKS", &table_out)]);
+    let table = fs::read_to_string(&table_out).unwrap_or_default();
+    assert!(
+        table.contains("LEASE"),
+        "the lease table lists no lease for the temporary file:\n{table}"
+    );
+    assert!(
+        out.status.success(),
+        "the recorder broke the editor's write lease:\n{}",
+        stderr(&out)
+    );
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"new contents\n",
+        "the editor's rename did not finish:\n{}",
+        stderr(&out)
+    );
+}
+
+/// Regenerate the single-tracee `exec sed -i` recording through the real recorder on Linux. The raw
+/// proof goes to tests/fixtures/recorder/sed-exec/proof.json. The committed fixture is that proof
+/// after `python3 tests/normalize_recorder_fixtures.py <old> <raw-dir> tests/fixtures/recorder`,
+/// where <raw-dir> holds only the sed-exec directory.
+#[test]
+#[ignore = "regenerates tests/fixtures/recorder/sed-exec on Linux with STOOP_REGENERATE_RECORDER_FIXTURES=1"]
+fn regenerate_single_tracee_sed_fixture() {
+    assert_eq!(
+        std::env::var("STOOP_REGENERATE_RECORDER_FIXTURES").as_deref(),
+        Ok("1")
+    );
+    let case = Case::new("regenerate-sed-exec");
+    case.file("config.txt", b"foo\n");
+    age();
+    let out = run(&case, "sed-exec", "exec sed -i s/foo/bar/ config.txt", &[]);
+    assert_recorded(&out, &case, "sed-exec");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recorder/sed-exec");
+    fs::create_dir_all(&dir).unwrap();
+    fs::copy(case.proof("sed-exec"), dir.join("proof.json")).unwrap();
+}

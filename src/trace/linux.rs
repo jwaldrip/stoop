@@ -10,9 +10,9 @@
 //! same stop, because the write is about to change it.
 
 use super::identity::{self, Observation, ReadBudget, Seen};
-use super::{ExecEvent, Scope, Trace};
+use super::{AtomicLanding, ExecEvent, Scope, Trace};
 use crate::ignore::Ignore;
-use crate::input::{file_id, hash_file, hash_file_with_oid};
+use crate::input::{file_id, hash_file, hash_file_with_identity, hash_file_with_oid};
 use crate::oid_attrs::is_absent;
 use crate::pathutil::{absolutize, to_key, without_dots, Physical};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -592,6 +592,41 @@ fn decode(r: &libc::user_regs_struct) -> (i64, [u64; 6]) {
     )
 }
 
+struct PriorBinding {
+    key: String,
+    seen: Seen,
+    verified: bool,
+}
+
+struct ReadCandidate {
+    path: PathBuf,
+    seen: Seen,
+}
+
+struct RenameCandidate {
+    from: PathBuf,
+    to: PathBuf,
+    key: String,
+    source: identity::FileStat,
+    parent: (u64, u64),
+    hash: String,
+}
+
+struct RenameOperation<'a> {
+    from: (Option<usize>, usize),
+    to: (Option<usize>, usize),
+    flags: Option<usize>,
+    a: &'a Path,
+    b: &'a Path,
+    a_meta: Option<&'a fs::Metadata>,
+    b_meta: Option<&'a fs::Metadata>,
+}
+
+enum PendingWitness {
+    Read(ReadCandidate),
+    Rename(RenameCandidate),
+}
+
 /// What priors need beyond the trace: where paths live, what is excluded, and how much
 /// content has been read so far.
 struct Rec<'a> {
@@ -603,6 +638,8 @@ struct Rec<'a> {
     root: PathBuf,
     hashed: u64,
     read_budget: ReadBudget,
+    rewrite_budget: ReadBudget,
+    prior_binding: Option<PriorBinding>,
     oid_epoch: Option<Arc<crate::oid_attrs::Epoch>>,
     link_walks: BTreeMap<PathBuf, Vec<PathBuf>>,
     redirected_reads: HashSet<String>,
@@ -614,6 +651,10 @@ struct Tracer<'a> {
     magic_epoch: u64,
     magic_cache: HashMap<PathBuf, (u64, bool)>,
     pending_topology: HashSet<i32>,
+    pending_witness: HashMap<i32, PendingWitness>,
+    confirmed_reads: HashMap<PathBuf, Seen>,
+    landing_inodes: HashMap<(u64, u64), String>,
+    shared_context: bool,
     live_tasks: HashSet<i32>,
     syscall: i64,
     allow_network: bool,
@@ -684,6 +725,10 @@ pub fn run<'a>(
         magic_epoch: 0,
         magic_cache: HashMap::new(),
         pending_topology: HashSet::new(),
+        pending_witness: HashMap::new(),
+        confirmed_reads: HashMap::new(),
+        landing_inodes: HashMap::new(),
+        shared_context: false,
         live_tasks: HashSet::from([pid]),
         syscall: 0,
         execs: observe_execs.then(|| ExecObserver::new(pid)),
@@ -695,6 +740,8 @@ pub fn run<'a>(
             oid_epoch: s.oid_epoch.clone(),
             hashed: 0,
             read_budget: ReadBudget::default(),
+            rewrite_budget: ReadBudget::default(),
+            prior_binding: None,
             link_walks: BTreeMap::new(),
             redirected_reads: HashSet::new(),
         }),
@@ -804,6 +851,11 @@ pub fn run<'a>(
         // Topology syscalls resume with PTRACE_SYSCALL, so their next syscall
         // stop occurs after the kernel has applied or rejected the mutation.
         let syscall_exit = libc::WIFSTOPPED(st) && libc::WSTOPSIG(st) == (libc::SIGTRAP | 0x80);
+        if syscall_exit {
+            tr.after_witness_stop(p);
+        } else {
+            tr.pending_witness.remove(&p);
+        }
         if syscall_exit || libc::WIFEXITED(st) || libc::WIFSIGNALED(st) {
             tr.after_topology_stop(p);
         }
@@ -854,13 +906,26 @@ pub fn run<'a>(
                 } else {
                     sig
                 };
-                resume(p, pass, tr.pending_topology.contains(&p));
+                resume(
+                    p,
+                    pass,
+                    tr.pending_topology.contains(&p) || tr.pending_witness.contains_key(&p),
+                );
             }
             e if e == libc::PTRACE_EVENT_SECCOMP => {
                 tr.on_syscall(p);
-                resume(p, 0, tr.pending_topology.contains(&p));
+                resume(
+                    p,
+                    0,
+                    tr.pending_topology.contains(&p) || tr.pending_witness.contains_key(&p),
+                );
             }
-            libc::PTRACE_EVENT_FORK | libc::PTRACE_EVENT_VFORK | libc::PTRACE_EVENT_CLONE => {
+            event @ (libc::PTRACE_EVENT_FORK
+            | libc::PTRACE_EVENT_VFORK
+            | libc::PTRACE_EVENT_CLONE) => {
+                if event == libc::PTRACE_EVENT_VFORK {
+                    tr.mark_shared_context();
+                }
                 if tr.rec.is_some() {
                     match event_message(p) {
                         Some(child) if tr.live_tasks.len() < MAX_EXEC_TASKS => {
@@ -941,6 +1006,38 @@ fn get_regs(pid: i32) -> Option<libc::user_regs_struct> {
         )
     };
     (r >= 0).then_some(regs)
+}
+
+/// Read a paired exit result and reject truncated or mismatched ptrace payloads.
+fn syscall_exit_result(pid: i32) -> Option<i64> {
+    #[repr(C)]
+    struct SyscallInfo {
+        op: u8,
+        reserved: [u8; 3],
+        arch: u32,
+        ip: u64,
+        sp: u64,
+        payload: [u64; 8],
+    }
+    let mut info: SyscallInfo = unsafe { std::mem::zeroed() };
+    let count = unsafe {
+        libc::ptrace(
+            0x420e as _,
+            pid,
+            std::mem::size_of::<SyscallInfo>(),
+            &mut info as *mut _,
+        )
+    };
+    if count < 33 || info.op != 2 {
+        return None;
+    }
+    let result = info.payload[0] as i64;
+    let regs = get_regs(pid)?;
+    #[cfg(target_arch = "x86_64")]
+    let register = regs.rax as i64;
+    #[cfg(target_arch = "aarch64")]
+    let register = regs.regs[0] as i64;
+    (register == result).then_some(result)
 }
 
 /// Read up to `len` bytes of the tracee's memory; fewer if the range ends early.
@@ -1824,6 +1921,16 @@ impl Rec<'_> {
             push_reason(t, format!("{key} is a special file"));
             return None;
         }
+        self.prior_content_id(t, phys, key, &m)
+    }
+
+    fn prior_content_id(
+        &mut self,
+        t: &mut Trace,
+        phys: &Path,
+        key: &str,
+        m: &fs::Metadata,
+    ) -> Option<String> {
         let exec = m.mode() & 0o111 != 0;
         let size = m.len();
         if size > MAX_FILE_BYTES || self.hashed + size > MAX_RUN_BYTES {
@@ -1845,7 +1952,21 @@ impl Rec<'_> {
             })
             .flatten()
             .cloned();
-        let hash = if basis.as_ref().is_some_and(|basis| basis.allows_oid()) {
+        let with_oid = basis.as_ref().is_some_and(|basis| basis.allows_oid());
+        let hash = if self
+            .prior_binding
+            .as_ref()
+            .is_some_and(|binding| binding.key == key)
+        {
+            hash_file_with_identity(phys, with_oid).map(|(hash, oid, bound)| {
+                if let (Some(binding), Some(bound)) = (&mut self.prior_binding, bound) {
+                    // The pathname stat chose this prefix, so it must be the descriptor's stat.
+                    binding.verified = identity::matches_prior(&binding.seen, &bound, &hash)
+                        && identity::file_stat(m) == bound.before;
+                }
+                (hash, oid)
+            })
+        } else if with_oid {
             hash_file_with_oid(phys)
         } else {
             hash_file(phys).map(|hash| (hash, None))
@@ -1869,7 +1990,445 @@ impl Rec<'_> {
     }
 }
 
+fn plain_argument(pid: i32, args: &[u64; 6], dirfd: Option<usize>, path: usize) -> bool {
+    if dirfd.is_some_and(|index| args[index] as i32 != AT_FDCWD) {
+        return false;
+    }
+    let Some(raw) = read_cstr(pid, args[path]) else {
+        return false;
+    };
+    !raw.is_empty()
+        && std::str::from_utf8(&raw).is_ok()
+        && !raw.split(|byte| *byte == b'/').any(|part| part == b"..")
+}
+fn successful_rename(result: i64) -> bool {
+    result == 0
+}
+
+fn same_renamed_file(before: &identity::FileStat, after: &identity::FileStat) -> bool {
+    before.dev == after.dev
+        && before.ino == after.ino
+        && before.size == after.size
+        && before.mode == after.mode
+        && before.mtime_ns == after.mtime_ns
+}
+
+fn prior_or_ancestor_exists(trace: &Trace, key: &str) -> bool {
+    Path::new(key)
+        .ancestors()
+        .take_while(|part| !part.as_os_str().is_empty())
+        .filter_map(Path::to_str)
+        .any(|part| trace.priors.contains_key(part))
+}
+
+fn invalidate_landing_inode(
+    trace: &mut Trace,
+    inodes: &mut HashMap<(u64, u64), String>,
+    metadata: &fs::Metadata,
+) {
+    if let Some(key) = inodes.remove(&(metadata.dev(), metadata.ino())) {
+        trace.atomic_landings.remove(&key);
+    }
+}
+
+fn invalidate_landing_path(
+    trace: &mut Trace,
+    inodes: &mut HashMap<(u64, u64), String>,
+    root: &Path,
+    path: &Path,
+) {
+    if trace.atomic_landings.is_empty() {
+        return;
+    }
+    if root.starts_with(path) {
+        trace.atomic_landings.clear();
+        inodes.clear();
+        return;
+    }
+    let Ok(relative) = path.strip_prefix(root) else {
+        return;
+    };
+    let Some(key) = relative.to_str() else {
+        trace.atomic_landings.clear();
+        inodes.clear();
+        return;
+    };
+    if key.is_empty() {
+        trace.atomic_landings.clear();
+        inodes.clear();
+        return;
+    }
+    // Descendants of `key` are the names under `key/`, which sort together. A sibling such as
+    // `key.old` sorts between `key` and `key/f`, so the scan starts at the prefix, not at `key`.
+    let prefix = format!("{key}/");
+    let mut names: Vec<String> = trace
+        .atomic_landings
+        .range(prefix.clone()..)
+        .take_while(|(name, _)| name.starts_with(&prefix))
+        .map(|(name, _)| name.clone())
+        .collect();
+    names.push(key.to_owned());
+    for name in names {
+        if let Some(landing) = trace.atomic_landings.remove(&name) {
+            inodes.remove(&(landing.stat.dev, landing.stat.ino));
+        }
+    }
+}
+
+/// A witness names a file by an ordinary spelling only. Below the canonical root, no component may
+/// be a symbolic link, because resolving one would name a different file than the spelling does.
+/// A path outside the root, such as a `/proc` route, is refused.
+fn plain_route(real: &Path, lexical: &Path) -> bool {
+    let Ok(below) = lexical.strip_prefix(real) else {
+        return false;
+    };
+    let mut at = real.to_path_buf();
+    for part in below.components() {
+        at.push(part);
+        if fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether the kernel's lock table lists a lock or a lease on the inode of `stat`. A table that
+/// cannot be read counts as listed, so the witness falls back to the legacy path.
+fn lock_table_lists(stat: &identity::FileStat) -> bool {
+    let Ok(table) = fs::read_to_string("/proc/locks") else {
+        return true;
+    };
+    let (major, minor) = dev_numbers(stat.dev);
+    table.split_whitespace().any(|field| {
+        let mut parts = field.split(':');
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(maj), Some(min), Some(ino), None) => {
+                u64::from_str_radix(maj, 16).ok() == Some(major)
+                    && u64::from_str_radix(min, 16).ok() == Some(minor)
+                    && ino.parse::<u64>().ok() == Some(stat.ino)
+            }
+            _ => false,
+        }
+    })
+}
+
+/// The major and minor numbers of a Linux device number, as `/proc/locks` prints them.
+fn dev_numbers(dev: u64) -> (u64, u64) {
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    (major, minor)
+}
+
 impl Tracer<'_> {
+    fn mark_shared_context(&mut self) {
+        self.shared_context = true;
+        self.pending_witness.clear();
+        self.confirmed_reads.clear();
+        self.t.atomic_landings.clear();
+        self.landing_inodes.clear();
+    }
+
+    /// The spelling a call names, joined onto its directory and not yet mapped through a proc
+    /// magic link. `resolve` maps the same join, so a witness compares the two.
+    fn lexical_path(
+        &mut self,
+        pid: i32,
+        args: &[u64; 6],
+        dirfd: Option<usize>,
+        path: usize,
+    ) -> Option<PathBuf> {
+        let raw = read_cstr(pid, args[path])?;
+        let p = PathBuf::from(OsString::from_vec(raw));
+        if p.is_absolute() {
+            return Some(without_dots(&p));
+        }
+        let base = match dirfd.map(|i| args[i] as i32) {
+            None | Some(AT_FDCWD) => self.cwd(pid),
+            Some(fd) => fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok(),
+        }?;
+        Some(without_dots(&base.join(&p)))
+    }
+
+    /// Return a key only for an exact, unredirected repository path.
+    fn exact_key(&mut self, path: &Path) -> Option<String> {
+        let rec = self.rec.as_mut()?;
+        if !path.starts_with(rec.phys.real()) {
+            return None;
+        }
+        // A witness lookup must not fill the parent cache that the legacy writer reads (P2-5).
+        let loc = rec.phys.locate_uncached(path)?;
+        if loc.redirected || loc.path != path {
+            return None;
+        }
+        let rel = rec.phys.repo_rel(path)?;
+        if rel.components().any(|part| part.as_os_str() == ".git") {
+            return None;
+        }
+        let key = rel.to_str()?;
+        if rec.ignore.is_ignored(key) {
+            return None;
+        }
+        Some(key.to_owned())
+    }
+
+    fn eligible_observation(&self, path: &Path, seen: &Seen) -> bool {
+        let Seen::File(first, hash) = seen else {
+            return false;
+        };
+        if matches!(hash, identity::ReadHash::StatOnly) {
+            return false;
+        }
+        let Some(observation) = self.t.seen.as_ref().and_then(|seen| seen.get(path)) else {
+            return false;
+        };
+        if !matches!(&observation.seen, Seen::File(stat, _) if stat == first) {
+            return false;
+        }
+        identity::skip(
+            &self.t.footprint,
+            Some(observation),
+            path,
+            false,
+            &identity::Post::FileStat(*first),
+        )
+        .is_none()
+    }
+
+    fn read_candidate(
+        &mut self,
+        pid: i32,
+        args: &[u64; 6],
+        dirfd: Option<usize>,
+        argument: usize,
+        path: &Path,
+    ) -> Option<ReadCandidate> {
+        if self.shared_context
+            || self.confirmed_reads.contains_key(path)
+            || self
+                .rec
+                .as_ref()
+                .is_none_or(|rec| !path.starts_with(rec.phys.real()))
+            || !plain_argument(pid, args, dirfd, argument)
+        {
+            return None;
+        }
+        let lexical = self.lexical_path(pid, args, dirfd, argument)?;
+        // The witness names the ordinary spelling only: a /proc route or a symlink on the way
+        // would name a different file from the one the call resolved (P2-2).
+        if lexical.as_path() != path
+            || !self
+                .rec
+                .as_ref()
+                .is_some_and(|rec| plain_route(rec.phys.real(), &lexical))
+        {
+            return None;
+        }
+        let key = self.exact_key(path)?;
+        if prior_or_ancestor_exists(&self.t, &key) {
+            return None;
+        }
+        let seen = self.t.seen.as_ref()?.get(path)?.seen.clone();
+        let Seen::File(stat, _) = &seen else {
+            return None;
+        };
+        let metadata = fs::symlink_metadata(path).ok()?;
+        if !metadata.is_file()
+            || metadata.nlink() != 1
+            || identity::file_stat(&metadata) != *stat
+            || !self.eligible_observation(path, &seen)
+        {
+            return None;
+        }
+        Some(ReadCandidate {
+            path: path.to_path_buf(),
+            seen,
+        })
+    }
+
+    fn after_witness_stop(&mut self, pid: i32) {
+        let Some(pending) = self.pending_witness.remove(&pid) else {
+            return;
+        };
+        let Some(result) = syscall_exit_result(pid) else {
+            return;
+        };
+        if self.shared_context {
+            return;
+        }
+        match pending {
+            PendingWitness::Read(candidate) => {
+                let Ok(fd) = i32::try_from(result) else {
+                    return;
+                };
+                if fd < 0 {
+                    return;
+                }
+                let proc_path = PathBuf::from(format!("/proc/{pid}/fd/{fd}"));
+                let Ok(name) = fs::read_link(&proc_path) else {
+                    return;
+                };
+                let Ok(metadata) = fs::metadata(&proc_path) else {
+                    return;
+                };
+                let Seen::File(first, _) = &candidate.seen else {
+                    return;
+                };
+                let Some(key) = self.exact_key(&candidate.path) else {
+                    return;
+                };
+                if name != candidate.path
+                    || !metadata.is_file()
+                    || metadata.nlink() != 1
+                    || identity::file_stat(&metadata) != *first
+                    || prior_or_ancestor_exists(&self.t, &key)
+                    || !self.eligible_observation(&candidate.path, &candidate.seen)
+                {
+                    return;
+                }
+                self.confirmed_reads.insert(candidate.path, candidate.seen);
+            }
+            PendingWitness::Rename(candidate) => {
+                if !successful_rename(result)
+                    || self.live_tasks.len() != 1
+                    || self.t.footprint.unknown
+                    || identity::link_route_unknown(&self.t.footprint)
+                {
+                    return;
+                }
+                if !matches!(fs::symlink_metadata(&candidate.from), Err(error) if is_absent(&error))
+                {
+                    return;
+                }
+                let Some(parent) = candidate
+                    .to
+                    .parent()
+                    .and_then(|path| fs::metadata(path).ok())
+                else {
+                    return;
+                };
+                let Ok(metadata) = fs::symlink_metadata(&candidate.to) else {
+                    return;
+                };
+                let stat = identity::file_stat(&metadata);
+                if !parent.is_dir()
+                    || (parent.dev(), parent.ino()) != candidate.parent
+                    || !metadata.is_file()
+                    || metadata.nlink() != 1
+                    || !same_renamed_file(&candidate.source, &stat)
+                    || self.exact_key(&candidate.to).as_deref() != Some(candidate.key.as_str())
+                {
+                    return;
+                }
+                let inode = (stat.dev, stat.ino);
+                if let Some(previous) = self.t.atomic_landings.insert(
+                    candidate.key.clone(),
+                    AtomicLanding {
+                        stat,
+                        hash: candidate.hash,
+                    },
+                ) {
+                    self.landing_inodes
+                        .remove(&(previous.stat.dev, previous.stat.ino));
+                }
+                self.landing_inodes.insert(inode, candidate.key);
+            }
+        }
+    }
+
+    fn rename_candidate(
+        &mut self,
+        pid: i32,
+        args: &[u64; 6],
+        operation: RenameOperation<'_>,
+    ) -> Option<(RenameCandidate, Seen)> {
+        let RenameOperation {
+            from,
+            to,
+            flags,
+            a,
+            b,
+            a_meta,
+            b_meta,
+        } = operation;
+        if self.shared_context
+            || self.live_tasks.len() != 1
+            || flags.is_some_and(|index| args[index] != 0)
+            || !plain_argument(pid, args, from.0, from.1)
+            || !plain_argument(pid, args, to.0, to.1)
+            || a == b
+            || a.parent() != b.parent()
+        {
+            return None;
+        }
+        let source = a_meta?;
+        let destination = b_meta?;
+        if !source.is_file()
+            || !destination.is_file()
+            || source.nlink() != 1
+            || destination.nlink() != 1
+            || (source.dev(), source.ino()) == (destination.dev(), destination.ino())
+        {
+            return None;
+        }
+        let (Some(lex_a), Some(lex_b)) = (
+            self.lexical_path(pid, args, from.0, from.1),
+            self.lexical_path(pid, args, to.0, to.1),
+        ) else {
+            return None;
+        };
+        // Both operands must be ordinary spellings, as for a read witness (P2-2).
+        if lex_a.as_path() != a
+            || lex_b.as_path() != b
+            || !self.rec.as_ref().is_some_and(|rec| {
+                plain_route(rec.phys.real(), &lex_a) && plain_route(rec.phys.real(), &lex_b)
+            })
+        {
+            return None;
+        }
+        let source_key = self.exact_key(a)?;
+        let key = self.exact_key(b)?;
+        if self.t.keys.get(a) != Some(&source_key)
+            || self.t.priors.get(&source_key).map(String::as_str) != Some("a")
+            || prior_or_ancestor_exists(&self.t, &key)
+        {
+            return None;
+        }
+        let seen = self.confirmed_reads.get(b)?.clone();
+        let Seen::File(first, _) = &seen else {
+            return None;
+        };
+        if identity::file_stat(destination) != *first || !self.eligible_observation(b, &seen) {
+            return None;
+        }
+        let parent = fs::metadata(a.parent()?).ok()?;
+        if !parent.is_dir() {
+            return None;
+        }
+        let source_stat = identity::file_stat(source);
+        // An open of a leased file breaks the lease, and the kernel signals its holder. The
+        // source is opened only when the lock table lists no lease or lock on its inode (P1-1).
+        if lock_table_lists(&source_stat) {
+            return None;
+        }
+        let rec = self.rec.as_mut()?;
+        let identity::ReadHash::Hashed(hash) =
+            identity::hash_bound(a, &source_stat, &mut rec.rewrite_budget)
+        else {
+            return None;
+        };
+        Some((
+            RenameCandidate {
+                from: a.to_path_buf(),
+                to: b.to_path_buf(),
+                key,
+                source: source_stat,
+                parent: (parent.dev(), parent.ino()),
+                hash,
+            },
+            seen,
+        ))
+    }
+
     /// Capture writable inherited descriptors even when no Git OID epoch exists.
     fn inspect_footprint_fds(&mut self, pid: i32) {
         if self.rec.is_none() {
@@ -1911,6 +2470,14 @@ impl Tracer<'_> {
         }
         rec.footprint_phys.clear();
         let location = rec.footprint_phys.locate(raw);
+        if let Some(location) = &location {
+            invalidate_landing_path(
+                &mut self.t,
+                &mut self.landing_inodes,
+                rec.phys.real(),
+                &location.path,
+            );
+        }
         let final_link = follows
             && fs::symlink_metadata(raw).is_ok_and(|metadata| metadata.file_type().is_symlink());
         let symlink_route = final_link
@@ -1937,6 +2504,12 @@ impl Tracer<'_> {
         if final_link {
             match fs::canonicalize(raw) {
                 Ok(target) => {
+                    invalidate_landing_path(
+                        &mut self.t,
+                        &mut self.landing_inodes,
+                        rec.phys.real(),
+                        &target,
+                    );
                     self.t.footprint.entries.insert(target);
                 }
                 Err(_) => self.t.footprint.unknown = true,
@@ -1949,6 +2522,7 @@ impl Tracer<'_> {
         };
         match metadata {
             Ok(metadata) => {
+                invalidate_landing_inode(&mut self.t, &mut self.landing_inodes, &metadata);
                 self.t
                     .footprint
                     .inodes
@@ -2456,6 +3030,17 @@ impl Tracer<'_> {
                     let creates_exclusively = f & libc::O_CREAT != 0 && f & libc::O_EXCL != 0;
                     let follows = f & libc::O_NOFOLLOW == 0 && !creates_exclusively;
                     self.write(&p, follows);
+                } else if content
+                    && self
+                        .rec
+                        .as_ref()
+                        .is_some_and(|rec| p.starts_with(rec.phys.real()))
+                {
+                    self.touch(p.clone(), true, true);
+                    if let Some(candidate) = self.read_candidate(pid, args, dirfd, path, &p) {
+                        self.pending_witness
+                            .insert(pid, PendingWitness::Read(candidate));
+                    }
                 } else {
                     self.touch(p, true, content);
                 }
@@ -2585,8 +3170,44 @@ impl Tracer<'_> {
         if a_dir || b_dir || symlink {
             self.topology_changed(pid);
         }
+        let mut candidate = self.rename_candidate(
+            pid,
+            args,
+            RenameOperation {
+                from,
+                to,
+                flags,
+                a: &a,
+                b: &b,
+                a_meta: a_meta.as_ref(),
+                b_meta: b_meta.as_ref(),
+            },
+        );
         let ka = self.write(&a, false);
+        if candidate.as_ref().is_some_and(|(candidate, seen)| {
+            prior_or_ancestor_exists(&self.t, &candidate.key)
+                || !self.eligible_observation(&b, seen)
+        }) {
+            candidate = None;
+        }
+        if let (Some((candidate, seen)), Some(rec)) = (&candidate, &mut self.rec) {
+            rec.prior_binding = Some(PriorBinding {
+                key: candidate.key.clone(),
+                seen: seen.clone(),
+                verified: false,
+            });
+        }
         let kb = self.write(&b, false);
+        let binding = self.rec.as_mut().and_then(|rec| rec.prior_binding.take());
+        if let Some((candidate, _)) = candidate.filter(|(candidate, _)| {
+            binding.as_ref().is_some_and(|binding| binding.verified)
+                && kb.as_deref() == Some(candidate.key.as_str())
+                && self.t.priors.contains_key(&candidate.key)
+                && !self.t.footprint.unknown
+        }) {
+            self.pending_witness
+                .insert(pid, PendingWitness::Rename(candidate));
+        }
         if directory && (ka.is_some() || kb.is_some()) {
             let name = |k: Option<String>, p: &Path| {
                 k.unwrap_or_else(|| absolutize(Path::new("/"), p).to_string_lossy().into_owned())
@@ -2761,6 +3382,9 @@ impl Tracer<'_> {
                 self.t.footprint.unknown = true;
             }
         }
+        if let Some(metadata) = &identity {
+            invalidate_landing_inode(&mut self.t, &mut self.landing_inodes, metadata);
+        }
         let Some(rec) = self.rec.as_mut() else {
             return;
         };
@@ -2934,6 +3558,13 @@ impl Tracer<'_> {
                                 Ok(source) if !source.file_type().is_symlink() => {}
                                 _ => note_symlink_write(&mut self.t, true, self.live_tasks.len()),
                             }
+                            if let Ok(source) = &metadata {
+                                invalidate_landing_inode(
+                                    &mut self.t,
+                                    &mut self.landing_inodes,
+                                    source,
+                                );
+                            }
                             footprint_inode(&mut self.t, metadata);
                         }
                         self.touch(p.clone(), true, false);
@@ -2972,6 +3603,11 @@ impl Tracer<'_> {
                     if flags.is_none_or(|f| f & NAMESPACE_FLAGS != 0) {
                         self.flag("it attempted to change namespaces");
                     }
+                    const SHARED_FLAGS: u64 =
+                        (libc::CLONE_VM | libc::CLONE_FS | libc::CLONE_FILES) as u64;
+                    if flags.is_none_or(|f| f & SHARED_FLAGS != 0) {
+                        self.mark_shared_context();
+                    }
                 }
                 Op::Connect => {
                     if !self.allow_network {
@@ -2984,6 +3620,9 @@ impl Tracer<'_> {
 }
 
 #[cfg(test)]
+mod witness_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
@@ -2993,6 +3632,44 @@ mod tests {
         assert!(!source_named_by_descriptor(Some(3), b"/absolute/source"));
         assert!(!source_named_by_descriptor(None, b"source"));
         assert!(!source_named_by_descriptor(Some(3), b""));
+    }
+
+    #[test]
+    fn rename_landing_requires_success_and_the_sampled_source_inode() {
+        let source = identity::FileStat {
+            dev: 1,
+            ino: 2,
+            size: 3,
+            mtime_ns: 4,
+            ctime_ns: 5,
+            mode: 0o100644,
+        };
+        assert!(successful_rename(0));
+        assert!(!successful_rename(-i64::from(libc::EACCES)));
+        assert!(!successful_rename(1));
+        assert!(same_renamed_file(&source, &source));
+        assert!(same_renamed_file(
+            &source,
+            &identity::FileStat {
+                ctime_ns: 9,
+                ..source
+            }
+        ));
+        for changed in [
+            identity::FileStat { dev: 9, ..source },
+            identity::FileStat { ino: 9, ..source },
+            identity::FileStat { size: 9, ..source },
+            identity::FileStat {
+                mode: 0o100755,
+                ..source
+            },
+            identity::FileStat {
+                mtime_ns: 9,
+                ..source
+            },
+        ] {
+            assert!(!same_renamed_file(&source, &changed));
+        }
     }
 
     #[test]
@@ -3073,6 +3750,8 @@ mod tests {
             root: root.clone(),
             hashed: 0,
             read_budget: ReadBudget::default(),
+            rewrite_budget: ReadBudget::default(),
+            prior_binding: None,
             oid_epoch: Some(Arc::new(crate::oid_attrs::Epoch {
                 basis: HashMap::new(),
                 git_dir: git_dir.clone(),
@@ -3134,6 +3813,10 @@ mod tests {
             magic_epoch: 0,
             magic_cache: HashMap::new(),
             pending_topology: HashSet::new(),
+            pending_witness: HashMap::new(),
+            confirmed_reads: HashMap::new(),
+            landing_inodes: HashMap::new(),
+            shared_context: false,
             live_tasks: HashSet::new(),
             syscall: 0,
             allow_network: false,

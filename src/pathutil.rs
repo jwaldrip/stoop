@@ -362,12 +362,16 @@ impl Physical {
         (!rel.as_os_str().is_empty()).then_some(rel)
     }
 
-    fn canonical_dir(&mut self, dir: &Path) -> Option<PathBuf> {
-        if let Some(c) = self.parents.get(dir) {
-            return Some(c.clone());
+    fn canonical_dir(&mut self, dir: &Path, cache: bool) -> Option<PathBuf> {
+        if cache {
+            if let Some(c) = self.parents.get(dir) {
+                return Some(c.clone());
+            }
         }
         let c = fs::canonicalize(dir).ok()?;
-        self.parents.insert(dir.to_path_buf(), c.clone());
+        if cache {
+            self.parents.insert(dir.to_path_buf(), c.clone());
+        }
         Some(c)
     }
 
@@ -391,6 +395,17 @@ impl Physical {
     /// Where `raw` (absolute, possibly with `..` that the kernel resolves through symlinks)
     /// names its entry. None when it has no name, such as `/` or a path ending in `..`.
     pub fn locate(&mut self, raw: &Path) -> Option<Location> {
+        self.locate_with(raw, true)
+    }
+
+    /// `locate` without reading or writing the cache. A witness uses it, so the legacy
+    /// resolver's cache is what it was before the witness looked.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub fn locate_uncached(&mut self, raw: &Path) -> Option<Location> {
+        self.locate_with(raw, false)
+    }
+
+    fn locate_with(&mut self, raw: &Path, cache: bool) -> Option<Location> {
         // Pseudo filesystems describe the process that reads them. Resolved here they would
         // describe stoop rather than the traced command, so they have no physical location.
         if ["/proc", "/sys", "/dev"].iter().any(|p| raw.starts_with(p)) {
@@ -398,7 +413,7 @@ impl Physical {
         }
         let name = raw.file_name()?;
         let dir = raw.parent()?;
-        match self.canonical_dir(dir) {
+        match self.canonical_dir(dir, cache) {
             Some(canon) => {
                 let spelled = absolutize(Path::new("/"), dir);
                 Some(Location {
@@ -408,7 +423,7 @@ impl Physical {
             }
             None => {
                 let spelled = absolutize(Path::new("/"), raw);
-                Some(match self.missing_location(dir, name) {
+                Some(match self.missing_location(dir, name, cache) {
                     Some(path) => Location {
                         redirected: path != spelled,
                         path,
@@ -424,11 +439,16 @@ impl Physical {
 
     /// Resolve the existing prefix of a missing parent physically. If `..` follows
     /// a missing name, the missing name itself is what the call observed.
-    fn missing_location(&mut self, dir: &Path, name: &std::ffi::OsStr) -> Option<PathBuf> {
+    fn missing_location(
+        &mut self,
+        dir: &Path,
+        name: &std::ffi::OsStr,
+        cache: bool,
+    ) -> Option<PathBuf> {
         let parts: Vec<Component> = dir.components().collect();
         for cut in (1..parts.len()).rev() {
             let head: PathBuf = parts[..cut].iter().collect();
-            let Some(mut out) = self.canonical_dir(&head) else {
+            let Some(mut out) = self.canonical_dir(&head, cache) else {
                 continue;
             };
             let mut first_missing = None;

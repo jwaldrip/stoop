@@ -28,6 +28,28 @@ pub struct FileStat {
     pub mode: u32,
 }
 
+/// Descriptor metadata from the same read that produced a prior's content digest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BoundRead {
+    pub before: FileStat,
+    pub after: FileStat,
+    pub bytes: u64,
+}
+
+pub fn matches_prior(seen: &Seen, bound: &BoundRead, digest: &str) -> bool {
+    let Seen::File(first, read_hash) = seen else {
+        return false;
+    };
+    bound.before == *first
+        && bound.after == *first
+        && bound.bytes == first.size
+        && match read_hash {
+            ReadHash::NotNeeded => true,
+            ReadHash::Hashed(read_digest) => read_digest == digest,
+            ReadHash::StatOnly => false,
+        }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirSeen {
     pub dev: u64,
@@ -563,6 +585,60 @@ mod tests {
                 hash: "other".into()
             },
             None
+        ));
+    }
+
+    #[test]
+    fn bound_prior_requires_stable_stats_length_and_the_racy_read_digest() {
+        let first = stat();
+        let bound = BoundRead {
+            before: first,
+            after: first,
+            bytes: first.size,
+        };
+        assert!(matches_prior(
+            &Seen::File(first, ReadHash::NotNeeded),
+            &bound,
+            "new"
+        ));
+        assert!(matches_prior(
+            &Seen::File(first, ReadHash::Hashed("same".into())),
+            &bound,
+            "same"
+        ));
+        assert!(!matches_prior(
+            &Seen::File(first, ReadHash::Hashed("old".into())),
+            &bound,
+            "new"
+        ));
+        assert!(!matches_prior(
+            &Seen::File(first, ReadHash::StatOnly),
+            &bound,
+            "new"
+        ));
+        assert!(!matches_prior(
+            &Seen::File(first, ReadHash::NotNeeded),
+            &BoundRead { bytes: 2, ..bound },
+            "new"
+        ));
+        assert!(!matches_prior(
+            &Seen::File(first, ReadHash::NotNeeded),
+            &BoundRead {
+                after: FileStat {
+                    ctime_ns: NOW + 1,
+                    ..first
+                },
+                ..bound
+            },
+            "new"
+        ));
+        assert!(!matches_prior(
+            &Seen::File(first, ReadHash::NotNeeded),
+            &BoundRead {
+                before: FileStat { ino: 99, ..first },
+                ..bound
+            },
+            "new"
         ));
     }
 

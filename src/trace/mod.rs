@@ -83,6 +83,13 @@ pub struct ExecEvent {
     pub cwd: PathBuf,
 }
 
+/// A replacement source verified at rename entry and at the successful destination landing.
+#[derive(Clone, Debug)]
+pub struct AtomicLanding {
+    pub stat: identity::FileStat,
+    pub hash: String,
+}
+
 #[derive(Default)]
 pub struct Trace {
     /// Every path the process tree looked at, lexically resolved.
@@ -96,6 +103,8 @@ pub struct Trace {
     /// Paths and inodes that the run may have modified.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub footprint: identity::Footprint,
+    /// Transient verified atomic replacements, keyed by the destination's existing proof key.
+    pub atomic_landings: BTreeMap<String, AtomicLanding>,
     /// Repository symlinks whose targets passed through a proc magic link at entry.
     pub magic_links: HashSet<PathBuf>,
     /// Paths the run wrote, renamed, removed or created, as the run named them.
