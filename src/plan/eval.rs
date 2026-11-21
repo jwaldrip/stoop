@@ -743,6 +743,34 @@ fn evaluate(
         erased: BTreeSet::new(),
     };
     for ((index, _, _), proof) in steps.iter().zip(&proofs) {
+        let output_paths: BTreeSet<&str> =
+            proof.outputs.iter().map(|out| out.path.as_str()).collect();
+        let mut pair_priors: BTreeMap<&str, Option<&Input>> = BTreeMap::new();
+        if let Some(priors) = &proof.priors {
+            for prior in priors {
+                if output_paths.contains(prior.path.as_str()) {
+                    match pair_priors.entry(prior.path.as_str()) {
+                        std::collections::btree_map::Entry::Vacant(entry) => {
+                            entry.insert(Some(prior));
+                        }
+                        std::collections::btree_map::Entry::Occupied(mut entry) => {
+                            entry.insert(None);
+                        }
+                    }
+                }
+            }
+        }
+        let mut pair_answers: BTreeMap<&str, Answer> = BTreeMap::new();
+        let mut pending_input: Option<(Decision, &Input)> = None;
+        macro_rules! stop {
+            ($result:expr) => {
+                return if let Some((miss, _)) = pending_input.take() {
+                    miss
+                } else {
+                    $result
+                }
+            };
+        }
         for input in &proof.inputs {
             if input.path.contains('\u{fffd}')
                 || input.path.chars().any(char::is_control)
@@ -753,10 +781,10 @@ fn evaluate(
                     || input.id.starts_with("f:")
                     || input.id.starts_with("x:"))
             {
-                return decision(
+                stop!(decision(
                     Code::Unplannable,
                     format!("step {index}: unsupported input {}", input.path),
-                );
+                ));
             }
             evidence.inputs += 1;
             if Path::new(&input.path).is_absolute() {
@@ -764,27 +792,38 @@ fn evaluate(
                     || ctx.event_path.as_deref() == Some(&input.path)
                 {
                     if ctx.event.as_deref() != Some(input.id.as_str()) {
-                        return decision(
+                        stop!(decision(
                             Code::InputChanged,
                             format!("step {index}: event payload changed"),
-                        );
+                        ));
                     }
                 } else {
                     evidence.assumed_outside += 1;
                 }
                 continue;
             }
+            let exact_pair = pair_priors
+                .get(input.path.as_str())
+                .and_then(|prior| *prior)
+                .is_some_and(|prior| prior == input)
+                && valid_path(&input.path)
+                && input.path != "."
+                && input
+                    .id
+                    .strip_prefix("f:")
+                    .or_else(|| input.id.strip_prefix("x:"))
+                    .is_some_and(|hash| lower_hex(hash, 64));
             let answer = match tree.compare(input, shortcut) {
                 Ok(answer) => answer,
                 Err(err) => {
-                    return decision(
+                    stop!(decision(
                         if err.starts_with("git:") {
                             Code::Error
                         } else {
                             Code::Unplannable
                         },
                         format!("step {index}: {}: {err}", input.path),
-                    )
+                    ));
                 }
             };
             if tree.overlay_affects(&input.path) {
@@ -792,7 +831,7 @@ fn evaluate(
             } else {
                 count(evidence, notes, explain, *index, &input.path, &answer);
             }
-            let actual = answer.id;
+            let actual = answer.id.as_str();
             if actual != input.id {
                 let why = if actual == "a" {
                     "removed"
@@ -811,7 +850,15 @@ fn evaluate(
                 result
                     .mismatches
                     .push((*index, input.path.clone(), why.into()));
-                return result;
+                if exact_pair && pending_input.is_none() {
+                    pending_input = Some((result, input));
+                    pair_answers.insert(input.path.as_str(), answer);
+                    continue;
+                }
+                stop!(result);
+            }
+            if exact_pair {
+                pair_answers.insert(input.path.as_str(), answer);
             }
         }
         // The recorder left these names out, so the planner checks no value for them. A name in
@@ -821,10 +868,10 @@ fn evaluate(
             .iter()
             .find(|name| proof.env.contains_key(*name))
         {
-            return decision(
+            stop!(decision(
                 Code::Unplannable,
                 format!("step {index}: {name} is both counted and excluded in its proof"),
-            );
+            ));
         }
         // A learned name is excluded only while its value looks like an identifier now. The planner
         // cannot see that value, so it cannot replay the exclusion.
@@ -832,12 +879,12 @@ fn evaluate(
             crate::volatile::curated_reason(name.as_str(), &crate::volatile::all_markers())
                 .is_none()
         }) {
-            return decision(
+            stop!(decision(
                 Code::Unplannable,
                 format!(
                     "step {index}: {name} was learned, so the planner cannot check its exclusion"
                 ),
-            );
+            ));
         }
         for (name, hash) in &proof.env {
             if known_github(name) {
@@ -847,17 +894,20 @@ fn evaluate(
                     ctx.github_vars.get(name).map(String::as_str).unwrap_or("")
                 };
                 if &crate::run::env_hash(name, value, ctx.salt.as_deref()) != hash {
-                    return decision(
+                    stop!(decision(
                         Code::EnvChanged,
                         format!("step {index}: {name} changed or unavailable"),
-                    );
+                    ));
                 }
             } else {
                 assumed_env.insert(name.clone());
             }
         }
         if let Some(reason) = proof.unplannable.first() {
-            return decision(Code::Unplannable, format!("step {index}: {reason}"));
+            stop!(decision(
+                Code::Unplannable,
+                format!("step {index}: {reason}")
+            ));
         }
         if proof.priors.is_none() && (!proof.outputs.is_empty() || !proof.removed.is_empty()) {
             let path = proof
@@ -866,10 +916,10 @@ fn evaluate(
                 .map(|p| p.path.as_str())
                 .or_else(|| proof.removed.first().map(String::as_str))
                 .unwrap();
-            return decision(
+            stop!(decision(
                 Code::Unplannable,
                 format!("recorded without prior states, and it wrote {path}"),
-            );
+            ));
         }
         for out in &proof.outputs {
             if !valid_path(&out.path)
@@ -880,24 +930,22 @@ fn evaluate(
                     || out.id.starts_with("l:")
                     || out.id.starts_with("dl:"))
             {
-                return decision(
+                stop!(decision(
                     Code::Unplannable,
                     format!("step {index}: invalid output {}", out.path),
-                );
+                ));
             }
         }
         for path in &proof.removed {
             if !valid_path(path) || path == "." {
-                return decision(
+                stop!(decision(
                     Code::Unplannable,
                     format!("step {index}: invalid removal {path}"),
-                );
+                ));
             }
         }
         if let Some(priors) = &proof.priors {
             let prior_paths: BTreeSet<&str> = priors.iter().map(|p| p.path.as_str()).collect();
-            let output_paths: BTreeSet<&str> =
-                proof.outputs.iter().map(|p| p.path.as_str()).collect();
             let changed_paths: BTreeSet<&str> = proof
                 .outputs
                 .iter()
@@ -911,10 +959,10 @@ fn evaluate(
                 .chain(proof.removed.iter())
             {
                 if !prior_paths.contains(path.as_str()) {
-                    return decision(
+                    stop!(decision(
                         Code::Unplannable,
                         format!("output {path} has no prior state"),
-                    );
+                    ));
                 }
             }
             for prior in priors {
@@ -929,25 +977,31 @@ fn evaluate(
                         let why = format!("parent of {} is not a directory", prior.path);
                         let mut result = decision(Code::PriorChanged, why.clone());
                         result.mismatches.push((*index, prior.path.clone(), why));
-                        return result;
+                        stop!(result);
                     }
                 }
                 evidence.priors += 1;
-                let answer = match tree.compare(prior, shortcut) {
-                    Ok(answer) => answer,
-                    Err(err) => {
-                        return decision(
-                            if err.starts_with("git:") {
-                                Code::Error
-                            } else {
-                                Code::Unplannable
-                            },
-                            err,
-                        )
-                    }
+                let compared;
+                let answer = if let Some(answer) = pair_answers.get(prior.path.as_str()) {
+                    answer
+                } else {
+                    compared = match tree.compare(prior, shortcut) {
+                        Ok(answer) => answer,
+                        Err(err) => {
+                            stop!(decision(
+                                if err.starts_with("git:") {
+                                    Code::Error
+                                } else {
+                                    Code::Unplannable
+                                },
+                                err,
+                            ));
+                        }
+                    };
+                    &compared
                 };
-                count(evidence, notes, explain, *index, &prior.path, &answer);
-                let actual = answer.id;
+                count(evidence, notes, explain, *index, &prior.path, answer);
+                let actual = answer.id.as_str();
                 let expected = prior.id.as_str();
                 let actual_kind = if actual == "a" {
                     "absent"
@@ -971,14 +1025,17 @@ fn evaluate(
                 {
                     "file"
                 } else {
-                    return decision(Code::Unplannable, format!("invalid prior {}", prior.path));
+                    stop!(decision(
+                        Code::Unplannable,
+                        format!("invalid prior {}", prior.path)
+                    ));
                 };
                 let exec = |id: &str| id == "xk" || id.starts_with("x:");
                 let why = if actual_kind != prior_kind {
                     Some(format!("prior {prior_kind} now {actual_kind}"))
                 } else if prior_kind == "link" && actual != expected {
                     Some("prior link target changed".into())
-                } else if prior_kind == "file" && exec(&actual) != exec(expected) {
+                } else if prior_kind == "file" && exec(actual) != exec(expected) {
                     Some("prior exec bit changed".into())
                 } else if prior_kind == "file"
                     && expected != "fk"
@@ -992,14 +1049,20 @@ fn evaluate(
                 if let Some(why) = why {
                     let mut result = decision(Code::PriorChanged, format!("{}: {why}", prior.path));
                     result.mismatches.push((*index, prior.path.clone(), why));
-                    return result;
+                    if pending_input
+                        .as_ref()
+                        .is_some_and(|(_, input)| *input == prior)
+                    {
+                        return result;
+                    }
+                    stop!(result);
                 }
                 if expected == "d" {
                     if tree.tree.has_non_utf8_below(&prior.path) {
-                        return decision(
+                        stop!(decision(
                             Code::Unplannable,
                             format!("{} contains a non-UTF-8 entry", prior.path),
-                        );
+                        ));
                     }
                     let prefix = format!("{}/", prior.path);
                     let mut children = tree.tree.below(&prior.path);
@@ -1015,18 +1078,21 @@ fn evaluate(
                         match tree.state(&child) {
                             Ok(State::Absent) => continue,
                             Ok(_) => {}
-                            Err(err) => return decision(Code::Unplannable, err),
+                            Err(err) => stop!(decision(Code::Unplannable, err)),
                         }
                         if !prior_paths.contains(child.as_str()) {
                             let why = "entry the run never saw".to_string();
                             let mut result =
                                 decision(Code::PriorChanged, format!("{child}: {why}"));
                             result.mismatches.push((*index, child, why));
-                            return result;
+                            stop!(result);
                         }
                     }
                 }
             }
+        }
+        if let Some((miss, _)) = pending_input {
+            return miss;
         }
         for out in &proof.outputs {
             if out.id != "d" && !out.id.starts_with("dl:") {
@@ -2085,15 +2151,15 @@ mod tests {
                 step.inputs.push(prior);
                 duplicate.push(step);
 
-                let original_steps = save_record(&f, "original", original);
-                let duplicate_steps = save_record(&f, "duplicate", duplicate);
+                let original_steps = save_record(&f, "job-original", original);
+                let duplicate_steps = save_record(&f, "job-duplicate", duplicate);
                 let original_spec = JobSpec {
-                    key: Some("original".into()),
+                    key: Some("job-original".into()),
                     steps: original_steps,
                     ..f.spec.clone()
                 };
                 let duplicate_spec = JobSpec {
-                    key: Some("duplicate".into()),
+                    key: Some("job-duplicate".into()),
                     steps: duplicate_steps,
                     ..f.spec.clone()
                 };
