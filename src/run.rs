@@ -1034,16 +1034,18 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 .flatten()
                 .chain(&hook.environment_placeholders)
                 .find_map(|placeholder| placeholder.filter.as_ref());
-            let ignore = Ignore::new(&o.ignore, Some(&root.join(".stoopignore")), &o.transient);
-            eprintln!(
-                "{}",
-                units::universe::explain(
-                    &root,
-                    &ignore,
-                    inline,
-                    configured.as_ref().map(|(filter, id)| (filter, *id)),
-                )
-            );
+            match units::universe::catalog_ignore(&root, &o.ignore, &o.transient) {
+                Ok(ignore) => eprintln!(
+                    "{}",
+                    units::universe::explain(
+                        &root,
+                        &ignore,
+                        inline,
+                        configured.as_ref().map(|(filter, id)| (filter, *id)),
+                    )
+                ),
+                Err(reason) => eprintln!("stoop: no unit universe: {}", units::hook::safe(&reason)),
+            }
         }
     }
     if !trace::supported() {

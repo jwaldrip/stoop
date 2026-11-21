@@ -726,13 +726,19 @@ impl ParsedHook {
         for filter in placeholders
             .iter()
             .flatten()
-            .chain(&environment_placeholders)
             .filter_map(|p| p.filter.as_ref())
         {
             if inline.is_some_and(|prior| prior != filter) {
                 return Err("two different unit filters in one command".into());
             }
             inline = Some(filter);
+        }
+        if environment_placeholders
+            .iter()
+            .filter_map(|p| p.filter.as_ref())
+            .any(Filter::exclusion_only)
+        {
+            return Err("an exclusion-only filter needs a default unit universe".into());
         }
         if inline.is_some_and(Filter::exclusion_only) && !has_default_universe {
             return Err("an exclusion-only filter needs a default unit universe".into());

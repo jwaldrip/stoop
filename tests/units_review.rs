@@ -87,15 +87,35 @@ fn bounded(mut command: Command) -> Output {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let drain = |mut reader: Box<dyn std::io::Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            bytes
+        })
+    };
+    let stdout = drain(Box::new(stdout));
+    let stderr = drain(Box::new(stderr));
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if child.try_wait().unwrap().is_some() {
-            return child.wait_with_output().unwrap();
+        if let Some(status) = child.try_wait().unwrap() {
+            return Output {
+                status,
+                stdout: stdout.join().unwrap(),
+                stderr: stderr.join().unwrap(),
+            };
         }
         if Instant::now() >= deadline {
             child.kill().unwrap();
-            let out = child.wait_with_output().unwrap();
-            panic!("explain blocked: {}", String::from_utf8_lossy(&out.stderr));
+            let status = child.wait().unwrap();
+            let _ = stdout.join().unwrap();
+            let stderr = stderr.join().unwrap();
+            panic!(
+                "explain blocked ({status}): {}",
+                String::from_utf8_lossy(&stderr)
+            );
         }
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -185,9 +205,29 @@ fn excessive_filter_length_and_pattern_count_leave_the_universe_unknown() {
     for pattern in ["a".repeat(65_537), format!("{}a", "a|".repeat(2048))] {
         let f = Fixture::new();
         f.file("a.t", b"");
-        let out = f.explain(&format!("{{changed:{pattern}}}"));
+        let placeholder = format!("{{changed:{pattern}}}");
+        let out = f.explain(&placeholder);
         unknown(&out);
+        let run = f
+            .command("run", &["/bin/echo", &placeholder])
+            .env("STOOP_OFF", "1")
+            .output()
+            .unwrap();
+        assert!(run.status.success(), "{}", err(&run));
+        assert_eq!(run.stdout, b"\n");
     }
+}
+
+#[test]
+fn overlong_exclusion_only_filter_keeps_the_legacy_refusal() {
+    let f = Fixture::new();
+    let placeholder = format!("{{changed:!{}}}", "a".repeat(65_537));
+    let run = f
+        .command("run", &["/bin/echo", &placeholder])
+        .env("STOOP_OFF", "1")
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(2), "{}", err(&run));
 }
 
 #[test]

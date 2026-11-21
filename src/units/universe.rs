@@ -20,14 +20,11 @@ pub(crate) struct UnitId(pub String);
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Reuse {
-    Listings,
     RerunInventory,
 }
 
-/// Directory listings alone cannot validate eligibility when `.stoopignore` is present, or
-/// when Git is consulted. The Git index, nested `.gitignore`, `.git/info/exclude`, global
-/// excludes, `core.excludesFile`, and Git configuration can change without changing any
-/// walked listing. `RerunInventory` requires a fresh walk and, if Git was used, fresh Git inventories.
+/// Directory listings do not capture entry types or ignore-rule and Git state changes.
+/// A catalog must be rediscovered before reuse.
 #[allow(dead_code)]
 pub(crate) struct Catalog {
     pub units: Vec<UnitId>,
@@ -38,6 +35,7 @@ pub(crate) struct Catalog {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 struct GitInventory {
     files: HashSet<String>,
+    ignored_files: HashSet<String>,
     ignored_dirs: HashSet<String>,
     prefix: String,
 }
@@ -92,10 +90,10 @@ impl GitInventory {
             .filter(|path| path.ends_with('/'))
             .map(|path| path[..path.len() - 1].to_owned())
             .collect();
-        let ignored_files: HashSet<&str> = ignored
+        let ignored_files: HashSet<String> = ignored
             .iter()
             .filter(|path| !path.ends_with('/'))
-            .map(String::as_str)
+            .cloned()
             .collect();
         for file in &files {
             if ignored_files.contains(file.as_str())
@@ -124,16 +122,24 @@ impl GitInventory {
         };
         Ok(Self {
             files,
+            ignored_files,
             ignored_dirs,
             prefix,
         })
     }
 
-    fn includes(&self, path: &str) -> bool {
-        if self.prefix.is_empty() {
-            self.files.contains(path)
+    fn classify(&self, path: &str) -> Result<bool, String> {
+        let full = if self.prefix.is_empty() {
+            std::borrow::Cow::Borrowed(path)
         } else {
-            self.files.contains(&format!("{}{path}", self.prefix))
+            std::borrow::Cow::Owned(format!("{}{path}", self.prefix))
+        };
+        if self.files.contains(full.as_ref()) {
+            Ok(true)
+        } else if self.ignored_files.contains(full.as_ref()) || self.prunes(path) {
+            Ok(false)
+        } else {
+            Err("Git inventory cannot classify a walked file".into())
         }
     }
 
@@ -190,6 +196,11 @@ fn inventory(root: &Path) -> Result<Option<GitInventory>, String> {
         crate::gitprobe::unit_files(repo).ok_or("Git unit inventory failed or exceeded 64 MiB")?;
     let ignored = crate::gitprobe::ignored_unit_dirs(repo)
         .ok_or("Git ignored-directory inventory failed or exceeded 64 MiB")?;
+    let confirmed =
+        crate::gitprobe::unit_files(repo).ok_or("Git unit inventory failed or exceeded 64 MiB")?;
+    if files != confirmed {
+        return Err("Git unit inventory changed during discovery".into());
+    }
     GitInventory::from_outputs(root, repo, &files, &ignored).map(Some)
 }
 
@@ -360,6 +371,63 @@ fn open_root(root: &Path) -> Result<std::fs::File, String> {
     Ok(dir)
 }
 
+/// Read the catalog's ignore file through the root descriptor without following links.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn catalog_ignore(
+    root: &Path,
+    extra: &[String],
+    transient: &[String],
+) -> Result<Ignore, String> {
+    use std::io::Read;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    const LIMIT: u64 = 1024 * 1024;
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("cannot read root: {error}"))?;
+    let directory = open_root(&root)?;
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".stoopignore".as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::NotFound {
+            return Ok(Ignore::new(extra, None, transient));
+        }
+        return Err(format!("cannot safely open .stoopignore: {error}"));
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect .stoopignore: {error}"))?;
+    if !metadata.is_file() || metadata.len() > LIMIT {
+        return Err(".stoopignore is not a regular file within the size limit".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read .stoopignore: {error}"))?;
+    if bytes.len() as u64 > LIMIT {
+        return Err(".stoopignore exceeds the size limit".into());
+    }
+    let text = std::str::from_utf8(&bytes).map_err(|_| ".stoopignore is not UTF-8")?;
+    let mut patterns: Vec<String> = text.lines().map(str::to_owned).collect();
+    patterns.extend_from_slice(extra);
+    Ok(Ignore::new(&patterns, None, transient))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub(crate) fn catalog_ignore(
+    _root: &Path,
+    _extra: &[String],
+    _transient: &[String],
+) -> Result<Ignore, String> {
+    Err("unit universe is not available on this platform".into())
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn directory_names(dir: &std::fs::File) -> Result<Vec<Vec<u8>>, String> {
     use std::ffi::CStr;
@@ -452,23 +520,26 @@ fn discover_with_hook<F: FnMut(&str)>(
     max_dirs: usize,
     before_open: &mut F,
 ) -> Result<Catalog, String> {
+    filter.validate()?;
+    let starts_excluded = filter.starts_with_exclusion();
+    if starts_excluded {
+        if let Some(base) = default.filter(|base| !std::ptr::eq(*base, filter)) {
+            base.validate()?;
+        }
+    }
     let root = root
         .canonicalize()
         .map_err(|error| format!("cannot read root: {error}"))?;
     let git = inventory(&root)?;
+    let mut match_budget = super::filter::MATCH_WORK_BUDGET;
     if max_dirs == 0 {
         return Err("more than 0 walked directories".into());
     }
     let mut stack = vec![Directory::new(open_root(&root)?, String::new())?];
-    let mut needs_inventory = git.is_some();
-    let exclusion_only = filter.exclusion_only();
     let mut visited = 1;
     let mut units = Vec::new();
     let mut inputs = Vec::new();
     while let Some(directory) = stack.last_mut() {
-        if directory.next == 0 && directory.names.iter().any(|name| name == b".stoopignore") {
-            needs_inventory = true;
-        }
         if directory.next == directory.names.len() {
             let mut after = directory_names(&directory.file)?;
             if input::list_hash_of_names(&mut after) != directory.listing {
@@ -516,18 +587,25 @@ fn discover_with_hook<F: FnMut(&str)>(
             stack.push(Directory::new(child_dir, child)?);
             visited += 1;
         } else if mode == libc::S_IFREG {
-            if git.as_ref().is_some_and(|git| !git.includes(&child)) {
-                continue;
+            if let Some(git) = &git {
+                if !git.classify(&child)? {
+                    continue;
+                }
             }
             if child.len() > 4096 {
                 return Err("a unit path cannot be represented".into());
             }
-            let matches = if exclusion_only {
-                default.is_some_and(|base| base.matches(&child, false))
-                    && filter.matches(&child, false)
+            let initial = if starts_excluded {
+                match default {
+                    Some(base) if !std::ptr::eq(base, filter) => {
+                        base.matches_counted(&child, false, true, &mut match_budget)?
+                    }
+                    _ => true,
+                }
             } else {
-                filter.matches(&child, false)
+                false
             };
+            let matches = filter.matches_counted(&child, false, initial, &mut match_budget)?;
             if !matches {
                 continue;
             }
@@ -544,11 +622,7 @@ fn discover_with_hook<F: FnMut(&str)>(
     }
     units.sort();
     inputs.sort_by(|a, b| a.path.cmp(&b.path));
-    let reuse = if needs_inventory {
-        Reuse::RerunInventory
-    } else {
-        Reuse::Listings
-    };
+    let reuse = Reuse::RerunInventory;
     Ok(Catalog {
         units,
         inputs,
@@ -696,7 +770,7 @@ mod tests {
         let ignore = Ignore::new(&[], None, &[]);
         let filter = Filter::inline("**/*.t");
         let plain = discover(&dir.0, &ignore, &filter, None).unwrap();
-        assert_eq!(plain.reuse, Reuse::Listings);
+        assert_eq!(plain.reuse, Reuse::RerunInventory);
         fs::write(dir.0.join(".stoopignore"), b"ignored.t\n").unwrap();
         let with_ignore = discover(&dir.0, &ignore, &filter, None).unwrap();
         assert_eq!(with_ignore.reuse, Reuse::RerunInventory);
