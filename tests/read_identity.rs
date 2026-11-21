@@ -1533,7 +1533,7 @@ fn an_inode_metadata_attempt_before_rename_keeps_legacy_recording() {
     let case = Case::new("atomic-inode-footprint");
     case.file("f", b"original\n");
     age();
-    let script = "exec python3 -c 'import os; fd = os.open(\"f\", os.O_RDONLY); os.fchown(fd, -1, -1); os.close(fd); open(\"f\").read(); open(\"tmp\", \"w\").write(\"done\\n\"); os.replace(\"tmp\", \"f\")'";
+    let script = "exec python3 -c 'import os; fd = os.open(\"f\", os.O_PATH); exec(\"try:\\n os.fchown(fd, -1, -1)\\nexcept OSError:\\n pass\"); os.close(fd); open(\"f\").read(); open(\"tmp\", \"w\").write(\"done\\n\"); os.replace(\"tmp\", \"f\")'";
     let out = run(&case, "atomic-inode-footprint", script, &[]);
     assert_recorded(&out, &case, "atomic-inode-footprint");
     let stored = proof(&case, "atomic-inode-footprint");

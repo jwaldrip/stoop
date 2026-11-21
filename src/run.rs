@@ -1498,6 +1498,11 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     }
 }
 
+fn landing_matches(landing: &trace::AtomicLanding, post: &trace::identity::Post) -> bool {
+    matches!(post, trace::identity::Post::File { stat, hash }
+        if *stat == landing.stat && *hash == landing.hash)
+}
+
 /// What the run left behind inside the repository, read once it finished: one entry for each
 /// in-scope path it wrote. Still there is an output. Gone again is removed, and the planner
 /// removes it with the step. Unreadable or special is a reason the planner cannot replay.
@@ -1517,10 +1522,10 @@ fn build_outputs(
     for (key, (id, post)) in keys.into_iter().zip(ids) {
         if !trace.footprint.unknown
             && !trace::identity::link_route_unknown(&trace.footprint)
-            && trace.atomic_landings.get(key).is_some_and(|landing| {
-                matches!(&post, trace::identity::Post::File { stat, hash }
-                    if *stat == landing.stat && *hash == landing.hash)
-            })
+            && trace
+                .atomic_landings
+                .get(key)
+                .is_some_and(|landing| landing_matches(landing, &post))
         {
             verified.push(key.clone());
         }
@@ -2502,6 +2507,44 @@ mod read_identity_tests {
     use super::*;
     use crate::trace::identity::{Observation, Post, Seen, Skip};
     use std::collections::HashMap;
+
+    #[test]
+    fn atomic_landing_needs_the_exit_stat_and_the_source_digest() {
+        let stat = crate::trace::identity::FileStat {
+            dev: 1,
+            ino: 2,
+            size: 3,
+            mtime_ns: 4,
+            ctime_ns: 5,
+            mode: 0o100644,
+        };
+        let landing = trace::AtomicLanding {
+            stat,
+            hash: "source".into(),
+        };
+        assert!(landing_matches(
+            &landing,
+            &Post::File {
+                stat,
+                hash: "source".into()
+            }
+        ));
+        assert!(!landing_matches(
+            &landing,
+            &Post::File {
+                stat,
+                hash: "other".into()
+            }
+        ));
+        assert!(!landing_matches(
+            &landing,
+            &Post::File {
+                stat: crate::trace::identity::FileStat { ino: 9, ..stat },
+                hash: "source".into(),
+            }
+        ));
+        assert!(!landing_matches(&landing, &Post::FileStat(stat)));
+    }
 
     #[test]
     fn synthetic_missing_and_unknown_observations_keep_v9_outcomes() {
