@@ -12,7 +12,7 @@
 <p>and every path it created, rewrote, renamed, removed or changed the mode of inside the repository.</p>
 
 <h2 id="proof">The proof</h2>
-<p>For eligible input candidates, stoop compares the first observed identity with the state after exit before saving that proof. If it changed, the run is not recorded. A timestamp, xattr or bind-alias change made by the command can make stoop refuse to record. Paths affected by the command's own write footprint and other unprovable routes retain the earlier recorder behavior; the <a href="blind-spots.html#mid-run-edits">limits</a> matter. Threads that share a working directory or descriptor table can redirect a path between stoop's look and the kernel's lookup, and an outside edit to that path can then still be recorded, as it was before this check.</p>
+<p>For eligible input candidates, stoop compares the first observed identity with the state after exit before saving that proof. If it changed, the run is not recorded. A timestamp, xattr or bind-alias change made by the command can make stoop refuse to record. Paths affected by the command's own write footprint and other unprovable routes retain the earlier recorder behavior; the <a href="blind-spots.html#mid-run-edits">limits</a> matter. Threads that share a working directory or descriptor table can redirect a path between stoop's look and the kernel's lookup. A raced call can be attributed to a file it did not affect, so an outside edit to that file can be recorded even if its earlier read route was observed correctly.</p>
 <p>When the command exits 0, stoop writes a proof: a JSON file under <code>.stoop/proofs/</code> holding</p>
 <table>
   <thead><tr><th>Part</th><th>What is stored</th></tr></thead>

@@ -142,7 +142,7 @@ Always single-quote the placeholder. Stoop refuses the shell-mangled forms befor
 | External state you can check | `--probe CMD`: its output must match for a skip |
 | What the run wrote in the repository | Must still be in place for a skip; throwaway output goes in `.stoopignore` |
 
-Before saving a proof, stoop also checks eligible inputs for changes during the run. Paths that overlap the command's own writes or lack a reliable physical route keep the earlier behavior. A timestamp, xattr or bind-alias change made by the command can make stoop refuse to record. Threads that share a working directory or descriptor table can redirect a path during a call, and an outside edit to that path can then still be recorded, as before the check. [Read the limits](https://stoop.build/docs/blind-spots.html#mid-run-edits).
+Before saving a proof, stoop also checks eligible inputs for changes during the run. Paths that overlap the command's own writes or lack a reliable physical route keep the earlier behavior. A timestamp, xattr or bind-alias change made by the command can make stoop refuse to record. Threads that share a working directory or descriptor table can redirect a path during a call. A raced call can be attributed to a file it did not affect, so an outside edit to that file can be recorded even if its earlier read route was observed correctly. [Read the limits](https://stoop.build/docs/blind-spots.html#mid-run-edits).
 
 stoop sees files. It can't see:
 
