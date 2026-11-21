@@ -18,7 +18,7 @@ use crate::pathutil::{absolutize, to_key, without_dots, Physical};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, BufRead, Read};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -39,6 +39,10 @@ const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const NT_PRSTATUS: usize = 1;
 const AT_FDCWD: i32 = -100;
 const PATH_MAX: usize = 4096;
+/// The initial PID namespace inode, from Linux `include/linux/proc_ns.h`.
+const PROC_PID_INIT_INO: u64 = 0xEFFF_FFFC;
+/// Bound work and memory while the tracee is stopped at rename entry.
+const LOCK_TABLE_CAP: u64 = 1 << 20;
 
 /// Linux ABI flags, the same on every architecture.
 const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
@@ -655,6 +659,8 @@ struct Tracer<'a> {
     confirmed_reads: HashMap<PathBuf, Seen>,
     landing_inodes: HashMap<(u64, u64), String>,
     shared_context: bool,
+    /// The lock table is complete only in the initial PID namespace.
+    initial_pid_namespace: bool,
     live_tasks: HashSet<i32>,
     syscall: i64,
     allow_network: bool,
@@ -728,6 +734,8 @@ pub fn run<'a>(
         pending_witness: HashMap::new(),
         confirmed_reads: HashMap::new(),
         landing_inodes: HashMap::new(),
+        initial_pid_namespace: scope.is_some()
+            && is_initial_pid_namespace(fs::read_link("/proc/self/ns/pid")),
         shared_context: false,
         live_tasks: HashSet::from([pid]),
         syscall: 0,
@@ -2092,6 +2100,18 @@ fn plain_route(real: &Path, lexical: &Path) -> bool {
     true
 }
 
+fn is_initial_pid_namespace(link: io::Result<PathBuf>) -> bool {
+    let Ok(link) = link else {
+        return false;
+    };
+    link.to_str()
+        .and_then(|name| name.strip_prefix("pid:["))
+        .and_then(|name| name.strip_suffix(']'))
+        .filter(|number| number.len() == 10)
+        .and_then(|number| number.parse::<u64>().ok())
+        == Some(PROC_PID_INIT_INO)
+}
+
 #[cfg(test)]
 thread_local! {
     static LOCK_TABLE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
@@ -2105,33 +2125,45 @@ fn lock_table_lists(stat: &identity::FileStat) -> bool {
     lock_table_lists_from(fs::File::open("/proc/locks"), stat)
 }
 
-fn lock_table_lists_from<R: io::Read>(table: io::Result<R>, stat: &identity::FileStat) -> bool {
-    let Ok(mut table) = table else {
+fn lock_table_lists_from<R: Read>(table: io::Result<R>, stat: &identity::FileStat) -> bool {
+    let Ok(table) = table else {
         return true;
     };
-    let mut text = String::new();
-    if table.read_to_string(&mut text).is_err() {
-        return true;
-    }
-    let (major, minor) = dev_numbers(stat.dev);
-    text.split_whitespace().any(|field| {
-        let mut parts = field.split(':');
-        match (parts.next(), parts.next(), parts.next(), parts.next()) {
-            (Some(maj), Some(min), Some(ino), None) => {
-                u64::from_str_radix(maj, 16).ok() == Some(major)
-                    && u64::from_str_radix(min, 16).ok() == Some(minor)
-                    && ino.parse::<u64>().ok() == Some(stat.ino)
-            }
-            _ => false,
+    let mut reader = io::BufReader::new(table.take(LOCK_TABLE_CAP + 1));
+    let mut line = Vec::new();
+    let mut total = 0u64;
+    loop {
+        line.clear();
+        let read = match reader.read_until(b'\n', &mut line) {
+            Ok(read) => read,
+            Err(_) => return true,
+        };
+        if read == 0 {
+            return false;
         }
-    })
-}
-
-/// The major and minor numbers of a Linux device number, as `/proc/locks` prints them.
-fn dev_numbers(dev: u64) -> (u64, u64) {
-    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
-    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
-    (major, minor)
+        total += read as u64;
+        if total > LOCK_TABLE_CAP {
+            return true;
+        }
+        let Ok(text) = std::str::from_utf8(&line) else {
+            return true;
+        };
+        if text.split_whitespace().any(|field| {
+            let mut parts = field.split(':');
+            match (parts.next(), parts.next(), parts.next(), parts.next()) {
+                (Some(major), Some(minor), Some(ino), None) => {
+                    u64::from_str_radix(major, 16).is_ok()
+                        && u64::from_str_radix(minor, 16).is_ok()
+                        && ino.parse::<u64>().ok() == Some(stat.ino)
+                }
+                _ => false,
+            }
+        }) {
+            // Some filesystems report a different device for a lock than for stat(). A matching
+            // inode on any device is enough to keep the legacy path.
+            return true;
+        }
+    }
 }
 
 impl Tracer<'_> {
@@ -2366,6 +2398,7 @@ impl Tracer<'_> {
             b_meta,
         } = operation;
         if self.shared_context
+            || !self.initial_pid_namespace
             || self.live_tasks.len() != 1
             || flags.is_some_and(|index| args[index] != 0)
             || !plain_argument(pid, args, from.0, from.1)
@@ -2420,12 +2453,16 @@ impl Tracer<'_> {
             return None;
         }
         let source_stat = identity::file_stat(source);
-        // An open of a leased file breaks the lease, and the kernel signals its holder. The
-        // source is opened only when the lock table lists no lease or lock on its inode (P1-1).
+        let rec = self.rec.as_mut()?;
+        let used = rec.rewrite_budget.hashed;
+        if used > identity::READ_HASH_BUDGET || source_stat.size > identity::READ_HASH_BUDGET - used
+        {
+            return None;
+        }
+        // Never open a source while its inode appears in the bounded lock table.
         if lock_table_lists(&source_stat) {
             return None;
         }
-        let rec = self.rec.as_mut()?;
         let identity::ReadHash::Hashed(hash) =
             identity::hash_bound(a, &source_stat, &mut rec.rewrite_budget)
         else {
@@ -3832,6 +3869,7 @@ mod tests {
             confirmed_reads: HashMap::new(),
             landing_inodes: HashMap::new(),
             shared_context: false,
+            initial_pid_namespace: false,
             live_tasks: HashSet::new(),
             syscall: 0,
             allow_network: false,

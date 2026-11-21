@@ -61,6 +61,7 @@ fn tracer_for(rec: Rec<'_>) -> Tracer<'_> {
         confirmed_reads: HashMap::new(),
         landing_inodes: HashMap::new(),
         shared_context: false,
+        initial_pid_namespace: is_initial_pid_namespace(fs::read_link("/proc/self/ns/pid")),
         live_tasks: HashSet::new(),
         syscall: 0,
         allow_network: false,
@@ -438,4 +439,121 @@ fn a_child_pid_namespace_withholds_the_rename_witness() {
             );
         },
     );
+}
+
+#[test]
+fn initial_pid_namespace_requires_the_kernel_initial_inode() {
+    assert_eq!(PROC_PID_INIT_INO, 4_026_531_836);
+    assert!(is_initial_pid_namespace(Ok(PathBuf::from(
+        "pid:[4026531836]"
+    ))));
+    for name in [
+        "pid:[4026531837]",
+        "pid:[4026532194]",
+        "mnt:[4026531836]",
+        "pid:[4026531836]\n",
+        "pid:[0xeffffffc]",
+    ] {
+        assert!(!is_initial_pid_namespace(Ok(PathBuf::from(name))), "{name}");
+    }
+    assert!(!is_initial_pid_namespace(Err(io::Error::from(
+        io::ErrorKind::NotFound
+    ))));
+    assert!(!is_initial_pid_namespace(Err(io::Error::from(
+        io::ErrorKind::PermissionDenied
+    ))));
+}
+
+#[test]
+fn a_cached_child_namespace_never_scans_the_lock_table() {
+    with_ordinary_rename(
+        "namespace-guard",
+        |tracer, pid, args, temp, target, metas| {
+            tracer.initial_pid_namespace = false;
+            let scans = LOCK_TABLE_SCANS.with(|count| count.get());
+            let used = tracer.rec.as_ref().unwrap().rewrite_budget.hashed;
+            assert!(!rename_offered(tracer, pid, args, temp, target, metas));
+            assert_eq!(LOCK_TABLE_SCANS.with(|count| count.get()), scans);
+            assert_eq!(tracer.rec.as_ref().unwrap().rewrite_budget.hashed, used);
+
+            tracer.initial_pid_namespace = true;
+            assert!(rename_offered(tracer, pid, args, temp, target, metas));
+            assert_eq!(LOCK_TABLE_SCANS.with(|count| count.get()), scans + 1);
+        },
+    );
+}
+
+#[test]
+fn source_budget_boundary_admits_only_bytes_that_can_be_hashed() {
+    with_ordinary_rename(
+        "budget-boundary",
+        |tracer, pid, args, temp, target, metas| {
+            tracer.initial_pid_namespace = true;
+            let before = identity::READ_HASH_BUDGET - 4;
+            tracer.rec.as_mut().unwrap().rewrite_budget.hashed = before;
+            assert!(rename_offered(tracer, pid, args, temp, target, metas));
+            assert_eq!(
+                tracer.rec.as_ref().unwrap().rewrite_budget.hashed,
+                identity::READ_HASH_BUDGET
+            );
+            fs::write(temp, b"").unwrap();
+            let empty = fs::symlink_metadata(temp).unwrap();
+            assert!(rename_offered(
+                tracer,
+                pid,
+                args,
+                temp,
+                target,
+                (&empty, metas.1)
+            ));
+            tracer.rec.as_mut().unwrap().rewrite_budget.hashed = identity::READ_HASH_BUDGET + 1;
+            let scans = LOCK_TABLE_SCANS.with(|count| count.get());
+            assert!(!rename_offered(
+                tracer,
+                pid,
+                args,
+                temp,
+                target,
+                (&empty, metas.1)
+            ));
+            assert_eq!(LOCK_TABLE_SCANS.with(|count| count.get()), scans);
+        },
+    );
+}
+
+#[test]
+fn lock_table_accepts_exact_cap_and_fails_closed_on_read_errors() {
+    let stat = landing(42, 0o100644).stat;
+    let exact = vec![b' '; 1 << 20];
+    assert!(!lock_table_lists_from(Ok(io::Cursor::new(exact)), &stat));
+    assert!(lock_table_lists_from::<io::Cursor<Vec<u8>>>(
+        Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        &stat
+    ));
+    assert!(lock_table_lists_from(
+        Ok(io::Cursor::new(vec![0xff])),
+        &stat
+    ));
+    struct Broken;
+    impl Read for Broken {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("injected read error"))
+        }
+    }
+    assert!(lock_table_lists_from(Ok(Broken), &stat));
+}
+
+#[test]
+fn matching_inode_is_conservative_across_different_devices() {
+    let stat = landing(42, 0o100644).stat;
+    let different_device = b"1: LEASE ADVISORY WRITE 7 00:ff:42 0 EOF\n";
+    assert!(lock_table_lists_from(
+        Ok(io::Cursor::new(different_device)),
+        &stat
+    ));
+    let other_inode = b"1: LEASE ADVISORY WRITE 7 00:ff:43 0 EOF\n";
+    assert!(!lock_table_lists_from(
+        Ok(io::Cursor::new(other_inode)),
+        &stat
+    ));
 }
