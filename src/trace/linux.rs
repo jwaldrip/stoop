@@ -2107,6 +2107,7 @@ fn plain_route(real: &Path, lexical: &Path) -> bool {
 #[cfg(test)]
 thread_local! {
     static LOCK_TABLE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static READ_WITNESS_STOPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether the kernel's lock table lists a lock or a lease on the inode of `stat`. A table that
@@ -2231,6 +2232,13 @@ impl Tracer<'_> {
             &identity::Post::FileStat(*first),
         )
         .is_none()
+    }
+
+    fn request_read_witness(&mut self, pid: i32, candidate: ReadCandidate) {
+        #[cfg(test)]
+        READ_WITNESS_STOPS.with(|count| count.set(count.get() + 1));
+        self.pending_witness
+            .insert(pid, PendingWitness::Read(candidate));
     }
 
     fn read_candidate(
@@ -3082,8 +3090,7 @@ impl Tracer<'_> {
                 {
                     self.touch(p.clone(), true, true);
                     if let Some(candidate) = self.read_candidate(pid, args, dirfd, path, &p) {
-                        self.pending_witness
-                            .insert(pid, PendingWitness::Read(candidate));
+                        self.request_read_witness(pid, candidate);
                     }
                 } else {
                     self.touch(p, true, content);
