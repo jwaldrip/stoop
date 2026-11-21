@@ -2012,7 +2012,7 @@ fn an_unplannable_proof_is_never_reused_by_stoop_run() {
 
     let path = w.store().join("proofs/t.json");
     let mut stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    stored["proofs"][0]["unplannable"] = serde_json::json!(["test reason"]);
+    stored["proofs"][0]["unplannable"] = serde_json::json!(["it read in.txt and also wrote it"]);
     fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
     let (code, err) = w.sh(script);
     assert_eq!(code, 0, "{err}");
@@ -2020,6 +2020,16 @@ fn an_unplannable_proof_is_never_reused_by_stoop_run() {
         err.contains("stoop: run") && !err.contains("stoop: skip"),
         "{err}"
     );
+}
+
+#[test]
+fn a_directory_rename_proof_still_skips_as_in_v9() {
+    let w = Ws::new("rename-reason-skips");
+    let script = "mkdir d && mv d e && cat in.txt >/dev/null";
+    recorded(&w, script);
+    let (code, err) = w.sh(script);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("stoop: skip"), "{err}");
 }
 
 #[test]

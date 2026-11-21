@@ -1166,9 +1166,11 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         why = String::from("no proof yet");
         hit_idx = None;
         for (i, p) in proofs.iter().enumerate() {
-            // A proof with a recorded planner-unplannable reason cannot justify a skip: the change
-            // it recorded was observed, but it could not be replayed.
-            if !p.unplannable.is_empty() {
+            // A proof whose recorded reason says the run read a path it also wrote, or read a file it
+            // then removed, cannot justify a skip: the change was observed but cannot be replayed.
+            if p.unplannable.iter().any(|reason| {
+                reason.ends_with("and also wrote it") || reason.ends_with("and then removed it")
+            }) {
                 continue;
             }
             let expired = max_age > 0 && now().saturating_sub(p.created) > max_age;
