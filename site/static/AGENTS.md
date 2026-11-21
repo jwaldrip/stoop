@@ -62,7 +62,7 @@ A run that fails records no proof, so the next run runs the command again.
 
 On macOS and Windows stoop does not trace, so it never skips and never records. It prints `stoop: not traced` and runs the command. Tracing needs Linux on x86-64 or arm64.
 
-To see the decision without running anything, use `explain`. It exits 0 for a skip and 1 for a run.
+Use `explain` to see the decision without launching the command. It checks local proofs only; configured probes can run. It exits 0 for a skip and 1 for a run.
 
 ## GitHub Actions
 
@@ -76,13 +76,11 @@ defaults:
 
 Install stoop in an earlier step with the one-line installer. Pull request runs read proofs, and only the default branch should write them: set `STOOP_SYNC_WRITE` there. A fresh runner has no proofs, so either cache the `.stoop/` directory with the CI's own cache, or share proofs through the git remote with `STOOP_SYNC=git`. The recipes are at https://stoop.build/docs/ci.html.
 
-## The changed-files placeholder
+## The changed-unit placeholder
 
-Write `'{changed}'` where a test command takes test files. Always single-quote it. Unquoted, the shell expands commas, wildcards or pipes before stoop sees them, and stoop refuses the shapes it can detect with exit 2. The environment spelling `'$STOOP_CHANGED'` works the same way.
+Write `'{changed}'` where a test command accepts test files, and single-quote it. The environment spelling `'$STOOP_CHANGED'` works the same way. Stoop removes the placeholder and its owning option and runs the full command; it does not select changed test files. Ambiguous ownership is refused with exit 2. An unchanged tree can still skip through the whole-command proof. Default-branch pushes, sync writers, and configured verification runs do not skip.
 
-For now a placeholder runs the full command. Stoop removes the placeholder and its owning option under the declared or legacy 2a rules; ambiguous ownership is refused with exit 2. An unchanged tree can still skip through the whole-command proof. Default-branch pushes, sync writers, and configured verification runs do not skip.
-
-Optional `.stoop.toml` at the root declares hook suites, option arities, and `verify_every`. See https://stoop.build/docs/cli.html#configuration. It does not enable partial test execution.
+On Linux and macOS, `stoop explain -- ./test '{changed:*.t}'` counts matching files without launching the test command. It does not save per-unit proofs. The optional `.stoop.toml` supplies a default `units` filter for a matching suite; an inline filter overrides it. On Windows the unit universe is unknown. See https://stoop.build/docs/cli.html#changed-hook.
 
 ## What a skip means
 

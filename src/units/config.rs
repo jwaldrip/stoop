@@ -55,6 +55,7 @@ pub(crate) struct Suite {
     cwd: Option<String>,
     matches: Vec<String>,
     pub options: Vec<OptionDeclaration>,
+    pub units: Option<Vec<String>>,
     pub independent: Option<bool>,
 }
 
@@ -304,6 +305,7 @@ pub(crate) fn load(root: &Path) -> Result<Config, ConfigError> {
             cwd: raw.cwd,
             matches,
             options,
+            units: raw.units,
             independent: raw.independent,
         });
     }
@@ -420,7 +422,11 @@ pub(crate) fn finish(
         }
     };
     let independent_false = suite.is_some_and(|suite| suite.independent == Some(false));
-    let hook = parsed.finish(argv, suite.map_or(&[], |suite| &suite.options));
+    let hook = parsed.finish(
+        argv,
+        suite.map_or(&[], |suite| &suite.options),
+        suite.is_some_and(|suite| suite.units.is_some()),
+    );
     (
         warning,
         hook.map(|hook| Prepared {

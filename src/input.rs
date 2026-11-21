@@ -148,18 +148,23 @@ pub fn records_oids(root: &Path) -> bool {
     crate::oid_attrs::snapshot(root).is_some()
 }
 
-fn list_hash(dir: &Path) -> Option<String> {
+pub(crate) fn list_hash(dir: &Path) -> Option<String> {
     let mut names: Vec<Vec<u8>> = Vec::new();
     for e in fs::read_dir(dir).ok()? {
         names.push(e.ok()?.file_name().as_encoded_bytes().to_vec());
     }
+    Some(list_hash_of_names(&mut names))
+}
+
+/// Hash the same encoded entry names as `list_hash`, irrespective of their source.
+pub(crate) fn list_hash_of_names(names: &mut [Vec<u8>]) -> String {
     names.sort();
     let mut h = blake3::Hasher::new();
     for n in names {
         h.update(&(n.len() as u64).to_le_bytes());
-        h.update(&n);
+        h.update(n);
     }
-    Some(h.finalize().to_hex().to_string())
+    h.finalize().to_hex().to_string()
 }
 
 /// Every byte counts, whatever the file is: source, binary, archive, model weights.
@@ -651,6 +656,65 @@ mod tests {
         let before = identify(&d, true, true).unwrap();
         fs::write(d.join("b"), "").unwrap();
         assert_ne!(before, identify(&d, true, true).unwrap());
+    }
+
+    #[test]
+    fn listing_name_hash_matches_the_original_recorder_algorithm() {
+        fn original(dir: &Path) -> String {
+            let mut names: Vec<Vec<u8>> = Vec::new();
+            for entry in fs::read_dir(dir).unwrap() {
+                names.push(entry.unwrap().file_name().as_encoded_bytes().to_vec());
+            }
+            names.sort();
+            let mut h = blake3::Hasher::new();
+            for name in names {
+                h.update(&(name.len() as u64).to_le_bytes());
+                h.update(&name);
+            }
+            h.finalize().to_hex().to_string()
+        }
+        let root = tmp("list-hash-corpus");
+        for directory in ["empty", "names", "large"] {
+            fs::create_dir(root.join(directory)).unwrap();
+        }
+        for name in [".hidden", "normal", "café", "文"] {
+            fs::write(root.join("names").join(name), b"").unwrap();
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let name = std::ffi::OsString::from_vec(vec![b'n', 0xff]);
+            fs::write(root.join("names").join(name), b"").unwrap();
+        }
+        #[cfg(unix)]
+        {
+            let mut names = vec![vec![b'n', 0xff], b".hidden".to_vec()];
+            let mut reference = names.clone();
+            reference.sort();
+            let mut h = blake3::Hasher::new();
+            for name in reference {
+                h.update(&(name.len() as u64).to_le_bytes());
+                h.update(&name);
+            }
+            assert_eq!(
+                list_hash_of_names(&mut names),
+                h.finalize().to_hex().to_string()
+            );
+        }
+        for i in 0..2048 {
+            fs::write(root.join("large").join(format!("{i:04}")), b"").unwrap();
+        }
+        for directory in ["empty", "names", "large"] {
+            let path = root.join(directory);
+            let expected = original(&path);
+            let mut names: Vec<Vec<u8>> = fs::read_dir(&path)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().as_encoded_bytes().to_vec())
+                .collect();
+            assert_eq!(list_hash(&path).unwrap(), expected);
+            assert_eq!(list_hash_of_names(&mut names), expected);
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

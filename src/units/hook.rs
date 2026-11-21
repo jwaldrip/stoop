@@ -1,5 +1,6 @@
 //! Explicit changed-unit hooks. Slice 2a executes only their full-command form.
 
+use super::filter::Filter;
 use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
@@ -8,7 +9,62 @@ pub(crate) struct Hook {
     pub original: Vec<OsString>,
     pub argv: Vec<OsString>,
     pub removed: Vec<OsString>,
+    #[allow(dead_code)]
+    pub spans: Vec<Vec<(usize, usize)>>,
+    pub placeholders: Vec<Vec<Placeholder>>,
+    pub shell_env_code: bool,
     pub placeholder: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlaceholderName {
+    Changed,
+    Units,
+    Unit,
+    ChangedInputs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Base {
+    Cwd,
+    Root,
+    Abs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Join {
+    Comma,
+    Space,
+    Newline,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum FileMode {
+    File,
+    Nul,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Placeholder {
+    pub name: PlaceholderName,
+    pub filter: Option<Filter>,
+    pub base: Base,
+    pub join: Option<Join>,
+    pub file: Option<FileMode>,
+    pub each: bool,
+}
+
+impl PlaceholderName {
+    fn from_name(name: &str) -> Self {
+        match name {
+            "changed" => Self::Changed,
+            "units" => Self::Units,
+            "unit" => Self::Unit,
+            "changed-inputs" => Self::ChangedInputs,
+            _ => unreachable!(),
+        }
+    }
 }
 
 const HINT: &str = "quote it: '{changed:*.test.ts|*.spec.ts}'";
@@ -65,9 +121,17 @@ fn lossy_shadow(text: &str) -> String {
     shown
 }
 
-fn segments(suffix: &str, inputs: bool) -> Result<(), String> {
+fn segments(suffix: &str, name: PlaceholderName) -> Result<Placeholder, String> {
+    let mut placeholder = Placeholder {
+        name,
+        filter: None,
+        base: Base::Cwd,
+        join: None,
+        file: None,
+        each: false,
+    };
     if suffix.is_empty() {
-        return Ok(());
+        return Ok(placeholder);
     }
     if !suffix.starts_with(':') {
         return Err("invalid placeholder".into());
@@ -110,9 +174,21 @@ fn segments(suffix: &str, inputs: bool) -> Result<(), String> {
                 return Err("conflicting placeholder modifiers".into());
             }
             *seen = true;
+            match part {
+                "cwd" => placeholder.base = Base::Cwd,
+                "root" => placeholder.base = Base::Root,
+                "abs" => placeholder.base = Base::Abs,
+                "comma" => placeholder.join = Some(Join::Comma),
+                "space" => placeholder.join = Some(Join::Space),
+                "newline" => placeholder.join = Some(Join::Newline),
+                "file" => placeholder.file = Some(FileMode::File),
+                "nul" => placeholder.file = Some(FileMode::Nul),
+                "each" => placeholder.each = true,
+                _ => unreachable!(),
+            }
             continue;
         }
-        if inputs {
+        if name == PlaceholderName::ChangedInputs {
             return Err("a changed-inputs placeholder cannot have a filter".into());
         }
         if filter {
@@ -122,7 +198,6 @@ fn segments(suffix: &str, inputs: bool) -> Result<(), String> {
         let mut pattern_start = 0;
         let mut slash_escape = false;
         let mut in_class = false;
-        let mut positive = false;
         for (idx, byte) in part.bytes().enumerate() {
             if slash_escape {
                 slash_escape = false;
@@ -142,7 +217,6 @@ fn segments(suffix: &str, inputs: bool) -> Result<(), String> {
                     if pattern.is_empty() || pattern == "!" {
                         return Err("empty pattern in placeholder filter".into());
                     }
-                    positive |= !pattern.starts_with('!');
                     pattern_start = idx + 1;
                 }
                 _ => {}
@@ -155,12 +229,9 @@ fn segments(suffix: &str, inputs: bool) -> Result<(), String> {
         if pattern.is_empty() || pattern == "!" {
             return Err("empty pattern in placeholder filter".into());
         }
-        positive |= !pattern.starts_with('!');
-        if !positive {
-            return Err("an exclusion-only filter needs a default unit universe".into());
-        }
+        placeholder.filter = Some(Filter::inline(part));
     }
-    Ok(())
+    Ok(placeholder)
 }
 
 fn shell_code(argv: &[String]) -> Option<(usize, Option<usize>)> {
@@ -237,7 +308,7 @@ fn is_boundary(byte: Option<u8>) -> bool {
     !byte.is_some_and(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
-fn spans(word: &str) -> Result<Vec<(usize, usize)>, String> {
+fn spans(word: &str) -> Result<Vec<(usize, usize, Placeholder)>, String> {
     let mut out = Vec::new();
     let mut i = 0;
     while i < word.len() {
@@ -254,8 +325,10 @@ fn spans(word: &str) -> Result<Vec<(usize, usize)>, String> {
                             quote_word(word)
                         )
                     })?;
-                    segments(&word[j..end - 1], name == "changed-inputs")?;
-                    found = Some(end);
+                    found = Some((
+                        end,
+                        segments(&word[j..end - 1], PlaceholderName::from_name(name))?,
+                    ));
                     break;
                 }
             }
@@ -266,8 +339,10 @@ fn spans(word: &str) -> Result<Vec<(usize, usize)>, String> {
                 if matches!(word.as_bytes().get(j), Some(b':') | Some(b'}') | None) {
                     let end = end_of(word, j)
                         .ok_or_else(|| format!("{} is cut off; {HINT}", quote_word(word)))?;
-                    segments(&word[j..end - 1], name == "changed-inputs")?;
-                    found = Some(end);
+                    found = Some((
+                        end,
+                        segments(&word[j..end - 1], PlaceholderName::from_name(name))?,
+                    ));
                     break;
                 }
             }
@@ -275,13 +350,13 @@ fn spans(word: &str) -> Result<Vec<(usize, usize)>, String> {
             if rest.starts_with(&env_plain) {
                 let end = i + env_plain.len();
                 if is_boundary(word.as_bytes().get(end).copied()) {
-                    found = Some(end);
+                    found = Some((end, segments("", PlaceholderName::from_name(name))?));
                     break;
                 }
             }
         }
-        if let Some(end) = found {
-            out.push((i, end));
+        if let Some((end, placeholder)) = found {
+            out.push((i, end, placeholder));
             i = end;
         } else {
             i += word[i..].chars().next().map_or(1, char::len_utf8);
@@ -376,6 +451,9 @@ fn ambiguous(name: &str) -> String {
 pub(crate) struct ParsedHook {
     argv: Vec<String>,
     spans: Vec<Vec<(usize, usize)>>,
+    placeholders: Vec<Vec<Placeholder>>,
+    shell_env_code: bool,
+    legacy_shell_exclusion_only: bool,
     placeholder: String,
     start: usize,
 }
@@ -384,6 +462,8 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
     let argv = shadows(exact);
     let shell = shell_code(&argv);
     let mut all = Vec::with_capacity(argv.len());
+    let mut placeholders = Vec::with_capacity(argv.len());
+    let mut legacy_shell_exclusion_only = false;
     let mut found = false;
     let mut env_code = false;
     let mut placeholder = String::new();
@@ -391,7 +471,12 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
         if exact[idx].to_str().is_some() && mangled(word) {
             return Err(MANGLED.to_string());
         }
-        let parts = spans(word)?;
+        let parsed_parts = spans(word)?;
+        let parts: Vec<_> = parsed_parts.iter().map(|(a, b, _)| (*a, *b)).collect();
+        let parsed: Vec<_> = parsed_parts
+            .into_iter()
+            .map(|(_, _, value)| value)
+            .collect();
         if let Some((code, zero)) = shell {
             if idx == code {
                 if parts.iter().any(|&(a, _)| word.as_bytes()[a] == b'{') {
@@ -404,6 +489,12 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
                     || word.contains("$STOOP_CHANGED_INPUTS_FILE")
                     || word.contains("${STOOP_CHANGED_INPUTS_FILE");
                 all.push(Vec::new());
+                legacy_shell_exclusion_only = parsed
+                    .iter()
+                    .filter_map(|item| item.filter.as_ref())
+                    .any(Filter::exclusion_only);
+                // Shell code keeps the 2a environment-only behavior. W4 filters belong in argv.
+                placeholders.push(Vec::new());
                 continue;
             }
             if !parts.is_empty() && zero.is_some_and(|zero| idx <= zero) {
@@ -431,6 +522,7 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
             found = true;
         }
         all.push(parts);
+        placeholders.push(parsed);
     }
     if !found && !env_code {
         return Ok(None);
@@ -439,6 +531,9 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
     Ok(Some(ParsedHook {
         argv,
         spans: all,
+        placeholders,
+        shell_env_code: env_code,
+        legacy_shell_exclusion_only,
         placeholder,
         start,
     }))
@@ -447,7 +542,7 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
 #[cfg(all(test, unix))]
 pub(crate) fn prepare(exact: &[OsString]) -> Result<Option<Hook>, String> {
     parse(exact)?
-        .map(|parsed| parsed.finish(exact, &[]))
+        .map(|parsed| parsed.finish(exact, &[], false))
         .transpose()
 }
 
@@ -623,13 +718,34 @@ impl ParsedHook {
         self,
         exact: &[OsString],
         options: &[OptionDeclaration],
+        has_default_universe: bool,
     ) -> Result<Hook, String> {
         let Self {
             argv,
             spans: all,
+            placeholders,
+            shell_env_code,
+            legacy_shell_exclusion_only,
             placeholder,
             start,
         } = self;
+        let mut inline = None;
+        for filter in placeholders
+            .iter()
+            .flatten()
+            .filter_map(|p| p.filter.as_ref())
+        {
+            if inline.is_some_and(|prior| prior != filter) {
+                return Err("two different unit filters in one command".into());
+            }
+            inline = Some(filter);
+        }
+        if legacy_shell_exclusion_only {
+            return Err("an exclusion-only filter needs a default unit universe".into());
+        }
+        if inline.is_some_and(Filter::exclusion_only) && !has_default_universe {
+            return Err("an exclusion-only filter needs a default unit universe".into());
+        }
         let remove = removals(&argv, &all, start, options)?;
         let mut exec = Vec::with_capacity(exact.len());
         let mut removed = Vec::new();
@@ -644,6 +760,9 @@ impl ParsedHook {
             original: exact.to_vec(),
             argv: exec,
             removed,
+            spans: all,
+            placeholders,
+            shell_env_code,
             placeholder,
         })
     }
@@ -654,7 +773,7 @@ pub(crate) fn normalize(word: &str) -> Result<String, String> {
     let parts = spans(word)?;
     let mut result = String::with_capacity(word.len());
     let mut cursor = 0;
-    for (start, end) in parts {
+    for (start, end, _) in parts {
         result.push_str(&word[cursor..start]);
         let token = &word[start..end];
         let mut normalized = None;
@@ -907,13 +1026,77 @@ pub(crate) fn empty_value_line(argv: &[OsString], explain: bool) -> Option<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::safe;
+    use super::*;
 
     #[test]
     fn safe_neutralises_control_bidi_and_workflow_text() {
         assert_eq!(safe("a\nb\u{1b}c"), "a\\u{a}b\\u{1b}c");
         assert_eq!(safe("x\u{202E}y"), "x\\u{202e}y");
         assert_eq!(safe("##[error]z::w"), "#%23[error]z%3A%3Aw");
+    }
+
+    #[test]
+    fn shell_environment_placeholders_stay_separate_from_argument_spans() {
+        let argv: Vec<OsString> = [
+            "sh",
+            "-c",
+            "echo ${STOOP_CHANGED:*.t}",
+            "sh",
+            "--files",
+            "{changed:*.t}",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let hook = parse(&argv)
+            .unwrap()
+            .unwrap()
+            .finish(&argv, &[], false)
+            .unwrap();
+        assert_eq!(hook.spans.len(), hook.placeholders.len());
+        for (spans, placeholders) in hook.spans.iter().zip(&hook.placeholders) {
+            assert_eq!(spans.len(), placeholders.len());
+        }
+        assert!(hook.shell_env_code);
+        assert_eq!(hook.argv, argv[..4]);
+    }
+
+    #[test]
+    fn shell_operand_never_contributes_unit_filters() {
+        for expression in [
+            "${STOOP_CHANGED:-x}",
+            "${STOOP_CHANGED:3}",
+            "${STOOP_CHANGED:foo}",
+            "${STOOP_CHANGED:1*2}",
+            "${STOOP_CHANGED:foo/bar}",
+            "$(printf x)",
+            "$((1+2))",
+            "{a,b}",
+            r"\${STOOP_CHANGED:*.t}",
+            "'${STOOP_CHANGED:*.t}'",
+            "\"${STOOP_CHANGED:*.t}\"",
+            "${STOOP_CHANGED:/foo}",
+        ] {
+            let code = format!("echo $STOOP_CHANGED {expression}");
+            let argv: Vec<OsString> = ["sh", "-c", code.as_str(), "zero"]
+                .into_iter()
+                .map(OsString::from)
+                .collect();
+            let hook = parse(&argv)
+                .unwrap()
+                .unwrap()
+                .finish(&argv, &[], false)
+                .unwrap();
+            assert!(hook.shell_env_code, "{expression}");
+            assert!(
+                hook.placeholders
+                    .iter()
+                    .flatten()
+                    .all(|item| item.filter.is_none()),
+                "{expression}"
+            );
+            assert_eq!(hook.argv, argv);
+        }
     }
 }
 

@@ -1018,6 +1018,37 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     if explain && !o.quiet {
         let dir = if rel_cwd.is_empty() { "." } else { &rel_cwd };
         eprintln!("stoop: dir {dir:?}");
+        if let Some(hook) = &hook {
+            if hook.shell_env_code {
+                eprintln!("stoop: shell-operand filters are unavailable; use a quoted argv placeholder such as '{{changed:/foo}}'");
+            }
+            let suite = config.select(&hook.original, &rel_cwd).ok().flatten();
+            let configured = suite.and_then(|suite| {
+                suite.units.as_ref().map(|patterns| {
+                    (
+                        units::filter::Filter::configured(patterns),
+                        suite.id.as_str(),
+                    )
+                })
+            });
+            let inline = hook
+                .placeholders
+                .iter()
+                .flatten()
+                .find_map(|placeholder| placeholder.filter.as_ref());
+            match units::universe::catalog_ignore(&root, &o.ignore, &o.transient) {
+                Ok(ignore) => eprintln!(
+                    "{}",
+                    units::universe::explain(
+                        &root,
+                        &ignore,
+                        inline,
+                        configured.as_ref().map(|(filter, id)| (filter, *id)),
+                    )
+                ),
+                Err(reason) => eprintln!("stoop: no unit universe: {}", units::hook::safe(&reason)),
+            }
+        }
     }
     if !trace::supported() {
         if explain {
@@ -1242,8 +1273,8 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 }
             }
         }
-        // A miss with a remote configured: someone else may already have proved this.
-        if hit_idx.is_some() || pulled || remote.is_none() || bypass {
+        // A run may fetch a missing proof; explain inspects only the local store.
+        if hit_idx.is_some() || pulled || remote.is_none() || bypass || explain {
             break;
         }
         pulled = true;
