@@ -20,10 +20,10 @@
 
 <h2 id="changed-hook">Changed-unit hook</h2>
 <p>Write <code>'{changed}'</code> where a test command takes test files, and say which files are tests: <code>stoop run -- npx jest '{changed:*.test.ts}'</code>. The filter is a list of patterns separated by <code>|</code>, with <code>!</code> to exclude. Always single-quote the placeholder. Unquoted, bash and zsh expand commas and wildcards before stoop sees them, and fish refuses the wildcard.</p>
-<p>In this release a placeholder runs the <strong>full command</strong>: the placeholder and the option in front of it are removed, so the command runs everything. Stoop does not yet run a subset of tests, so an unchanged tree skips only through the whole-command proof. When the full command runs, stoop prints the words it removed.</p>
+<p>In this release a placeholder runs the <strong>full command</strong>: the placeholder and the option that owns it are removed. A declared option uses its declared arity; an undeclared option immediately before a standalone placeholder follows the v0.2.0 rule. Stoop does not yet run a subset of tests, so an unchanged tree skips only through the whole-command proof. When the full command runs, stoop prints the words it removed.</p>
 <p>The placeholder assumes two things about the command: each test file passes alone exactly as it does in the full suite, and running the command with no test files does nothing beyond running them all. Stoop cannot check either premise.</p>
-<p>Stoop detects the common quoting mistakes and exits 2 before anything runs: a comma inside braces, a <code>|</code> or <code>;</code> outside quotes, a placeholder cut off by <code>|</code>, <code>;</code> or a space, a brace-expanded word such as <code>changed:*.t</code>, and a placeholder in shell code or in the <code>$0</code> of a shell command. Stoop refuses an option that takes several values, such as <code>--files a b '{changed}'</code>, because it cannot tell where the values end. Use <code>--files='{changed}'</code>, or put the placeholder right after the option or after <code>--</code>. Option declarations arrive with the configuration slice.</p>
-<p>On the first run of a placeholder argv, stoop records that argv before running it, whatever the result. The record is not a proof and never causes a skip. If a later invocation has the placeholder removed or emptied, as a shell does with an unquoted <code>$STOOP_CHANGED</code>, stoop runs the full command and names the expansion. The exit status is the command's own.</p>
+<p>Stoop detects common quoting mistakes and exits 2 before anything runs: a comma inside braces, a <code>|</code> or <code>;</code> outside quotes, a cut-off placeholder, a brace-expanded word such as <code>changed:*.t</code>, or a placeholder in shell code or a shell command's <code>$0</code>. An undeclared option with an ambiguous value extent is refused. Attach the placeholder, put it immediately after its option or after <code>--</code>, or declare the option in <code>.stoop.toml</code>.</p>
+<p>On the first run of a placeholder argv, stoop records that argv before running it, whatever the result. The record is not a proof and never causes a skip. If a later invocation has the placeholder removed or emptied, stoop recovers its full form only when the recorded form and configuration still agree. Changed configuration and conflicting configured forms are refused with exit 2. To refresh a stale record after changing configuration, run the same command again with the placeholder quoted. Multiple unconfigured legacy matches run as typed without a skip.</p>
 <h3 id="quoting">Quoting</h3>
 <p>Each row is what the shell does before stoop starts. Stoop's Linux CI covers every row.</p>
 <table>
@@ -40,6 +40,25 @@
     <tr><td>GitHub Actions <code>run:</code></td><td><code>'{changed:*.t}'</code> or <code>'$STOOP_CHANGED'</code></td><td>The placeholder or environment spelling, unchanged, under the step's bash.</td></tr>
   </tbody>
 </table>
+
+<h2 id="configuration">Hook configuration</h2>
+<p>An optional <code>.stoop.toml</code> at the selected root configures explicit hooks. Plain commands do not read it. Unknown or duplicate keys, invalid values, or multiple matching suites produce one warning with a location. Stoop ignores the configuration for that invocation and runs the full hook command without a proof skip. An ambiguous option still needs a valid declaration or an unambiguous argv.</p>
+<p>Configuration and GitHub event inputs used by a hook must be regular files no larger than 8 MiB. Unreadable, oversized, or nonregular inputs prevent a proof skip.</p>
+<pre><code>[units]
+default_branch = "main"
+verify_every = 20
+
+[[units.suite]]
+id = "tests"
+cwd = "."
+match = ["./test", "--files", "base", "more", "{changed}"]
+options = [{ names = ["--files", "-f"], values = "many" }]</code></pre>
+<p>A suite's required <code>id</code> is unique, and its nonempty <code>match</code> array matches the typed argv exactly. A token <code>*</code> matches one argument. Placeholder aliases normalize to the same spelling, but filters and modifiers remain part of the match. <code>cwd</code> is root-relative, with <code>.</code> for the root; omitting it matches any directory.</p>
+<p>Each option declaration lists aliases and uses <code>values = 0</code>, <code>1</code>, or <code>"many"</code>. Declarations match exact option words and long <code>--name=value</code> forms. Attached short values or partial placeholder values touching a declared name are refused. Without a declaration, the v0.2.0 adjacent-option and attached-carrier rules remain, and ambiguous value extents refuse with exit 2. After <code>--</code> all words are positional. Zero leaves a following placeholder positional; one consumes one value; many consumes values through the next option or <code>--</code>. Repeated aliases of a selected declared option are removed too.</p>
+<p>For a declared <code>many</code> option, <code>-foo{changed} tail</code> and <code>--files=base{changed} tail</code> are refused. Without a declaration, those forms keep their v0.2.0 behavior.</p>
+<p>Two delimiter cases changed from v0.2.0 to preserve positional words. <code>./runner --files '{changed}' -- --files positional</code> now runs <code>./runner -- --files positional</code> instead of <code>./runner</code>. <code>./runner -- --files '{changed}'</code> now runs <code>./runner -- --files</code> instead of <code>./runner</code>.</p>
+<p>The accepted suite keys also include <code>enabled</code>, <code>independent</code>, and a <code>units</code> pattern array. These do not enable subset execution. <code>independent = false</code> runs the full hook even when a whole-command proof matches. The global <code>enabled</code> setting and suite <code>enabled</code> opt out of splitting; this release does not split. Runner tables, templates, and job counts are not supported yet.</p>
+<p>Hooked commands run fully on a default-branch push, an explicitly enabled sync writer, and every <code>verify_every</code>th positive run ordinal. Missing or invalid ordinals force a full run when sampling is configured. GitHub uses its event payload and push ref; a pull request merge ref is not a default-branch push. Unavailable or conflicting CI branch context forces a full run. Branch data never grants permission to publish proofs.</p>
 <h2 id="options">Options</h2>
 <p>Options go before <code>--</code>. Everything after it is the command.</p>
 <dl>
@@ -82,6 +101,8 @@
   <thead><tr><th>Variable</th><th>Effect</th></tr></thead>
   <tbody>
     <tr><td><code>STOOP_FULL=1</code></td><td>Never skip; still record. For the nightly full run.</td></tr>
+    <tr><td><code>STOOP_RUN_NUMBER</code></td><td>Positive ordinal used for <code>verify_every</code>. If absent on GitHub, <code>GITHUB_RUN_NUMBER</code> is used.</td></tr>
+    <tr><td><code>STOOP_DEFAULT_BRANCH</code></td><td>Default branch override for hooked commands when the provider does not supply it. Otherwise stoop uses the configured branch, then the sync remote's local HEAD.</td></tr>
     <tr><td><code>STOOP_OFF=1</code></td><td>Don't trace or skip; run commands directly.</td></tr>
     <tr><td><code>STOOP_DTRACE_DIAGNOSTIC=1</code></td><td>macOS only, with passwordless <code>sudo</code>: run the command once under DTrace and print a report. Never recorded. <code>list</code> adds the paths and the process tree; <code>raw</code> adds every line the tracer printed.</td></tr>
     <tr><td><code>STOOP_STORE=DIR</code></td><td>Default for <code>--store</code>.</td></tr>
