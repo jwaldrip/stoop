@@ -1711,6 +1711,14 @@ fn mkdir_p_on_a_tracked_directory_is_an_input_not_a_prior() {
 }
 
 #[test]
+fn mkdir_p_keeps_the_prior_from_an_earlier_successful_creation() {
+    let w = Ws::new("mkdirp-created");
+    let p = recorded(&w, "mkdir new && mkdir -p new");
+    assert_eq!(prior(&p, "new"), Some("a".into()));
+    assert!(pairs(&p, "outputs").contains(&("new".into(), "d".into())));
+}
+
+#[test]
 fn renaming_directories_is_unplannable() {
     let w = Ws::new("dirrename");
     w.write("x/f", "x");

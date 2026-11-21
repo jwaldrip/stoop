@@ -1364,6 +1364,33 @@ fn a_failed_namespace_attempt_without_an_outside_change_still_records() {
 }
 
 #[test]
+fn a_failed_create_cannot_hide_a_changed_parent() {
+    for existing in [false, true] {
+        let key = if existing {
+            "failed-create-file-parent"
+        } else {
+            "failed-create-missing-parent"
+        };
+        let case = Case::new(key);
+        if existing {
+            case.file("blocked", b"not a directory");
+        }
+        let fifo = case.fifo("failed-create.fifo");
+        let script =
+            "if (echo x > blocked/child) 2>/dev/null; then exit 7; fi; cat \"$FIFO\" >/dev/null";
+        let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+        let release = meet(&fifo);
+        if existing {
+            fs::remove_file(case.root().join("blocked")).unwrap();
+        }
+        fs::create_dir(case.root().join("blocked")).unwrap();
+        drop(release);
+        let out = child.wait_with_output().unwrap();
+        assert_not_recorded(&out, &case, key, "blocked changed while the command ran");
+    }
+}
+
+#[test]
 fn a_changed_ignored_regular_path_does_not_refuse_an_otherwise_recordable_run() {
     let key = "ignored-path-appears";
     let case = Case::new(key);

@@ -3053,17 +3053,18 @@ impl Tracer<'_> {
         if expected.as_deref().is_some_and(is_dynamic) {
             return None;
         }
+        // A failed lookup still depends on the first absent or non-directory parent.
+        // Keep this path only for prior capture; a successful write must still verify `expected`.
+        let unresolved = if expected.is_none() {
+            raw.ancestors().skip(1).find_map(|ancestor| {
+                let prefix = write_destination(ancestor, true)?;
+                Some(prefix.join(raw.strip_prefix(ancestor).ok()?))
+            })
+        } else {
+            None
+        };
         if !self.t.removed_by_run.is_empty() || !self.own_absence_looks.is_empty() {
-            // Even a failed attempt invalidates removal evidence. For a missing parent, resolve
-            // the longest available prefix so the attempt still invalidates the affected name.
-            let unresolved = if expected.is_none() {
-                raw.ancestors().skip(1).find_map(|ancestor| {
-                    let prefix = write_destination(ancestor, true)?;
-                    Some(prefix.join(raw.strip_prefix(ancestor).ok()?))
-                })
-            } else {
-                None
-            };
+            // Even a failed attempt invalidates removal evidence.
             if let Some(destination) = expected.as_ref().or(unresolved.as_ref()) {
                 for name in destination.ancestors() {
                     if self.own_absence_looks.remove(name)
@@ -3107,6 +3108,11 @@ impl Tracer<'_> {
         if oid_sensitive && !deferred_mkdir_oid {
             self.t.oid_attrs_changed = true;
         }
+        if let Some(parent) = unresolved.as_deref().and_then(Path::parent) {
+            // The failed lookup observed this blocker. A foreign change after the lookup must
+            // not turn its entry-time prior into a proof for a different command outcome.
+            self.touch(parent.to_path_buf(), Use::Look);
+        }
         self.touch(raw.to_path_buf(), Use::Name);
         self.invalidate_settled(expected.as_deref(), before);
         let mut read_parent = None;
@@ -3118,47 +3124,33 @@ impl Tracer<'_> {
                     .filter(|parent| self.read_files.contains(*parent))
                     .map(Path::to_path_buf);
             }
-            if self
-                .t
-                .touched
-                .get(destination)
-                .is_some_and(|touch| touch.read)
-                && self
-                    .t
-                    .seen
-                    .as_ref()
-                    .and_then(|seen| seen.get(destination))
-                    .is_some_and(|seen| matches!(seen, Seen::Symlink { .. }))
-            {
-                self.t.read_write_conflicts.insert(destination.clone());
-            }
         }
         if let WriteKind::Link {
             source: Some((_, id)),
         } = &kind
         {
             self.invalidate_settled(None, Some(*id));
-            if let Some(reads) = self.read_inodes.get(id) {
-                self.t.read_write_conflicts.extend(reads.iter().cloned());
-                if let Some(destination) = &expected {
-                    self.t.read_write_conflicts.insert(destination.clone());
-                }
-            }
+            // The link may fail; source-read conflicts are attributed only on success.
         }
         let read_priors = expected
             .as_deref()
             .map(|destination| self.capture_read_prior(destination, before))
             .unwrap_or_default();
         let rec = self.rec.as_mut()?;
-        let key = expected
-            .as_deref()
-            .and_then(|destination| rec.write(&mut self.t, raw, destination))
-            .or_else(|| {
-                expected
-                    .is_none()
-                    .then(|| rec.key_of(raw, &mut self.t))
-                    .flatten()
-            });
+        let mkdir_existing = matches!(&kind, WriteKind::Create { directory: true })
+            && metadata.as_ref().is_some_and(Result::is_ok);
+        let key = if mkdir_existing {
+            // The observed existing name is an input, not a write prior. If it vanishes and the
+            // mkdir succeeds, path verification fails closed because it was not absent at entry.
+            expected
+                .as_deref()
+                .and_then(|destination| rec.key_of(destination, &mut self.t))
+        } else {
+            expected
+                .as_deref()
+                .or(unresolved.as_deref())
+                .and_then(|destination| rec.write(&mut self.t, raw, destination))
+        };
         if key
             .as_ref()
             .is_some_and(|key| rec.redirected_reads.contains(key))
@@ -3371,6 +3363,29 @@ impl Tracer<'_> {
             self.flag("it could not confirm where its change landed");
             return;
         };
+        if self
+            .t
+            .touched
+            .get(&destination)
+            .is_some_and(|touch| touch.read)
+            && self
+                .t
+                .seen
+                .as_ref()
+                .and_then(|seen| seen.get(&destination))
+                .is_some_and(|seen| matches!(seen, Seen::Symlink { .. }))
+        {
+            self.t.read_write_conflicts.insert(destination.clone());
+        }
+        if let WriteKind::Link {
+            source: Some((_, id)),
+        } = &path.kind
+        {
+            if let Some(reads) = self.read_inodes.get(id) {
+                self.t.read_write_conflicts.extend(reads.iter().cloned());
+                self.t.read_write_conflicts.insert(destination.clone());
+            }
+        }
         if let Some(parent) = path.read_parent {
             self.t.read_write_conflicts.insert(parent);
         }
