@@ -1090,6 +1090,46 @@ fn foreign_bytes_read_back_after_an_own_write_refuse_and_the_retry_fails() {
 }
 
 #[test]
+fn foreign_bytes_read_back_through_an_outside_alias_never_skip() {
+    let key = "foreign-read-back-outside-alias";
+    let case = Case::new(key);
+    let file = case.file("src/f", b"original\n");
+    let alias = case.dir.join("outside-link");
+    symlink(&file, &alias).unwrap();
+    age();
+    let fifo = case.fifo("outside-read-back.fifo");
+    let env = [("FIFO", fifo.as_path()), ("ALIAS", alias.as_path())];
+    let script = "printf 'bad\\n' > src/f; cat \"$FIFO\" >/dev/null; grep -qx good \"$ALIAS\"";
+    let child = spawn(&case, key, script, &env);
+    let release = meet(&fifo);
+    fs::write(&file, b"good\n").unwrap();
+    drop(release);
+    let first = child.wait_with_output().unwrap();
+    let first_err = stderr(&first);
+    assert!(first.status.success(), "{first_err}");
+    if first_err.contains("stoop: recorded ") {
+        assert!(
+            !proof(&case, key)["unplannable"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{first_err}"
+        );
+    } else {
+        assert_refused_for(&first, &case, key, &["src/f", "outside-link"]);
+    }
+    let mut retry = spawn(&case, key, script, &env);
+    let release = meet_if_running(&fifo, &mut retry);
+    let reached_fifo = release.is_some();
+    drop(release);
+    let again = retry.wait_with_output().unwrap();
+    let err = stderr(&again);
+    assert!(reached_fifo, "retry never reached the FIFO:\n{err}");
+    assert_eq!(again.status.code(), Some(1), "{err}");
+    assert!(!err.contains("stoop: skip"), "{err}");
+}
+
+#[test]
 fn replacing_a_hard_link_source_after_the_link_refuses_the_record() {
     let key = "hard-link-replaced-source";
     let case = Case::new(key);

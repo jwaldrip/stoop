@@ -2002,6 +2002,27 @@ fn a_read_through_an_alias_of_a_written_path_is_unplannable() {
 }
 
 #[test]
+fn an_unplannable_proof_is_never_reused_by_stoop_run() {
+    let w = Ws::new("unplannable-runtime-reuse");
+    let script = "cat in.txt >/dev/null";
+    recorded(&w, script);
+    let (code, err) = w.sh(script);
+    assert_eq!(code, 0, "{err}");
+    assert!(err.contains("stoop: skip"), "{err}");
+
+    let path = w.store().join("proofs/t.json");
+    let mut stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    stored["proofs"][0]["unplannable"] = serde_json::json!(["test reason"]);
+    fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    let (code, err) = w.sh(script);
+    assert_eq!(code, 0, "{err}");
+    assert!(
+        err.contains("stoop: run") && !err.contains("stoop: skip"),
+        "{err}"
+    );
+}
+
+#[test]
 fn a_cached_parent_is_not_reused_after_a_symlink_replaces_it() {
     let w = Ws::new("cache");
     w.write("sub/keep", "k");

@@ -1166,6 +1166,11 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         why = String::from("no proof yet");
         hit_idx = None;
         for (i, p) in proofs.iter().enumerate() {
+            // A proof with a recorded planner-unplannable reason cannot justify a skip: the change
+            // it recorded was observed, but it could not be replayed.
+            if !p.unplannable.is_empty() {
+                continue;
+            }
             let expired = max_age > 0 && now().saturating_sub(p.created) > max_age;
             let diffs: Vec<(String, &'static str)> = if p.provenance.is_none() {
                 vec![("provenance".to_string(), "missing; run once to refresh")]
@@ -1524,7 +1529,17 @@ fn build_outputs(
                 let own_absence = id.as_deref() == Some("a")
                     && prior.map(String::as_str) == Some("a")
                     && trace.removal_explains_absence(&path);
-                if !own_absence {
+                let own_removal = id.as_deref() == Some("a")
+                    && prior.is_some_and(|prior| prior.as_str() != "a")
+                    && matches!(
+                        trace.removed_by_run.get(&path),
+                        Some(crate::trace::Removal::Unlinked)
+                    );
+                if own_removal {
+                    // The run read the file and then removed it with its own verified unlink. The
+                    // prior stays a runtime input, and the proof is never reused by a skip.
+                    reasons.push(format!("it read {key} and then removed it"));
+                } else if !own_absence {
                     if id
                         .as_deref()
                         .is_none_or(|value| value == "a" || value == "u")
