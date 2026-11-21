@@ -789,6 +789,28 @@ mod tests {
     }
 
     #[test]
+    fn catalog_reuse_type_requires_inventory_refresh_in_every_mode() {
+        for (git_mode, ignored) in [(false, false), (false, true), (true, false), (true, true)] {
+            let dir = Dir::new();
+            if git_mode {
+                git(&dir.0, &["init", "-q"]);
+            }
+            if ignored {
+                fs::write(dir.0.join(".stoopignore"), b"ignored.t\n").unwrap();
+            }
+            let catalog = discover(
+                &dir.0,
+                &Ignore::new(&[], None, &[]),
+                &Filter::inline("**/*.t"),
+                None,
+            )
+            .unwrap();
+            // An added reuse variant makes this pattern refutable and fails compilation.
+            let Reuse::RerunInventory = catalog.reuse;
+        }
+    }
+
+    #[test]
     fn nested_stoopignore_symlink_also_requires_inventory_refresh() {
         use std::os::unix::fs::symlink;
         let dir = Dir::new();
