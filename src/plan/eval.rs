@@ -1992,6 +1992,129 @@ mod tests {
         assert_eq!(f.decide(BTreeMap::new()).code, Code::Proved);
     }
     #[test]
+    fn exact_input_prior_pair_preserves_prior_diagnostic_in_all_modes() {
+        let mut f = Fixture::new();
+        let old = input("dir/a", &file_id(b"old"));
+        let mut p = proof(vec![]);
+        p.outputs.push(input("dir/a", &file_id(b"new")));
+        p.priors = Some(vec![old.clone()]);
+        f.install(vec![p.clone()]);
+
+        for mode in [Prefilter::On, Prefilter::Off, Prefilter::Check] {
+            let original = plan(&f, &f.spec, mode);
+            assert_eq!(original.code, Code::PriorChanged);
+            p.inputs.push(old.clone());
+            replace_first(&mut f, p.clone());
+            let duplicate = plan(&f, &f.spec, mode);
+            assert_eq!(plan_key(&duplicate), plan_key(&original), "{mode:?}");
+            p.inputs.clear();
+            replace_first(&mut f, p.clone());
+        }
+    }
+
+    #[test]
+    fn input_prior_pair_requires_identical_unique_evidence_and_a_reached_prior() {
+        let mut f = Fixture::new();
+        let old = input("dir/a", &file_id(b"old"));
+        let mut p = proof(vec![old.clone()]);
+        p.outputs.push(input("dir/a", &file_id(b"new")));
+        p.priors = Some(vec![old.clone()]);
+        f.install(vec![p.clone()]);
+
+        let mut cases = Vec::new();
+        let mut different_id = p.clone();
+        different_id.priors.as_mut().unwrap()[0].id = file_id(b"different");
+        cases.push(different_id);
+        let mut different_oid = p.clone();
+        different_oid.priors.as_mut().unwrap()[0].oid = Some("sha1:1234".into());
+        cases.push(different_oid);
+        let mut different_basis = p.clone();
+        different_basis.priors.as_mut().unwrap()[0].oid_basis = Some(clean_basis());
+        cases.push(different_basis);
+        let mut ambiguous = p.clone();
+        ambiguous.priors.as_mut().unwrap().push(old);
+        cases.push(ambiguous);
+        let mut blocked = p.clone();
+        blocked.unplannable.push("blocked before priors".into());
+        cases.push(blocked);
+        let mut earlier_prior = p.clone();
+        earlier_prior
+            .priors
+            .as_mut()
+            .unwrap()
+            .insert(0, input("dir", "a"));
+        cases.push(earlier_prior);
+        let mut no_matching_output = p;
+        no_matching_output.outputs = vec![];
+        cases.push(no_matching_output);
+
+        for (case, candidate) in cases.into_iter().enumerate() {
+            replace_first(&mut f, candidate);
+            for mode in [Prefilter::On, Prefilter::Off, Prefilter::Check] {
+                let result = plan(&f, &f.spec, mode);
+                assert_eq!(result.code, Code::InputChanged, "case {case}, {mode:?}");
+                assert_eq!(
+                    result.mismatches,
+                    vec![(1, "dir/a".into(), "changed".into())],
+                    "case {case}, {mode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prior_pair_equivalence_corpus_including_an_earlier_overlay() {
+        for overlay in [false, true] {
+            for expected in [b"tracked".as_slice(), b"old".as_slice()] {
+                let f = Fixture::new();
+                let initial = if overlay {
+                    let mut first = proof(vec![]);
+                    first.outputs.push(input("dir/a", &file_id(b"overlay")));
+                    first.priors = Some(vec![input("dir/a", &file_id(b"tracked"))]);
+                    vec![first]
+                } else {
+                    vec![]
+                };
+                let prior = input("dir/a", &file_id(expected));
+                let mut step = proof(vec![]);
+                step.outputs.push(input("dir/a", &file_id(b"result")));
+                step.priors = Some(vec![prior.clone()]);
+                let mut original = initial.clone();
+                original.push(step.clone());
+                let mut duplicate = initial;
+                step.inputs.push(prior);
+                duplicate.push(step);
+
+                let original_steps = save_record(&f, "original", original);
+                let duplicate_steps = save_record(&f, "duplicate", duplicate);
+                let original_spec = JobSpec {
+                    key: Some("original".into()),
+                    steps: original_steps,
+                    ..f.spec.clone()
+                };
+                let duplicate_spec = JobSpec {
+                    key: Some("duplicate".into()),
+                    steps: duplicate_steps,
+                    ..f.spec.clone()
+                };
+                for mode in [Prefilter::On, Prefilter::Off, Prefilter::Check] {
+                    let baseline = plan(&f, &original_spec, mode);
+                    let with_duplicate = plan(&f, &duplicate_spec, mode);
+                    assert_eq!(
+                        plan_key(&with_duplicate),
+                        plan_key(&baseline),
+                        "overlay={overlay}, expected={expected:?}, {mode:?}"
+                    );
+                    assert!(
+                        baseline.skip || !with_duplicate.skip,
+                        "a previous miss became a skip"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn mkdir_needs_the_path_absent_and_prior_coverage() {
         let mut f = Fixture::new();
         let mut p = proof(vec![]);

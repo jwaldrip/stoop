@@ -1334,3 +1334,169 @@ fn a_hard_link_from_an_explicit_directory_descriptor_with_a_live_task_skips_comp
         stderr(&out)
     );
 }
+
+fn assert_no_input(stored: &Value, path: &str) {
+    assert!(
+        stored["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry["path"] != path),
+        "unexpected input for {path}: {}",
+        stored["inputs"]
+    );
+}
+
+#[test]
+fn atomic_sed_records_the_preimage_then_runs_to_a_fixed_point() {
+    let case = Case::new("atomic-sed-fixed-point");
+    case.file("f", b"one\n");
+    age();
+    let script = "exec sed -i 's/^one$/done/' f";
+
+    let first = run(&case, "atomic-sed", script, &[]);
+    assert_recorded(&first, &case, "atomic-sed");
+    let stored = proof(&case, "atomic-sed");
+    assert_file_entry(&stored, "inputs", "f", b"one\n");
+    assert_file_entry(&stored, "priors", "f", b"one\n");
+    assert_file_entry(&stored, "outputs", "f", b"done\n");
+    let input = stored["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["path"] == "f");
+    let prior = stored["priors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["path"] == "f");
+    assert_eq!(input, prior);
+    let temp = stored["removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(Value::as_str)
+        .find(|name| name.starts_with("sed"))
+        .expect("the temporary source remains a removal");
+    assert_entry_id(&stored, "priors", temp, "a");
+
+    let second = run(&case, "atomic-sed", script, &[]);
+    assert_recorded(&second, &case, "atomic-sed");
+    assert!(
+        stderr(&second).contains("stoop: run "),
+        "{}",
+        stderr(&second)
+    );
+    let stored = proof(&case, "atomic-sed");
+    for field in ["inputs", "priors", "outputs"] {
+        assert_file_entry(&stored, field, "f", b"done\n");
+    }
+    let third = run(&case, "atomic-sed", script, &[]);
+    assert!(third.status.success(), "{}", stderr(&third));
+    assert!(
+        stderr(&third).contains("stoop: skip "),
+        "{}",
+        stderr(&third)
+    );
+    assert_eq!(fs::read(case.root().join("f")).unwrap(), b"done\n");
+}
+
+#[test]
+fn atomic_sed_that_always_changes_its_input_never_skips() {
+    let case = Case::new("atomic-sed-changing");
+    case.file("f", b"one\n");
+    age();
+    let script = "exec sed -i 's/^/x/' f";
+    for (before, after) in [
+        (b"one\n".as_slice(), b"xone\n".as_slice()),
+        (b"xone\n".as_slice(), b"xxone\n".as_slice()),
+        (b"xxone\n".as_slice(), b"xxxone\n".as_slice()),
+    ] {
+        let out = run(&case, "atomic-changing", script, &[]);
+        assert_recorded(&out, &case, "atomic-changing");
+        assert!(stderr(&out).contains("stoop: run "), "{}", stderr(&out));
+        let stored = proof(&case, "atomic-changing");
+        assert_file_entry(&stored, "inputs", "f", before);
+        assert_file_entry(&stored, "priors", "f", before);
+        assert_file_entry(&stored, "outputs", "f", after);
+        assert_eq!(fs::read(case.root().join("f")).unwrap(), after);
+    }
+}
+
+#[test]
+fn atomic_replace_after_a_foreign_preimage_change_keeps_legacy_prior() {
+    let case = Case::new("atomic-before-foreign-edit");
+    let file = case.file("f", b"original\n");
+    age();
+    let fifo = case.fifo("atomic-before.fifo");
+    let script = "exec python3 -c 'import os; open(\"f\").read(); open(\"tmp\", \"w\").write(\"done\\n\"); open(os.environ[\"FIFO\"]).read(); os.replace(\"tmp\", \"f\")'";
+    let child = spawn(&case, "atomic-before", script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::write(file, b"foreign\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_recorded(&out, &case, "atomic-before");
+    let stored = proof(&case, "atomic-before");
+    assert_no_input(&stored, "f");
+    assert_file_entry(&stored, "priors", "f", b"foreign\n");
+    assert_file_entry(&stored, "outputs", "f", b"done\n");
+}
+
+#[test]
+fn foreign_changes_after_atomic_landing_do_not_gain_an_input() {
+    for replace_inode in [false, true] {
+        let key = if replace_inode {
+            "atomic-after-inode"
+        } else {
+            "atomic-after-bytes"
+        };
+        let case = Case::new(key);
+        let file = case.file("f", b"original\n");
+        age();
+        let fifo = case.fifo("atomic-after.fifo");
+        let script = "exec python3 -c 'import os; open(\"f\").read(); open(\"tmp\", \"w\").write(\"done\\n\"); os.replace(\"tmp\", \"f\"); open(os.environ[\"FIFO\"]).read()'";
+        let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+        let release = meet(&fifo);
+        if replace_inode {
+            let foreign = case.outside("replacement", b"foreign\n");
+            fs::rename(foreign, &file).unwrap();
+        } else {
+            fs::write(&file, b"foreign\n").unwrap();
+        }
+        drop(release);
+        let out = child.wait_with_output().unwrap();
+        assert_recorded(&out, &case, key);
+        let stored = proof(&case, key);
+        assert_no_input(&stored, "f");
+        assert_file_entry(&stored, "priors", "f", b"original\n");
+        assert_file_entry(&stored, "outputs", "f", b"foreign\n");
+    }
+}
+
+#[test]
+fn failed_rename_keeps_legacy_recording_without_an_input() {
+    let case = Case::new("atomic-failed-rename");
+    case.file("f", b"original\n");
+    age();
+    let script = "exec python3 -c 'import os; open(\"f\").read(); exec(\"try:\\n os.rename(\\\"missing\\\", \\\"f\\\")\\nexcept FileNotFoundError:\\n pass\")'";
+    let out = run(&case, "atomic-failed", script, &[]);
+    assert_recorded(&out, &case, "atomic-failed");
+    let stored = proof(&case, "atomic-failed");
+    assert_no_input(&stored, "f");
+    assert_file_entry(&stored, "priors", "f", b"original\n");
+    assert_file_entry(&stored, "outputs", "f", b"original\n");
+}
+
+#[test]
+fn same_inode_rename_keeps_legacy_recording_without_an_input() {
+    let case = Case::new("atomic-same-inode");
+    case.file("f", b"original\n");
+    age();
+    let script = "exec python3 -c 'import os; open(\"f\").read(); os.link(\"f\", \"tmp\"); os.replace(\"tmp\", \"f\")'";
+    let out = run(&case, "atomic-same-inode", script, &[]);
+    assert_recorded(&out, &case, "atomic-same-inode");
+    let stored = proof(&case, "atomic-same-inode");
+    assert_no_input(&stored, "f");
+    assert_file_entry(&stored, "priors", "f", b"original\n");
+    assert_file_entry(&stored, "outputs", "f", b"original\n");
+}
