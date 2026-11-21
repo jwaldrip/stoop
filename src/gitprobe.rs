@@ -663,6 +663,17 @@ mod tests {
     }
 
     #[test]
+    fn unit_inventory_over_64_mib_returns_no_bytes() {
+        let output = run(
+            sh("head -c 67108865 /dev/zero"),
+            b"",
+            MAX_UNIT_FILES_BYTES,
+            Duration::from_secs(10),
+        );
+        assert_eq!(output, None);
+    }
+
+    #[test]
     fn symbolic_ref_probes_are_exact_and_validate_remote_names() {
         assert!(allowed(&["symbolic-ref", "-q", "HEAD"]));
         assert!(allowed(&[

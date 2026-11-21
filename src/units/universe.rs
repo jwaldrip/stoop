@@ -27,7 +27,7 @@ pub(crate) enum Reuse {
 /// Directory listings alone cannot validate eligibility when `.stoopignore` is present, or
 /// when Git is consulted. The Git index, nested `.gitignore`, `.git/info/exclude`, global
 /// excludes, `core.excludesFile`, and Git configuration can change without changing any
-/// walked listing. `RerunInventory` requires a fresh walk and fresh Git inventories.
+/// walked listing. `RerunInventory` requires a fresh walk and, if Git was used, fresh Git inventories.
 #[allow(dead_code)]
 pub(crate) struct Catalog {
     pub units: Vec<UnitId>,
