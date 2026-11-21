@@ -79,6 +79,22 @@ class SingleTraceeSed(unittest.TestCase):
                     self.normalize(changed)
                 self.assertFalse((self.out / "sed-exec" / "proof.json").exists())
 
+    def test_unapproved_null_environment_entry_is_rejected(self):
+        changed = copy.deepcopy(self.original)
+        changed["proofs"][0]["env"]["UNAPPROVED_REVIEW_SENTINEL"] = None
+        with self.assertRaisesRegex(SystemExit, "environment"):
+            self.normalize(changed)
+        self.assertFalse((self.out / "sed-exec" / "proof.json").exists())
+
+    def test_approved_environment_entries_must_be_strings(self):
+        for value in (None, 0, False, [], {}):
+            with self.subTest(value=value):
+                changed = copy.deepcopy(self.original)
+                changed["proofs"][0]["env"]["HOME"] = value
+                with self.assertRaisesRegex(SystemExit, "environment"):
+                    self.normalize(changed)
+                self.assertFalse((self.out / "sed-exec" / "proof.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

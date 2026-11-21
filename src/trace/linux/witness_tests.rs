@@ -559,3 +559,95 @@ fn matching_inode_is_conservative_across_different_devices() {
         &stat
     ));
 }
+
+#[test]
+fn a_lock_table_that_cannot_fit_in_one_page_is_withheld() {
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+    let stat = landing(42, 0o100644).stat;
+    assert!(page > 256);
+    assert!(!lock_table_lists_from(
+        Ok(io::Cursor::new(vec![b' '; page - 256])),
+        &stat
+    ));
+    assert!(
+        lock_table_lists_from(Ok(io::Cursor::new(vec![b' '; page - 255])), &stat),
+        "a table beyond one page less the margin must keep the legacy recorder"
+    );
+    assert!(lock_table_lists_from(
+        Ok(io::Cursor::new(vec![b' '; page])),
+        &stat
+    ));
+}
+
+#[test]
+fn a_lock_table_snapshot_uses_only_one_read() {
+    struct Counted {
+        reads: std::rc::Rc<std::cell::Cell<usize>>,
+    }
+    impl Read for Counted {
+        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+            let previous = self.reads.get();
+            self.reads.set(previous + 1);
+            if previous == 0 {
+                output[0] = b' ';
+                Ok(1)
+            } else {
+                Ok(0)
+            }
+        }
+    }
+    let count = std::rc::Rc::new(std::cell::Cell::new(0));
+    let stat = landing(42, 0o100644).stat;
+    assert!(!lock_table_lists_from(
+        Ok(Counted {
+            reads: count.clone()
+        }),
+        &stat
+    ));
+    assert_eq!(count.get(), 1, "a lock snapshot must use one bounded read");
+}
+
+fn recorded_input_bytes(tracer: &Tracer<'_>, root: &Path, ignore: &Ignore) -> Vec<u8> {
+    let mut physical = Physical::new(root, root);
+    let inputs = crate::run::build_inputs(
+        root,
+        &mut physical,
+        &tracer.t,
+        ignore,
+        &std::collections::BTreeSet::new(),
+    )
+    .unwrap();
+    serde_json::to_vec(&(inputs, crate::run::build_priors(&tracer.t))).unwrap()
+}
+
+#[test]
+fn disabled_read_witness_requests_no_stop_and_preserves_legacy_inputs() {
+    let root = scratch("disabled-read-witness");
+    let path = root.join("f");
+    fs::write(&path, b"unchanged\n").unwrap();
+    let ignore = Ignore::new(&[], None, &[]);
+    let mut legacy = tracer_for(rec_for(&root, &ignore));
+    legacy.t.seen = Some(HashMap::new());
+    legacy.touch(path.clone(), true, true);
+
+    let mut disabled = tracer_for(rec_for(&root, &ignore));
+    disabled.t.seen = Some(HashMap::new());
+    disabled.initial_pid_namespace = false;
+    let pid = std::process::id() as i32;
+    let spelling = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let args = path_args(&spelling);
+    let before = READ_WITNESS_STOPS.with(|count| count.get());
+    disabled.open(pid, &args, None, 1, Some(2));
+    assert_eq!(
+        READ_WITNESS_STOPS.with(|count| count.get()),
+        before,
+        "a disabled witness must request zero extra read stops"
+    );
+    assert!(!disabled.pending_witness.contains_key(&pid));
+    assert_eq!(
+        recorded_input_bytes(&disabled, &root, &ignore),
+        recorded_input_bytes(&legacy, &root, &ignore),
+        "the serialized legacy input and prior records must be byte-identical"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
