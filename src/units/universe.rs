@@ -2,10 +2,13 @@
 
 use super::filter::Filter;
 use crate::ignore::Ignore;
-use crate::input::{self, Input};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::input;
+use crate::input::Input;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 use std::collections::HashSet;
 use std::path::Path;
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 use std::path::PathBuf;
 
 const MAX_UNITS: usize = 4096;
@@ -20,6 +23,7 @@ pub(crate) struct Catalog {
     pub inputs: Vec<Input>,
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 struct GitInventory {
     files: HashSet<String>,
     ignored_dirs: HashSet<String>,
@@ -27,6 +31,7 @@ struct GitInventory {
 }
 
 /// A valid Git record uses root-relative UTF-8 paths and no control characters.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn parse_git_records(bytes: &[u8], directories: bool) -> Result<Vec<String>, String> {
     if bytes.is_empty() {
         return Ok(Vec::new());
@@ -60,6 +65,7 @@ fn parse_git_records(bytes: &[u8], directories: bool) -> Result<Vec<String>, Str
         .collect()
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 impl GitInventory {
     fn from_outputs(
         root: &Path,
@@ -124,6 +130,7 @@ impl GitInventory {
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn git_available() -> bool {
     let Some(path) = std::env::var_os("PATH") else {
         return false;
@@ -149,6 +156,7 @@ fn git_available() -> bool {
     })
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn inventory(root: &Path) -> Result<Option<GitInventory>, String> {
     let Some(repo) = root.ancestors().find(|dir| dir.join(".git").exists()) else {
         return Ok(None);
@@ -221,6 +229,7 @@ pub(crate) fn explain(
     }
 }
 
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn discover_with_limits(
     root: &Path,
     ignore: &Ignore,
@@ -229,90 +238,280 @@ fn discover_with_limits(
     max_units: usize,
     max_dirs: usize,
 ) -> Result<Catalog, String> {
+    discover_with_hook(
+        root,
+        ignore,
+        filter,
+        default,
+        max_units,
+        max_dirs,
+        &mut |_| {},
+    )
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn discover_with_limits(
+    _root: &Path,
+    _ignore: &Ignore,
+    _filter: &Filter,
+    _default: Option<&Filter>,
+    _max_units: usize,
+    _max_dirs: usize,
+) -> Result<Catalog, String> {
+    Err("unit universe is not available on this platform".into())
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+struct Directory {
+    file: std::fs::File,
+    key: String,
+    names: Vec<Vec<u8>>,
+    next: usize,
+    listing: String,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Directory {
+    fn new(file: std::fs::File, key: String) -> Result<Self, String> {
+        let mut names = directory_names(&file)?;
+        let listing = input::list_hash_of_names(&mut names);
+        Ok(Self {
+            file,
+            key,
+            names,
+            next: 0,
+            listing,
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_child(dir: &std::fs::File, name: &mut Vec<u8>) -> Result<std::fs::File, String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    name.push(0);
+    // The final component must be a directory and cannot be followed through a symlink.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr().cast(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    name.pop();
+    if fd < 0 {
+        return Err(format!(
+            "cannot open a directory without following links: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(fd) })
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_root(root: &Path) -> Result<std::fs::File, String> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::path::Component;
+    let mut dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/")
+        .map_err(|error| format!("cannot open root directory: {error}"))?;
+    for component in root.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                dir = open_child(&dir, &mut name.as_bytes().to_vec())?;
+            }
+            _ => return Err("invalid root directory".into()),
+        }
+    }
+    Ok(dir)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn directory_names(dir: &std::fs::File) -> Result<Vec<Vec<u8>>, String> {
+    use std::ffi::CStr;
+    use std::os::fd::AsRawFd;
+    struct Stream(*mut libc::DIR);
+    impl Drop for Stream {
+        fn drop(&mut self) {
+            unsafe {
+                libc::closedir(self.0);
+            }
+        }
+    }
+    // Open a fresh description so reading the duplicate does not advance the caller's offset.
+    let fresh = open_child(dir, &mut b".".to_vec())?;
+    let duplicate = unsafe { libc::fcntl(fresh.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate < 0 {
+        return Err(format!(
+            "cannot duplicate a directory: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(duplicate);
+        }
+        return Err(format!("cannot read a directory: {error}"));
+    }
+    let stream = Stream(stream);
+    let mut names = Vec::new();
+    loop {
+        #[cfg(target_os = "linux")]
+        let errno = unsafe { libc::__errno_location() };
+        #[cfg(target_os = "macos")]
+        let errno = unsafe { libc::__error() };
+        unsafe {
+            *errno = 0;
+        }
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let code = unsafe { *errno };
+            if code != 0 {
+                return Err(format!(
+                    "cannot read a directory entry: {}",
+                    std::io::Error::from_raw_os_error(code)
+                ));
+            }
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if name != b"." && name != b".." {
+            names.push(name.to_vec());
+        }
+    }
+    Ok(names)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn entry_mode(dir: &std::fs::File, name: &mut Vec<u8>) -> Result<libc::mode_t, String> {
+    use std::mem::MaybeUninit;
+    use std::os::fd::AsRawFd;
+    let mut stat = MaybeUninit::<libc::stat>::uninit();
+    name.push(0);
+    let rc = unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr().cast(),
+            stat.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    name.pop();
+    if rc != 0 {
+        return Err(format!(
+            "cannot inspect a directory entry: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(unsafe { stat.assume_init() }.st_mode)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn discover_with_hook<F: FnMut(&str)>(
+    root: &Path,
+    ignore: &Ignore,
+    filter: &Filter,
+    default: Option<&Filter>,
+    max_units: usize,
+    max_dirs: usize,
+    before_open: &mut F,
+) -> Result<Catalog, String> {
     let root = root
         .canonicalize()
         .map_err(|error| format!("cannot read root: {error}"))?;
     let git = inventory(&root)?;
-    let mut pending = vec![(root.clone(), String::new())];
+    if max_dirs == 0 {
+        return Err("more than 0 walked directories".into());
+    }
+    let mut stack = vec![Directory::new(open_root(&root)?, String::new())?];
+    let mut visited = 1;
     let mut units = Vec::new();
     let mut inputs = Vec::new();
-    while let Some((directory, key)) = pending.pop() {
-        if inputs.len() >= max_dirs {
-            return Err(format!("more than {max_dirs} walked directories"));
-        }
-        let before = input::list_hash(&directory).ok_or("cannot read a directory listing")?;
-        let entries = std::fs::read_dir(&directory)
-            .map_err(|error| format!("cannot walk a directory: {error}"))?;
-        for entry in entries {
-            let entry = entry.map_err(|error| format!("cannot read a directory entry: {error}"))?;
-            let name = entry.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if name == ".git" || name == ".stoop" {
-                continue;
+    while let Some(directory) = stack.last_mut() {
+        if directory.next == directory.names.len() {
+            let mut after = directory_names(&directory.file)?;
+            if input::list_hash_of_names(&mut after) != directory.listing {
+                return Err("a directory changed while its units were listed".into());
             }
-            let child = if key.is_empty() {
-                name.to_string()
-            } else {
-                format!("{key}/{name}")
-            };
-            if ignore.is_ignored(&child) {
-                continue;
-            }
-            let kind = entry
-                .file_type()
-                .map_err(|error| format!("cannot inspect a directory entry: {error}"))?;
-            if kind.is_symlink() {
-                continue;
-            }
-            if kind.is_dir() {
-                if !git.as_ref().is_some_and(|git| git.prunes(&child)) {
-                    pending.push((entry.path(), child));
-                }
-            } else if kind.is_file() {
-                if git.as_ref().is_some_and(|git| !git.includes(&child)) {
-                    continue;
-                }
-                if child.len() > 4096 {
-                    return Err("a unit path cannot be represented".into());
-                }
-                let matches = if filter.exclusion_only() {
-                    default.is_some_and(|base| base.matches(&child, false))
-                        && filter.matches(&child, false)
+            let directory = stack.pop().unwrap();
+            inputs.push(Input {
+                path: if directory.key.is_empty() {
+                    ".".to_string()
                 } else {
-                    filter.matches(&child, false)
-                };
-                if !matches {
-                    continue;
-                }
-                if child.len() > 4096
-                    || child.chars().any(|c| c == '\0' || c == '\n')
-                    || child.split('/').any(|part| matches!(part, "" | "." | ".."))
-                {
-                    return Err("a unit path cannot be represented".into());
-                }
-                if units.len() >= max_units {
-                    return Err(format!("more than {max_units} units"));
-                }
-                units.push(UnitId(child));
+                    directory.key
+                },
+                id: format!("dl:{}", directory.listing),
+                oid: None,
+                oid_basis: None,
+            });
+            continue;
+        }
+        let name = &mut directory.names[directory.next];
+        directory.next += 1;
+        let Some(text) = std::str::from_utf8(name).ok() else {
+            continue;
+        };
+        if text == ".git" || text == ".stoop" {
+            continue;
+        }
+        let child = if directory.key.is_empty() {
+            text.to_string()
+        } else {
+            format!("{}/{text}", directory.key)
+        };
+        if ignore.is_ignored(&child) {
+            continue;
+        }
+        let mode = entry_mode(&directory.file, name)? & libc::S_IFMT;
+        if mode == libc::S_IFDIR {
+            if git.as_ref().is_some_and(|git| git.prunes(&child)) {
+                continue;
             }
+            if visited >= max_dirs {
+                return Err(format!("more than {max_dirs} walked directories"));
+            }
+            before_open(&child);
+            let child_dir = open_child(&directory.file, name)?;
+            stack.push(Directory::new(child_dir, child)?);
+            visited += 1;
+        } else if mode == libc::S_IFREG {
+            if git.as_ref().is_some_and(|git| !git.includes(&child)) {
+                continue;
+            }
+            if child.len() > 4096 {
+                return Err("a unit path cannot be represented".into());
+            }
+            let matches = if filter.exclusion_only() {
+                default.is_some_and(|base| base.matches(&child, false))
+                    && filter.matches(&child, false)
+            } else {
+                filter.matches(&child, false)
+            };
+            if !matches {
+                continue;
+            }
+            if child.chars().any(|c| c == '\0' || c == '\n')
+                || child.split('/').any(|part| matches!(part, "" | "." | ".."))
+            {
+                return Err("a unit path cannot be represented".into());
+            }
+            if units.len() >= max_units {
+                return Err(format!("more than {max_units} units"));
+            }
+            units.push(UnitId(child));
         }
-        let after = input::list_hash(&directory).ok_or("cannot recheck a directory listing")?;
-        if before != after {
-            return Err("a directory changed while its units were listed".into());
-        }
-        inputs.push(Input {
-            path: if key.is_empty() { ".".to_string() } else { key },
-            id: format!("dl:{after}"),
-            oid: None,
-            oid_basis: None,
-        });
     }
     units.sort();
     inputs.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Catalog { units, inputs })
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
 mod tests {
     use super::*;
     use std::fs;
@@ -335,6 +534,20 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .current_dir(dir)
+            .env("HOME", dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]
@@ -412,5 +625,146 @@ mod tests {
         );
         assert!(discover_with_limits(&dir.0, &ignore, &filter, None, 1, 2).is_err());
         assert!(discover_with_limits(&dir.0, &ignore, &filter, None, 2, 1).is_err());
+    }
+
+    #[test]
+    fn a_git_worktree_tracks_empty_directories_and_their_new_files() {
+        let dir = Dir::new();
+        git(&dir.0, &["init", "-q"]);
+        fs::create_dir(dir.0.join("empty")).unwrap();
+        let ignore = Ignore::new(&[], None, &[]);
+        let filter = Filter::inline("**/*.t");
+        let before = discover(&dir.0, &ignore, &filter, None).unwrap();
+        let old = before
+            .inputs
+            .iter()
+            .find(|input| input.path == "empty")
+            .unwrap()
+            .id
+            .clone();
+        fs::write(dir.0.join("empty/new.t"), b"x").unwrap();
+        let after = discover(&dir.0, &ignore, &filter, None).unwrap();
+        assert_ne!(
+            old,
+            after
+                .inputs
+                .iter()
+                .find(|input| input.path == "empty")
+                .unwrap()
+                .id
+        );
+        assert_eq!(after.units, vec![UnitId("empty/new.t".into())]);
+    }
+
+    #[test]
+    fn pruned_git_directories_do_not_count_toward_the_walk_limit() {
+        let dir = Dir::new();
+        git(&dir.0, &["init", "-q"]);
+        fs::write(dir.0.join(".gitignore"), b"ignored/\n").unwrap();
+        fs::create_dir(dir.0.join("ignored")).unwrap();
+        fs::write(dir.0.join("ignored/a.t"), b"x").unwrap();
+        let catalog = discover_with_limits(
+            &dir.0,
+            &Ignore::new(&[], None, &[]),
+            &Filter::inline("**/*.t"),
+            None,
+            4096,
+            1,
+        )
+        .unwrap();
+        assert!(catalog.units.is_empty());
+        assert_eq!(catalog.inputs.len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn seventy_thousand_files_in_a_wholly_ignored_directory_are_pruned() {
+        let dir = Dir::new();
+        git(&dir.0, &["init", "-q"]);
+        fs::write(dir.0.join(".gitignore"), b"ignored/\n").unwrap();
+        fs::create_dir(dir.0.join("ignored")).unwrap();
+        for i in 0..70_000 {
+            fs::write(dir.0.join("ignored").join(format!("{i:05}.t")), b"").unwrap();
+        }
+        let catalog = discover_with_limits(
+            &dir.0,
+            &Ignore::new(&[], None, &[]),
+            &Filter::inline("**/*.t"),
+            None,
+            4096,
+            1,
+        )
+        .unwrap();
+        assert!(catalog.units.is_empty());
+        assert_eq!(catalog.inputs.len(), 1);
+    }
+
+    #[test]
+    fn force_added_file_under_an_ignored_directory_is_a_unit_or_unknown() {
+        let dir = Dir::new();
+        git(&dir.0, &["init", "-q"]);
+        fs::write(dir.0.join(".gitignore"), b"ignored/\n").unwrap();
+        fs::create_dir(dir.0.join("ignored")).unwrap();
+        fs::write(dir.0.join("ignored/tracked.t"), b"x").unwrap();
+        git(&dir.0, &["add", "-f", "ignored/tracked.t"]);
+        match discover(
+            &dir.0,
+            &Ignore::new(&[], None, &[]),
+            &Filter::inline("**/*.t"),
+            None,
+        ) {
+            Ok(catalog) => assert!(catalog.units.contains(&UnitId("ignored/tracked.t".into()))),
+            Err(reason) => assert!(reason.contains("disagrees"), "{reason}"),
+        }
+    }
+
+    #[test]
+    fn swapping_a_directory_for_an_outside_symlink_refuses_the_universe() {
+        use std::os::unix::fs::symlink;
+        let dir = Dir::new();
+        let outside = Dir::new();
+        fs::create_dir(dir.0.join("victim")).unwrap();
+        fs::write(outside.0.join("outside.t"), b"x").unwrap();
+        let mut swap = |child: &str| {
+            if child == "victim" {
+                fs::rename(dir.0.join("victim"), dir.0.join("old-victim")).unwrap();
+                symlink(&outside.0, dir.0.join("victim")).unwrap();
+            }
+        };
+        let result = discover_with_hook(
+            &dir.0,
+            &Ignore::new(&[], None, &[]),
+            &Filter::inline("**/*.t"),
+            None,
+            4096,
+            65_536,
+            &mut swap,
+        );
+        match result {
+            Ok(_) => panic!("the swapped symlink was followed"),
+            Err(reason) => assert!(
+                reason.contains("cannot open a directory without following links"),
+                "{reason}"
+            ),
+        }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn windows_reports_the_universe_unknown() {
+        let result = discover(
+            Path::new("."),
+            &Ignore::new(&[], None, &[]),
+            &Filter::inline("**/*.t"),
+            None,
+        );
+        match result {
+            Ok(_) => panic!("Windows must not claim a discovered unit universe"),
+            Err(reason) => assert_eq!(reason, "unit universe is not available on this platform"),
+        }
     }
 }

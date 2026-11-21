@@ -1,4 +1,5 @@
 //! Read-only unit catalog discovery through the public CLI.
+#![cfg(any(target_os = "linux", target_os = "macos"))]
 
 #[cfg(unix)]
 use std::collections::BTreeMap;
