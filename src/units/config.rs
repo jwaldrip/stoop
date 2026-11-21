@@ -55,6 +55,8 @@ pub(crate) struct Suite {
     cwd: Option<String>,
     matches: Vec<String>,
     pub options: Vec<OptionDeclaration>,
+    #[allow(dead_code)]
+    pub units: Option<Vec<String>>,
     pub independent: Option<bool>,
 }
 
@@ -304,6 +306,7 @@ pub(crate) fn load(root: &Path) -> Result<Config, ConfigError> {
             cwd: raw.cwd,
             matches,
             options,
+            units: raw.units,
             independent: raw.independent,
         });
     }
