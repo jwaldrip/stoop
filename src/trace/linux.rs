@@ -2092,14 +2092,29 @@ fn plain_route(real: &Path, lexical: &Path) -> bool {
     true
 }
 
+#[cfg(test)]
+thread_local! {
+    static LOCK_TABLE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Whether the kernel's lock table lists a lock or a lease on the inode of `stat`. A table that
 /// cannot be read counts as listed, so the witness falls back to the legacy path.
 fn lock_table_lists(stat: &identity::FileStat) -> bool {
-    let Ok(table) = fs::read_to_string("/proc/locks") else {
+    #[cfg(test)]
+    LOCK_TABLE_SCANS.with(|scans| scans.set(scans.get() + 1));
+    lock_table_lists_from(fs::File::open("/proc/locks"), stat)
+}
+
+fn lock_table_lists_from<R: io::Read>(table: io::Result<R>, stat: &identity::FileStat) -> bool {
+    let Ok(mut table) = table else {
         return true;
     };
+    let mut text = String::new();
+    if table.read_to_string(&mut text).is_err() {
+        return true;
+    }
     let (major, minor) = dev_numbers(stat.dev);
-    table.split_whitespace().any(|field| {
+    text.split_whitespace().any(|field| {
         let mut parts = field.split(':');
         match (parts.next(), parts.next(), parts.next(), parts.next()) {
             (Some(maj), Some(min), Some(ino), None) => {
