@@ -2212,9 +2212,7 @@ impl Tracer<'_> {
         {
             return None;
         }
-        let Some(lexical) = self.lexical_path(pid, args, dirfd, argument) else {
-            return None;
-        };
+        let lexical = self.lexical_path(pid, args, dirfd, argument)?;
         // The witness names the ordinary spelling only: a /proc route or a symlink on the way
         // would name a different file from the one the call resolved (P2-2).
         if lexical.as_path() != path
