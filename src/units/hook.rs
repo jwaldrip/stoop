@@ -12,6 +12,7 @@ pub(crate) struct Hook {
     #[allow(dead_code)]
     pub spans: Vec<Vec<(usize, usize)>>,
     pub placeholders: Vec<Vec<Placeholder>>,
+    pub environment_placeholders: Vec<Placeholder>,
     pub placeholder: String,
 }
 
@@ -451,6 +452,7 @@ pub(crate) struct ParsedHook {
     argv: Vec<String>,
     spans: Vec<Vec<(usize, usize)>>,
     placeholders: Vec<Vec<Placeholder>>,
+    environment_placeholders: Vec<Placeholder>,
     placeholder: String,
     start: usize,
 }
@@ -460,6 +462,7 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
     let shell = shell_code(&argv);
     let mut all = Vec::with_capacity(argv.len());
     let mut placeholders = Vec::with_capacity(argv.len());
+    let mut environment_placeholders = Vec::new();
     let mut found = false;
     let mut env_code = false;
     let mut placeholder = String::new();
@@ -485,7 +488,8 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
                     || word.contains("$STOOP_CHANGED_INPUTS_FILE")
                     || word.contains("${STOOP_CHANGED_INPUTS_FILE");
                 all.push(Vec::new());
-                placeholders.push(parsed);
+                environment_placeholders = parsed;
+                placeholders.push(Vec::new());
                 continue;
             }
             if !parts.is_empty() && zero.is_some_and(|zero| idx <= zero) {
@@ -523,6 +527,7 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
         argv,
         spans: all,
         placeholders,
+        environment_placeholders,
         placeholder,
         start,
     }))
@@ -713,6 +718,7 @@ impl ParsedHook {
             argv,
             spans: all,
             placeholders,
+            environment_placeholders,
             placeholder,
             start,
         } = self;
@@ -720,6 +726,7 @@ impl ParsedHook {
         for filter in placeholders
             .iter()
             .flatten()
+            .chain(&environment_placeholders)
             .filter_map(|p| p.filter.as_ref())
         {
             if inline.is_some_and(|prior| prior != filter) {
@@ -746,6 +753,7 @@ impl ParsedHook {
             removed,
             spans: all,
             placeholders,
+            environment_placeholders,
             placeholder,
         })
     }
@@ -1009,13 +1017,47 @@ pub(crate) fn empty_value_line(argv: &[OsString], explain: bool) -> Option<Strin
 
 #[cfg(test)]
 mod tests {
-    use super::safe;
+    use super::*;
 
     #[test]
     fn safe_neutralises_control_bidi_and_workflow_text() {
         assert_eq!(safe("a\nb\u{1b}c"), "a\\u{a}b\\u{1b}c");
         assert_eq!(safe("x\u{202E}y"), "x\\u{202e}y");
         assert_eq!(safe("##[error]z::w"), "#%23[error]z%3A%3Aw");
+    }
+
+    #[test]
+    fn shell_environment_placeholders_stay_separate_from_argument_spans() {
+        let argv: Vec<OsString> = [
+            "sh",
+            "-c",
+            "echo ${STOOP_CHANGED:*.t}",
+            "sh",
+            "--files",
+            "{changed:*.t}",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect();
+        let hook = parse(&argv)
+            .unwrap()
+            .unwrap()
+            .finish(&argv, &[], false)
+            .unwrap();
+        assert_eq!(hook.spans.len(), hook.placeholders.len());
+        for (spans, placeholders) in hook.spans.iter().zip(&hook.placeholders) {
+            assert_eq!(spans.len(), placeholders.len());
+        }
+        assert_eq!(hook.environment_placeholders.len(), 1);
+        assert_eq!(
+            hook.environment_placeholders[0]
+                .filter
+                .as_ref()
+                .unwrap()
+                .text(),
+            "*.t"
+        );
+        assert_eq!(hook.argv, argv[..4]);
     }
 }
 

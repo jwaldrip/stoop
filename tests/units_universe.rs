@@ -120,6 +120,14 @@ fn explain_counts_units_for_an_inline_filter() {
 }
 
 #[test]
+fn explain_uses_a_filter_from_a_shell_environment_reference() {
+    let f = Fixture::new();
+    f.file("tests/a.t");
+    let output = f.command("explain", &["sh", "-c", "echo ${STOOP_CHANGED:*.t}", "sh"]);
+    tracked(&stderr(&output), 1);
+}
+
+#[test]
 fn config_units_is_the_default_filter() {
     let f = Fixture::new();
     f.file("tests/a.t");

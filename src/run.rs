@@ -1032,6 +1032,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 .placeholders
                 .iter()
                 .flatten()
+                .chain(&hook.environment_placeholders)
                 .find_map(|placeholder| placeholder.filter.as_ref());
             let ignore = Ignore::new(&o.ignore, Some(&root.join(".stoopignore")), &o.transient);
             eprintln!(
