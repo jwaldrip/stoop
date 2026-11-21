@@ -637,11 +637,26 @@ mod tests {
         for name in [".hidden", "normal", "café", "文"] {
             fs::write(root.join("names").join(name), b"").unwrap();
         }
-        #[cfg(unix)]
+        #[cfg(target_os = "linux")]
         {
             use std::os::unix::ffi::OsStringExt;
             let name = std::ffi::OsString::from_vec(vec![b'n', 0xff]);
             fs::write(root.join("names").join(name), b"").unwrap();
+        }
+        #[cfg(unix)]
+        {
+            let mut names = vec![vec![b'n', 0xff], b".hidden".to_vec()];
+            let mut reference = names.clone();
+            reference.sort();
+            let mut h = blake3::Hasher::new();
+            for name in reference {
+                h.update(&(name.len() as u64).to_le_bytes());
+                h.update(&name);
+            }
+            assert_eq!(
+                list_hash_of_names(&mut names),
+                h.finalize().to_hex().to_string()
+            );
         }
         for i in 0..2048 {
             fs::write(root.join("large").join(format!("{i:04}")), b"").unwrap();
