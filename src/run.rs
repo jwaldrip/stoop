@@ -2640,3 +2640,48 @@ mod read_identity_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod landing_witness_tests {
+    use super::*;
+
+    /// Finding P2-7: the emitted output ID of a promoted landing must carry the execute bit and
+    /// digest of the landed inode. A disagreeing ID must not verify, and neither must a missing one.
+    #[test]
+    fn landing_needs_the_emitted_output_id_to_match_the_landed_mode_and_digest() {
+        let stat = trace::identity::FileStat {
+            dev: 1,
+            ino: 2,
+            size: 1,
+            mtime_ns: 1,
+            ctime_ns: 1,
+            mode: 0o100644,
+        };
+        let mut landed = Trace::default();
+        landed.atomic_landings.insert(
+            "f".into(),
+            trace::AtomicLanding {
+                stat,
+                hash: "h".into(),
+            },
+        );
+        let post = trace::identity::Post::File {
+            stat,
+            hash: "h".into(),
+        };
+        let matching = crate::input::file_id(false, "h");
+        let executable = crate::input::file_id(true, "h");
+        assert!(
+            landing_verified(&landed, "f", Some(matching.as_str()), &post),
+            "control: the output ID that matches the landed mode and digest verifies"
+        );
+        assert!(
+            !landing_verified(&landed, "f", Some(executable.as_str()), &post),
+            "P2-7: an executable output ID must not verify a 0644 landing"
+        );
+        assert!(
+            !landing_verified(&landed, "f", None, &post),
+            "P2-7: an unreadable output must not verify the landing"
+        );
+    }
+}

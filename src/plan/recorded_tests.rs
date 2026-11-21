@@ -77,7 +77,7 @@ impl Fixture {
         fs::create_dir_all(&root).unwrap();
         put(&root, "in.txt", "one");
         match case {
-            "sed" => put(&root, "config.txt", "foo\n"),
+            "sed" | "sed-exec" => put(&root, "config.txt", "foo\n"),
             "mkdir" => put(&root, "src/keep", "keep"),
             "rename" => put(&root, "d/file", "keep"),
             "eol" | "failed" => {}
@@ -235,7 +235,7 @@ impl Drop for Fixture {
 fn change(f: &Fixture, case: &str) {
     use std::os::unix::fs::PermissionsExt;
     match case {
-        "sed" | "proc" => put(&f.root, "config.txt", "changed\n"),
+        "sed" | "sed-exec" | "proc" => put(&f.root, "config.txt", "changed\n"),
         "mkdir" => {
             fs::remove_dir_all(f.root.join("src")).unwrap();
             put(&f.root, "src", "not a directory");
@@ -251,8 +251,8 @@ fn change(f: &Fixture, case: &str) {
     }
 }
 
-const CASES: [&str; 8] = [
-    "sed", "mkdir", "eol", "chmod", "parent", "failed", "proc", "app",
+const CASES: [&str; 9] = [
+    "sed", "sed-exec", "mkdir", "eol", "chmod", "parent", "failed", "proc", "app",
 ];
 
 fn expected_change(case: &str) -> Code {
@@ -396,4 +396,23 @@ fn real_recorded_directory_rename_and_symlink_write_are_unplannable() {
         let result = f.decision();
         assert_eq!(result.code, Code::Unplannable, "{case}: {}", result.detail);
     }
+}
+
+/// The single-tracee `exec sed -i` recording must carry the promoted input that the shell-wrapped
+/// sed recording lacks: `config.txt` is an input equal to its prior. Finding P2-6.
+#[test]
+fn single_tracee_sed_records_the_promoted_config_input() {
+    let f = Fixture::new("sed-exec");
+    let proof = f.store.load("t").remove(0);
+    let prior = proof
+        .priors
+        .as_ref()
+        .and_then(|priors| priors.iter().find(|input| input.path == "config.txt"))
+        .expect("config.txt prior");
+    let input = proof
+        .inputs
+        .iter()
+        .find(|input| input.path == "config.txt")
+        .expect("config.txt promoted input");
+    assert_eq!(input.id, prior.id);
 }

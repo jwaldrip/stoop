@@ -3518,6 +3518,9 @@ impl Tracer<'_> {
 }
 
 #[cfg(test)]
+mod witness_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[test]
