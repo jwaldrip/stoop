@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 CASES = {"sed", "mkdir", "rename", "eol", "chmod", "parent", "failed", "symlink", "proc", "app"}
+NEW_CASE = "sed-exec"
 ENV_CHANGES = {
     "CACHE_ON_FAILURE", "GOROOT_1_24_X64", "GOROOT_1_27_X64", "HCA_CLOUD_PROVIDER",
     "HOME", "ImageVersion", "SGX_AESM_ADDR", "SYSTEMD_EXEC_PID", "XDG_CONFIG_HOME",
@@ -29,6 +30,13 @@ def sed_temp(proof):
     return priors[0]
 
 
+def shell_wrapped_fork(proof):
+    """The committed sed recording ran `sh -c` with sed as a child (the vfork fallback). `exec`
+    makes sed the only traced task, the form whose rename witness promotes config.txt."""
+    argv = proof["argv"]
+    return argv[:2] == ["sh", "-c"] and not argv[2].startswith("exec ")
+
+
 def comparable(value, case, path=()):
     if isinstance(value, dict):
         return {key: comparable(item, case, path + (key,)) for key, item in value.items()}
@@ -46,11 +54,52 @@ def comparable(value, case, path=()):
     return value
 
 
+def single_tracee_sed(old_dir, raw_dir, output_dir):
+    """The `exec sed -i` recording. Its environment is restored to the committed sed recording's,
+    which ran on the same runner, and its promoted config.txt input must equal its prior."""
+    reference = json.loads((old_dir / "sed" / "proof.json").read_text())["proofs"][0]
+    raw = json.loads((raw_dir / NEW_CASE / "proof.json").read_text())
+    if len(raw["proofs"]) != 1:
+        raise SystemExit(f"{NEW_CASE}: expected exactly one proof")
+    generated = raw["proofs"][0]
+    if generated["provenance"]["version"] != 11:
+        raise SystemExit(f"{NEW_CASE}: expected recorder version 11")
+    if generated["argv"] != ["sh", "-c", "exec sed -i s/foo/bar/ config.txt"]:
+        raise SystemExit(f"{NEW_CASE}: the recording is not the single-tracee exec form")
+    changed = {
+        key for key in reference["env"].keys() | generated["env"].keys()
+        if reference["env"].get(key) != generated["env"].get(key)
+    }
+    if not changed <= ENV_CHANGES:
+        raise SystemExit(f"{NEW_CASE}: unexpected environment deltas: {sorted(changed - ENV_CHANGES)}")
+    prior = [item for item in generated["priors"] if item["path"] == "config.txt"]
+    promoted = [item for item in generated["inputs"] if item["path"] == "config.txt"]
+    if len(prior) != 1 or promoted != prior:
+        raise SystemExit(f"{NEW_CASE}: the promoted config.txt input must equal its prior")
+    sed_temp(generated)
+    normalized = copy.deepcopy(raw)
+    normalized["proofs"][0]["env"] = copy.deepcopy(reference["env"])
+    old_inputs = {item["path"]: item for item in reference["inputs"]}
+    for item in normalized["proofs"][0]["inputs"]:
+        previous = old_inputs.get(item["path"])
+        if (previous and runner_system_file(item) and runner_system_file(previous)
+                and item["id"][:2] == previous["id"][:2] and item["id"] != previous["id"]):
+            item["id"] = previous["id"]
+    target = output_dir / NEW_CASE / "proof.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(normalized, separators=(",", ":")))
+    print(f"{NEW_CASE}: promoted config.txt input {promoted[0]['id']}")
+
+
 def main():
     if len(sys.argv) != 4:
         raise SystemExit("usage: normalize_recorder_fixtures.py OLD RAW OUTPUT")
     old_dir, raw_dir, output_dir = map(Path, sys.argv[1:])
-    if {p.parent.name for p in raw_dir.glob("*/proof.json")} != CASES:
+    raw_cases = {p.parent.name for p in raw_dir.glob("*/proof.json")}
+    if raw_cases == {NEW_CASE}:
+        single_tracee_sed(old_dir, raw_dir, output_dir)
+        return
+    if raw_cases != CASES | {NEW_CASE}:
         raise SystemExit("raw fixture case set differs")
     for case in sorted(CASES):
         old = json.loads((old_dir / case / "proof.json").read_text())
@@ -79,7 +128,11 @@ def main():
             old_prior = [item for item in before["priors"] if item["path"] == "config.txt"]
             new_prior = [item for item in generated["priors"] if item["path"] == "config.txt"]
             promoted = [item for item in generated["inputs"] if item["path"] == "config.txt"]
-            if len(old_prior) != 1 or new_prior != old_prior or promoted not in ([], old_prior):
+            if len(old_prior) != 1 or new_prior != old_prior:
+                raise SystemExit("sed: the generated config.txt prior differs from the committed one")
+            if promoted == [] and not shell_wrapped_fork(generated):
+                raise SystemExit("sed: an empty config.txt input list is valid only for the shell-wrapped sed")
+            if promoted not in ([], old_prior):
                 raise SystemExit("sed: any added config.txt input must equal its prior")
             sed_temp(before)
             sed_temp(generated)
@@ -101,6 +154,7 @@ def main():
             f"sed_temp_prior={sed_names}; sed_temp_removed={sed_names}; "
             f"sed_prior_input={len(promoted) if case == 'sed' else 0}"
         )
+    single_tracee_sed(old_dir, raw_dir, output_dir)
 
 
 if __name__ == "__main__":

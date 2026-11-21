@@ -1586,3 +1586,24 @@ os.close(fd)
         stderr(&out)
     );
 }
+
+/// Regenerate the single-tracee `exec sed -i` recording through the real recorder on Linux. The raw
+/// proof goes to tests/fixtures/recorder/sed-exec/proof.json. The committed fixture is that proof
+/// after `python3 tests/normalize_recorder_fixtures.py <old> <raw-dir> tests/fixtures/recorder`,
+/// where <raw-dir> holds only the sed-exec directory.
+#[test]
+#[ignore = "regenerates tests/fixtures/recorder/sed-exec on Linux with STOOP_REGENERATE_RECORDER_FIXTURES=1"]
+fn regenerate_single_tracee_sed_fixture() {
+    assert_eq!(
+        std::env::var("STOOP_REGENERATE_RECORDER_FIXTURES").as_deref(),
+        Ok("1")
+    );
+    let case = Case::new("regenerate-sed-exec");
+    case.file("config.txt", b"foo\n");
+    age();
+    let out = run(&case, "sed-exec", "exec sed -i s/foo/bar/ config.txt", &[]);
+    assert_recorded(&out, &case, "sed-exec");
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recorder/sed-exec");
+    fs::create_dir_all(&dir).unwrap();
+    fs::copy(case.proof("sed-exec"), dir.join("proof.json")).unwrap();
+}
