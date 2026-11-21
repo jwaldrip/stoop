@@ -2916,22 +2916,57 @@ impl Tracer<'_> {
             push_changed(&mut self.t, destination);
             return Vec::new();
         }
+        // The prior's blob id comes from the same bytes as its hash, and only when the basis allows
+        // an id. Without that basis the hash alone is recorded, as before.
+        let basis = (!self.t.oid_attrs_changed)
+            .then(|| {
+                rec.oid_epoch
+                    .as_ref()
+                    .and_then(|epoch| epoch.basis.get(&key))
+                    .cloned()
+            })
+            .flatten();
+        let want_oid = basis.as_ref().is_some_and(|basis| basis.allows_oid());
+        let mut oid = None;
         let prior = match &seen {
             Seen::Absent => Some("a".to_string()),
-            Seen::File(file) => match &file.read_hash {
-                identity::ReadHash::Hashed(hash) => {
-                    Some(file_id(file.stat.mode & 0o111 != 0, hash))
-                }
-                identity::ReadHash::NotNeeded => {
-                    match identity::hash_bound(destination, &file.stat, &mut rec.reads) {
-                        identity::ReadHash::Hashed(hash) => {
-                            Some(file_id(file.stat.mode & 0o111 != 0, &hash))
+            Seen::File(file) => {
+                let exec = file.stat.mode & 0o111 != 0;
+                match &file.read_hash {
+                    identity::ReadHash::Hashed(first) if !want_oid => Some(file_id(exec, first)),
+                    identity::ReadHash::Hashed(first) => {
+                        // The bytes are read again for the blob id. They must still be the bytes
+                        // hashed at the read, or the prior is refused.
+                        match identity::hash_bound_with_oid(
+                            destination,
+                            &file.stat,
+                            &mut rec.reads,
+                            true,
+                        ) {
+                            (identity::ReadHash::Hashed(hash), read_oid) if &hash == first => {
+                                oid = read_oid;
+                                Some(file_id(exec, &hash))
+                            }
+                            _ => None,
                         }
-                        _ => None,
                     }
+                    identity::ReadHash::NotNeeded => {
+                        match identity::hash_bound_with_oid(
+                            destination,
+                            &file.stat,
+                            &mut rec.reads,
+                            want_oid,
+                        ) {
+                            (identity::ReadHash::Hashed(hash), read_oid) => {
+                                oid = read_oid;
+                                Some(file_id(exec, &hash))
+                            }
+                            _ => None,
+                        }
+                    }
+                    _ => None,
                 }
-                _ => None,
-            },
+            }
             _ => None,
         };
         let Some(prior) = prior else {
@@ -2951,6 +2986,10 @@ impl Tracer<'_> {
         }
         if new_prior {
             rec.hashed += prior_bytes;
+            if let (Some(basis), Some(oid)) = (basis, oid) {
+                self.t.prior_oids.insert(key.clone(), oid);
+                self.t.prior_oid_bases.insert(key.clone(), basis);
+            }
         }
         self.t.priors.entry(key).or_insert(prior);
         vec![destination.to_path_buf()]

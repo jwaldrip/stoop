@@ -224,6 +224,26 @@ pub fn blob_oid(bytes: &[u8], sha256: bool) -> String {
     digest_hex("", digest.finish())
 }
 
+/// A Git blob id being computed. Its header comes from the byte length, so `finish` is the id only
+/// when exactly that many bytes were added.
+pub(crate) struct BlobOid(ring::digest::Context);
+
+impl BlobOid {
+    pub(crate) fn new(len: u64) -> Self {
+        let mut digest = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);
+        blob_header(&mut digest, len);
+        Self(digest)
+    }
+
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        self.0.update(bytes);
+    }
+
+    pub(crate) fn finish(self) -> String {
+        digest_hex("sha1:", self.0.finish())
+    }
+}
+
 fn hash_reader_with_oid(mut reader: impl Read, len: u64) -> io::Result<(String, Option<String>)> {
     let mut blake = blake3::Hasher::new();
     let mut git = ring::digest::Context::new(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY);

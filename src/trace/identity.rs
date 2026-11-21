@@ -287,8 +287,19 @@ fn needs_hash(file: &FileSeen, now: i128) -> bool {
 
 /// Hash an opened regular file only when its full stat matches `expected` before and after the read.
 pub(crate) fn hash_bound(path: &Path, expected: &FileStat, budget: &mut ReadBudget) -> ReadHash {
+    hash_bound_with_oid(path, expected, budget, false).0
+}
+
+/// As `hash_bound`, also returning the Git blob id of the same bytes when `oid` is set. The id is
+/// only returned with a `Hashed` result, so it always describes the bytes that were hashed.
+pub(crate) fn hash_bound_with_oid(
+    path: &Path,
+    expected: &FileStat,
+    budget: &mut ReadBudget,
+    oid: bool,
+) -> (ReadHash, Option<String>) {
     if budget.hashed > READ_HASH_BUDGET {
-        return ReadHash::OverBudget;
+        return (ReadHash::OverBudget, None);
     }
     let mut options = fs::OpenOptions::new();
     options.read(true);
@@ -297,34 +308,48 @@ pub(crate) fn hash_bound(path: &Path, expected: &FileStat, budget: &mut ReadBudg
     #[cfg(windows)]
     options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
     let Ok(file) = options.open(path) else {
-        return ReadHash::Unhashable;
+        return (ReadHash::Unhashable, None);
     };
-    hash_opened(&file, &file, expected, budget)
+    hash_opened_with_oid(&file, &file, expected, budget, oid)
 }
 
 /// Hash bytes from the opened descriptor, requiring the full captured stat on both sides.
+#[cfg_attr(not(test), allow(dead_code))]
 fn hash_opened<R: Read>(
+    file: &fs::File,
+    reader: R,
+    expected: &FileStat,
+    budget: &mut ReadBudget,
+) -> ReadHash {
+    hash_opened_with_oid(file, reader, expected, budget, false).0
+}
+
+/// `hash_opened`, also computing the blob id of the bytes read when `oid` is set. The bytes must
+/// total `expected.size`, which the stat check requires, so the id's header is exact.
+fn hash_opened_with_oid<R: Read>(
     file: &fs::File,
     mut reader: R,
     expected: &FileStat,
     budget: &mut ReadBudget,
-) -> ReadHash {
+    oid: bool,
+) -> (ReadHash, Option<String>) {
     let Ok(before) = file.metadata() else {
-        return ReadHash::Unhashable;
+        return (ReadHash::Unhashable, None);
     };
     if !before.is_file() || file_stat(&before) != *expected {
-        return ReadHash::Moved;
+        return (ReadHash::Moved, None);
     }
     let remaining = READ_HASH_BUDGET.saturating_sub(budget.hashed);
     let mut consumed = 0_u64;
     let mut hasher = blake3::Hasher::new();
+    let mut git = oid.then(|| crate::input::BlobOid::new(expected.size));
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let limit = (remaining + 1 - consumed).min(buffer.len() as u64) as usize;
         let n = match reader.read(&mut buffer[..limit]) {
             Ok(n) => n,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(_) => return ReadHash::Unhashable,
+            Err(_) => return (ReadHash::Unhashable, None),
         };
         if n == 0 {
             break;
@@ -332,17 +357,23 @@ fn hash_opened<R: Read>(
         consumed += n as u64;
         budget.hashed = budget.hashed.saturating_add(n as u64);
         if consumed > remaining {
-            return ReadHash::OverBudget;
+            return (ReadHash::OverBudget, None);
         }
         hasher.update(&buffer[..n]);
+        if let Some(git) = git.as_mut() {
+            git.update(&buffer[..n]);
+        }
     }
     let Ok(after) = file.metadata() else {
-        return ReadHash::Unhashable;
+        return (ReadHash::Unhashable, None);
     };
     if !after.is_file() || file_stat(&after) != *expected || consumed != expected.size {
-        return ReadHash::Moved;
+        return (ReadHash::Moved, None);
     }
-    ReadHash::Hashed(hasher.finalize().to_hex().to_string())
+    (
+        ReadHash::Hashed(hasher.finalize().to_hex().to_string()),
+        git.map(crate::input::BlobOid::finish),
+    )
 }
 
 /// At a read stop for `path`, hash its bytes if the file is racy and not yet hashed. A symbolic
@@ -1249,5 +1280,34 @@ mod tests {
         assert!(!still_holds(&seen, &link, &mut budget));
         assert_eq!(budget.hashed, 0);
         fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod bound_oid_tests {
+    use super::*;
+
+    #[test]
+    fn a_bound_hash_returns_the_blob_id_of_the_same_bytes() {
+        let dir = std::env::temp_dir().join(format!("stoop-bound-oid-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f");
+        std::fs::write(&path, b"blob bytes\n").unwrap();
+        let stat = file_stat(&std::fs::symlink_metadata(&path).unwrap());
+        let mut budget = ReadBudget::default();
+        let (read, oid) = hash_bound_with_oid(&path, &stat, &mut budget, true);
+        let hash = blake3::hash(b"blob bytes\n").to_hex().to_string();
+        assert_eq!(read, ReadHash::Hashed(hash));
+        assert_eq!(
+            oid,
+            Some(format!(
+                "sha1:{}",
+                crate::input::blob_oid(b"blob bytes\n", false)
+            ))
+        );
+        let (_, without) = hash_bound_with_oid(&path, &stat, &mut budget, false);
+        assert_eq!(without, None);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
