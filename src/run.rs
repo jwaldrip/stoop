@@ -1506,15 +1506,17 @@ fn landing_matches(landing: &trace::AtomicLanding, post: &trace::identity::Post)
 fn landing_verified(
     trace: &Trace,
     key: &str,
-    _id: Option<&str>,
+    id: Option<&str>,
     post: &trace::identity::Post,
 ) -> bool {
     !trace.footprint.unknown
         && !trace::identity::link_route_unknown(&trace.footprint)
-        && trace
-            .atomic_landings
-            .get(key)
-            .is_some_and(|landing| landing_matches(landing, post))
+        && trace.atomic_landings.get(key).is_some_and(|landing| {
+            landing_matches(landing, post)
+                && id.is_some_and(|id| {
+                    id == crate::input::file_id(landing.stat.mode & 0o111 != 0, &landing.hash)
+                })
+        })
 }
 
 /// What the run left behind inside the repository, read once it finished: one entry for each

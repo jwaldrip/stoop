@@ -1960,7 +1960,9 @@ impl Rec<'_> {
         {
             hash_file_with_identity(phys, with_oid).map(|(hash, oid, bound)| {
                 if let (Some(binding), Some(bound)) = (&mut self.prior_binding, bound) {
-                    binding.verified = identity::matches_prior(&binding.seen, &bound, &hash);
+                    // The pathname stat chose this prefix, so it must be the descriptor's stat.
+                    binding.verified = identity::matches_prior(&binding.seen, &bound, &hash)
+                        && identity::file_stat(m) == bound.before;
                 }
                 (hash, oid)
             })
@@ -2056,18 +2058,65 @@ fn invalidate_landing_path(
         inodes.clear();
         return;
     }
+    // Descendants of `key` are the names under `key/`, which sort together. A sibling such as
+    // `key.old` sorts between `key` and `key/f`, so the scan starts at the prefix, not at `key`.
     let prefix = format!("{key}/");
-    let keys: Vec<String> = trace
+    let mut names: Vec<String> = trace
         .atomic_landings
-        .range(key.to_owned()..)
-        .take_while(|(name, _)| name.as_str() == key || name.starts_with(&prefix))
+        .range(prefix.clone()..)
+        .take_while(|(name, _)| name.starts_with(&prefix))
         .map(|(name, _)| name.clone())
         .collect();
-    for name in keys {
+    names.push(key.to_owned());
+    for name in names {
         if let Some(landing) = trace.atomic_landings.remove(&name) {
             inodes.remove(&(landing.stat.dev, landing.stat.ino));
         }
     }
+}
+
+/// A witness names a file by an ordinary spelling only. Below the canonical root, no component may
+/// be a symbolic link, because resolving one would name a different file than the spelling does.
+/// A path outside the root, such as a `/proc` route, is refused.
+fn plain_route(real: &Path, lexical: &Path) -> bool {
+    let Ok(below) = lexical.strip_prefix(real) else {
+        return false;
+    };
+    let mut at = real.to_path_buf();
+    for part in below.components() {
+        at.push(part);
+        if fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether the kernel's lock table lists a lock or a lease on the inode of `stat`. A table that
+/// cannot be read counts as listed, so the witness falls back to the legacy path.
+fn lock_table_lists(stat: &identity::FileStat) -> bool {
+    let Ok(table) = fs::read_to_string("/proc/locks") else {
+        return true;
+    };
+    let (major, minor) = dev_numbers(stat.dev);
+    table.split_whitespace().any(|field| {
+        let mut parts = field.split(':');
+        match (parts.next(), parts.next(), parts.next(), parts.next()) {
+            (Some(maj), Some(min), Some(ino), None) => {
+                u64::from_str_radix(maj, 16).ok() == Some(major)
+                    && u64::from_str_radix(min, 16).ok() == Some(minor)
+                    && ino.parse::<u64>().ok() == Some(stat.ino)
+            }
+            _ => false,
+        }
+    })
+}
+
+/// The major and minor numbers of a Linux device number, as `/proc/locks` prints them.
+fn dev_numbers(dev: u64) -> (u64, u64) {
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    (major, minor)
 }
 
 impl Tracer<'_> {
@@ -2079,13 +2128,35 @@ impl Tracer<'_> {
         self.landing_inodes.clear();
     }
 
+    /// The spelling a call names, joined onto its directory and not yet mapped through a proc
+    /// magic link. `resolve` maps the same join, so a witness compares the two.
+    fn lexical_path(
+        &mut self,
+        pid: i32,
+        args: &[u64; 6],
+        dirfd: Option<usize>,
+        path: usize,
+    ) -> Option<PathBuf> {
+        let raw = read_cstr(pid, args[path])?;
+        let p = PathBuf::from(OsString::from_vec(raw));
+        if p.is_absolute() {
+            return Some(without_dots(&p));
+        }
+        let base = match dirfd.map(|i| args[i] as i32) {
+            None | Some(AT_FDCWD) => self.cwd(pid),
+            Some(fd) => fs::read_link(format!("/proc/{pid}/fd/{fd}")).ok(),
+        }?;
+        Some(without_dots(&base.join(&p)))
+    }
+
     /// Return a key only for an exact, unredirected repository path.
     fn exact_key(&mut self, path: &Path) -> Option<String> {
         let rec = self.rec.as_mut()?;
         if !path.starts_with(rec.phys.real()) {
             return None;
         }
-        let loc = rec.phys.locate(path)?;
+        // A witness lookup must not fill the parent cache that the legacy writer reads (P2-5).
+        let loc = rec.phys.locate_uncached(path)?;
         if loc.redirected || loc.path != path {
             return None;
         }
@@ -2138,6 +2209,19 @@ impl Tracer<'_> {
                 .as_ref()
                 .is_none_or(|rec| !path.starts_with(rec.phys.real()))
             || !plain_argument(pid, args, dirfd, argument)
+        {
+            return None;
+        }
+        let Some(lexical) = self.lexical_path(pid, args, dirfd, argument) else {
+            return None;
+        };
+        // The witness names the ordinary spelling only: a /proc route or a symlink on the way
+        // would name a different file from the one the call resolved (P2-2).
+        if lexical.as_path() != path
+            || !self
+                .rec
+                .as_ref()
+                .is_some_and(|rec| plain_route(rec.phys.real(), &lexical))
         {
             return None;
         }
@@ -2288,6 +2372,21 @@ impl Tracer<'_> {
         {
             return None;
         }
+        let (Some(lex_a), Some(lex_b)) = (
+            self.lexical_path(pid, args, from.0, from.1),
+            self.lexical_path(pid, args, to.0, to.1),
+        ) else {
+            return None;
+        };
+        // Both operands must be ordinary spellings, as for a read witness (P2-2).
+        if lex_a.as_path() != a
+            || lex_b.as_path() != b
+            || !self.rec.as_ref().is_some_and(|rec| {
+                plain_route(rec.phys.real(), &lex_a) && plain_route(rec.phys.real(), &lex_b)
+            })
+        {
+            return None;
+        }
         let source_key = self.exact_key(a)?;
         let key = self.exact_key(b)?;
         if self.t.keys.get(a) != Some(&source_key)
@@ -2308,6 +2407,11 @@ impl Tracer<'_> {
             return None;
         }
         let source_stat = identity::file_stat(source);
+        // An open of a leased file breaks the lease, and the kernel signals its holder. The
+        // source is opened only when the lock table lists no lease or lock on its inode (P1-1).
+        if lock_table_lists(&source_stat) {
+            return None;
+        }
         let rec = self.rec.as_mut()?;
         let identity::ReadHash::Hashed(hash) =
             identity::hash_bound(a, &source_stat, &mut rec.rewrite_budget)
