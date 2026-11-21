@@ -610,6 +610,8 @@ mod tests {
 
     #[test]
     fn exact_unit_and_directory_limits_refuse_the_next_item() {
+        assert_eq!(MAX_UNITS, 4096);
+        assert_eq!(MAX_DIRS, 65_536);
         let dir = Dir::new();
         fs::create_dir(dir.0.join("a")).unwrap();
         fs::write(dir.0.join("a/one.t"), b"1").unwrap();
@@ -725,8 +727,10 @@ mod tests {
         let outside = Dir::new();
         fs::create_dir(dir.0.join("victim")).unwrap();
         fs::write(outside.0.join("outside.t"), b"x").unwrap();
+        let triggered = std::cell::Cell::new(false);
         let mut swap = |child: &str| {
             if child == "victim" {
+                triggered.set(true);
                 fs::rename(dir.0.join("victim"), dir.0.join("old-victim")).unwrap();
                 symlink(&outside.0, dir.0.join("victim")).unwrap();
             }
@@ -740,6 +744,7 @@ mod tests {
             65_536,
             &mut swap,
         );
+        assert!(triggered.get(), "the directory swap did not run");
         match result {
             Ok(_) => panic!("the swapped symlink was followed"),
             Err(reason) => assert!(
@@ -747,6 +752,24 @@ mod tests {
                 "{reason}"
             ),
         }
+    }
+
+    #[test]
+    fn a_replaced_parent_path_cannot_redirect_an_open_directory_handle() {
+        use std::os::unix::fs::symlink;
+        let dir = Dir::new();
+        let outside = Dir::new();
+        fs::create_dir_all(dir.0.join("parent/child")).unwrap();
+        fs::write(dir.0.join("parent/child/safe.t"), b"safe").unwrap();
+        fs::create_dir(outside.0.join("child")).unwrap();
+        fs::write(outside.0.join("child/outside.t"), b"outside").unwrap();
+        let parent = open_root(&dir.0.join("parent").canonicalize().unwrap()).unwrap();
+        fs::rename(dir.0.join("parent"), dir.0.join("old-parent")).unwrap();
+        symlink(&outside.0, dir.0.join("parent")).unwrap();
+        let child = open_child(&parent, &mut b"child".to_vec()).unwrap();
+        let names = directory_names(&child).unwrap();
+        assert!(names.contains(&b"safe.t".to_vec()), "{names:?}");
+        assert!(!names.contains(&b"outside.t".to_vec()), "{names:?}");
     }
 }
 
