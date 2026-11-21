@@ -1019,6 +1019,9 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         let dir = if rel_cwd.is_empty() { "." } else { &rel_cwd };
         eprintln!("stoop: dir {dir:?}");
         if let Some(hook) = &hook {
+            if hook.shell_unmodeled {
+                eprintln!("stoop: unsupported shell syntax; shell-operand filters are not used");
+            }
             if !hook.native_shell_placeholders.is_empty() {
                 eprintln!("stoop: native shell expansion is not a unit filter; pass an exact top-level filter such as '{{changed:/foo}}' in argv");
             }

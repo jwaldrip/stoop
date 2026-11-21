@@ -14,6 +14,7 @@ pub(crate) struct Hook {
     pub placeholders: Vec<Vec<Placeholder>>,
     pub environment_placeholders: Vec<Placeholder>,
     pub native_shell_placeholders: Vec<Placeholder>,
+    pub shell_unmodeled: bool,
     pub placeholder: String,
 }
 
@@ -373,19 +374,66 @@ enum ShellPlaceholder {
     Escaped,
 }
 
-/// Classify shell operands once, before both validation and catalog selection.
-fn shell_placeholder_kind(
-    word: &str,
-    start: usize,
-    end: usize,
-    placeholder: &Placeholder,
-) -> ShellPlaceholder {
-    let escapes = word.as_bytes()[..start]
-        .iter()
-        .rev()
-        .take_while(|&&byte| byte == b'\\')
-        .count();
-    if escapes % 2 != 0 {
+/// Find literal placeholder spans using the supported POSIX shell quoting subset.
+/// Any construct outside that subset leaves the entire operand on the legacy path.
+fn shell_literal_spans(word: &str, spans: &[(usize, usize)]) -> Option<Vec<bool>> {
+    let bytes = word.as_bytes();
+    let mut literal = Vec::with_capacity(spans.len());
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    let (mut i, mut next) = (0usize, 0usize);
+    while i < bytes.len() {
+        if let Some(&(start, end)) = spans.get(next) {
+            if i == start {
+                let token = &bytes[start..end];
+                if !single && token.windows(2).any(|pair| pair == b"$(") {
+                    return None;
+                }
+                literal.push(single || escaped);
+                escaped = false;
+                i = end;
+                next += 1;
+                continue;
+            }
+        }
+        let byte = bytes[i];
+        if escaped {
+            escaped = false;
+            i += 1;
+            continue;
+        }
+        if single {
+            if byte == b'\'' {
+                single = false;
+            }
+            i += 1;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'\'' && !double {
+            single = true;
+        } else if byte == b'"' {
+            double = !double;
+        } else if byte == b'`'
+            || (byte == b'$' && bytes.get(i + 1) == Some(&b'('))
+            || (!double && byte == b'$' && bytes.get(i + 1) == Some(&b'\''))
+            || (!double && byte == b'<' && bytes.get(i + 1) == Some(&b'<'))
+            || (!double
+                && byte == b'#'
+                && (i == 0
+                    || bytes[i - 1].is_ascii_whitespace()
+                    || b";|&()".contains(&bytes[i - 1])))
+        {
+            return None;
+        }
+        i += 1;
+    }
+    (!single && !double && !escaped).then_some(literal)
+}
+
+/// Only unambiguous leading glob or root-path forms are filters in shell code.
+fn shell_placeholder_kind(word: &str, start: usize, end: usize, literal: bool) -> ShellPlaceholder {
+    if literal {
         return ShellPlaceholder::Escaped;
     }
     let token = &word[start..end];
@@ -396,25 +444,17 @@ fn shell_placeholder_kind(
         return ShellPlaceholder::Unit;
     };
     let suffix = &token[colon + 1..token.len() - 1];
-    if suffix.starts_with(['-', '=', '?', '+']) || placeholder.filter.is_none() {
+    if suffix.starts_with(['-', '=', '?', '+']) {
         return ShellPlaceholder::Native;
     }
-    let text = suffix.trim();
-    let starts_operand = text
+    if suffix
         .as_bytes()
         .first()
-        .is_some_and(|byte| byte.is_ascii_alphanumeric() || b"_(!~+-$".contains(byte));
-    let arithmetic_chars = text
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"_ \t()[]+-*/%<>=!~&|^?$#".contains(&byte));
-    let ends_operator = text
-        .as_bytes()
-        .last()
-        .is_some_and(|byte| b"*/%<>=!~&|^?".contains(byte));
-    if starts_operand && arithmetic_chars && !ends_operator {
-        ShellPlaceholder::Native
-    } else {
+        .is_some_and(|byte| b"*[\\/".contains(byte))
+    {
         ShellPlaceholder::Unit
+    } else {
+        ShellPlaceholder::Native
     }
 }
 
@@ -507,6 +547,8 @@ pub(crate) struct ParsedHook {
     placeholders: Vec<Vec<Placeholder>>,
     environment_placeholders: Vec<Placeholder>,
     native_shell_placeholders: Vec<Placeholder>,
+    shell_unmodeled: bool,
+    legacy_shell_exclusion_only: bool,
     placeholder: String,
     start: usize,
 }
@@ -518,6 +560,8 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
     let mut placeholders = Vec::with_capacity(argv.len());
     let mut environment_placeholders = Vec::new();
     let mut native_shell_placeholders = Vec::new();
+    let mut shell_unmodeled = false;
+    let mut legacy_shell_exclusion_only = false;
     let mut found = false;
     let mut env_code = false;
     let mut placeholder = String::new();
@@ -543,12 +587,22 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
                     || word.contains("$STOOP_CHANGED_INPUTS_FILE")
                     || word.contains("${STOOP_CHANGED_INPUTS_FILE");
                 all.push(Vec::new());
-                for ((start, end), item) in parts.iter().copied().zip(parsed) {
-                    match shell_placeholder_kind(word, start, end, &item) {
-                        ShellPlaceholder::Unit => environment_placeholders.push(item),
-                        ShellPlaceholder::Native => native_shell_placeholders.push(item),
-                        ShellPlaceholder::Escaped => {}
+                legacy_shell_exclusion_only = parsed
+                    .iter()
+                    .filter_map(|item| item.filter.as_ref())
+                    .any(Filter::exclusion_only);
+                if let Some(literals) = shell_literal_spans(word, &parts) {
+                    for (((start, end), item), literal) in
+                        parts.iter().copied().zip(parsed).zip(literals)
+                    {
+                        match shell_placeholder_kind(word, start, end, literal) {
+                            ShellPlaceholder::Unit => environment_placeholders.push(item),
+                            ShellPlaceholder::Native => native_shell_placeholders.push(item),
+                            ShellPlaceholder::Escaped => {}
+                        }
                     }
+                } else {
+                    shell_unmodeled = true;
                 }
                 placeholders.push(Vec::new());
                 continue;
@@ -590,6 +644,8 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
         placeholders,
         environment_placeholders,
         native_shell_placeholders,
+        shell_unmodeled,
+        legacy_shell_exclusion_only,
         placeholder,
         start,
     }))
@@ -782,6 +838,8 @@ impl ParsedHook {
             placeholders,
             environment_placeholders,
             native_shell_placeholders,
+            shell_unmodeled,
+            legacy_shell_exclusion_only,
             placeholder,
             start,
         } = self;
@@ -797,12 +855,7 @@ impl ParsedHook {
             }
             inline = Some(filter);
         }
-        if environment_placeholders
-            .iter()
-            .chain(&native_shell_placeholders)
-            .filter_map(|p| p.filter.as_ref())
-            .any(Filter::exclusion_only)
-        {
+        if legacy_shell_exclusion_only {
             return Err("an exclusion-only filter needs a default unit universe".into());
         }
         if inline.is_some_and(Filter::exclusion_only) && !has_default_universe {
@@ -826,6 +879,7 @@ impl ParsedHook {
             placeholders,
             environment_placeholders,
             native_shell_placeholders,
+            shell_unmodeled,
             placeholder,
         })
     }
