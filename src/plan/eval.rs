@@ -2129,6 +2129,26 @@ mod tests {
     }
 
     #[test]
+    fn a_different_oid_basis_never_reuses_an_input_answer_for_a_prior() {
+        let mut f = Fixture::new();
+        let old = input("dir/a", &file_id(b"old"));
+        let mut observed = old.clone();
+        observed.oid = Some(format!(
+            "sha1:{}",
+            crate::input::blob_oid(b"tracked", false)
+        ));
+        observed.oid_basis = Some(clean_basis());
+        let mut p = proof(vec![observed]);
+        p.outputs.push(input("dir/a", &file_id(b"new")));
+        p.priors = Some(vec![old]);
+        f.install(vec![p]);
+
+        assert_eq!(plan(&f, &f.spec, Prefilter::On).code, Code::PriorChanged);
+        assert_eq!(plan(&f, &f.spec, Prefilter::Off).code, Code::InputChanged);
+        assert_eq!(plan(&f, &f.spec, Prefilter::Check).code, Code::Error);
+    }
+
+    #[test]
     fn prior_pair_equivalence_corpus_including_an_earlier_overlay() {
         for overlay in [false, true] {
             for expected in [b"tracked".as_slice(), b"old".as_slice()] {
@@ -2175,6 +2195,116 @@ mod tests {
                         baseline.skip || !with_duplicate.skip,
                         "a previous miss became a skip"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recorded_rewrite_proofs_keep_decisions_with_an_exact_prior_input() {
+        for (case, original_bytes) in [
+            ("sed", b"foo\n".as_slice()),
+            ("proc", b"old content".as_slice()),
+        ] {
+            for with_oid in [false, true] {
+                let f = Fixture::new();
+                fs::write(f.root.join("config.txt"), original_bytes).unwrap();
+                git(&f.root, &["add", "config.txt"]);
+                git(
+                    &f.root,
+                    &[
+                        "-c",
+                        "user.name=test",
+                        "-c",
+                        "user.email=test@example.com",
+                        "commit",
+                        "-qm",
+                        "recorded input",
+                    ],
+                );
+                let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/recorder")
+                    .join(case)
+                    .join("proof.json");
+                let document: serde_json::Value =
+                    serde_json::from_slice(&fs::read(fixture).unwrap()).unwrap();
+                let mut recorded: Proof =
+                    serde_json::from_value(document["proofs"][0].clone()).unwrap();
+                recorded.created = 90;
+                recorded.provenance = proof(vec![]).provenance;
+                recorded.env.clear();
+                recorded.env_excluded.clear();
+                recorded.inputs.retain(|input| input.path != "config.txt");
+                let prior = recorded
+                    .priors
+                    .as_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find(|prior| prior.path == "config.txt")
+                    .unwrap();
+                if with_oid {
+                    prior.oid = Some(format!(
+                        "sha1:{}",
+                        crate::input::blob_oid(original_bytes, false)
+                    ));
+                    prior.oid_basis = Some(clean_basis());
+                }
+                let prior = prior.clone();
+                let original_steps = save_record(&f, "job-recorded", vec![recorded.clone()]);
+                recorded.inputs.push(prior);
+                let paired_steps = save_record(&f, "job-paired", vec![recorded]);
+                let original_spec = JobSpec {
+                    key: Some("job-recorded".into()),
+                    steps: original_steps,
+                    ..f.spec.clone()
+                };
+                let paired_spec = JobSpec {
+                    key: Some("job-paired".into()),
+                    steps: paired_steps,
+                    ..f.spec.clone()
+                };
+
+                for changed in [false, true] {
+                    if changed {
+                        fs::write(f.root.join("config.txt"), b"changed\n").unwrap();
+                        git(&f.root, &["add", "config.txt"]);
+                        git(
+                            &f.root,
+                            &[
+                                "-c",
+                                "user.name=test",
+                                "-c",
+                                "user.email=test@example.com",
+                                "commit",
+                                "-qm",
+                                "changed input",
+                            ],
+                        );
+                    }
+                    let mut reference = None;
+                    for mode in [Prefilter::On, Prefilter::Off, Prefilter::Check] {
+                        let baseline = plan(&f, &original_spec, mode);
+                        let paired = plan(&f, &paired_spec, mode);
+                        assert_eq!(
+                            baseline.code,
+                            if changed {
+                                Code::PriorChanged
+                            } else {
+                                Code::Proved
+                            },
+                            "{case}, with_oid={with_oid}, changed={changed}, {mode:?}"
+                        );
+                        assert_eq!(
+                            plan_key(&paired),
+                            plan_key(&baseline),
+                            "{case}, with_oid={with_oid}, changed={changed}, {mode:?}"
+                        );
+                        if let Some(reference) = &reference {
+                            assert_eq!(&plan_key(&paired), reference, "{case}, {mode:?}");
+                        } else {
+                            reference = Some(plan_key(&paired));
+                        }
+                    }
                 }
             }
         }

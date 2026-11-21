@@ -1444,12 +1444,11 @@ fn atomic_replace_after_a_foreign_preimage_change_keeps_legacy_prior() {
 
 #[test]
 fn foreign_changes_after_atomic_landing_do_not_gain_an_input() {
-    for replace_inode in [false, true] {
-        let key = if replace_inode {
-            "atomic-after-inode"
-        } else {
-            "atomic-after-bytes"
-        };
+    for (key, replace_inode, bytes) in [
+        ("atomic-after-bytes", false, b"foreign\n".as_slice()),
+        ("atomic-after-inode", true, b"foreign\n".as_slice()),
+        ("atomic-after-same-bytes", true, b"done\n".as_slice()),
+    ] {
         let case = Case::new(key);
         let file = case.file("f", b"original\n");
         age();
@@ -1458,10 +1457,10 @@ fn foreign_changes_after_atomic_landing_do_not_gain_an_input() {
         let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
         let release = meet(&fifo);
         if replace_inode {
-            let foreign = case.outside("replacement", b"foreign\n");
+            let foreign = case.outside("replacement", bytes);
             fs::rename(foreign, &file).unwrap();
         } else {
-            fs::write(&file, b"foreign\n").unwrap();
+            fs::write(&file, bytes).unwrap();
         }
         drop(release);
         let out = child.wait_with_output().unwrap();
@@ -1469,7 +1468,7 @@ fn foreign_changes_after_atomic_landing_do_not_gain_an_input() {
         let stored = proof(&case, key);
         assert_no_input(&stored, "f");
         assert_file_entry(&stored, "priors", "f", b"original\n");
-        assert_file_entry(&stored, "outputs", "f", b"foreign\n");
+        assert_file_entry(&stored, "outputs", "f", bytes);
     }
 }
 
@@ -1499,4 +1498,32 @@ fn same_inode_rename_keeps_legacy_recording_without_an_input() {
     assert_no_input(&stored, "f");
     assert_file_entry(&stored, "priors", "f", b"original\n");
     assert_file_entry(&stored, "outputs", "f", b"original\n");
+}
+
+#[test]
+fn an_attempted_write_before_the_read_keeps_legacy_atomic_recording() {
+    let case = Case::new("atomic-write-before-read");
+    case.file("f", b"original\n");
+    age();
+    let script = "exec python3 -c 'import os; exec(\"try:\\n os.rename(\\\"missing\\\", \\\"f\\\")\\nexcept FileNotFoundError:\\n pass\"); open(\"f\").read(); open(\"tmp\", \"w\").write(\"done\\n\"); os.replace(\"tmp\", \"f\")'";
+    let out = run(&case, "atomic-write-before-read", script, &[]);
+    assert_recorded(&out, &case, "atomic-write-before-read");
+    let stored = proof(&case, "atomic-write-before-read");
+    assert_no_input(&stored, "f");
+    assert_file_entry(&stored, "priors", "f", b"original\n");
+    assert_file_entry(&stored, "outputs", "f", b"done\n");
+}
+
+#[test]
+fn an_attempted_write_after_atomic_landing_withdraws_the_witness() {
+    let case = Case::new("atomic-write-after-landing");
+    case.file("f", b"original\n");
+    age();
+    let script = "exec python3 -c 'import os; open(\"f\").read(); open(\"tmp\", \"w\").write(\"done\\n\"); os.replace(\"tmp\", \"f\"); exec(\"try:\\n os.rename(\\\"missing\\\", \\\"f\\\")\\nexcept FileNotFoundError:\\n pass\")'";
+    let out = run(&case, "atomic-write-after-landing", script, &[]);
+    assert_recorded(&out, &case, "atomic-write-after-landing");
+    let stored = proof(&case, "atomic-write-after-landing");
+    assert_no_input(&stored, "f");
+    assert_file_entry(&stored, "priors", "f", b"original\n");
+    assert_file_entry(&stored, "outputs", "f", b"done\n");
 }
