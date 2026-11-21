@@ -675,6 +675,22 @@ mod tests {
     }
 
     #[test]
+    fn plain_catalog_requires_refresh_when_an_entry_type_changes() {
+        use std::os::unix::fs::symlink;
+        let dir = Dir::new();
+        fs::write(dir.0.join("a.t"), b"a").unwrap();
+        let ignore = Ignore::new(&[], None, &[]);
+        let filter = Filter::inline("**/*.t");
+        let before = discover(&dir.0, &ignore, &filter, None).unwrap();
+        assert_eq!(format!("{:?}", before.reuse), "RerunInventory");
+        fs::remove_file(dir.0.join("a.t")).unwrap();
+        symlink("missing", dir.0.join("a.t")).unwrap();
+        let after = discover(&dir.0, &ignore, &filter, None).unwrap();
+        assert_eq!(before.inputs[0].id, after.inputs[0].id);
+        assert!(after.units.is_empty());
+    }
+
+    #[test]
     fn catalog_reuse_reflects_git_and_stoopignore_sources() {
         let dir = Dir::new();
         let ignore = Ignore::new(&[], None, &[]);

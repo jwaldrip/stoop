@@ -313,4 +313,13 @@ mod tests {
         assert!(!f.matches("tests", false));
         assert!(!f.matches("tests/a.t", false));
     }
+
+    #[test]
+    fn trailing_separator_obeys_backslash_escape_parity() {
+        let even = Filter::inline(r"dir\\/");
+        assert!(even.matches("dir\\/", true));
+        assert!(!even.matches("dir\\", false));
+        let odd = Filter::inline(r"dir\/");
+        assert!(!odd.matches("dir/", true));
+    }
 }

@@ -5,12 +5,19 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 struct Fixture(PathBuf);
 
 impl Fixture {
     fn new() -> Self {
-        let root = std::env::temp_dir().join(format!("stoop-head-compat-{}", std::process::id()));
+        let root = std::env::temp_dir().join(format!(
+            "stoop-head-compat-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("runner"), "#!/bin/sh\nprintf 'argc=%s\\n' \"$#\"\nfor arg do printf '<%s>\\n' \"$arg\"; done\nprintf 'changed=<%s>\\n' \"${STOOP_CHANGED-UNSET}\"\n").unwrap();
         fs::set_permissions(root.join("runner"), fs::Permissions::from_mode(0o755)).unwrap();
@@ -25,6 +32,26 @@ impl Fixture {
             .env("STOOP_OFF", "1")
             .current_dir(&self.0)
             .args(["run", "--no-record", "--", "./runner"])
+            .args(args)
+            .output()
+            .unwrap();
+        (output.status.code(), output.stdout)
+    }
+
+    fn invoke_shell(
+        &self,
+        binary: &Path,
+        shell: &str,
+        code: &str,
+        args: &[&str],
+    ) -> (Option<i32>, Vec<u8>) {
+        let output = Command::new(binary)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &self.0)
+            .env("STOOP_OFF", "1")
+            .current_dir(&self.0)
+            .args(["run", "--no-record", "--", shell, "-c", code, "sentinel"])
             .args(args)
             .output()
             .unwrap();
@@ -101,4 +128,56 @@ fn origin_main_and_head_prepare_the_same_argv_for_existing_hook_forms() {
         }
     }
     assert_eq!(checked, 702);
+}
+
+#[test]
+#[ignore = "requires STOOP_BASE_BIN built independently from origin/main"]
+fn origin_main_and_head_agree_on_native_shell_expansions() {
+    let base = PathBuf::from(
+        std::env::var_os("STOOP_BASE_BIN").expect("build origin/main and set STOOP_BASE_BIN"),
+    );
+    let head = Path::new(env!("CARGO_BIN_EXE_stoop"));
+    let f = Fixture::new();
+    let expressions = [
+        "${STOOP_CHANGED:-fallback}",
+        "${STOOP_CHANGED-fallback}",
+        "${STOOP_CHANGED:=fallback}",
+        "${STOOP_CHANGED=fallback}",
+        "${STOOP_CHANGED:+alternate}",
+        "${STOOP_CHANGED+alternate}",
+        "${STOOP_CHANGED:?required}",
+        "${STOOP_CHANGED?required}",
+        "${#STOOP_CHANGED}",
+        "${STOOP_CHANGED%tail}",
+        "${STOOP_CHANGED%%tail}",
+        "${STOOP_CHANGED#head}",
+        "${STOOP_CHANGED##head}",
+        "${STOOP_CHANGED:1}",
+        "${STOOP_CHANGED/a/b}",
+        "$(printf command)",
+        "$((1+2))",
+        "{a,b}",
+    ];
+    let selectors: &[&[&str]] = &[
+        &["--files", "{changed:*.t}"],
+        &["--files={changed:*.t}"],
+        &["{changed:*.t}"],
+        &["--", "{changed:*.t}"],
+    ];
+    let shells = ["sh", "bash", "dash"];
+    let mut checked = 0;
+    for shell in shells {
+        for expression in expressions {
+            let code = format!("printf '<%s>\\n' \"{expression}\" \"$@\"");
+            for args in selectors {
+                assert_eq!(
+                    f.invoke_shell(&base, shell, &code, args),
+                    f.invoke_shell(head, shell, &code, args),
+                    "shell={shell} code={code:?} args={args:?}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 216);
 }
