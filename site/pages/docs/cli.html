@@ -137,4 +137,8 @@ options = [{ names = ["--files", "-f"], values = "many" }]</code></pre>
   <dd>The run passed and a proof was written.</dd>
   <dt>stoop: not recorded: REASON</dt>
   <dd>The run passed but couldn't be vouched for. See <a href="how-it-works.html#fails-wide">when it runs anyway</a>.</dd>
+  <dt>stoop: not recorded: KEY changed while the command ran</dt>
+  <dd>An eligible input's first observed identity differs from its exit state. The command keeps its exit status and no proof is saved. A timestamp, xattr or bind-alias change made by the command can make stoop refuse to record. See <a href="blind-spots.html#mid-run-edits">the coverage limits</a>.</dd>
+  <dt>stoop: debug: not compared KEY: REASON</dt>
+  <dd>With <code>STOOP_DEBUG</code>, an input comparison was skipped because its observation, physical route or write footprint could not support it.</dd>
 </dl>
