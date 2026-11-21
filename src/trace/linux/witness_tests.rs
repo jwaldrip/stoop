@@ -413,14 +413,14 @@ fn an_over_budget_source_is_not_scanned_or_opened() {
         let scans_before = LOCK_TABLE_SCANS.with(|scans| scans.get());
         assert!(!rename_offered(tracer, pid, args, temp, target, metas));
         assert_eq!(
-            tracer.rec.as_ref().unwrap().rewrite_budget.hashed,
-            used,
-            "an over-budget source must not be opened or hashed"
-        );
-        assert_eq!(
             LOCK_TABLE_SCANS.with(|scans| scans.get()),
             scans_before,
             "an over-budget source must not scan the lock table"
+        );
+        assert_eq!(
+            tracer.rec.as_ref().unwrap().rewrite_budget.hashed,
+            used,
+            "an over-budget source must not be opened or hashed"
         );
     });
 }

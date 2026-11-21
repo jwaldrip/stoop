@@ -53,6 +53,32 @@ class SingleTraceeSed(unittest.TestCase):
             self.normalize(changed)
         self.assertFalse((self.out / "sed-exec" / "proof.json").exists())
 
+    def test_other_recorded_fields_remain_checked(self):
+        def extra_input(proof):
+            proof["inputs"].append({"path": "extra", "id": "a", "oid": None})
+
+        def extra_output(proof):
+            proof["outputs"].append({"path": "extra", "id": "a", "oid": None})
+
+        def extra_removal(proof):
+            proof["removed"].append("extra")
+
+        def changed_ignore(proof):
+            proof["ignore"].append("extra")
+
+        def changed_environment(proof):
+            proof["env"]["PATH"] = "changed"
+
+        for mutate in (
+            extra_input, extra_output, extra_removal, changed_ignore, changed_environment,
+        ):
+            with self.subTest(mutation=mutate.__name__):
+                changed = copy.deepcopy(self.original)
+                mutate(changed["proofs"][0])
+                with self.assertRaises(SystemExit):
+                    self.normalize(changed)
+                self.assertFalse((self.out / "sed-exec" / "proof.json").exists())
+
 
 if __name__ == "__main__":
     unittest.main()
