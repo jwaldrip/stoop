@@ -193,6 +193,9 @@ fn origin_main_and_head_agree_on_native_shell_expansions() {
         "printf '<%s>\\n' \\${STOOP_CHANGED:*.u} \"$@\"",
         "printf '<%s>\\n' \"${STOOP_CHANGED: a[\"0\"]}\" \"$@\"",
         "printf '<%s>\\n' \"${STOOP_CHANGED: 1\n + 1}\" \"$@\"",
+        "printf '<%s>\\n' \"${STOOP_CHANGED:\\\n-fallback}\" \"$@\"",
+        "printf '<%s>\\n' \"${STOOP_CHANGED:\\\n1}\" \"$@\"",
+        "printf '<%s>\\n' \"${STOOP_CHANGED:\\\n 1+1}\" \"$@\"",
         "case x in x) printf '%s\\n' '${STOOP_CHANGED:*.u}' ;; esac",
         "case x in x) printf '%s\\n' \"${STOOP_CHANGED:-fallback}\" ;; esac",
         "for x in one; do printf '%s\\n' '${STOOP_CHANGED:*.u}'; done",
@@ -233,5 +236,5 @@ fn origin_main_and_head_agree_on_native_shell_expansions() {
             }
         }
     }
-    assert_eq!(checked, 1608);
+    assert_eq!(checked, 1644);
 }

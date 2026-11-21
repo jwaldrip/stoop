@@ -154,6 +154,93 @@ fn native_shell_fallback_is_not_a_conflicting_unit_filter() {
     assert_eq!(out.stdout, b"<fallback>\n");
 }
 
+fn continued_shell_code(suffix: &str) -> String {
+    let continuation: String = ['\\', '\n'].into_iter().collect();
+    format!("printf '<%s>\\n' \"${{STOOP_CHANGED:{continuation}{suffix}}}\" \"$@\"")
+}
+
+fn assert_continued_shell_run(suffix: &str, expected: &[u8]) {
+    let f = Fixture::new();
+    let code = continued_shell_code(suffix);
+    let out = f
+        .command(
+            "run",
+            &["bash", "-c", &code, "zero", "--files", "{changed:*.t}"],
+        )
+        .env("STOOP_OFF", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", err(&out));
+    assert_eq!(out.stdout, expected);
+}
+
+#[test]
+fn shell_line_continuation_preserves_fallback() {
+    assert_continued_shell_run("-fallback", b"<fallback>\n");
+}
+
+#[test]
+fn shell_line_continuation_preserves_numeric_substring() {
+    assert_continued_shell_run("1", b"<>\n");
+}
+
+#[test]
+fn shell_line_continuation_preserves_arithmetic_substring() {
+    assert_continued_shell_run(" 1+1", b"<>\n");
+}
+
+#[test]
+fn explain_uses_config_instead_of_shell_line_continuation() {
+    let f = Fixture::new();
+    f.file("a.t", b"");
+    f.file(
+        ".stoop.toml",
+        b"[[units.suite]]\nid = 'shell'\nmatch = ['bash', '-c', '*', 'zero']\nunits = ['*.t']\n",
+    );
+    let code = continued_shell_code("-fallback");
+    let out = f
+        .command("explain", &["bash", "-c", &code, "zero"])
+        .output()
+        .unwrap();
+    let text = err(&out);
+    assert!(
+        text.contains("tracked 1 units; filter '*.t' (.stoop.toml suite shell)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("shell-operand filters are unavailable"),
+        "{text}"
+    );
+}
+
+#[test]
+fn distinct_shell_operand_filters_do_not_conflict() {
+    let f = Fixture::new();
+    f.file("a.t", b"");
+    f.file(
+        ".stoop.toml",
+        b"[[units.suite]]\nid = 'shell'\nmatch = ['sh', '-c', '*', 'zero']\nunits = ['*.t']\n",
+    );
+    let out = f
+        .command(
+            "explain",
+            &[
+                "sh",
+                "-c",
+                "echo ${STOOP_CHANGED:*.u} ${STOOP_CHANGED:*.t}",
+                "zero",
+            ],
+        )
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{}", err(&out));
+    assert!(
+        err(&out).contains("tracked 1 units; filter '*.t'"),
+        "{}",
+        err(&out)
+    );
+}
+
 #[test]
 fn single_quoted_shell_placeholder_text_stays_literal() {
     let f = Fixture::new();
