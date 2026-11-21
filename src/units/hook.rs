@@ -13,6 +13,7 @@ pub(crate) struct Hook {
     pub spans: Vec<Vec<(usize, usize)>>,
     pub placeholders: Vec<Vec<Placeholder>>,
     pub environment_placeholders: Vec<Placeholder>,
+    pub native_shell_placeholders: Vec<Placeholder>,
     pub placeholder: String,
 }
 
@@ -365,6 +366,58 @@ fn spans(word: &str) -> Result<Vec<(usize, usize, Placeholder)>, String> {
     Ok(out)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShellPlaceholder {
+    Unit,
+    Native,
+    Escaped,
+}
+
+/// Classify shell operands once, before both validation and catalog selection.
+fn shell_placeholder_kind(
+    word: &str,
+    start: usize,
+    end: usize,
+    placeholder: &Placeholder,
+) -> ShellPlaceholder {
+    let escapes = word.as_bytes()[..start]
+        .iter()
+        .rev()
+        .take_while(|&&byte| byte == b'\\')
+        .count();
+    if escapes % 2 != 0 {
+        return ShellPlaceholder::Escaped;
+    }
+    let token = &word[start..end];
+    if !token.starts_with("${") {
+        return ShellPlaceholder::Unit;
+    }
+    let Some(colon) = token.find(':') else {
+        return ShellPlaceholder::Unit;
+    };
+    let suffix = &token[colon + 1..token.len() - 1];
+    if suffix.starts_with(['-', '=', '?', '+']) || placeholder.filter.is_none() {
+        return ShellPlaceholder::Native;
+    }
+    let text = suffix.trim();
+    let starts_operand = text
+        .as_bytes()
+        .first()
+        .is_some_and(|byte| byte.is_ascii_alphanumeric() || b"_(!~+-$".contains(byte));
+    let arithmetic_chars = text
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"_ \t()[]+-*/%<>=!~&|^?$#".contains(&byte));
+    let ends_operator = text
+        .as_bytes()
+        .last()
+        .is_some_and(|byte| b"*/%<>=!~&|^?".contains(byte));
+    if starts_operand && arithmetic_chars && !ends_operator {
+        ShellPlaceholder::Native
+    } else {
+        ShellPlaceholder::Unit
+    }
+}
+
 fn mangled(word: &str) -> bool {
     if word.contains('{') {
         return false;
@@ -453,6 +506,7 @@ pub(crate) struct ParsedHook {
     spans: Vec<Vec<(usize, usize)>>,
     placeholders: Vec<Vec<Placeholder>>,
     environment_placeholders: Vec<Placeholder>,
+    native_shell_placeholders: Vec<Placeholder>,
     placeholder: String,
     start: usize,
 }
@@ -463,6 +517,7 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
     let mut all = Vec::with_capacity(argv.len());
     let mut placeholders = Vec::with_capacity(argv.len());
     let mut environment_placeholders = Vec::new();
+    let mut native_shell_placeholders = Vec::new();
     let mut found = false;
     let mut env_code = false;
     let mut placeholder = String::new();
@@ -488,7 +543,13 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
                     || word.contains("$STOOP_CHANGED_INPUTS_FILE")
                     || word.contains("${STOOP_CHANGED_INPUTS_FILE");
                 all.push(Vec::new());
-                environment_placeholders = parsed;
+                for ((start, end), item) in parts.iter().copied().zip(parsed) {
+                    match shell_placeholder_kind(word, start, end, &item) {
+                        ShellPlaceholder::Unit => environment_placeholders.push(item),
+                        ShellPlaceholder::Native => native_shell_placeholders.push(item),
+                        ShellPlaceholder::Escaped => {}
+                    }
+                }
                 placeholders.push(Vec::new());
                 continue;
             }
@@ -528,6 +589,7 @@ pub(crate) fn parse(exact: &[OsString]) -> Result<Option<ParsedHook>, String> {
         spans: all,
         placeholders,
         environment_placeholders,
+        native_shell_placeholders,
         placeholder,
         start,
     }))
@@ -719,6 +781,7 @@ impl ParsedHook {
             spans: all,
             placeholders,
             environment_placeholders,
+            native_shell_placeholders,
             placeholder,
             start,
         } = self;
@@ -726,6 +789,7 @@ impl ParsedHook {
         for filter in placeholders
             .iter()
             .flatten()
+            .chain(&environment_placeholders)
             .filter_map(|p| p.filter.as_ref())
         {
             if inline.is_some_and(|prior| prior != filter) {
@@ -735,6 +799,7 @@ impl ParsedHook {
         }
         if environment_placeholders
             .iter()
+            .chain(&native_shell_placeholders)
             .filter_map(|p| p.filter.as_ref())
             .any(Filter::exclusion_only)
         {
@@ -760,6 +825,7 @@ impl ParsedHook {
             spans: all,
             placeholders,
             environment_placeholders,
+            native_shell_placeholders,
             placeholder,
         })
     }

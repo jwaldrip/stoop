@@ -1019,6 +1019,9 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         let dir = if rel_cwd.is_empty() { "." } else { &rel_cwd };
         eprintln!("stoop: dir {dir:?}");
         if let Some(hook) = &hook {
+            if !hook.native_shell_placeholders.is_empty() {
+                eprintln!("stoop: native shell expansion is not a unit filter; pass an exact top-level filter such as '{{changed:/foo}}' in argv");
+            }
             let suite = config.select(&hook.original, &rel_cwd).ok().flatten();
             let configured = suite.and_then(|suite| {
                 suite.units.as_ref().map(|patterns| {
