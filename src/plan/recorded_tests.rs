@@ -57,6 +57,7 @@ struct Fixture {
     store: Store,
     jobs: JobStore,
     spec: JobSpec,
+    proof_key: &'static str,
     created: u64,
 }
 impl Fixture {
@@ -121,12 +122,15 @@ impl Fixture {
             .join("tests/fixtures/recorder")
             .join(case)
             .join("proof.json");
+        let proof_key = if case == "sed-exec" { "sed-exec" } else { "t" };
         let store = Store::new(root.join("store"));
-        store.import("t", &fs::read(proof_file).unwrap()).unwrap();
-        let proof = store.load("t").remove(0);
+        store
+            .import(proof_key, &fs::read(proof_file).unwrap())
+            .unwrap();
+        let proof = store.load(proof_key).remove(0);
         let proof = if with_ids {
             let patched = with_blob_ids(&root, proof);
-            store.save("t", patched.clone()).unwrap();
+            store.save(proof_key, patched.clone()).unwrap();
             patched
         } else {
             proof
@@ -150,7 +154,7 @@ impl Fixture {
                 event_path: Some("/tmp/event.json".into()),
                 run: Some("1/1".into()),
                 steps: vec![StepRecord {
-                    key: "t".into(),
+                    key: proof_key.into(),
                     proof: proof.digest(),
                     how: StepHow::Ran,
                 }],
@@ -171,7 +175,7 @@ impl Fixture {
             if_text: None,
             steps: vec![StepSpec::Traced {
                 index: 1,
-                key: "t".into(),
+                key: proof_key.into(),
                 max_age: None,
             }],
             blocked: None,
@@ -183,6 +187,7 @@ impl Fixture {
             store,
             jobs,
             spec,
+            proof_key,
             created,
         }
     }
@@ -300,7 +305,7 @@ fn real_recorded_proofs_plan_the_same_with_blob_ids_in_every_mode() {
         let f = Fixture::with_blob_ids(case);
         let control = f.decision_mode(Prefilter::On);
         assert_eq!(control.code, Code::Proved, "{case}: {}", control.detail);
-        let tagged = f.store.load("t").iter().any(|p| {
+        let tagged = f.store.load(f.proof_key).iter().any(|p| {
             p.inputs
                 .iter()
                 .chain(p.priors.iter().flatten())
@@ -403,7 +408,7 @@ fn real_recorded_directory_rename_and_symlink_write_are_unplannable() {
 #[test]
 fn single_tracee_sed_records_the_promoted_config_input() {
     let f = Fixture::new("sed-exec");
-    let proof = f.store.load("t").remove(0);
+    let proof = f.store.load(f.proof_key).remove(0);
     let prior = proof
         .priors
         .as_ref()
