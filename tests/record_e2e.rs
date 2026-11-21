@@ -1277,6 +1277,18 @@ fn a_failed_descriptor_link_attempt_still_drops_blob_ids() {
     assert_blob_oid(&control, "inputs", "in.txt", &control_oid);
 }
 
+#[test]
+fn a_failed_link_to_an_existing_hard_link_still_records() {
+    let w = Ws::new("failed-link-same-inode");
+    fs::hard_link(w.root.join("in.txt"), w.root.join("alias")).unwrap();
+    let p = recorded(
+        &w,
+        "cat in.txt >/dev/null; if ln in.txt alias 2>/dev/null; then exit 17; fi",
+    );
+    assert!(pairs(&p, "inputs").contains(&("in.txt".into(), format!("f:{}", hash(b"one")))));
+    assert!(!pairs(&p, "outputs").iter().any(|(path, _)| path == "alias"));
+}
+
 /// A descriptor the run inherits, open for writing on a watched file, drops every blob id in the
 /// run. The same descriptor on an ordinary file outside the repository keeps them.
 #[test]

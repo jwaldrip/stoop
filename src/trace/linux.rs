@@ -691,6 +691,8 @@ struct PendingPath {
     /// A successful namespace mutation would change this previously observed parent.
     read_parent: Option<PathBuf>,
     read_priors: Vec<PathBuf>,
+    /// Other read names for this inode conflict only if this mutation succeeds.
+    read_aliases: Vec<PathBuf>,
     rename_before: Option<Seen>,
     confirmed_after: Option<FileIdentity>,
     kind: WriteKind,
@@ -2430,10 +2432,16 @@ impl Tracer<'_> {
             else {
                 continue;
             };
-            if self.t.read_before_write.contains(path)
-                && self.t.priors.get(key).map(String::as_str) == Some("a")
-                && fs::symlink_metadata(path).ok().as_ref().map(file_identity) != Some(*expected)
+            if !self.t.read_before_write.contains(path)
+                || self.t.priors.get(key).map(String::as_str) != Some("a")
             {
+                continue;
+            }
+            let changed = match fs::symlink_metadata(path) {
+                Ok(metadata) => file_identity(&metadata) != *expected,
+                Err(error) => !is_absent(&error) || !self.t.removal_explains_absence(path),
+            };
+            if changed {
                 self.t.changed_during.insert(path.clone());
             }
         }
@@ -2845,14 +2853,6 @@ impl Tracer<'_> {
         destination: &Path,
         before: Option<FileIdentity>,
     ) -> Vec<PathBuf> {
-        if let Some(reads) = before.and_then(|id| self.read_inodes.get(&id)) {
-            for read in reads.iter().filter(|read| read.as_path() != destination) {
-                self.t.read_write_conflicts.insert(read.clone());
-                self.t
-                    .read_write_conflicts
-                    .insert(destination.to_path_buf());
-            }
-        }
         if !self.read_files.contains(destination) || self.t.read_before_write.contains(destination)
         {
             return Vec::new();
@@ -3182,6 +3182,30 @@ impl Tracer<'_> {
             self.invalidate_settled(None, Some(*id));
             // The link may fail; source-read conflicts are attributed only on success.
         }
+        let read_aliases: Vec<PathBuf> = before
+            .and_then(|id| self.read_inodes.get(&id))
+            .into_iter()
+            .flatten()
+            .filter(|read| expected.as_deref() != Some(read.as_path()))
+            .cloned()
+            .collect();
+        if let Some(destination) = expected
+            .as_deref()
+            .filter(|destination| *destination == raw)
+        {
+            if self.t.touched.get(raw).is_some_and(|touch| touch.read)
+                && self
+                    .t
+                    .seen
+                    .as_ref()
+                    .and_then(|seen| seen.get(raw))
+                    .is_some_and(|seen| matches!(seen, Seen::Absent))
+            {
+                // The lookup was previously absent behind a missing parent. Recheck that exact
+                // name at the first write rather than losing the original observation.
+                self.read_files.insert(destination.to_path_buf());
+            }
+        }
         let read_priors = if mkdir_existing {
             Vec::new()
         } else {
@@ -3232,6 +3256,7 @@ impl Tracer<'_> {
             deferred_mkdir_oid,
             read_parent,
             read_priors,
+            read_aliases,
             confirmed_after: None,
             rename_before: None,
             kind,
@@ -3415,6 +3440,22 @@ impl Tracer<'_> {
             self.flag("it could not confirm where its change landed");
             return;
         };
+        if !path.read_aliases.is_empty() {
+            self.t.read_write_conflicts.extend(path.read_aliases);
+            self.t.read_write_conflicts.insert(destination.clone());
+        }
+        if mark_name
+            && path.absent
+            && matches!(
+                &path.kind,
+                WriteKind::Create { directory: true } | WriteKind::Rename { source: false, .. }
+            )
+            && fs::symlink_metadata(&destination).is_ok_and(|metadata| metadata.is_dir())
+        {
+            // This run recreated the name it had just looked up as absent. Its final inode is
+            // checked against the last successful landing before any proof is recorded.
+            self.t.absent_after_removal.remove(&destination);
+        }
         if self
             .t
             .touched
@@ -4139,6 +4180,7 @@ mod tests {
             deferred_mkdir_oid: false,
             read_parent: None,
             read_priors: Vec::new(),
+            read_aliases: Vec::new(),
             rename_before: None,
             confirmed_after: None,
             kind: WriteKind::Create { directory: true },
@@ -4423,6 +4465,7 @@ mod tests {
             deferred_mkdir_oid: false,
             read_parent: None,
             read_priors: Vec::new(),
+            read_aliases: Vec::new(),
             rename_before: None,
             confirmed_after: None,
             kind,
@@ -4506,6 +4549,7 @@ mod tests {
                     deferred_mkdir_oid: false,
                     read_parent: None,
                     read_priors: Vec::new(),
+                    read_aliases: Vec::new(),
                     rename_before: None,
                     confirmed_after: None,
                     kind: WriteKind::Modify,
