@@ -210,6 +210,9 @@ fn unmodeled_shell_operand_uses_config_and_reports_the_fallback() {
         "echo `printf x` ${STOOP_CHANGED:*.u}",
         "echo x # ${STOOP_CHANGED:*.u}",
         "cat <<EOF\n${STOOP_CHANGED:*.u}\nEOF",
+        "echo $(printf %s ${STOOP_CHANGED:*.u})",
+        "echo ${STOOP_CHANGED:*.u} '",
+        "echo ${STOOP_CHANGED:*.u} \\",
     ] {
         let out = f
             .command("explain", &["sh", "-c", code, "zero"])
