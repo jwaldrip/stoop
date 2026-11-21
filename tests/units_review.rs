@@ -155,6 +155,79 @@ fn native_shell_fallback_is_not_a_conflicting_unit_filter() {
 }
 
 #[test]
+fn single_quoted_shell_placeholder_text_stays_literal() {
+    let f = Fixture::new();
+    let out = f
+        .command(
+            "run",
+            &[
+                "sh",
+                "-c",
+                "printf '%s\\n' '${STOOP_CHANGED:*.u}'",
+                "sentinel",
+                "--files",
+                "{changed:*.t}",
+            ],
+        )
+        .env("STOOP_OFF", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", err(&out));
+    assert_eq!(out.stdout, b"${STOOP_CHANGED:*.u}\n");
+}
+
+#[test]
+fn bash_array_and_multiline_arithmetic_stay_native() {
+    let f = Fixture::new();
+    for code in [
+        "printf '<%s>\\n' \"${STOOP_CHANGED: a[\"0\"]}\" \"$@\"",
+        "printf '<%s>\\n' \"${STOOP_CHANGED: 1\n + 1}\" \"$@\"",
+    ] {
+        let out = f
+            .command(
+                "run",
+                &["bash", "-c", code, "sentinel", "--files", "{changed:*.t}"],
+            )
+            .env("STOOP_OFF", "1")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{code:?}: {}", err(&out));
+        assert_eq!(out.stdout, b"<>\n");
+    }
+}
+
+#[test]
+fn unmodeled_shell_operand_uses_config_and_reports_the_fallback() {
+    let f = Fixture::new();
+    f.file("a.t", b"");
+    f.file(
+        ".stoop.toml",
+        b"[[units.suite]]\nid = 'shell'\nmatch = ['sh', '-c', '*', 'zero']\nunits = ['*.t']\n",
+    );
+    for code in [
+        "echo $(printf x) ${STOOP_CHANGED:*.u}",
+        "echo $'x' ${STOOP_CHANGED:*.u}",
+        "echo `printf x` ${STOOP_CHANGED:*.u}",
+        "echo x # ${STOOP_CHANGED:*.u}",
+        "cat <<EOF\n${STOOP_CHANGED:*.u}\nEOF",
+    ] {
+        let out = f
+            .command("explain", &["sh", "-c", code, "zero"])
+            .output()
+            .unwrap();
+        let text = err(&out);
+        assert!(
+            text.contains("tracked 1 units; filter '*.t'"),
+            "{code:?}: {text}"
+        );
+        assert!(
+            text.contains("unsupported shell syntax"),
+            "{code:?}: {text}"
+        );
+    }
+}
+
+#[test]
 fn explain_uses_config_for_native_shell_fallback_and_names_the_ambiguity() {
     let f = Fixture::new();
     f.file("a.t", b"");

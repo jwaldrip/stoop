@@ -1149,6 +1149,10 @@ mod tests {
             ("$((1+2))", None),
             ("{a,b}", None),
             (r"\${STOOP_CHANGED:*.t}", None),
+            ("'${STOOP_CHANGED:*.t}'", None),
+            ("\"${STOOP_CHANGED:*.t}\"", Some("*.t")),
+            ("pre'${STOOP_CHANGED:*.t}'post", None),
+            ("'pre'\"${STOOP_CHANGED:*.t}\"", Some("*.t")),
             ("${STOOP_CHANGED:*.t}", Some("*.t")),
             ("${STOOP_CHANGED:/foo}", Some("/foo")),
         ] {

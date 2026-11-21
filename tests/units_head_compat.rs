@@ -187,5 +187,43 @@ fn origin_main_and_head_agree_on_native_shell_expansions() {
             }
         }
     }
-    assert_eq!(checked, 312);
+    let quoted_codes = [
+        "printf '<%s>\\n' '${STOOP_CHANGED:*.u}' \"$@\"",
+        "printf '<%s>\\n' pre'${STOOP_CHANGED:*.u}'post \"$@\"",
+        "printf '<%s>\\n' \\${STOOP_CHANGED:*.u} \"$@\"",
+        "printf '<%s>\\n' \"${STOOP_CHANGED: a[\"0\"]}\" \"$@\"",
+        "printf '<%s>\\n' \"${STOOP_CHANGED: 1\n + 1}\" \"$@\"",
+    ];
+    for shell in shells {
+        for code in quoted_codes {
+            for args in selectors {
+                assert_eq!(
+                    f.invoke_shell(&base, shell, code, args),
+                    f.invoke_shell(head, shell, code, args),
+                    "shell={shell} code={code:?} args={args:?}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    for shell in shells {
+        for byte in 0x20u8..=0x7e {
+            let expansion = format!("${{STOOP_CHANGED:{}foo}}", byte as char);
+            for code in [
+                format!("printf '<%s>\\n' {expansion} \"$@\""),
+                format!("printf '<%s>\\n' \"{expansion}\" \"$@\""),
+                format!("printf '<%s>\\n' '{expansion}' \"$@\""),
+                format!("printf '<%s>\\n' \\{expansion} \"$@\""),
+            ] {
+                let args = ["--files", "{changed}"];
+                assert_eq!(
+                    f.invoke_shell(&base, shell, &code, &args),
+                    f.invoke_shell(head, shell, &code, &args),
+                    "shell={shell} code={code:?} args={args:?}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 1512);
 }
