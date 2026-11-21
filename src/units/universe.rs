@@ -18,9 +18,21 @@ const MAX_DIRS: usize = 65_536;
 pub(crate) struct UnitId(pub String);
 
 #[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reuse {
+    Listings,
+    RerunInventory,
+}
+
+/// Directory listings alone cannot validate eligibility when `.stoopignore` is present, or
+/// when Git is consulted. The Git index, nested `.gitignore`, `.git/info/exclude`, global
+/// excludes, `core.excludesFile`, and Git configuration can change without changing any
+/// walked listing. `RerunInventory` requires a fresh walk and fresh Git inventories.
+#[allow(dead_code)]
 pub(crate) struct Catalog {
     pub units: Vec<UnitId>,
     pub inputs: Vec<Input>,
+    pub reuse: Reuse,
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -78,7 +90,7 @@ impl GitInventory {
         let ignored_dirs: HashSet<String> = ignored
             .iter()
             .filter(|path| path.ends_with('/'))
-            .cloned()
+            .map(|path| path[..path.len() - 1].to_owned())
             .collect();
         let ignored_files: HashSet<&str> = ignored
             .iter()
@@ -89,7 +101,7 @@ impl GitInventory {
             if ignored_files.contains(file.as_str())
                 || file
                     .match_indices('/')
-                    .any(|(at, _)| ignored_dirs.contains(&file[..=at]))
+                    .any(|(at, _)| ignored_dirs.contains(&file[..at]))
             {
                 return Err("Git inventory disagrees with its ignored paths".into());
             }
@@ -118,15 +130,25 @@ impl GitInventory {
     }
 
     fn includes(&self, path: &str) -> bool {
-        self.files.contains(&format!("{}{path}", self.prefix))
+        if self.prefix.is_empty() {
+            self.files.contains(path)
+        } else {
+            self.files.contains(&format!("{}{path}", self.prefix))
+        }
     }
 
     fn prunes(&self, path: &str) -> bool {
-        let path = format!("{}{path}/", self.prefix);
-        self.ignored_dirs.contains(&path)
-            || path
-                .match_indices('/')
-                .any(|(at, _)| self.ignored_dirs.contains(&path[..=at]))
+        let pruned = |path: &str| {
+            self.ignored_dirs.contains(path)
+                || path
+                    .match_indices('/')
+                    .any(|(at, _)| self.ignored_dirs.contains(&path[..at]))
+        };
+        if self.prefix.is_empty() {
+            pruned(path)
+        } else {
+            pruned(&format!("{}{path}", self.prefix))
+        }
     }
 }
 
@@ -287,17 +309,26 @@ impl Directory {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn open_child(dir: &std::fs::File, name: &mut Vec<u8>) -> Result<std::fs::File, String> {
-    use std::os::fd::{AsRawFd, FromRawFd};
     name.push(0);
+    // Directory entry names cannot contain NUL.
+    let result = open_child_cstr(dir, unsafe {
+        std::ffi::CStr::from_bytes_with_nul_unchecked(name)
+    });
+    name.pop();
+    result
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn open_child_cstr(dir: &std::fs::File, name: &std::ffi::CStr) -> Result<std::fs::File, String> {
+    use std::os::fd::{AsRawFd, FromRawFd};
     // The final component must be a directory and cannot be followed through a symlink.
     let fd = unsafe {
         libc::openat(
             dir.as_raw_fd(),
-            name.as_ptr().cast(),
+            name.as_ptr(),
             libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
-    name.pop();
     if fd < 0 {
         return Err(format!(
             "cannot open a directory without following links: {}",
@@ -342,7 +373,7 @@ fn directory_names(dir: &std::fs::File) -> Result<Vec<Vec<u8>>, String> {
         }
     }
     // Open a fresh description so reading the duplicate does not advance the caller's offset.
-    let fresh = open_child(dir, &mut b".".to_vec())?;
+    let fresh = open_child_cstr(dir, c".")?;
     let duplicate = unsafe { libc::fcntl(fresh.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate < 0 {
         return Err(format!(
@@ -429,10 +460,15 @@ fn discover_with_hook<F: FnMut(&str)>(
         return Err("more than 0 walked directories".into());
     }
     let mut stack = vec![Directory::new(open_root(&root)?, String::new())?];
+    let mut needs_inventory = git.is_some();
+    let exclusion_only = filter.exclusion_only();
     let mut visited = 1;
     let mut units = Vec::new();
     let mut inputs = Vec::new();
     while let Some(directory) = stack.last_mut() {
+        if directory.next == 0 && directory.names.iter().any(|name| name == b".stoopignore") {
+            needs_inventory = true;
+        }
         if directory.next == directory.names.len() {
             let mut after = directory_names(&directory.file)?;
             if input::list_hash_of_names(&mut after) != directory.listing {
@@ -486,7 +522,7 @@ fn discover_with_hook<F: FnMut(&str)>(
             if child.len() > 4096 {
                 return Err("a unit path cannot be represented".into());
             }
-            let matches = if filter.exclusion_only() {
+            let matches = if exclusion_only {
                 default.is_some_and(|base| base.matches(&child, false))
                     && filter.matches(&child, false)
             } else {
@@ -508,7 +544,16 @@ fn discover_with_hook<F: FnMut(&str)>(
     }
     units.sort();
     inputs.sort_by(|a, b| a.path.cmp(&b.path));
-    Ok(Catalog { units, inputs })
+    let reuse = if needs_inventory {
+        Reuse::RerunInventory
+    } else {
+        Reuse::Listings
+    };
+    Ok(Catalog {
+        units,
+        inputs,
+        reuse,
+    })
 }
 
 #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
@@ -627,6 +672,46 @@ mod tests {
         );
         assert!(discover_with_limits(&dir.0, &ignore, &filter, None, 1, 2).is_err());
         assert!(discover_with_limits(&dir.0, &ignore, &filter, None, 2, 1).is_err());
+    }
+
+    #[test]
+    fn catalog_reuse_reflects_git_and_stoopignore_sources() {
+        let dir = Dir::new();
+        let ignore = Ignore::new(&[], None, &[]);
+        let filter = Filter::inline("**/*.t");
+        let plain = discover(&dir.0, &ignore, &filter, None).unwrap();
+        assert_eq!(plain.reuse, Reuse::Listings);
+        fs::write(dir.0.join(".stoopignore"), b"ignored.t\n").unwrap();
+        let with_ignore = discover(&dir.0, &ignore, &filter, None).unwrap();
+        assert_eq!(with_ignore.reuse, Reuse::RerunInventory);
+        assert_ne!(plain.inputs[0].id, with_ignore.inputs[0].id);
+        fs::remove_file(dir.0.join(".stoopignore")).unwrap();
+        git(&dir.0, &["init", "-q"]);
+        assert_eq!(
+            discover(&dir.0, &ignore, &filter, None).unwrap().reuse,
+            Reuse::RerunInventory
+        );
+        fs::write(dir.0.join(".stoopignore"), b"ignored.t\n").unwrap();
+        assert_eq!(
+            discover(&dir.0, &ignore, &filter, None).unwrap().reuse,
+            Reuse::RerunInventory
+        );
+    }
+
+    #[test]
+    fn nested_stoopignore_symlink_also_requires_inventory_refresh() {
+        use std::os::unix::fs::symlink;
+        let dir = Dir::new();
+        fs::create_dir(dir.0.join("nested")).unwrap();
+        symlink("missing", dir.0.join("nested/.stoopignore")).unwrap();
+        let catalog = discover(
+            &dir.0,
+            &Ignore::new(&[], None, &[]),
+            &Filter::inline("**/*.t"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(catalog.reuse, Reuse::RerunInventory);
     }
 
     #[test]

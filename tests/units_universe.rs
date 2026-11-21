@@ -186,6 +186,47 @@ fn the_walk_skips_git_ignored_paths_but_keeps_tracked_files() {
     tracked(&f.explain("{changed:**/*.t}"), 2);
 }
 
+#[test]
+fn editing_gitignore_changes_explain_count_without_changing_directory_names() {
+    let f = Fixture::new();
+    f.git(&["init", "-q"]);
+    f.file("a.t");
+    fs::write(f.root.join(".gitignore"), "a.t\n").unwrap();
+    let listing = || {
+        let mut names: Vec<_> = fs::read_dir(&f.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listing();
+    tracked(&f.explain("{changed:a.t}"), 0);
+    fs::write(f.root.join(".gitignore"), "b.t\n").unwrap();
+    tracked(&f.explain("{changed:a.t}"), 1);
+    assert_eq!(listing(), before);
+}
+
+#[test]
+fn editing_stoopignore_changes_explain_count_without_changing_directory_names() {
+    let f = Fixture::new();
+    f.file("a.t");
+    fs::write(f.root.join(".stoopignore"), "a.t\n").unwrap();
+    let listing = || {
+        let mut names: Vec<_> = fs::read_dir(&f.root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    let before = listing();
+    tracked(&f.explain("{changed:a.t}"), 0);
+    fs::write(f.root.join(".stoopignore"), "b.t\n").unwrap();
+    tracked(&f.explain("{changed:a.t}"), 1);
+    assert_eq!(listing(), before);
+}
+
 #[cfg(unix)]
 #[test]
 fn directory_symlinks_are_not_followed() {
