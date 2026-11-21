@@ -302,3 +302,81 @@ fn matcher_directory_only_pattern_does_not_match_files() {
     f.file("tests/a.t");
     tracked(&f.explain("{changed:**/*.t/}"), 0);
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn explain_never_pulls_or_writes_but_the_same_run_can_pull() {
+    fn refs(dir: &Path) -> String {
+        let output = Command::new("git")
+            .current_dir(dir)
+            .args(["for-each-ref", "--format=%(refname)", "refs/stoop"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{}", stderr(&output));
+        String::from_utf8(output.stdout).unwrap()
+    }
+    let remote = Fixture::new();
+    remote.git(&["init", "-q", "--bare"]);
+    let f = Fixture::new();
+    f.git(&["init", "-q"]);
+    f.file("tests/a.t");
+    f.git(&["add", "tests/a.t"]);
+    f.git(&[
+        "-c",
+        "user.name=stoop-test",
+        "-c",
+        "user.email=stoop-test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-qm",
+        "fixture",
+    ]);
+    f.git(&["remote", "add", "origin", remote.root.to_str().unwrap()]);
+    let invoke = |action: &str, writer: bool| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_stoop"));
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("HOME", &f.root)
+            .env("STOOP_STORE", f.root.join(".stoop"))
+            .current_dir(&f.root)
+            .args([
+                action,
+                "--root",
+                ".",
+                "--no-learn-volatile",
+                "--sync",
+                "git",
+            ]);
+        if writer {
+            command.arg("--sync-write");
+        }
+        command.args(["--", "/bin/cat", "tests/a.t", "{changed:*.t}"]);
+        command.output().unwrap()
+    };
+    let published = invoke("run", true);
+    assert!(published.status.success(), "{}", stderr(&published));
+    assert!(
+        stderr(&published).contains("published"),
+        "{}",
+        stderr(&published)
+    );
+    fs::remove_dir_all(f.root.join(".stoop")).unwrap();
+    for name in refs(&f.root).lines() {
+        f.git(&["update-ref", "-d", name]);
+    }
+    f.file(".stoop/sentinel");
+    let store_before = snapshot(&f.root.join(".stoop"));
+    let local_before = refs(&f.root);
+    let remote_before = refs(&remote.root);
+    assert!(!remote_before.is_empty());
+    let explain = invoke("explain", false);
+    assert_eq!(explain.status.code(), Some(1), "{}", stderr(&explain));
+    assert_eq!(snapshot(&f.root.join(".stoop")), store_before);
+    assert_eq!(refs(&f.root), local_before);
+    assert_eq!(refs(&remote.root), remote_before);
+    let run = invoke("run", false);
+    assert!(run.status.success(), "{}", stderr(&run));
+    assert!(!refs(&f.root).is_empty(), "{}", stderr(&run));
+}

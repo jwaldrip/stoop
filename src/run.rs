@@ -1268,8 +1268,8 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 }
             }
         }
-        // A miss with a remote configured: someone else may already have proved this.
-        if hit_idx.is_some() || pulled || remote.is_none() || bypass {
+        // A run may fetch a missing proof; explain inspects only the local store.
+        if hit_idx.is_some() || pulled || remote.is_none() || bypass || explain {
             break;
         }
         pulled = true;
