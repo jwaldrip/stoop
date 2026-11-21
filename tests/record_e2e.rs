@@ -1719,6 +1719,18 @@ fn mkdir_p_keeps_the_prior_from_an_earlier_successful_creation() {
 }
 
 #[test]
+fn replacing_an_own_created_directory_records_its_final_child() {
+    let w = Ws::new("own-replaced-parent");
+    let p = recorded(
+        &w,
+        "test ! -e build && mkdir build && mv build old && mkdir build && echo ok > build/out",
+    );
+    assert!(pairs(&p, "outputs")
+        .iter()
+        .any(|(path, _)| path == "build/out"));
+}
+
+#[test]
 fn renaming_directories_is_unplannable() {
     let w = Ws::new("dirrename");
     w.write("x/f", "x");

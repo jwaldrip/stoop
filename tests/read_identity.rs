@@ -1391,6 +1391,39 @@ fn a_failed_create_cannot_hide_a_changed_parent() {
 }
 
 #[test]
+fn a_foreign_replacement_of_an_own_created_parent_is_refused() {
+    let key = "foreign-own-parent-replacement";
+    let case = Case::new(key);
+    let fifo = case.fifo("foreign-parent.fifo");
+    let script =
+        "test ! -e build && mkdir build && cat \"$FIFO\" >/dev/null && echo ok > build/out";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::rename(case.root().join("build"), case.dir.join("original-build")).unwrap();
+    fs::create_dir(case.root().join("build")).unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_refused_for(&out, &case, key, &["build"]);
+}
+
+#[test]
+fn a_foreign_parent_replacement_after_the_child_write_is_refused() {
+    let key = "foreign-parent-replacement-after-child";
+    let case = Case::new(key);
+    let fifo = case.fifo("foreign-parent-after.fifo");
+    let script =
+        "test ! -e build && mkdir build && echo ok > build/out && cat \"$FIFO\" >/dev/null";
+    let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::rename(case.root().join("build"), case.dir.join("original-build")).unwrap();
+    fs::create_dir(case.root().join("build")).unwrap();
+    fs::write(case.root().join("build/out"), b"ok\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_refused_for(&out, &case, key, &["build"]);
+}
+
+#[test]
 fn a_changed_ignored_regular_path_does_not_refuse_an_otherwise_recordable_run() {
     let key = "ignored-path-appears";
     let case = Case::new(key);

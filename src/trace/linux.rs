@@ -1285,6 +1285,7 @@ pub fn run<'a>(
     if !tr.pending_writes.is_empty() {
         tr.flag("it lost the exit stop of a pending write");
     }
+    tr.check_landed_absence_inputs();
     tr.t.execs = tr.execs.and_then(ExecObserver::finish);
     Ok(tr.t)
 }
@@ -2391,6 +2392,53 @@ impl Tracer<'_> {
             })
     }
 
+    /// An absent name observed before this run created the directory has no pre-existing
+    /// directory contents to conflict with its own later child creation.
+    fn own_created_parent(&self, parent: &Path) -> bool {
+        let Some(rec) = self.rec.as_ref() else {
+            return false;
+        };
+        let Some(key) = parent
+            .strip_prefix(rec.phys.real())
+            .ok()
+            .and_then(Path::to_str)
+        else {
+            return false;
+        };
+        if !self.t.read_before_write.contains(parent)
+            || self.t.priors.get(key).map(String::as_str) != Some("a")
+        {
+            return false;
+        }
+        let inode = fs::symlink_metadata(parent)
+            .ok()
+            .filter(|metadata| metadata.is_dir())
+            .as_ref()
+            .map(file_identity);
+        self.own_output_metadata(parent, inode)
+    }
+
+    /// Keep the landing identity live until the trace ends: an outside replacement of an
+    /// own-created input must not be mistaken for the directory or file the run created.
+    fn check_landed_absence_inputs(&mut self) {
+        let Some(rec) = self.rec.as_ref() else { return };
+        for (path, expected) in &self.landed_inodes {
+            let Some(key) = path
+                .strip_prefix(rec.phys.real())
+                .ok()
+                .and_then(Path::to_str)
+            else {
+                continue;
+            };
+            if self.t.read_before_write.contains(path)
+                && self.t.priors.get(key).map(String::as_str) == Some("a")
+                && fs::symlink_metadata(path).ok().as_ref().map(file_identity) != Some(*expected)
+            {
+                self.t.changed_during.insert(path.clone());
+            }
+        }
+    }
+
     /// Read/write ordering is tracked separately from the synthetic observations used to
     /// describe a write's link route. Inode identity also joins distinct hard-link names.
     fn note_real_read(&mut self, raw: &Path, how: Use) -> bool {
@@ -3093,6 +3141,8 @@ impl Tracer<'_> {
         let absent = metadata
             .as_ref()
             .is_some_and(|m| m.as_ref().is_err_and(is_absent));
+        let mkdir_existing = matches!(&kind, WriteKind::Create { directory: true })
+            && metadata.as_ref().is_some_and(Result::is_ok);
         let before = metadata
             .as_ref()
             .and_then(|m| m.as_ref().ok())
@@ -3132,13 +3182,15 @@ impl Tracer<'_> {
             self.invalidate_settled(None, Some(*id));
             // The link may fail; source-read conflicts are attributed only on success.
         }
-        let read_priors = expected
-            .as_deref()
-            .map(|destination| self.capture_read_prior(destination, before))
-            .unwrap_or_default();
+        let read_priors = if mkdir_existing {
+            Vec::new()
+        } else {
+            expected
+                .as_deref()
+                .map(|destination| self.capture_read_prior(destination, before))
+                .unwrap_or_default()
+        };
         let rec = self.rec.as_mut()?;
-        let mkdir_existing = matches!(&kind, WriteKind::Create { directory: true })
-            && metadata.as_ref().is_some_and(Result::is_ok);
         let key = if mkdir_existing {
             // The observed existing name is an input, not a write prior. If it vanishes and the
             // mkdir succeeds, path verification fails closed because it was not absent at entry.
@@ -3387,7 +3439,9 @@ impl Tracer<'_> {
             }
         }
         if let Some(parent) = path.read_parent {
-            self.t.read_write_conflicts.insert(parent);
+            if !self.own_created_parent(&parent) {
+                self.t.read_write_conflicts.insert(parent);
+            }
         }
         self.t.read_before_write.extend(path.read_priors);
         self.t.landed.insert(destination.clone());
@@ -4063,6 +4117,34 @@ mod tests {
         assert!(deferred_mkdir_invalidates_oid(true, -(libc::EPERM as i64)));
         assert!(deferred_mkdir_invalidates_oid(true, 0));
         assert!(!deferred_mkdir_invalidates_oid(false, 0));
+    }
+
+    #[test]
+    fn mkdir_success_after_an_existing_entry_cannot_be_attributed() {
+        let root =
+            std::env::temp_dir().join(format!("stoop-mkdir-entry-race-{}", std::process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("dir");
+        fs::create_dir(&path).unwrap();
+        let before = file_identity(&fs::symlink_metadata(&path).unwrap());
+        fs::rename(&path, root.join("old")).unwrap();
+        fs::create_dir(&path).unwrap();
+        let pending = PendingPath {
+            raw: path.clone(),
+            expected: Some(path),
+            follows: false,
+            key: Some("dir".into()),
+            before: Some(before),
+            absent: false,
+            deferred_mkdir_oid: false,
+            read_parent: None,
+            read_priors: Vec::new(),
+            rename_before: None,
+            confirmed_after: None,
+            kind: WriteKind::Create { directory: true },
+        };
+        assert!(verified_path_mutation(&pending, std::slice::from_ref(&pending)).is_none());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
