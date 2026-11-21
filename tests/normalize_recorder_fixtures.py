@@ -57,11 +57,18 @@ def comparable(value, case, path=()):
 def single_tracee_sed(old_dir, raw_dir, output_dir):
     """The `exec sed -i` recording. Its environment is restored to the committed sed recording's,
     which ran on the same runner, and its promoted config.txt input must equal its prior."""
-    reference = json.loads((old_dir / "sed" / "proof.json").read_text())["proofs"][0]
+    reference_document = json.loads((old_dir / "sed" / "proof.json").read_text())
+    if len(reference_document["proofs"]) != 1:
+        raise SystemExit(f"{NEW_CASE}: expected exactly one reference proof")
+    reference = reference_document["proofs"][0]
     raw = json.loads((raw_dir / NEW_CASE / "proof.json").read_text())
     if len(raw["proofs"]) != 1:
         raise SystemExit(f"{NEW_CASE}: expected exactly one proof")
     generated = raw["proofs"][0]
+    if raw["key"] != NEW_CASE or reference_document["key"] != "t":
+        raise SystemExit(f"{NEW_CASE}: unexpected proof key")
+    if reference["argv"] != ["sh", "-c", "sed -i s/foo/bar/ config.txt"]:
+        raise SystemExit(f"{NEW_CASE}: unexpected reference command")
     if generated["provenance"]["version"] != 11:
         raise SystemExit(f"{NEW_CASE}: expected recorder version 11")
     if generated["argv"] != ["sh", "-c", "exec sed -i s/foo/bar/ config.txt"]:
@@ -73,9 +80,19 @@ def single_tracee_sed(old_dir, raw_dir, output_dir):
     if not changed <= ENV_CHANGES:
         raise SystemExit(f"{NEW_CASE}: unexpected environment deltas: {sorted(changed - ENV_CHANGES)}")
     prior = [item for item in generated["priors"] if item["path"] == "config.txt"]
+    reference_prior = [item for item in reference["priors"] if item["path"] == "config.txt"]
+    if len(reference_prior) != 1 or prior != reference_prior:
+        raise SystemExit(f"{NEW_CASE}: config.txt prior differs from the reference")
+    output = [item for item in generated["outputs"] if item["path"] == "config.txt"]
+    reference_output = [item for item in reference["outputs"] if item["path"] == "config.txt"]
+    if len(reference_output) != 1 or output != reference_output:
+        raise SystemExit(f"{NEW_CASE}: config.txt output differs from the reference")
     promoted = [item for item in generated["inputs"] if item["path"] == "config.txt"]
-    if len(prior) != 1 or promoted != prior:
+    if promoted != prior:
         raise SystemExit(f"{NEW_CASE}: the promoted config.txt input must equal its prior")
+    if any(item["path"] == "config.txt" for item in reference["inputs"]):
+        raise SystemExit(f"{NEW_CASE}: reference unexpectedly contains a config.txt input")
+    sed_temp(reference)
     sed_temp(generated)
     normalized = copy.deepcopy(raw)
     normalized["proofs"][0]["env"] = copy.deepcopy(reference["env"])
@@ -85,6 +102,15 @@ def single_tracee_sed(old_dir, raw_dir, output_dir):
         if (previous and runner_system_file(item) and runner_system_file(previous)
                 and item["id"][:2] == previous["id"][:2] and item["id"] != previous["id"]):
             item["id"] = previous["id"]
+    expected = comparable(reference_document, "sed")
+    actual = comparable(normalized, "sed")
+    actual["key"] = expected["key"]
+    actual["proofs"][0]["argv"] = expected["proofs"][0]["argv"]
+    actual["proofs"][0]["inputs"] = [
+        item for item in actual["proofs"][0]["inputs"] if item["path"] != "config.txt"
+    ]
+    if actual != expected:
+        raise SystemExit(f"{NEW_CASE}: remaining proof fields differ from the reference")
     target = output_dir / NEW_CASE / "proof.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(normalized, separators=(",", ":")))
