@@ -1503,6 +1503,20 @@ fn landing_matches(landing: &trace::AtomicLanding, post: &trace::identity::Post)
         if *stat == landing.stat && *hash == landing.hash)
 }
 
+fn landing_verified(
+    trace: &Trace,
+    key: &str,
+    _id: Option<&str>,
+    post: &trace::identity::Post,
+) -> bool {
+    !trace.footprint.unknown
+        && !trace::identity::link_route_unknown(&trace.footprint)
+        && trace
+            .atomic_landings
+            .get(key)
+            .is_some_and(|landing| landing_matches(landing, post))
+}
+
 /// What the run left behind inside the repository, read once it finished: one entry for each
 /// in-scope path it wrote. Still there is an output. Gone again is removed, and the planner
 /// removes it with the step. Unreadable or special is a reason the planner cannot replay.
@@ -1520,13 +1534,7 @@ fn build_outputs(
     let mut reasons = Vec::new();
     let mut verified = Vec::new();
     for (key, (id, post)) in keys.into_iter().zip(ids) {
-        if !trace.footprint.unknown
-            && !trace::identity::link_route_unknown(&trace.footprint)
-            && trace
-                .atomic_landings
-                .get(key)
-                .is_some_and(|landing| landing_matches(landing, &post))
-        {
+        if landing_verified(trace, key, id.as_ref().map(|(id, _)| id.as_str()), &post) {
             verified.push(key.clone());
         }
         match id.map(|(id, _)| id) {

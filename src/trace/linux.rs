@@ -1921,6 +1921,16 @@ impl Rec<'_> {
             push_reason(t, format!("{key} is a special file"));
             return None;
         }
+        self.prior_content_id(t, phys, key, &m)
+    }
+
+    fn prior_content_id(
+        &mut self,
+        t: &mut Trace,
+        phys: &Path,
+        key: &str,
+        m: &fs::Metadata,
+    ) -> Option<String> {
         let exec = m.mode() & 0o111 != 0;
         let size = m.len();
         if size > MAX_FILE_BYTES || self.hashed + size > MAX_RUN_BYTES {
