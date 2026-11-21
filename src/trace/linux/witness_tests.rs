@@ -348,3 +348,94 @@ fn a_rename_witness_names_only_ordinary_operands() {
     );
     fs::remove_dir_all(root).unwrap();
 }
+
+fn with_ordinary_rename(
+    name: &str,
+    check: impl FnOnce(&mut Tracer<'_>, i32, &[u64; 6], &Path, &Path, (&fs::Metadata, &fs::Metadata)),
+) {
+    let root = scratch(name);
+    let temp = root.join("t");
+    let target = root.join("f");
+    fs::write(&temp, b"new\n").unwrap();
+    fs::write(&target, b"old\n").unwrap();
+    let metas = (
+        fs::symlink_metadata(&temp).unwrap(),
+        fs::symlink_metadata(&target).unwrap(),
+    );
+    let ignore = Ignore::new(&[], None, &[]);
+    let mut tracer = tracer_for(rec_for(&root, &ignore));
+    let pid = std::process::id() as i32;
+    tracer.live_tasks.insert(pid);
+    tracer.t.keys.insert(temp.clone(), "t".into());
+    tracer.t.priors.insert("t".into(), "a".into());
+    let seen = Seen::File(stat_of(&target), identity::ReadHash::NotNeeded);
+    tracer.confirmed_reads.insert(target.clone(), seen.clone());
+    tracer.t.seen = Some(HashMap::from([(
+        target.clone(),
+        identity::Observation {
+            seen,
+            route_physical: true,
+            appeared: false,
+        },
+    )]));
+    let source = CString::new(temp.as_os_str().as_bytes()).unwrap();
+    let destination = CString::new(target.as_os_str().as_bytes()).unwrap();
+    let mut args = [0u64; 6];
+    args[1] = source.as_ptr() as u64;
+    args[2] = destination.as_ptr() as u64;
+    check(
+        &mut tracer,
+        pid,
+        &args,
+        &temp,
+        &target,
+        (&metas.0, &metas.1),
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn an_oversized_lock_table_withholds_the_witness() {
+    let stat = landing(42, 0o100644).stat;
+    let table = vec![b' '; (1 << 20) + 1];
+    assert!(
+        lock_table_lists_from(Ok(io::Cursor::new(table)), &stat),
+        "an oversized lock table must fall back to the legacy recorder"
+    );
+}
+
+#[test]
+fn an_over_budget_source_is_not_scanned_or_opened() {
+    with_ordinary_rename("budget-limit", |tracer, pid, args, temp, target, metas| {
+        let used = identity::READ_HASH_BUDGET - 3;
+        tracer.rec.as_mut().unwrap().rewrite_budget.hashed = used;
+        let scans_before = LOCK_TABLE_SCANS.with(|scans| scans.get());
+        assert!(!rename_offered(tracer, pid, args, temp, target, metas));
+        assert_eq!(
+            tracer.rec.as_ref().unwrap().rewrite_budget.hashed,
+            used,
+            "an over-budget source must not be opened or hashed"
+        );
+        assert_eq!(
+            LOCK_TABLE_SCANS.with(|scans| scans.get()),
+            scans_before,
+            "an over-budget source must not scan the lock table"
+        );
+    });
+}
+
+#[test]
+#[ignore = "requires a child PID namespace with its own procfs"]
+fn a_child_pid_namespace_withholds_the_rename_witness() {
+    let namespace = fs::read_link("/proc/self/ns/pid").expect("PID namespace");
+    assert_ne!(namespace, Path::new("pid:[4026531836]"));
+    with_ordinary_rename(
+        "child-pid-namespace",
+        |tracer, pid, args, temp, target, metas| {
+            assert!(
+                !rename_offered(tracer, pid, args, temp, target, metas),
+                "a child PID namespace cannot establish lock-table completeness"
+            );
+        },
+    );
+}

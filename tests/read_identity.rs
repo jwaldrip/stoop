@@ -22,6 +22,9 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+const SED_FIXTURE_BEFORE: &[u8] = b"foo\n";
+const SED_FIXTURE_AFTER: &[u8] = b"bar\n";
+
 /// A repository root and the scratch space around it, under the test's temporary directory.
 /// Removed when the test ends.
 struct Case {
@@ -1599,11 +1602,44 @@ fn regenerate_single_tracee_sed_fixture() {
         Ok("1")
     );
     let case = Case::new("regenerate-sed-exec");
-    case.file("config.txt", b"foo\n");
+    case.file("config.txt", SED_FIXTURE_BEFORE);
     age();
     let out = run(&case, "sed-exec", "exec sed -i s/foo/bar/ config.txt", &[]);
     assert_recorded(&out, &case, "sed-exec");
+    assert_eq!(
+        fs::read(case.root().join("config.txt")).unwrap(),
+        SED_FIXTURE_AFTER
+    );
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/recorder/sed-exec");
     fs::create_dir_all(&dir).unwrap();
     fs::copy(case.proof("sed-exec"), dir.join("proof.json")).unwrap();
+}
+
+#[test]
+fn sed_fixture_ids_match_the_generator_bytes() {
+    for name in ["sed", "sed-exec"] {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/recorder")
+            .join(name)
+            .join("proof.json");
+        let document: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let proof = &document["proofs"][0];
+        assert_file_entry(proof, "priors", "config.txt", SED_FIXTURE_BEFORE);
+        assert_file_entry(proof, "outputs", "config.txt", SED_FIXTURE_AFTER);
+        if name == "sed-exec" {
+            assert_file_entry(proof, "inputs", "config.txt", SED_FIXTURE_BEFORE);
+        }
+    }
+}
+
+#[test]
+fn sed_exec_normalizer_rejects_corrupted_recordings() {
+    let script =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/normalize_recorder_fixtures_test.py");
+    let output = Command::new("python3").arg(script).output().unwrap();
+    assert!(
+        output.status.success(),
+        "fixture normalizer controls failed:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

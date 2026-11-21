@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+"""Regression controls for the real single-tracee sed fixture normalizer."""
+import copy
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import normalize_recorder_fixtures as normalizer
+
+FIXTURES = Path(__file__).resolve().parent / "fixtures" / "recorder"
+
+
+class SingleTraceeSed(unittest.TestCase):
+    def setUp(self):
+        self.original = json.loads((FIXTURES / "sed-exec" / "proof.json").read_text())
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.raw = Path(self.tmp.name) / "raw"
+        self.out = Path(self.tmp.name) / "out"
+        (self.raw / "sed-exec").mkdir(parents=True)
+
+    def normalize(self, proof):
+        (self.raw / "sed-exec" / "proof.json").write_text(json.dumps(proof))
+        normalizer.single_tracee_sed(FIXTURES, self.raw, self.out)
+
+    def test_real_recording_is_accepted(self):
+        self.normalize(self.original)
+        self.assertTrue((self.out / "sed-exec" / "proof.json").exists())
+
+    def test_altered_output_digest_is_rejected(self):
+        changed = copy.deepcopy(self.original)
+        output = next(x for x in changed["proofs"][0]["outputs"] if x["path"] == "config.txt")
+        output["id"] = "f:" + "0" * 64
+        with self.assertRaisesRegex(SystemExit, "output"):
+            self.normalize(changed)
+        self.assertFalse((self.out / "sed-exec" / "proof.json").exists())
+
+    def test_matching_but_altered_prior_and_input_are_rejected(self):
+        changed = copy.deepcopy(self.original)
+        proof = changed["proofs"][0]
+        for name in ("priors", "inputs"):
+            entry = next(x for x in proof[name] if x["path"] == "config.txt")
+            entry["id"] = "f:" + "0" * 64
+        with self.assertRaisesRegex(SystemExit, "prior"):
+            self.normalize(changed)
+        self.assertFalse((self.out / "sed-exec" / "proof.json").exists())
+
+    def test_unrelated_proof_field_is_rejected(self):
+        changed = copy.deepcopy(self.original)
+        changed["proofs"][0]["unexpected_field"] = "must not disappear"
+        with self.assertRaisesRegex(SystemExit, "proof"):
+            self.normalize(changed)
+        self.assertFalse((self.out / "sed-exec" / "proof.json").exists())
+
+
+if __name__ == "__main__":
+    unittest.main()
