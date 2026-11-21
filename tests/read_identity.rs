@@ -1527,3 +1527,17 @@ fn an_attempted_write_after_atomic_landing_withdraws_the_witness() {
     assert_file_entry(&stored, "priors", "f", b"original\n");
     assert_file_entry(&stored, "outputs", "f", b"done\n");
 }
+
+#[test]
+fn an_inode_metadata_attempt_before_rename_keeps_legacy_recording() {
+    let case = Case::new("atomic-inode-footprint");
+    case.file("f", b"original\n");
+    age();
+    let script = "exec python3 -c 'import os; fd = os.open(\"f\", os.O_RDONLY); os.fchown(fd, -1, -1); os.close(fd); open(\"f\").read(); open(\"tmp\", \"w\").write(\"done\\n\"); os.replace(\"tmp\", \"f\")'";
+    let out = run(&case, "atomic-inode-footprint", script, &[]);
+    assert_recorded(&out, &case, "atomic-inode-footprint");
+    let stored = proof(&case, "atomic-inode-footprint");
+    assert_no_input(&stored, "f");
+    assert_file_entry(&stored, "priors", "f", b"original\n");
+    assert_file_entry(&stored, "outputs", "f", b"done\n");
+}
