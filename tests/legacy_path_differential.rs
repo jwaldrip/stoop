@@ -889,18 +889,29 @@ fn explain_of_a_suite() {
         subject.starts_with(&base),
         "D16 explain: the base's lines come first\n{base}\n{subject}"
     );
-    let mut added = subject[base.len()..].lines();
-    let tracked = added.next().unwrap_or_default();
-    assert!(
-        tracked
-            .starts_with("stoop: tracked 2 units, 0 inputs; 0 proven, 2 without a proof (suite "),
-        "{tracked}"
-    );
-    assert_eq!(
-        added.next(),
-        Some("stoop: would run an attribution pass: 2 launches")
-    );
-    assert_eq!(added.next(), None);
+    let added = &subject[base.len()..];
+    // An A/A run (both sides one binary) adds nothing. A comparison against the base adds the two lines.
+    if pair.bins[0] == pair.bins[1] {
+        assert_eq!(
+            added, "",
+            "D16 explain: an A/A run must print the base's lines alone"
+        );
+    } else {
+        let mut lines = added.lines();
+        let tracked = lines.next().unwrap_or_default();
+        assert!(
+            tracked.starts_with(
+                "stoop: tracked 2 units, 0 inputs; 0 proven, 2 without a proof (suite "
+            ),
+            "{added}"
+        );
+        assert_eq!(
+            lines.next(),
+            Some("stoop: would run an attribution pass: 2 launches"),
+            "{added}"
+        );
+        assert_eq!(lines.next(), None, "{added}");
+    }
     pair.compare_store(".stoop");
 }
 
