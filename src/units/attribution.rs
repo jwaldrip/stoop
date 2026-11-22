@@ -4,17 +4,19 @@
 //! every run that does not dispatch is the legacy path, unchanged. `stoop explain` asks the same
 //! checks, through `screen` and `probe`, so it predicts the decision made here.
 
-use super::bundle::{self, LaunchGuard, Pass, Pending, Start, Stored};
+use super::bundle::{self, LaunchGuard, Pass, Pending, Scratch, Start, Stored};
 use super::config::Config;
 use super::expand;
-use super::hook::{safe, Hook};
+use super::hook::{safe, Base, FileMode, Hook};
 use super::policy;
 use crate::ignore::Ignore;
 use crate::pathutil::{to_key, Physical};
 use crate::proof::now;
 use crate::run::{self, assemble_with, How, Lookup, Outcome, RootListing, RunCx};
 use crate::trace::Trace;
+use std::ffi::OsString;
 use std::fmt;
+use std::io;
 use std::path::Path;
 
 /// Runs the attribution pass when every condition of spec 3.1 holds. `None` leaves the run to the
@@ -29,12 +31,15 @@ pub(crate) fn pass(
 ) -> Option<Outcome> {
     let hook = cx.hook.as_ref()?;
     // Checks 1 to 7 are decided by `screen`, which `stoop explain` calls too.
-    let (_, launches) = screen(cx, hook, config, lookup, Ok(pending)).ok()?;
-    // 8 and 9: the bundle is checked without the lock, then again under it.
+    let pending = screen(cx, hook, config, lookup, Ok(pending)).ok()?;
+    // 8 and 9: the bundle is checked without the lock, then again under it. The store's unit folder is
+    // transient: no trace of it becomes an input, wherever the store sits (spec 4.7).
+    let mut transient = cx.o.transient.clone();
+    transient.extend(store_patterns(cx.root, store));
     let ignore = Ignore::new(
         &cx.o.ignore,
         Some(&cx.root.join(".stoopignore")),
-        &cx.o.transient,
+        &transient,
     );
     let guard = LaunchGuard {
         env: cx.env_now.clone(),
@@ -60,16 +65,42 @@ pub(crate) fn pass(
         quiet,
         format!(
             "stoop: attribution pass: {} units, one launch each",
-            launches.len()
+            pending.units().len()
         ),
     );
     let real_root = std::fs::canonicalize(cx.root).unwrap_or_else(|_| cx.root.clone());
+    let forms = expand::list_forms(hook);
     let mut status = 0;
     let mut over_budget = 0;
-    for launch in &launches {
+    for unit in pending.units() {
+        let unit_name = safe(unit);
+        // The launch's list files live in its own folder, which is removed when this iteration ends.
+        let mut folder = match bundle_pass.scratch() {
+            Ok(folder) => folder,
+            Err(error) => {
+                status = keep(status, not_launched(quiet, &unit_name, &error));
+                continue;
+            }
+        };
+        let lists = match Lists::write(&mut folder, cx.root, cx.cwd, unit, &forms) {
+            Ok(lists) => lists,
+            Err(error) => {
+                status = keep(status, not_launched(quiet, &unit_name, &error));
+                continue;
+            }
+        };
+        let Some(launch) = expand::launch(hook, unit, cx.root, cx.cwd, &|mode, base| {
+            lists.get(mode, base)
+        }) else {
+            let why = "its arguments cannot be expanded";
+            status = keep(status, not_launched(quiet, &unit_name, &why));
+            continue;
+        };
         std::env::set_var("STOOP_CHANGED", &launch.value);
         std::env::set_var("STOOP_UNITS", &launch.value);
-        let unit = safe(&launch.unit);
+        std::env::set_var("STOOP_CHANGED_FILE", &lists.changed);
+        std::env::set_var("STOOP_CHANGED_INPUTS", "");
+        std::env::set_var("STOOP_CHANGED_INPUTS_FILE", &lists.inputs);
         let unit_status =
             match run::launch_traced(cx, &launch.argv, &ignore, &real_root, false, false, false) {
                 // A trace that fails before the command starts has run nothing. The unit runs once
@@ -79,7 +110,7 @@ pub(crate) fn pass(
                     say(
                         quiet,
                         format!(
-                            "stoop: not traced ({}); running {unit} without a proof",
+                            "stoop: not traced ({}); running {unit_name} without a proof",
                             safe(&error.to_string())
                         ),
                     );
@@ -89,7 +120,7 @@ pub(crate) fn pass(
                 Ok(trace) if !unit_evidence(cx.root, &real_root, &trace, &launch.unit) => {
                     say(
                         quiet,
-                        format!("stoop: no proof for {unit}: the launch never read it"),
+                        format!("stoop: no proof for {unit_name}: the launch never read it"),
                     );
                     0
                 }
@@ -108,16 +139,17 @@ pub(crate) fn pass(
                         }
                         Err(why) => say(
                             quiet,
-                            format!("stoop: not recorded for {unit}: {}", safe(&why.to_string())),
+                            format!(
+                                "stoop: not recorded for {unit_name}: {}",
+                                safe(&why.to_string())
+                            ),
                         ),
                     }
                     0
                 }
             };
         // The first nonzero status in catalog order. A failing unit never stops the pass.
-        if status == 0 {
-            status = unit_status;
-        }
+        status = keep(status, unit_status);
     }
     for name in run::HOOK_ENV {
         std::env::set_var(name, "");
@@ -165,7 +197,7 @@ pub(crate) enum Refusal {
     Ci,
     /// Splitting is turned off by `enabled = false`, at the top level or on the suite.
     Disabled,
-    /// The hook uses a form one unit cannot stand for: a list file, `{changed-inputs}` or shell code.
+    /// The hook uses a form one unit cannot stand for: `{changed-inputs}`, or a list with a join.
     Form,
     /// A unit's text holds the separator of a joined placeholder.
     Join,
@@ -198,7 +230,7 @@ impl fmt::Display for Refusal {
             Self::Ci => "CI is set, so the run keeps the full command",
             Self::Disabled => "splitting is turned off by enabled = false",
             Self::Form => {
-                "the hook uses a form a single unit cannot stand for (a list file, {changed-inputs} or shell code)"
+                "the hook uses a form a single unit cannot stand for ({changed-inputs}, or a list with a join)"
             }
             Self::Join => "a unit's text contains the separator of a joined placeholder",
             Self::NoBundle => "the suite has no current record of an earlier full run",
@@ -229,7 +261,7 @@ fn screen<'p>(
     config: &Config,
     lookup: &Lookup,
     pending: Result<&'p Pending, Refusal>,
-) -> Result<(&'p Pending, Vec<expand::Launch>), Refusal> {
+) -> Result<&'p Pending, Refusal> {
     // STOOP_OFF makes the run untraced before it looks at anything else. Explain names it first, even
     // when the whole command's proof still holds or the full form is forced.
     if run::env_switch("STOOP_OFF", true) {
@@ -254,12 +286,14 @@ fn screen<'p>(
     if config.splitting_disabled(&hook.original, cx.rel_cwd) {
         return Err(Refusal::Disabled);
     }
-    // 6 and 7: every placeholder must expand to one unit, for every unit of the roster.
+    // 6 and 7: every placeholder must stand for one unit, and every unit of the roster must expand.
     if !expand::supported(hook) {
         return Err(Refusal::Form);
     }
-    let launches = expand::launches(hook, pending.units(), cx.root, cx.cwd).ok_or(Refusal::Join)?;
-    Ok((pending, launches))
+    if !expand::expands(hook, pending.units(), cx.root, cx.cwd) {
+        return Err(Refusal::Join);
+    }
+    Ok(pending)
 }
 
 /// The two lines `stoop explain` adds to a suite's decision (spec 4.16): the tracked counts, then
@@ -282,7 +316,7 @@ pub(crate) fn explain_lines(
         lookup,
         suite.pending.as_ref().map_err(|refusal| *refusal),
     )
-    .and_then(|(pending, launches)| bundle::probe(store, pending, key).map(|()| launches.len()));
+    .and_then(|pending| bundle::probe(store, pending, key).map(|()| pending.units().len()));
     let (inputs, proven) = bundle::counts(store, &suite.id, &suite.units, key);
     let total = suite.units.len();
     let tracked = format!(
@@ -302,6 +336,99 @@ fn say(quiet: bool, line: String) {
     if !quiet {
         eprintln!("{line}");
     }
+}
+
+/// The status of a unit that was not launched: 125, the status of a run that stoop could not carry
+/// out. One line for the operator says why, unless `--quiet` asks for none.
+fn not_launched(quiet: bool, unit: &str, why: &dyn fmt::Display) -> i32 {
+    say(quiet, format!("stoop: not launched for {unit}: {why}"));
+    125
+}
+
+/// The first nonzero status in catalog order, so a failing unit never stops the pass (spec 3.9).
+fn keep(status: i32, unit: i32) -> i32 {
+    if status == 0 {
+        unit
+    } else {
+        status
+    }
+}
+
+/// The transient exclusion of a store's unit folder (spec 4.7). A pattern with a slash matches only that
+/// folder and what it holds, so a folder that merely shares the store's name is still an input. The folder
+/// is named by its absolute path, and by its root-relative key when the store sits inside the root.
+fn store_patterns(root: &Path, store: &Path) -> Vec<String> {
+    let folder = store.join("units").join("v1");
+    let absolute = folder.to_string_lossy().into_owned();
+    let key = to_key(root, &folder);
+    if key == absolute {
+        vec![absolute]
+    } else {
+        vec![absolute, key]
+    }
+}
+
+/// The files one launch names (spec 3.7, 4.12). `changed` is the newline list of the unit's cwd-relative
+/// path, which `STOOP_CHANGED_FILE` names and `{changed:file}` reads. `inputs` is empty, for
+/// `STOOP_CHANGED_INPUTS_FILE`. `others` holds the other list forms the hook names, once each.
+struct Lists {
+    changed: OsString,
+    inputs: OsString,
+    others: Vec<(FileMode, Base, OsString)>,
+}
+
+impl Lists {
+    /// Writes the launch's files into its folder, and returns their paths.
+    fn write(
+        folder: &mut Scratch,
+        root: &Path,
+        cwd: &Path,
+        unit: &str,
+        forms: &[(FileMode, Base)],
+    ) -> io::Result<Lists> {
+        let changed = write_form(folder, root, cwd, unit, FileMode::File, Base::Cwd)?;
+        let mut others: Vec<(FileMode, Base, OsString)> = Vec::new();
+        for &(mode, base) in forms {
+            let named = (mode, base) == (FileMode::File, Base::Cwd);
+            if named || others.iter().any(|(m, b, _)| *m == mode && *b == base) {
+                continue;
+            }
+            let path = write_form(folder, root, cwd, unit, mode, base)?;
+            others.push((mode, base, path));
+        }
+        let inputs = folder.write("inputs", &[])?.into_os_string();
+        Ok(Lists {
+            changed,
+            inputs,
+            others,
+        })
+    }
+
+    /// The path of the list file a form reads.
+    fn get(&self, mode: FileMode, base: Base) -> Option<OsString> {
+        if (mode, base) == (FileMode::File, Base::Cwd) {
+            return Some(self.changed.clone());
+        }
+        self.others
+            .iter()
+            .find(|(m, b, _)| *m == mode && *b == base)
+            .map(|(_, _, path)| path.clone())
+    }
+}
+
+/// Writes one unit's list in a form into the launch's folder, and returns its path.
+fn write_form(
+    folder: &mut Scratch,
+    root: &Path,
+    cwd: &Path,
+    unit: &str,
+    mode: FileMode,
+    base: Base,
+) -> io::Result<OsString> {
+    let bytes = expand::list_bytes(root, cwd, unit, mode, base);
+    Ok(folder
+        .write(expand::list_name(mode, base), &bytes)?
+        .into_os_string())
 }
 
 /// Whether the launch read the unit's own file: a content read of it under the name the unit has,
