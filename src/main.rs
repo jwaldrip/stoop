@@ -229,10 +229,18 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
                 }
                 Err(error) => eprintln!("{error}"),
             }
-            for (line, warning) in run::units::bundle::list(&suite_store_for(&o)) {
-                println!("{line}");
-                if let Some(warning) = warning {
-                    eprintln!("{warning}");
+            match suite_store_for(&o) {
+                Ok(store) => {
+                    for (line, warning) in run::units::bundle::list(&store) {
+                        println!("{line}");
+                        if let Some(warning) = warning {
+                            eprintln!("{warning}");
+                        }
+                    }
+                }
+                Err(message) => {
+                    println!("suite\t-\tunavailable");
+                    eprintln!("{message}");
                 }
             }
             0
@@ -256,7 +264,14 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
                 return 2;
             }
             if o.units_forget {
-                return match run::units::bundle::forget(&suite_store_for(&o), key) {
+                let store = match suite_store_for(&o) {
+                    Ok(store) => store,
+                    Err(message) => {
+                        eprintln!("{message}");
+                        return 1;
+                    }
+                };
+                return match run::units::bundle::forget(&store, key) {
                     Ok(true) => 0,
                     Ok(false) => {
                         eprintln!("stoop: no suite named {}", run::safe(key));
@@ -380,10 +395,17 @@ fn store_for(o: &Opts) -> proof::Store {
     proof::Store::new(run::store_for(o, &cwd, &root))
 }
 
-fn suite_store_for(o: &Opts) -> PathBuf {
+/// The suite store, or the reason suites are unavailable (see `run::suite_store_refused`).
+fn suite_store_for(o: &Opts) -> Result<PathBuf, String> {
     let cwd = std::env::current_dir().unwrap_or_default();
     let root = run::root_for(o, &cwd);
-    run::store_for(o, &cwd, &root)
+    if run::suite_store_refused(o, &root) {
+        return Err(format!(
+            "stoop: suites are unavailable: {} is a link or not a directory",
+            run::safe(&root.join(".stoop").display().to_string())
+        ));
+    }
+    Ok(run::store_for(o, &cwd, &root))
 }
 
 fn jobs_for(o: &Opts) -> job::JobStore {

@@ -162,6 +162,14 @@ pub fn store_for(o: &Opts, cwd: &Path, root: &Path) -> PathBuf {
     canonical_path(&absolutize(cwd, &path))
 }
 
+/// Whether suite files would go through the implicit `<root>/.stoop`, and that path is a link or
+/// not a directory. A configured store is trusted: the operator chose it.
+pub(crate) fn suite_store_refused(o: &Opts, root: &Path) -> bool {
+    o.store.is_none()
+        && env_str("STOOP_STORE").is_none()
+        && units::bundle::implicit_store_refused(root)
+}
+
 /// The path with symlinks resolved. A path that does not exist yet resolves through its parent,
 /// so the same store has the same path before and after its first run.
 fn canonical_path(path: &Path) -> PathBuf {
@@ -867,6 +875,9 @@ fn unit_bookkeeping(
     independent_false: bool,
 ) -> Option<units::bundle::Pending> {
     if !eligible_for_units(cx, config_invalid, independent_false) {
+        return None;
+    }
+    if suite_store_refused(cx.o, cx.root) {
         return None;
     }
     let hook = cx.hook.as_ref()?;

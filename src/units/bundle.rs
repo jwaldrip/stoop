@@ -326,7 +326,6 @@ pub(crate) struct Area {
     dir: PathBuf,
 }
 
-#[cfg(not(unix))]
 fn is_link(meta: &fs::Metadata) -> bool {
     #[cfg(windows)]
     let reparse = {
@@ -337,6 +336,16 @@ fn is_link(meta: &fs::Metadata) -> bool {
     #[cfg(not(windows))]
     let reparse = false;
     meta.file_type().is_symlink() || reparse
+}
+
+/// Whether the implicit store, `<root>/.stoop`, is a link or not a directory. It is examined before
+/// the path is resolved, because the repository controls that path: a link there would send suite
+/// files wherever it points. A configured store is never examined.
+pub(crate) fn implicit_store_refused(root: &Path) -> bool {
+    match fs::symlink_metadata(root.join(".stoop")) {
+        Ok(meta) => is_link(&meta) || !meta.is_dir(),
+        Err(error) => error.kind() != io::ErrorKind::NotFound,
+    }
 }
 
 #[cfg(not(unix))]
@@ -1204,5 +1213,31 @@ mod presence_tests {
             suite_id(&words, "", None, None),
             suite_id(&words, "", Some(""), None)
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod store_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn only_a_link_or_a_file_at_the_implicit_store_is_refused() {
+        let root = std::env::temp_dir().join(format!("stoop-implicit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let store = root.join(".stoop");
+        assert!(
+            !implicit_store_refused(&root),
+            "an absent store is created on demand"
+        );
+        fs::create_dir(&store).unwrap();
+        assert!(!implicit_store_refused(&root), "a directory is used");
+        fs::remove_dir(&store).unwrap();
+        std::os::unix::fs::symlink(&root, &store).unwrap();
+        assert!(implicit_store_refused(&root), "a link is refused");
+        fs::remove_file(&store).unwrap();
+        fs::write(&store, b"").unwrap();
+        assert!(implicit_store_refused(&root), "a file is refused");
+        let _ = fs::remove_dir_all(&root);
     }
 }
