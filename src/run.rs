@@ -2717,4 +2717,30 @@ mod landing_witness_tests {
             "P2-7: an unreadable output must not verify the landing"
         );
     }
+
+    #[test]
+    fn a_stat_only_landing_uses_the_final_output_hash_for_its_id() {
+        let stat = trace::identity::FileStat {
+            dev: 1,
+            ino: 2,
+            size: 1,
+            mtime_ns: 1,
+            ctime_ns: 2,
+            mode: 0o100644,
+        };
+        let mut landed = Trace::default();
+        landed.atomic_landings.insert(
+            "f".into(),
+            trace::AtomicLanding {
+                stat,
+                hash: "earlier-source-hash".into(),
+            },
+        );
+        let post = trace::identity::Post::File {
+            stat,
+            hash: "final-output-hash".into(),
+        };
+        let id = crate::input::file_id(false, "final-output-hash");
+        assert!(landing_verified(&landed, "f", Some(&id), &post));
+    }
 }

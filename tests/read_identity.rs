@@ -1613,38 +1613,31 @@ fn an_inode_metadata_attempt_before_rename_keeps_legacy_recording() {
     assert_file_entry(&stored, "outputs", "f", b"done\n");
 }
 
-/// Finding P1-1: a single-process editor holds a write lease on its temporary file and renames
-/// the file over one the command already read. The recorder must not open the leased file to hash
-/// it, because that open breaks the lease and the kernel signals the editor. The rename must
-/// finish, and the lease table must list the lease the editor took.
+/// The recorder must not open an editor's write-leased temporary file. The lease stays intact,
+/// no SIGIO arrives, and the successful stat-only replacement still promotes the old input.
 #[test]
 fn a_write_lease_on_the_rename_source_is_not_broken_by_the_recorder() {
     let case = Case::new("lease");
     let target = case.file("f", b"old contents\n");
     age();
-    let table_out = case.dir.join("locks.txt");
-    // `exec` makes the editor the only traced task. Without it the shell forks python3, the
-    // recorder sees two live tasks, and the rename witness never opens the leased file.
+    // `exec` makes the editor the only traced task, which permits the rename witness.
     let script = r#"exec python3 -c '
-import fcntl, os
+import fcntl, os, signal
+signals = []
+signal.signal(signal.SIGIO, lambda *_: signals.append("SIGIO"))
 with open("f", "rb") as read:
     read.read()
 fd = os.open("t", os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o644)
 fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_WRLCK)
 fcntl.fcntl(fd, fcntl.F_SETOWN, os.getpid())
 fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_ASYNC)
-with open("/proc/locks") as table, open(os.environ["LOCKS"], "w") as out:
-    out.write("".join(line for line in table if "LEASE" in line))
 os.write(fd, b"new contents\n")
 os.rename("t", "f")
+assert fcntl.fcntl(fd, fcntl.F_GETLEASE) == fcntl.F_WRLCK, "write lease was broken"
+assert not signals, f"lease signal received: {signals}"
 os.close(fd)
-'"#;
-    let out = run(&case, "lease", script, &[("LOCKS", &table_out)]);
-    let table = fs::read_to_string(&table_out).unwrap_or_default();
-    assert!(
-        table.contains("LEASE"),
-        "the lease table lists no lease for the temporary file:\n{table}"
-    );
+' "#;
+    let out = run(&case, "lease", script, &[]);
     assert!(
         out.status.success(),
         "the recorder broke the editor's write lease:\n{}",
@@ -1656,6 +1649,9 @@ os.close(fd)
         "the editor's rename did not finish:\n{}",
         stderr(&out)
     );
+    assert_recorded(&out, &case, "lease");
+    let stored = proof(&case, "lease");
+    assert_atomic_recording(&stored, "f", b"old contents\n", b"new contents\n", true);
 }
 
 /// Regenerate the single-tracee `exec sed -i` recording through the real recorder on Linux. The raw

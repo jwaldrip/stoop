@@ -5,7 +5,7 @@
 use super::*;
 use crate::ignore::Ignore;
 use std::ffi::CString;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{symlink, PermissionsExt};
 
@@ -393,6 +393,83 @@ fn with_ordinary_rename(
         &temp,
         &target,
         (&metas.0, &metas.1),
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn a_rename_witness_never_opens_its_source() {
+    with_ordinary_rename(
+        "source-never-opened",
+        |tracer, pid, args, temp, target, metas| {
+            let fd = unsafe { libc::inotify_init1(libc::IN_CLOEXEC | libc::IN_NONBLOCK) };
+            assert!(fd >= 0, "{}", io::Error::last_os_error());
+            let watch = unsafe { OwnedFd::from_raw_fd(fd) };
+            let path = CString::new(temp.as_os_str().as_bytes()).unwrap();
+            assert!(
+                unsafe { libc::inotify_add_watch(watch.as_raw_fd(), path.as_ptr(), libc::IN_OPEN) }
+                    >= 0,
+                "{}",
+                io::Error::last_os_error()
+            );
+            assert!(rename_offered(tracer, pid, args, temp, target, metas));
+            let mut events = [0u8; 1024];
+            let count =
+                unsafe { libc::read(watch.as_raw_fd(), events.as_mut_ptr().cast(), events.len()) };
+            assert_eq!(count, -1, "rename witness opened its source");
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::EAGAIN)
+            );
+        },
+    );
+}
+
+#[test]
+fn a_landing_needs_the_entry_stat_except_its_ctime() {
+    let before = landing(42, 0o100644).stat;
+    assert!(same_renamed_file(
+        &before,
+        &identity::FileStat {
+            ctime_ns: before.ctime_ns + 1,
+            ..before
+        }
+    ));
+    for after in [
+        identity::FileStat { dev: 2, ..before },
+        identity::FileStat { ino: 43, ..before },
+        identity::FileStat { size: 2, ..before },
+        identity::FileStat {
+            mode: 0o100755,
+            ..before
+        },
+        identity::FileStat {
+            mode: 0o120644,
+            ..before
+        },
+        identity::FileStat {
+            mtime_ns: 2,
+            ..before
+        },
+    ] {
+        assert!(!same_renamed_file(&before, &after), "{after:?}");
+    }
+}
+
+#[test]
+fn a_source_changed_after_entry_does_not_match_its_landing() {
+    let root = scratch("changed-source");
+    let source = root.join("t");
+    let destination = root.join("f");
+    fs::write(&source, b"old\n").unwrap();
+    fs::write(&destination, b"previous\n").unwrap();
+    let entry = stat_of(&source);
+    fs::write(&source, b"new contents\n").unwrap();
+    fs::rename(&source, &destination).unwrap();
+    let landing = stat_of(&destination);
+    assert!(
+        !same_renamed_file(&entry, &landing),
+        "a changed source must not produce a verified landing"
     );
     fs::remove_dir_all(root).unwrap();
 }
