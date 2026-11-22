@@ -15,7 +15,7 @@
     <tr><td><code>stoop --help</code>, <code>stoop --version</code></td><td>Help text and version.</td></tr>
   </tbody>
 </table>
-<p>The store root, including an implicit <code>.stoop</code> directory, is trusted and must not be replaced while stoop runs; suite files under <code>units/v1</code> are opened relative to it and never follow a link below it.</p>
+<p>The store root, including an implicit <code>.stoop</code> directory, is trusted and must not be replaced while stoop runs. On Unix, suite files under <code>units/v1</code> are opened relative to the store root and never follow a link below it. On Windows, stoop checks some suite paths for links and reparse points, but the checks are path-based and not atomic: a directory replaced by a junction after a check is still followed.</p>
 
 <p>On a traced <code>stoop run</code>, recognized test, lint and build launches can produce one diagnostic line, for example <code>stoop: observed jest via npm (diagnostic only)</code>. The original command still runs unchanged; the observation is not saved in its proof. Warm skips, <code>--quiet</code>, <code>--no-record</code>, <code>stoop sh</code> and <code>stoop explain</code> omit the line.</p>
 <p>Observation stops at 1,024 captured execs, 1,024 tracked tasks or 1,024 pending child stops, or if an exec has more than 128 arguments or 16 KiB of arguments. Runners observed before a limit can still be reported; the command continues unchanged.</p>
