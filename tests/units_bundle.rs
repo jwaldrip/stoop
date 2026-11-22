@@ -381,6 +381,7 @@ fn a_newer_bundle_version_is_never_overwritten_and_ls_identifies_it() {
     success(&f.run(&[], Some("{changed:*.t}"), &[]));
     let (path, mut bundle) = f.one_bundle();
     bundle["v"] = 2.into();
+    bundle["generation"] = "a future schema".into();
     let newer = serde_json::to_vec(&bundle).unwrap();
     fs::write(&path, &newer).unwrap();
     success(&f.run(&[], Some("{changed:*.t}"), &[]));

@@ -253,7 +253,7 @@ enum ReadBundle {
 #[derive(Deserialize)]
 struct Header {
     v: u64,
-    generation: Option<u64>,
+    generation: Option<serde_json::Value>,
 }
 
 fn read_bundle(dir: &Path, id: &str) -> ReadBundle {
@@ -269,6 +269,8 @@ fn read_bundle(dir: &Path, id: &str) -> ReadBundle {
     if header.v != u64::from(VERSION)
         || header
             .generation
+            .as_ref()
+            .and_then(serde_json::Value::as_u64)
             .is_some_and(|generation| generation > u64::from(GENERATION))
     {
         return ReadBundle::OtherVersion;
