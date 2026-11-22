@@ -286,9 +286,23 @@ fn attribution_launches_export_their_unit() {
     for (launch, unit) in launches.iter().zip(ROSTER) {
         assert_eq!(launch.env("changed"), unit);
         assert_eq!(launch.env("units"), unit);
-        for name in ["changed_file", "changed_inputs", "changed_inputs_file"] {
-            assert_eq!(launch.env(name), "", "{name}");
-        }
+        // The list file and the inputs file sit in this launch's own folder below the store, and
+        // the folder is removed when the launch returns. Their content and mode are checked by
+        // tests/units_lists.rs, because this runner logs only the paths.
+        let id = bundle(&s)["suite"].as_str().unwrap().to_owned();
+        let list = Path::new(launch.env("changed_file"));
+        let folder = list.parent().unwrap();
+        let store = fs::canonicalize(s.root.join(".stoop/units/v1")).unwrap();
+        assert_eq!(folder.parent(), Some(store.as_path()), "{folder:?}");
+        let folder_name = folder.file_name().unwrap().to_str().unwrap();
+        assert!(folder_name.starts_with(&format!(".{id}-")), "{folder_name}");
+        assert!(folder_name.ends_with(".scratch"), "{folder_name}");
+        assert_eq!(list.file_name().unwrap(), "changed");
+        assert_eq!(
+            launch.env("changed_inputs_file"),
+            folder.join("inputs").to_str().unwrap()
+        );
+        assert_eq!(launch.env("changed_inputs"), "");
     }
 
     let tests = s.root.join("tests");
@@ -619,11 +633,12 @@ fn a_filter_that_selects_no_unit_never_dispatches() {
 /// A21's suite: the shell hook is its match, and its roster is the tree's tests.
 const SHELL_SUITE: &str = "[[units.suite]]\nid = \"shell\"\nmatch = ['sh', '-c', './t; s=$?; : \"$STOOP_CHANGED\"; exit $s', 'sh']\nunits = ['tests/**/*.t']\n";
 
-// A21 (guard: passes on the base and must stay green). A hook whose shell code reads
-// $STOOP_CHANGED keeps the first-run form even with a roster: `expand::supported` refuses shell
-// environment code, so the changed run is the full command with one runner launch and no pass.
+// A21: a hook whose shell code reads $STOOP_CHANGED dispatches like any other hook. The changed run
+// makes one launch per unit of the roster, and each launch exports its own unit, its own list file
+// and an empty inputs file. Fails on a tree that refuses shell environment code: the changed run is
+// the full command with one launch and no pass.
 #[test]
-fn a_shell_environment_hook_never_dispatches() {
+fn a_shell_environment_hook_dispatches_per_unit() {
     let s = Suite::new();
     s.config(SHELL_SUITE);
     let words = ["sh", "-c", "./t; s=$?; : \"$STOOP_CHANGED\"; exit $s", "sh"];
@@ -633,11 +648,31 @@ fn a_shell_environment_hook_never_dispatches() {
     let out = s.run(&s.root, &[], &words, &[]);
     success(&out);
     assert!(
-        !text(&out.stderr).contains("attribution pass"),
+        text(&out.stderr).contains("attribution pass: 3 units, one launch each"),
         "{}",
         text(&out.stderr)
     );
-    full_form(&s.launches());
+    let launches = s.launches();
+    assert_eq!(launches.len(), 3, "{launches:?}");
+    let id = bundle(&s)["suite"].as_str().unwrap().to_owned();
+    for (launch, unit) in launches.iter().zip(ROSTER) {
+        assert_eq!(launch.env("changed"), unit);
+        assert_eq!(launch.env("units"), unit);
+        let list = Path::new(launch.env("changed_file"));
+        let folder = list.parent().unwrap();
+        let folder_name = folder.file_name().unwrap().to_str().unwrap();
+        assert!(folder_name.starts_with(&format!(".{id}-")), "{folder_name}");
+        assert_eq!(list.file_name().unwrap(), "changed");
+        assert_eq!(
+            launch.env("changed_inputs_file"),
+            folder.join("inputs").to_str().unwrap()
+        );
+        assert_eq!(launch.env("changed_inputs"), "");
+    }
+    let bundle = bundle(&s);
+    for unit in ROSTER {
+        assert!(bundle["units"][unit][0].is_object(), "{unit}: {bundle}");
+    }
 }
 
 /// The legacy key of the one proof file under `.stoop/proofs`.
