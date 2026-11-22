@@ -615,9 +615,7 @@ impl Area {
         {
             match at::open_dir(&self.dir, name, false) {
                 Ok(Some(dir)) => {
-                    for entry in at::names(&dir).unwrap_or_default() {
-                        let _ = at::unlink(&dir, &entry);
-                    }
+                    at::empty(&dir);
                     drop(dir);
                     let _ = at::rmdir(&self.dir, name);
                 }
@@ -837,6 +835,22 @@ mod at {
         // SAFETY: the stream is open and not used after this call.
         unsafe { libc::closedir(stream) };
         Ok(names)
+    }
+
+    /// Removes every entry of a directory, so the directory is empty. An entry is unlinked as itself, so a
+    /// link is removed and never followed. An entry that will not unlink is a folder: it is emptied the same
+    /// way and then removed. An entry that still cannot go is left, and so is the folder that holds it.
+    pub(super) fn empty(dir: &OwnedFd) {
+        for name in names(dir).unwrap_or_default() {
+            if unlink(dir, &name).is_ok() {
+                continue;
+            }
+            if let Ok(Some(child)) = open_dir(dir, &name, false) {
+                empty(&child);
+                drop(child);
+                let _ = rmdir(dir, &name);
+            }
+        }
     }
 }
 
@@ -1065,9 +1079,9 @@ pub(crate) enum Stored {
 }
 
 /// One launch's directory of list files (spec 3.7 and 4.7): `.<suite>-<pid>-<n>.scratch`, made under
-/// the suite lock with mode 0700, and its files with mode 0600. Dropping it removes its files and then
-/// the directory, so a launch leaves nothing behind unless the process is killed. The next pass or
-/// record that takes the suite lock clears what a kill left (`clear_temps`).
+/// the suite lock with mode 0700, and its files with mode 0600. Dropping it removes every entry the
+/// launch left in it, then the directory, so a launch leaves nothing behind unless the process is killed.
+/// The next pass or record that takes the suite lock clears what a kill left (`clear_temps`).
 #[cfg(unix)]
 pub(crate) struct Scratch {
     /// The suite directory, which holds the launch directory's entry.
@@ -1075,9 +1089,6 @@ pub(crate) struct Scratch {
     name: String,
     dir: std::os::fd::OwnedFd,
     path: PathBuf,
-    /// The names written, removed on drop. A name is listed before its write, so a failed write is
-    /// removed too.
-    files: Vec<String>,
 }
 
 #[cfg(unix)]
@@ -1107,7 +1118,6 @@ impl Scratch {
             path: area.path.join(&name),
             name,
             dir,
-            files: Vec::new(),
         })
     }
 
@@ -1118,7 +1128,6 @@ impl Scratch {
             file,
             libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
         )?;
-        self.files.push(file.to_owned());
         handle.write_all(bytes)?;
         Ok(self.path.join(file))
     }
@@ -1126,10 +1135,10 @@ impl Scratch {
 
 #[cfg(unix)]
 impl Drop for Scratch {
+    /// Removes every entry the launch left in its directory, whatever the runner wrote there, and then the
+    /// directory. Nothing is followed: a link is removed as itself (`at::empty`).
     fn drop(&mut self) {
-        for file in &self.files {
-            let _ = at::unlink(&self.dir, file);
-        }
+        at::empty(&self.dir);
         let _ = at::rmdir(&self.parent, &self.name);
     }
 }
