@@ -586,4 +586,23 @@ mod pins {
             assert!(!paths.contains(&"."), "{paths:?}");
         }
     }
+
+    // P11: dispatch needs a stored legacy proof (spec 3.1, check 3: `!lookup.proofs.is_empty()`).
+    // A bundle without one is the state a legacy proof's removal leaves, while the bundle
+    // survives. Here the proofs go and the bundle stays, then a change must take the full form.
+    // Check 8 holds here (the bundle is current with `whole` set), so this pin alone stops a dispatch.
+    #[test]
+    fn p11_a_bundle_without_a_legacy_proof_runs_the_full_form() {
+        let s = Suite::new();
+        cold(&s);
+        fs::remove_dir_all(s.root.join(".stoop/proofs")).unwrap();
+        assert!(
+            s.bundle().is_some(),
+            "the bundle must survive the proof's removal"
+        );
+        change(&s);
+        s.clear_log();
+        success(&s.hook(&[]));
+        full_form(&s);
+    }
 }
