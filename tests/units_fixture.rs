@@ -29,7 +29,7 @@
 //! | `T_FAIL_ALONE=<P>` (IF) | In the test-word form, test P fails after it has run. Its reads and the other tests are unchanged. |
 //! | `T_LS_ROOT=1` / `T_STAT_ROOT=1` | `ls -a <root>` (logs `ls_root`) / `test -d <root>` (logs `stat_root`), once per invocation. |
 //! | `LOG=<path>` (outside the root) | Per invocation it logs `launch`, then `arg=<w>` for each argument, then `changed=`, `units=`, `changed_file=`, `changed_inputs=`, `changed_inputs_file=` (newlines inside a value logged as `\|`), then the per-test lines. |
-//! | exit | 1 if any test failed, else 0. |
+//! | exit | 1 if any test failed, or if `T_FAIL_FULL` (IF) fails the no-argument form after its tests; else 0. |
 //!
 //! `T_RECORDS` comes in W8 and writes to `$STOOP_RESULT_FILE`.
 //!
