@@ -743,6 +743,7 @@ fn a_proven_suite_locked_elsewhere_prints_no_busy_line() {
     let s = Suite::new();
     success(&s.hook(&[]));
     edit(&s, 2);
+    s.clear_log();
     success(&s.hook(&[]));
     one_per_unit(&s.launches(), &ROSTER);
     let held = fs::OpenOptions::new()

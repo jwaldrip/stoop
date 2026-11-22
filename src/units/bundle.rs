@@ -1974,13 +1974,21 @@ mod pass_tests {
         let roster = ["tests/a.t"];
         let id = pending_for(&roster).suite;
         let dir = seed("read-only", &bundle_for(pending_for(&roster), "key"));
-        // The lock entry exists already, so only the new proof entry can be refused.
+        // The lock entry must exist, but no lock is taken. A flock taken here stays held by any
+        // child that another test thread forks before it execs, and then `start` reports Busy.
         let area = Area::open(&dir, false).unwrap().unwrap();
-        drop(lock(&area, &id).unwrap());
+        drop(area.lock_file(&lock_name(&id)).unwrap());
         let suite_dir = dir.join("units/v1");
+        /// Restores the directory's mode when the test ends, even when an assertion fails first.
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+            }
+        }
+        let _restore = Restore(suite_dir.clone());
         fs::set_permissions(&suite_dir, fs::Permissions::from_mode(0o500)).unwrap();
         let started = start(&dir, &pending_for(&roster), "key", guard());
-        fs::set_permissions(&suite_dir, fs::Permissions::from_mode(0o700)).unwrap();
         assert!(
             matches!(started, Start::No),
             "a pass starts only when its proofs can be stored"
