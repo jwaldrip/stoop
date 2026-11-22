@@ -11,7 +11,7 @@ use super::policy;
 use crate::ignore::Ignore;
 use crate::pathutil::{to_key, Physical};
 use crate::proof::now;
-use crate::run::{self, assemble, How, Lookup, Outcome, RunCx};
+use crate::run::{self, assemble_with, How, Lookup, Outcome, RootListing, RunCx};
 use crate::trace::Trace;
 use std::path::Path;
 
@@ -107,7 +107,7 @@ pub(crate) fn pass(
                     0
                 }
                 Ok(trace) => {
-                    match assemble(cx.root, &real_root, &trace, &ignore) {
+                    match assemble_with(cx.root, &real_root, &trace, &ignore, RootListing::Record) {
                         Ok(kept) => {
                             let stored = bundle_pass.record(
                                 &launch.unit,
