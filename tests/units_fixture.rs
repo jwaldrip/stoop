@@ -181,13 +181,21 @@ fn f2_dash_words_alone_take_the_no_argument_form() {
         assert_eq!(code(&out), 0, "{name}");
         assert_eq!(s.launches()[0].ran(), ROSTER, "{name}");
     }
+    // Lint runs before the roster for a dash-only invocation too.
+    s.executable("lint", "#!/bin/sh\nprintf 'linted\\n' >> \"$LOG\"\n");
     s.clear_log();
     let out = s.direct(&s.root, &["-v"], &[("T_LINT", "1")]);
     assert_eq!(code(&out), 0);
-    assert!(s.launches()[0]
-        .lines
+    let lines = &s.launches()[0].lines;
+    let linted = lines
         .iter()
-        .any(|line| line == "ran=tests/a.t"));
+        .position(|line| line == "linted")
+        .expect("lint ran");
+    let first = lines
+        .iter()
+        .position(|line| line == "ran=tests/a.t")
+        .unwrap();
+    assert!(linted < first, "{lines:?}");
 }
 
 #[test]
