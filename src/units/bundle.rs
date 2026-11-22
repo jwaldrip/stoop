@@ -27,8 +27,10 @@ const MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// `forget --units` removes the lock file, so a process waiting on the old file can take a lock
 /// that no other process contends for. A lock is trusted only while it is still the named entry.
 const LOCK_ATTEMPTS: usize = 3;
-/// The least time between two writes of a pass's bundle. A killed pass loses at most this much of
-/// its proofs, and the units whose proofs are lost are attributed again on a later run.
+/// The least time between two writes of a pass's bundle. A pass writes its bundle when it stores
+/// its first unit proof, then at most once a second as it stores more, and at its end. A killed
+/// pass keeps what its last write held; units whose proofs were lost get no unit proof until
+/// `stoop forget --units`.
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -998,8 +1000,9 @@ pub(crate) struct Pass {
 }
 
 impl Pass {
-    /// Keeps one unit's proof as its only version, and writes the bundle with it. A version that
-    /// would exceed the budget is dropped with the table entries it added.
+    /// Keeps one unit's proof as its only version. The bundle is written when a write is due (see
+    /// `FLUSH_INTERVAL`). A version that would exceed the budget is dropped with the table entries
+    /// it added.
     pub(crate) fn record(
         &mut self,
         unit: &str,
@@ -1090,9 +1093,10 @@ impl Pass {
 }
 
 impl Drop for Pass {
-    /// Writes what the pass still holds when it ends, however it ends: the proofs that no write has
-    /// stored yet, or, when it stored none, the marker for its roster. A write that fails is ignored,
-    /// as `record` ignores one.
+    /// Runs when the pass returns and when it unwinds. It writes what the pass still holds: the
+    /// proofs that no write has stored yet, or, when it stored none, the marker for its roster. A
+    /// signal or an abort does not run it (release builds abort on panic), so a pass ended that way
+    /// keeps what its last write held. A write that fails here is ignored, as `record` ignores one.
     fn drop(&mut self) {
         if !self.dirty && !self.bundle.units.is_empty() {
             return;
