@@ -122,6 +122,7 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
         let _ = fs::remove_dir_all(self.outside());
+        let _ = fs::remove_dir_all(self.root.with_extension("stray"));
     }
 }
 
@@ -839,6 +840,11 @@ fn an_explicit_store_through_a_link_is_trusted() {
         let f = Fixture::new();
         let outside = f.outside();
         fs::create_dir_all(&outside).unwrap();
+        // The repository's own .stoop is a link to a stray directory. The explicit store must be
+        // the only place suites go.
+        let stray = f.root.with_extension("stray");
+        fs::create_dir_all(&stray).unwrap();
+        std::os::unix::fs::symlink(&stray, f.root.join(".stoop")).unwrap();
         let link_path = f.root.join("linked");
         std::os::unix::fs::symlink(&outside, &link_path).unwrap();
         let link = link_path.to_str().unwrap();
@@ -848,7 +854,7 @@ fn an_explicit_store_through_a_link_is_trusted() {
             (vec!["--store", link], Vec::new())
         };
         success(&f.run(&options, Some("{changed:*.t}"), &env));
-        assert!(!f.root.join(".stoop").exists());
+        assert!(!stray.join("units").exists());
         let bundle = only_file(&outside.join("units/v1"));
         let id = bundle.file_stem().unwrap().to_str().unwrap().to_owned();
         let mut ls = f.command(&f.root);
