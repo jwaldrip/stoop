@@ -554,6 +554,24 @@ impl Area {
         }
     }
 
+    /// Whether a new entry can be made in the suite directory. A pass that could not store its
+    /// first proof would launch every unit and keep nothing, so it does not start.
+    fn writable(&self, suite: &str) -> bool {
+        let name = format!(
+            ".{suite}-{}-{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        match self.create_temp(&name) {
+            Ok(file) => {
+                drop(file);
+                let _ = self.unlink(&name);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
     /// Whether the open lock file is still the entry the name refers to. Windows offers no file
     /// identity through std, so the lock is trusted as opened there.
     fn same_entry(&self, file: &File, name: &str) -> bool {
@@ -1091,6 +1109,9 @@ fn start_with(
     let Some(mut bundle) = ready(&area, pending, &digest) else {
         return Start::No;
     };
+    if !area.writable(&pending.suite) {
+        return Start::No;
+    }
     let Ok(bytes) = serde_json::to_vec(&guard) else {
         return Start::No;
     };
