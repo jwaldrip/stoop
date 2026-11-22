@@ -547,3 +547,59 @@ fn exhausted_read_budget_requests_no_stops_and_preserves_legacy_inputs() {
     assert_eq!(recorded_input_bytes(&disabled, &root, &ignore), expected);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn direct_writable_opens_bind_confirmed_reads_without_exit_stops() {
+    let root = scratch("direct-write-no-stop");
+    let path = root.join("f");
+    fs::write(&path, b"before\n").unwrap();
+    let ignore = Ignore::new(&[], None, &[]);
+    let pid = std::process::id() as i32;
+    let spelling = CString::new(path.as_os_str().as_bytes()).unwrap();
+    for flags in [
+        None,
+        Some(libc::O_WRONLY),
+        Some(libc::O_WRONLY | libc::O_APPEND),
+        Some(libc::O_WRONLY | libc::O_TRUNC),
+        Some(libc::O_RDWR),
+    ] {
+        let mut tracer = tracer_for(rec_for(&root, &ignore));
+        tracer.confirmed_reads.insert(
+            path.clone(),
+            Seen::File(stat_of(&path), identity::ReadHash::NotNeeded),
+        );
+        let mut args = path_args(&spelling);
+        args[2] = flags.unwrap_or_default() as u64;
+        let before = READ_WITNESS_STOPS.with(|count| count.get());
+        tracer.open(pid, &args, None, 1, flags.map(|_| 2));
+        assert!(tracer.t.bound_priors.contains("f"), "{flags:?}");
+        assert!(tracer.pending_witness.is_empty(), "{flags:?}");
+        assert_eq!(READ_WITNESS_STOPS.with(|count| count.get()), before);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn direct_write_binding_requires_the_witness_and_plain_spelling() {
+    let root = scratch("direct-write-conditions");
+    let path = root.join("f");
+    fs::write(&path, b"before\n").unwrap();
+    let ignore = Ignore::new(&[], None, &[]);
+    let pid = std::process::id() as i32;
+    let ordinary = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let proc_route = CString::new("/proc/self/cwd/f").unwrap();
+    for (witness, spelling) in [(false, &ordinary), (true, &proc_route)] {
+        let mut tracer = tracer_for(rec_for(&root, &ignore));
+        if witness {
+            tracer.confirmed_reads.insert(
+                path.clone(),
+                Seen::File(stat_of(&path), identity::ReadHash::NotNeeded),
+            );
+        }
+        let args = path_args(spelling);
+        tracer.write_open(pid, &args, None, 1, &path, true);
+        assert!(tracer.t.bound_priors.is_empty());
+        assert!(tracer.pending_witness.is_empty());
+    }
+    fs::remove_dir_all(root).unwrap();
+}
