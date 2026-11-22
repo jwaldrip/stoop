@@ -38,6 +38,8 @@ const NO_PASS_DISABLED: &str =
 const NO_PASS_FORM: &str = "stoop: no attribution pass: the hook uses a form a single unit cannot stand for (a list file, {changed-inputs} or shell code)";
 const NO_PASS_OPTIONS: &str = "stoop: no attribution pass: --no-record, --allow-network, --probe, --ignore or --ignore-env keeps the full command";
 const NO_PASS_FORCED: &str = "stoop: no attribution pass: the run is forced to the full command";
+const NO_PASS_OFF: &str =
+    "stoop: no attribution pass: STOOP_OFF turns tracing off, so the run is the full command";
 
 /// Writes `n` copies of the line the pinned roster reads, so each `n` is a different size.
 fn edit(s: &Suite, n: usize) {
@@ -318,10 +320,10 @@ fn explain_names_a_shell_environment_hook() {
     assert!(!started_pass(&run), "{}", err(&run));
 }
 
-// E10: the options and the forced full run that keep a recorded, changed suite from a pass. Each
-// names its own reason, and nothing is written.
+// E10: the options, the forced full run and tracing turned off by STOOP_OFF keep a recorded, changed
+// suite from a pass. Each names its own reason, nothing is written, and the run agrees.
 #[test]
-fn explain_names_options_and_a_forced_run() {
+fn explain_names_options_forced_and_untraced_runs() {
     let s = Suite::new();
     success(&s.hook(&[]));
     edit(&s, 2);
@@ -331,6 +333,13 @@ fn explain_names_options_and_a_forced_run() {
     let out = explain_is_read_only(&s, &PINNED, &[("STOOP_FULL", "1")], &[]);
     assert_eq!(code(&out), 1, "{}", err(&out));
     assert_eq!(tail(&out).1, NO_PASS_FORCED);
+    let untraced: [(&str, &str); 1] = [("STOOP_OFF", "1")];
+    let out = explain_is_read_only(&s, &PINNED, &untraced, &[]);
+    assert_eq!(code(&out), 1, "{}", err(&out));
+    assert_eq!(tail(&out).1, NO_PASS_OFF);
+    let run = s.hook(&untraced);
+    success(&run);
+    assert!(!started_pass(&run), "{}", err(&run));
 }
 
 // E11: a command with no placeholder names no suite, so explain prints neither line.

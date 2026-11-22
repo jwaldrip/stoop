@@ -152,6 +152,8 @@ pub(crate) enum Refusal {
     /// An option keeps the suite whole: `--no-record`, `--allow-network`, `--probe`, `--ignore` or
     /// `--ignore-env`.
     Options,
+    /// `STOOP_OFF` turns tracing off, so the run is the full command without a trace.
+    Off,
     /// The filter selects no unit.
     NoUnits,
     /// The roster cannot be recorded: an argument is not UTF-8, a unit name is not valid, or there
@@ -183,6 +185,7 @@ impl fmt::Display for Refusal {
             Self::Options => {
                 "--no-record, --allow-network, --probe, --ignore or --ignore-env keeps the full command"
             }
+            Self::Off => "STOOP_OFF turns tracing off, so the run is the full command",
             Self::NoUnits => "the filter selects no unit",
             Self::Unrecordable => {
                 "the roster cannot be recorded: an argument is not UTF-8, a unit name is not valid, or there are more than 4,096 units"
@@ -211,6 +214,7 @@ pub(crate) struct Suite {
     pub(crate) id: String,
     /// The roster, in catalog order.
     pub(crate) units: Vec<String>,
+    /// The record a pass would write for the roster, or the refusal that keeps it from being made.
     pub(crate) pending: Result<Pending, Refusal>,
 }
 
