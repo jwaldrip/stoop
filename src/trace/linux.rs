@@ -2134,8 +2134,12 @@ impl LockTable {
     }
 
     fn open() -> Option<Self> {
+        Self::open_from(fs::File::open("/proc/locks"))
+    }
+
+    fn open_from<R: Read>(source: io::Result<R>) -> Option<Self> {
         let mut table = Self::allocate()?;
-        table.snapshot(fs::File::open("/proc/locks"))?;
+        table.snapshot(source)?;
         Some(table)
     }
 

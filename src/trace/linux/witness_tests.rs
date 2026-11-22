@@ -692,3 +692,20 @@ fn exhausted_budget_and_unusable_table_request_no_read_stops() {
     }
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn lock_table_preflight_rejects_unreadable_or_overlong_snapshots() {
+    assert!(LockTable::open_from(Ok(io::Cursor::new(b""))).is_some());
+    assert!(
+        LockTable::open_from::<io::Cursor<Vec<u8>>>(Err(io::Error::from(
+            io::ErrorKind::PermissionDenied
+        )))
+        .is_none()
+    );
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+    assert!(LockTable::open_from(Ok(io::Cursor::new(vec![
+        b' ';
+        page - LOCK_TABLE_MARGIN + 1
+    ])))
+    .is_none());
+}
