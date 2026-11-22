@@ -1,16 +1,22 @@
 #!/bin/sh
-# Fake hook runner for stoop's unit tests. Its contract is the table in
+# Fake hook runner for stoop's unit tests. Its contract is the table in the module doc of
 # tests/units_fixture.rs; change both together. POSIX sh: it must run under dash.
 #
-# No test arguments: run every *.t under the root except slow/ (and every *.u with
-# T_U=1), in LC_ALL=C order. With T_LINT=1 it runs <root>/lint first.
-# Test arguments: run each one, relative to the cwd. Words starting with '-' are logged only.
-# LOG (a file outside the root) receives one block of lines per invocation.
+# A word that does not start with '-' names a test. With no such word, the runner runs every
+# *.t under the root except slow/ (and every *.u with T_U=1), in LC_ALL=C order, after
+# <root>/lint when T_LINT=1. With test words it runs each one, relative to the cwd. Words
+# starting with '-' are logged and otherwise ignored. LOG (outside the root) gets the record.
 
 ROOT=$(cd "$(dirname "$0")" && pwd -P) || exit 2
-ARGS=$#
 STATUS=0
 HELD=
+TESTS=0
+for word in "$@"; do
+	case $word in
+		-*) ;;
+		*) TESTS=1 ;;
+	esac
+done
 
 note() {
 	if [ -n "${LOG:-}" ]; then
@@ -34,7 +40,7 @@ hold() {
 }
 
 run_test() {
-	if [ "$ARGS" -gt 0 ] && [ "${T_STAT_UNIT:-}" = 1 ]; then
+	if [ "$TESTS" = 1 ] && [ "${T_STAT_UNIT:-}" = 1 ]; then
 		note "statted=$1"
 		if [ ! -e "$1" ]; then
 			note "failed=$1"
@@ -84,10 +90,10 @@ note "changed_inputs_file=$(flat "${STOOP_CHANGED_INPUTS_FILE:-}")"
 if [ -n "${T_WRITE:-}" ]; then
 	printf 'written\n' > "$T_WRITE"
 fi
-if [ "$ARGS" -gt 0 ] && [ "${T_IGNORE:-}" = 1 ]; then
+if [ "$TESTS" = 1 ] && [ "${T_IGNORE:-}" = 1 ]; then
 	exit 0
 fi
-if [ "$ARGS" -eq 0 ] && [ "${T_LINT:-}" = 1 ]; then
+if [ "$TESTS" = 0 ] && [ "${T_LINT:-}" = 1 ]; then
 	"$ROOT/lint"
 fi
 if [ "${T_LS_ROOT:-}" = 1 ]; then
@@ -102,7 +108,7 @@ if [ -n "${T_READ_OTHER:-}" ]; then
 	cat "$T_READ_OTHER" > /dev/null
 fi
 
-if [ "$ARGS" -eq 0 ]; then
+if [ "$TESTS" = 0 ]; then
 	cd "$ROOT" || exit 2
 	set -f
 	for P in $(list_tests); do

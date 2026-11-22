@@ -106,6 +106,38 @@ fn f2_arguments_run_relative_to_the_cwd_and_log_the_environment() {
         assert!(launch.lines.contains(&format!("{name}=")), "{name}");
     }
 }
+#[test]
+fn f2_dash_words_alone_take_the_no_argument_form() {
+    let s = Suite::new();
+    let out = s.direct(&s.root, &["-v"], &[]);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    let launches = s.launches();
+    assert_eq!(launches[0].args, ["-v"]);
+    assert_eq!(launches[0].ran(), ROSTER);
+
+    // A dash word beside a test word runs only the test.
+    s.clear_log();
+    let out = s.direct(&s.root, &["-v", "tests/a.t"], &[]);
+    assert_eq!(code(&out), 0);
+    let launches = s.launches();
+    assert_eq!(launches[0].args, ["-v", "tests/a.t"]);
+    assert_eq!(launches[0].ran(), ["tests/a.t"]);
+
+    // The same holds for each knob that depends on whether a test word is present.
+    for (name, value) in [("T_IGNORE", "1"), ("T_STAT_UNIT", "1")] {
+        s.clear_log();
+        let out = s.direct(&s.root, &["-v"], &[(name, value)]);
+        assert_eq!(code(&out), 0, "{name}");
+        assert_eq!(s.launches()[0].ran(), ROSTER, "{name}");
+    }
+    s.clear_log();
+    let out = s.direct(&s.root, &["-v"], &[("T_LINT", "1")]);
+    assert_eq!(code(&out), 0);
+    assert!(s.launches()[0]
+        .lines
+        .iter()
+        .any(|line| line == "ran=tests/a.t"));
+}
 
 #[test]
 fn f3_a_flag_naming_fail_fails_its_test_and_the_run() {
