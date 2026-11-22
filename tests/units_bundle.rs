@@ -953,6 +953,10 @@ const F_WRLCK: libc::c_int = 1;
 /// descriptor of the file in this process may take one.
 fn take_write_lease(file: &File) {
     use std::os::unix::io::AsRawFd;
+    // A lease break notifies the lease holder with SIGIO, whose default action would end this test
+    // binary. The notification does not release the lease, so ignoring it changes nothing measured.
+    // SAFETY: `signal` changes only the disposition of SIGIO, to one that runs no handler.
+    unsafe { libc::signal(libc::SIGIO, libc::SIG_IGN) };
     // SAFETY: `F_SETLEASE` reads only its integer argument.
     let rc = unsafe { libc::fcntl(file.as_raw_fd(), F_SETLEASE, F_WRLCK) };
     assert_eq!(rc, 0, "F_SETLEASE: {}", std::io::Error::last_os_error());
