@@ -362,10 +362,16 @@ fn a_busy_suite_lock_leaves_the_bundle_and_output_unchanged() {
         .open(path.with_extension("lock"))
         .unwrap();
     lock.lock().unwrap();
-    let busy = f.run(&[], Some("{changed:*.t}"), &[]);
+    let new_unit = f.root.join("tests/new.t");
+    let busy = f.run(
+        &[],
+        Some("{changed:*.t}"),
+        &[("MAKE_UNIT", new_unit.to_str().unwrap())],
+    );
     assert_eq!(busy.status.code(), first.status.code());
     assert_eq!(busy.stdout, first.stdout);
     assert_eq!(busy.stderr, first.stderr);
+    assert!(new_unit.exists());
     assert_eq!(fs::read(path).unwrap(), before);
 }
 
