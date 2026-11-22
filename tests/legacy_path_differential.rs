@@ -761,6 +761,97 @@ fn hooked() {
     pair.compare_store(".stoop");
 }
 
+/// Each condition that keeps a recorded, filtered suite on the full form must print, store and
+/// exit exactly as the base does. The suite is changed each time, so none of these is a skip.
+fn attribution_not_dispatched() {
+    fn setup(pair: &Pair, config: &str) {
+        pair.write(
+            "runner",
+            "#!/bin/sh\ncat in.txt >/dev/null\nprintf 'unit\\n'\n",
+        );
+        pair.write("tests/a.t", "in.txt\n");
+        pair.write("tests/b.t", "in.txt\n");
+        if !config.is_empty() {
+            pair.write(".stoop.toml", config);
+        }
+        for root in &pair.roots {
+            fs::set_permissions(root.join("runner"), fs::Permissions::from_mode(0o755)).unwrap();
+        }
+    }
+    let run = [
+        "run",
+        "--key",
+        "units",
+        "--",
+        "./runner",
+        "{changed:**/*.t}",
+    ];
+    let explain = [
+        "explain",
+        "--key",
+        "units",
+        "--",
+        "./runner",
+        "{changed:**/*.t}",
+    ];
+    let no_record = [
+        "run",
+        "--key",
+        "units",
+        "--no-record",
+        "--",
+        "./runner",
+        "{changed:**/*.t}",
+    ];
+
+    let pair = Pair::new("attribution");
+    setup(&pair, "");
+    contains(&pair.step("D15 cold", "", &run, &[]), "recorded");
+    pair.write("in.txt", "two\n");
+    contains(
+        &pair.step("D15 STOOP_FULL", "", &run, &[("STOOP_FULL", "1")]),
+        "STOOP_FULL is set",
+    );
+    pair.write("in.txt", "three\n");
+    contains(
+        &pair.step("D15 CI outside Git", "", &run, &[("CI", "true")]),
+        "unknown CI branch context",
+    );
+    pair.write("in.txt", "four\n");
+    pair.step("D15 explain", "", &explain, &[]);
+    pair.write("in.txt", "five\n");
+    pair.step("D15 no-record", "", &no_record, &[]);
+    pair.compare_store(".stoop");
+
+    let disabled = Pair::new("attribution-disabled");
+    setup(&disabled, "[units]\nenabled = false\n");
+    contains(
+        &disabled.step("D15 disabled cold", "", &run, &[]),
+        "recorded",
+    );
+    disabled.write("in.txt", "two\n");
+    disabled.step("D15 disabled change", "", &run, &[]);
+    disabled.compare_store(".stoop");
+
+    let newer = Pair::new("attribution-newer");
+    setup(&newer, "");
+    contains(&newer.step("D15 newer cold", "", &run, &[]), "recorded");
+    for root in &newer.roots {
+        for entry in fs::read_dir(root.join(".stoop/units/v1")).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                value["v"] = 2.into();
+                value["generation"] = "a future schema".into();
+                fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            }
+        }
+    }
+    newer.write("in.txt", "two\n");
+    newer.step("D15 newer bundle change", "", &run, &[]);
+    newer.compare_store(".stoop");
+}
+
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .current_dir(dir)
@@ -965,5 +1056,6 @@ fn legacy_paths_match_the_base() {
     midrun();
     readonly_and_full();
     hooked();
+    attribution_not_dispatched();
     sync();
 }
