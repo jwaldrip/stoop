@@ -155,6 +155,12 @@ fn consistent_context(names: &[&str]) -> Result<Option<String>, ()> {
     Ok(found)
 }
 
+/// Whether this run is a CI job. Forced full runs and attribution passes both read it here, so
+/// the two can never disagree.
+pub(crate) fn ci() -> bool {
+    std::env::var_os("CI").is_some()
+}
+
 /// Return why a hooked run must ignore a matching whole-command proof, if any.
 pub(crate) fn forced_reason(
     root: &Path,
@@ -184,7 +190,7 @@ pub(crate) fn forced_reason(
             None => return Some("no run number for verify_every".into()),
         }
     }
-    let ci = std::env::var_os("CI").is_some();
+    let ci = ci();
     let github = std::env::var_os("GITHUB_ACTIONS").is_some();
     let configured = match configured_default(config) {
         Ok(value) => value,
