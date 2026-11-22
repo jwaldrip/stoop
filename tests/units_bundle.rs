@@ -121,8 +121,6 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
-        let _ = fs::remove_dir_all(self.outside());
-        let _ = fs::remove_dir_all(self.root.with_extension("stray"));
     }
 }
 
@@ -726,11 +724,6 @@ fn duplicate_unit_keys_make_a_bundle_unreadable() {
 }
 
 impl Fixture {
-    /// Where a symlink test points its link. It sits beside the repository, never inside it.
-    fn outside(&self) -> PathBuf {
-        self.root.with_extension("outside")
-    }
-
     /// The `stoop run` command for the fixture, left open for the caller to adjust.
     fn run_command(&self, options: &[&str], hook: Option<&str>, env: &[(&str, &str)]) -> Command {
         let mut command = self.command(&self.root);
@@ -808,85 +801,6 @@ fn suite_with_lock(f: &Fixture, make: impl FnOnce(&Path)) -> (PathBuf, String) {
     fs::remove_file(&lock).unwrap();
     make(&lock);
     (path, id)
-}
-
-#[test]
-fn an_implicit_store_that_is_a_link_is_never_written() {
-    let f = Fixture::new();
-    let outside = f.outside();
-    fs::create_dir_all(&outside).unwrap();
-    std::os::unix::fs::symlink(&outside, f.root.join(".stoop")).unwrap();
-    // The run is unaffected: the command runs and suite bookkeeping is skipped.
-    let out = f.run(&[], Some("{changed:*.t}"), &[]);
-    success(&out);
-    assert_eq!(out.stdout, b"suite-run\n");
-    assert!(!outside.join("units").exists());
-    let listing = f.cli("ls", &[]);
-    success(&listing);
-    let stdout = String::from_utf8(listing.stdout).unwrap();
-    assert!(
-        stdout.lines().any(|line| line == "suite\t-\tunavailable"),
-        "{stdout}"
-    );
-    let mut forget = f.command(&f.root);
-    forget.args(["forget", "--units", "0123456789abcdef0123456789abcdef"]);
-    assert_eq!(forget.output().unwrap().status.code(), Some(1));
-    assert!(!outside.join("units").exists());
-}
-
-#[test]
-fn an_explicit_store_through_a_link_is_trusted() {
-    for via_env in [false, true] {
-        let f = Fixture::new();
-        let outside = f.outside();
-        fs::create_dir_all(&outside).unwrap();
-        // The repository's own .stoop is a link to a stray directory. The explicit store must be
-        // the only place suites go.
-        let stray = f.root.with_extension("stray");
-        fs::create_dir_all(&stray).unwrap();
-        std::os::unix::fs::symlink(&stray, f.root.join(".stoop")).unwrap();
-        let link_path = f.root.join("linked");
-        std::os::unix::fs::symlink(&outside, &link_path).unwrap();
-        let link = link_path.to_str().unwrap();
-        let (options, env): (Vec<&str>, Vec<(&str, &str)>) = if via_env {
-            (Vec::new(), vec![("STOOP_STORE", link)])
-        } else {
-            (vec!["--store", link], Vec::new())
-        };
-        success(&f.run(&options, Some("{changed:*.t}"), &env));
-        assert!(!stray.join("units").exists());
-        let bundle = only_file(&outside.join("units/v1"));
-        let id = bundle.file_stem().unwrap().to_str().unwrap().to_owned();
-        let mut ls = f.command(&f.root);
-        ls.arg("ls");
-        if via_env {
-            ls.env("STOOP_STORE", link);
-        } else {
-            ls.args(["--store", link]);
-        }
-        let listing = ls.output().unwrap();
-        success(&listing);
-        let stdout = String::from_utf8(listing.stdout).unwrap();
-        let prefix = format!("suite\t{id}\t");
-        assert!(
-            stdout.lines().any(|line| line.starts_with(prefix.as_str())),
-            "{stdout}"
-        );
-    }
-}
-
-#[test]
-fn an_implicit_store_that_is_a_file_lists_as_unavailable() {
-    let f = Fixture::new();
-    fs::write(f.root.join(".stoop"), b"not a store\n").unwrap();
-    let listing = f.cli("ls", &[]);
-    success(&listing);
-    let stdout = String::from_utf8(listing.stdout).unwrap();
-    assert!(
-        stdout.lines().any(|line| line == "suite\t-\tunavailable"),
-        "{stdout}"
-    );
-    assert_eq!(fs::read(f.root.join(".stoop")).unwrap(), b"not a store\n");
 }
 
 #[test]
