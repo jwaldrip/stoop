@@ -19,8 +19,8 @@
 //! | `T_STAT_UNIT=1` | With test words: `test -e P` instead of running it. Logs `statted=P`. |
 //! | `T_FIFO=<path>`, `T_FIFO_AT=<P>` | One `read < $T_FIFO` per invocation, after the first test (or after the test logged as `T_FIFO_AT`) has read its files. |
 //! | `T_IF=<path>` | The toggle for the rows marked (IF). |
-//! | `T_WRITE=<path>` (IF) | Writes `written` to that path once per invocation, before any test, unless `T_WRITE_AT` is set (then see the running-test row). |
-//! | `T_WRITE_AT=<P>` (IF) | Narrows `T_WRITE` to the invocation that runs test P, written right before P's reads. |
+//! | `T_WRITE=<path>` (IF) | Writes `written` to that path, relative to the cwd, once per invocation before any test. With `T_WRITE_AT` set it writes only in that test's invocation: see the next row. |
+//! | `T_WRITE_AT=<P>` (IF) | Narrows `T_WRITE` to the invocation that runs test P, written right before P's reads. P must exist and be run, not statted by `T_STAT_UNIT`. The path rules depend on the form. In the no-argument form the write runs after the runner has moved to the root, so a relative `T_WRITE` path is root-relative, as `T_WRITE_FULL` is, and P is spelled as the roster lists it: root-relative, for example `tests/b.t`. In the test-word form the write stays relative to the cwd, and P is spelled as the test word is: relative to the cwd, for example `../tests/b.t` from `docs`. |
 //! | `T_WRITE_EACH=1` | Each test P writes `written` to `${P%.*}.out` after its reads, in every invocation that runs it. Not (IF). |
 //! | `T_WRITE_FULL=<path>` | The no-argument form writes `written` to the path after it moves to the root and before its first test, so a relative path is root-relative. Not (IF). |
 //! | `T_READ_OTHER=<path>` (IF) | Reads that path once per invocation, relative to the cwd. |
