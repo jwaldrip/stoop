@@ -554,6 +554,28 @@ fn f6_t_if_absent_turns_off_t_write_and_t_read_other() {
 }
 
 #[test]
+fn f6_a_directory_named_by_t_if_counts_as_present() {
+    let s = Suite::new();
+    // The table says T_IF names a path that exists. A directory exists too, so the knob acts.
+    let toggle = s.outside.join("toggle-dir");
+    fs::create_dir(&toggle).unwrap();
+    let written = s.outside.join("written");
+    let out = s.direct(
+        &s.root,
+        &["tests/a.t"],
+        &[
+            ("T_IF", toggle.to_str().unwrap()),
+            ("T_WRITE", written.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert_eq!(
+        fs::read(&written).expect("T_WRITE did not write with a directory as T_IF"),
+        b"written\n"
+    );
+}
+
+#[test]
 fn f7_t_write_at_writes_only_for_the_named_test_before_its_reads() {
     let s = Suite::new();
     // b reads out.src after its own inputs, so a write made before b's reads shows in its output.
