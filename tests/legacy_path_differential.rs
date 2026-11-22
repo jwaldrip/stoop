@@ -410,23 +410,27 @@ fn probes() {
         "changed",
     );
     let failing = "printf 'failed\\n' >> probe.log; false";
+    let failed_script =
+        "cat in.txt >/dev/null; printf 'ran\\n' >> probe-failed-child.log; printf 'child ran\\n'";
     contains(
         &pair.run(
             "D7 failed before",
             "fail-before",
             &["--probe", failing],
-            script,
+            failed_script,
             &[],
         ),
         "probe failed before",
     );
     let conditional = "printf 'check\\n' >> probe.log; [ ! -f fail ] && cat probe.txt";
+    let conditional_script =
+        "cat in.txt >/dev/null; printf 'ran\\n' >> probe-lookup-child.log; printf 'child ran\\n'";
     contains(
         &pair.run(
             "D7 conditional record",
             "fail-after",
             &["--probe", conditional],
-            script,
+            conditional_script,
             &[],
         ),
         "recorded",
@@ -437,7 +441,7 @@ fn probes() {
             "D7 failing lookup",
             "fail-after",
             &["--probe", conditional],
-            script,
+            conditional_script,
             &[],
         ),
         "probe failed",
@@ -448,11 +452,23 @@ fn probes() {
             "D7 changes during",
             "during",
             &options,
-            "cat in.txt >/dev/null; echo v3 > probe.txt",
+            "cat in.txt >/dev/null; printf 'ran\\n' >> probe-during-child.log; printf 'child ran\\n'; echo v3 > probe.txt",
             &[],
         ),
         "probe changed while the command ran",
     );
+    for (path, expected) in [
+        ("probe-failed-child.log", "ran\n"),
+        ("probe-lookup-child.log", "ran\nran\n"),
+        ("probe-during-child.log", "ran\n"),
+    ] {
+        pair.compare_file(path);
+        assert_eq!(
+            fs::read_to_string(pair.roots[0].join(path)).unwrap(),
+            expected,
+            "D7 child execution for {path}"
+        );
+    }
     pair.compare_file("probe.log");
     assert_eq!(
         fs::read_to_string(pair.roots[0].join("probe.log")).unwrap(),
