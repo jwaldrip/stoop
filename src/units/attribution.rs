@@ -82,6 +82,7 @@ pub(crate) fn pass(
     let mut written = Written::default();
     let mut named = Named::default();
     let mut status = 0;
+    let mut unlaunched = false;
     let mut ran = 0;
     let mut over_budget = 0;
     // The first launch that breaks an independence check, by its roster index, and what it breaks.
@@ -92,14 +93,16 @@ pub(crate) fn pass(
         let mut folder = match bundle_pass.scratch() {
             Ok(folder) => folder,
             Err(error) => {
-                status = keep(status, not_launched(quiet, &unit_name, &error));
+                not_launched(quiet, &unit_name, &error);
+                unlaunched = true;
                 continue;
             }
         };
         let lists = match Lists::write(&mut folder, cx.root, cx.cwd, unit, &forms) {
             Ok(lists) => lists,
             Err(error) => {
-                status = keep(status, not_launched(quiet, &unit_name, &error));
+                not_launched(quiet, &unit_name, &error);
+                unlaunched = true;
                 continue;
             }
         };
@@ -107,7 +110,8 @@ pub(crate) fn pass(
             lists.get(mode, base)
         }) else {
             let why = "its arguments cannot be expanded";
-            status = keep(status, not_launched(quiet, &unit_name, &why));
+            not_launched(quiet, &unit_name, &why);
+            unlaunched = true;
             continue;
         };
         std::env::set_var("STOOP_CHANGED", &launch.value);
@@ -192,14 +196,15 @@ pub(crate) fn pass(
         std::env::set_var(name, "");
     }
     let id = pending.suite();
-    // A violation disables the suite and keeps the proofs it already holds. An over-budget pass disables it with
-    // none (spec 3.6). Either way the state is stored under the lock this pass holds.
-    let disabling = match &stopped {
-        Some((_, violation)) => Some((violation.code(), violation.label(), true)),
-        None if over_budget > 0 => Some(("over_budget", OVER_BUDGET.to_owned(), false)),
-        None => None,
-    };
-    if let Some((code, label, keep_units)) = disabling {
+    // The state a stopped pass stores is decided by `disabling` (spec 3.6). It is stored under the lock this pass holds.
+    if let Some(Disabling {
+        code,
+        label,
+        keep_units,
+    }) = disabling(
+        stopped.as_ref().map(|(_, violation)| violation),
+        over_budget > 0,
+    ) {
         let stored = if keep_units {
             bundle_pass.disable(code, &label)
         } else {
@@ -223,18 +228,19 @@ pub(crate) fn pass(
             );
         }
     }
-    // A run that stopped before its last launch has no verdict when nothing failed (spec 3.7). It says how far it
-    // got (spec 3.12).
+    // A run with no failing launch has no verdict when a unit was not launched or it stopped before its last launch
+    // (spec 3.7). A stop says how far it got (spec 3.12).
     let planned = units.len();
-    if status == 0 && matches!(&stopped, Some((index, _)) if index + 1 < planned) {
+    let stopped_early = matches!(&stopped, Some((index, _)) if index + 1 < planned);
+    if status == 0 && stopped_early {
         say(
             quiet,
             format!(
                 "stoop: this run has no verdict (exit 125): only {ran} of {planned} launches ran"
             ),
         );
-        status = 125;
     }
+    status = exit_status(status, unlaunched || stopped_early);
     Some(Outcome {
         status,
         key: key.to_owned(),
@@ -429,11 +435,10 @@ fn say(quiet: bool, line: String) {
     }
 }
 
-/// The status of a unit that was not launched: 125, the status of a run that stoop could not carry
-/// out. One line for the operator says why, unless `--quiet` asks for none.
-fn not_launched(quiet: bool, unit: &str, why: &dyn fmt::Display) -> i32 {
+/// Says why a unit was not launched. Such a unit has no status, so the run has no verdict unless a launch fails
+/// (spec 3.7). One line for the operator says why, unless `--quiet` asks for none.
+fn not_launched(quiet: bool, unit: &str, why: &dyn fmt::Display) {
     say(quiet, format!("stoop: not launched for {unit}: {why}"));
-    125
 }
 
 /// The first nonzero status in catalog order, so a failing unit never stops the pass (spec 3.9).
@@ -442,6 +447,45 @@ fn keep(status: i32, unit: i32) -> i32 {
         unit
     } else {
         status
+    }
+}
+
+/// What a pass stores when it stops (spec 3.6): the suite's state, and whether the unit proofs it holds are kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Disabling {
+    code: &'static str,
+    label: String,
+    keep_units: bool,
+}
+
+/// The state a pass stores when it stops. A breach disables the suite and keeps the unit proofs it holds. A pass
+/// whose unit proofs exceed the budget disables it with none. A breach is why the pass stopped, so it takes
+/// precedence over the budget.
+fn disabling(stopped: Option<&Violation>, over_budget: bool) -> Option<Disabling> {
+    match (stopped, over_budget) {
+        (Some(violation), _) => Some(Disabling {
+            code: violation.code(),
+            label: violation.label(),
+            keep_units: true,
+        }),
+        (None, true) => Some(Disabling {
+            code: "over_budget",
+            label: OVER_BUDGET.to_owned(),
+            keep_units: false,
+        }),
+        (None, false) => None,
+    }
+}
+
+/// The exit status of a run (spec 3.7). A failing launch is a verdict, so its status wins, even 125. Without one, the
+/// run has no verdict when `no_verdict` holds, and it exits 125; otherwise it exits 0.
+fn exit_status(failure: i32, no_verdict: bool) -> i32 {
+    if failure != 0 {
+        failure
+    } else if no_verdict {
+        125
+    } else {
+        0
     }
 }
 
@@ -527,6 +571,8 @@ fn write_form(
 #[cfg(all(test, unix))]
 mod tests {
     use super::super::independence::unit_evidence;
+    use super::super::independence::Violation;
+    use super::{disabling, exit_status, Disabling};
     use crate::trace::{Touch, Trace};
     use std::fs;
     use std::os::unix::fs::symlink;
@@ -604,5 +650,52 @@ mod tests {
         let trace = trace(&[(dir.join("tests/b.t"), READ), (dir.join("src.src"), READ)]);
         assert!(!unit_evidence(&dir, &real, &trace, "tests/a.t"));
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_over_budget_pass_disables_the_suite_and_keeps_no_unit() {
+        assert_eq!(
+            disabling(None, true),
+            Some(Disabling {
+                code: "over_budget",
+                label: "unit proofs exceed 8 MiB".to_owned(),
+                keep_units: false,
+            })
+        );
+    }
+
+    #[test]
+    fn a_pass_with_no_breach_and_no_overflow_stores_no_state() {
+        assert_eq!(disabling(None, false), None);
+    }
+
+    #[test]
+    fn a_breach_keeps_its_units_and_takes_precedence_over_an_overflow() {
+        let breach = Violation::WroteUnit {
+            writer: "tests/a.t".to_owned(),
+            unit: "tests/b.t".to_owned(),
+        };
+        let expected = Some(Disabling {
+            code: "wrote_unit",
+            label: "tests/a.t wrote tests/b.t".to_owned(),
+            keep_units: true,
+        });
+        assert_eq!(disabling(Some(&breach), false), expected.clone());
+        assert_eq!(disabling(Some(&breach), true), expected);
+    }
+
+    #[test]
+    fn a_failing_launch_keeps_its_status_after_a_unit_was_not_launched() {
+        assert_eq!(exit_status(1, true), 1);
+        assert_eq!(exit_status(2, true), 2);
+        assert_eq!(exit_status(1, false), 1);
+        // A failing launch that itself exits 125 keeps 125 as its own status.
+        assert_eq!(exit_status(125, true), 125);
+    }
+
+    #[test]
+    fn a_run_with_no_failure_has_no_verdict_when_a_unit_was_not_launched_or_it_stopped() {
+        assert_eq!(exit_status(0, false), 0);
+        assert_eq!(exit_status(0, true), 125);
     }
 }
