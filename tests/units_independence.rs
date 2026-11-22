@@ -184,6 +184,17 @@ fn i1a_a_unit_writing_what_a_later_unit_reads_disables_the_suite_at_the_reader()
     let err = text(&out.stderr);
     assert!(err.contains(&disabled_line(&suite_id(&s), &label)), "{err}");
     assert_eq!(proven(&s), ["tests/a.t", "tests/b.t"]);
+    // A disabled suite counts no proof, though two of its units hold one (cli.html).
+    let explained = explain_with(&s, &[]);
+    assert_eq!(code(&explained), 1, "{}", text(&explained.stderr));
+    let stderr = text(&explained.stderr);
+    let lines: Vec<&str> = stderr.lines().collect();
+    let id = suite_id(&s);
+    let tracked =
+        format!("stoop: tracked 3 units, 0 inputs; 0 proven, 3 without a proof (suite {id})");
+    assert_eq!(lines[lines.len() - 2], tracked, "{stderr}");
+    let decision = format!("stoop: no attribution pass: suite {id} disabled: {label}; run 'stoop forget --units {id}' after fixing it");
+    assert_eq!(lines[lines.len() - 1], decision, "{stderr}");
 }
 
 // I1b: unit c writes a path that the proofs of a and b read. The writer-side check catches it at c, the
@@ -538,4 +549,73 @@ fn i14_explain_names_a_disabled_suite_after_the_tracked_line() {
         ),
         "{err}"
     );
+}
+
+// I5b: a failing unit that writes another unit's file is still a writer-side breach. Spec 3.3 applies check (a)
+// whatever the launch's status. The pass stops at the failing unit, so one launch runs, and the run exits with the
+// failure's status. Fails on a tree that checks the writer side only for a passing launch: the second unit then
+// launches, and the breach is reported there, at the reader.
+#[test]
+fn i5b_a_failing_unit_that_writes_another_units_file_is_still_a_writer_side_breach() {
+    let s = Suite::new();
+    success(&s.hook(&[]));
+    s.write("tests/a.flag", "fail\n");
+    edit(&s, 2);
+    s.clear_log();
+    let out = s.hook(&[("T_WRITE", "tests/b.t"), ("T_WRITE_AT", "tests/a.t")]);
+    let err = text(&out.stderr);
+    assert_eq!(code(&out), 1, "{err}");
+    let launches = s.launches();
+    one_per_unit(&launches, &["tests/a.t"]);
+    assert_eq!(launches[0].failed(), ["tests/a.t"], "{launches:?}");
+    let (reason, label) = disabled(&s);
+    assert_eq!(reason, "wrote_unit");
+    assert_eq!(label, "tests/a.t wrote tests/b.t");
+    assert!(err.contains(&disabled_line(&suite_id(&s), &label)), "{err}");
+    assert!(!err.contains("no verdict"), "{err}");
+    assert!(bundle(&s)["units"].as_object().unwrap().is_empty());
+}
+
+// I1c: the writes of a failing launch still count for the later units (spec 3.3: after every launch, W joins the
+// invocation's written paths). I1a's setup, with unit a failing: unit c reads what a wrote, so c is the reader-side
+// breach. Every unit launches, the run exits with a's failure, and the suite is disabled at c. Fails on a tree that
+// counts only a passing launch's writes: c is proven, and the suite stays ready.
+#[test]
+fn i1c_a_failing_units_writes_still_reach_the_later_units() {
+    let s = Suite::new();
+    success(&s.hook(&[]));
+    s.write("tests/a.flag", "fail\n");
+    edit(&s, 2);
+    s.clear_log();
+    let out = s.hook(&[("T_WRITE", "src/c.src"), ("T_WRITE_AT", "tests/a.t")]);
+    let err = text(&out.stderr);
+    assert_eq!(code(&out), 1, "{err}");
+    one_per_unit(&s.launches(), &ROSTER);
+    let (reason, label) = disabled(&s);
+    assert_eq!(reason, "wrote_input");
+    assert_eq!(label, "tests/a.t wrote src/c.src, which tests/c.t reads");
+    assert!(err.contains(&disabled_line(&suite_id(&s), &label)), "{err}");
+    assert_eq!(proven(&s), ["tests/b.t"]);
+}
+
+// I15: a full run under another tracer provenance records the bundle again, and keeps a disabled suite disabled.
+// Spec 3.6: only `forget --units` or a generation bump clears the state. Fails on a tree whose record() of another
+// provenance stores the suite ready: the change after that then starts a pass.
+#[test]
+fn i15_a_full_run_under_another_provenance_keeps_the_suite_disabled() {
+    let s = Suite::new();
+    success(&s.hook(&[]));
+    edit(&s, 2);
+    s.clear_log();
+    assert_eq!(code(&s.hook(&[("T_READ_OTHER", "tests/b.t")])), 125);
+    let (reason, label) = disabled(&s);
+    let path = s.bundle_path().unwrap();
+    let mut stored: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    stored["provenance"]["version"] = Value::from(999);
+    fs::write(&path, serde_json::to_vec(&stored).unwrap()).unwrap();
+    edit(&s, 3);
+    s.clear_log();
+    success(&s.hook(&[]));
+    full_form(&s.launches());
+    assert_eq!(disabled(&s), (reason, label));
 }

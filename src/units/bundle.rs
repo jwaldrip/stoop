@@ -2415,6 +2415,93 @@ mod pass_tests {
             "the proof whose due write failed is written at the end"
         );
     }
+
+    /// A guard with the given lists, in the order given, and one environment entry.
+    fn guard_with(excluded: &[&str], ignore: &[&str]) -> LaunchGuard {
+        LaunchGuard {
+            env: BTreeMap::from([("FOO".to_owned(), "a".to_owned())]),
+            env_excluded: excluded.iter().map(|name| (*name).to_owned()).collect(),
+            ignore: ignore.iter().map(|pattern| (*pattern).to_owned()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_guard_digest_ignores_the_order_and_repeats_of_its_lists() {
+        let canonical = guard_with(&["A", "B"], &["x", "y"]).digest();
+        assert_eq!(
+            guard_with(&["B", "A"], &["y", "x"]).digest(),
+            canonical,
+            "order"
+        );
+        assert_eq!(
+            guard_with(&["B", "A", "A"], &["y", "x", "y"]).digest(),
+            canonical,
+            "repeats"
+        );
+        assert_ne!(
+            guard_with(&["A"], &["x", "y"]).digest(),
+            canonical,
+            "a name still counts"
+        );
+        assert_ne!(
+            guard_with(&["A", "B"], &["x"]).digest(),
+            canonical,
+            "a pattern still counts"
+        );
+        let other_env = LaunchGuard {
+            env: BTreeMap::from([("FOO".to_owned(), "b".to_owned())]),
+            ..guard_with(&["A", "B"], &["x", "y"])
+        };
+        assert_ne!(
+            other_env.digest(),
+            canonical,
+            "the environment still counts"
+        );
+    }
+
+    #[test]
+    fn start_and_record_store_the_digest_of_the_same_guard() {
+        let roster = ["tests/a.t"];
+        let id = pending_for(&roster).suite;
+        let dir = seed("digest-agree", &bundle_for(pending_for(&roster), "key"));
+        let excluded = ["B", "A", "A"];
+        let ignore = ["y", "x"];
+        let started = pass_of(start(
+            &dir,
+            &pending_for(&roster),
+            "key",
+            guard_with(&excluded, &ignore),
+        ));
+        let at_start = started.bundle.guard_digest.clone();
+        drop(started);
+        let proof = Proof {
+            created: 1,
+            argv: Vec::new(),
+            cwd: None,
+            scope: None,
+            provenance: Some(Provenance::current()),
+            env: BTreeMap::from([("FOO".to_owned(), "a".to_owned())]),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            removed: Vec::new(),
+            ignore: Some(ignore.iter().map(|pattern| (*pattern).to_owned()).collect()),
+            priors: None,
+            unplannable: Vec::new(),
+            probes: BTreeMap::new(),
+            env_excluded: excluded.iter().map(|name| (*name).to_owned()).collect(),
+        };
+        record(&dir, pending_for(&roster), "key", "p-1", proof);
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        let ReadBundle::Current(stored) = read_bundle(&area, &id) else {
+            panic!("the recorded bundle is not current");
+        };
+        assert_eq!(stored.guard_digest, at_start, "start and record agree");
+        assert_eq!(
+            at_start,
+            guard_with(&excluded, &ignore).digest(),
+            "start stores the guard's digest"
+        );
+    }
 }
 
 /// M1 (ignored, a measurement). The cost of encoding, writing (with fsync and rename) and parsing a
