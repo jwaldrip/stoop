@@ -1,26 +1,31 @@
-//! The attribution pass (spec 3.1 to 3.4). A changed run of a hooked suite launches each unit of its
-//! roster once, in roster order, under one traced launch each. A launch that exits 0 and read its
-//! own file stores that unit's proof. Nothing is skipped on the strength of a unit proof yet, so
-//! every run that does not dispatch is the legacy path, unchanged. `stoop explain` asks the same
-//! checks, through `screen` and `probe`, so it predicts the decision made here.
+//! The attribution pass (spec 3.1 to 3.7). A changed run of a hooked suite launches each unit of its roster
+//! once, in roster order, under one traced launch each. Each launch is judged by the independence checks in
+//! `launch` (spec 3.3): one that breaks a check stops the pass and disables the suite. Nothing is skipped on
+//! the strength of a unit proof yet, so every run that does not dispatch is the legacy path, unchanged.
+//! `stoop explain` asks the same checks, through `screen` and `probe`, so it predicts the decision made here.
 
 use super::bundle::{self, LaunchGuard, Pass, Pending, Scratch, Start, Stored};
 use super::config::Config;
 use super::expand;
 use super::hook::{safe, Base, FileMode, Hook};
+use super::independence::{Named, Roster, Violation, Written};
+use super::launch::{self, Observed, Verdict};
 use super::policy;
 use crate::ignore::Ignore;
-use crate::pathutil::{to_key, Physical};
+use crate::input::Input;
+use crate::pathutil::to_key;
 use crate::proof::now;
-use crate::run::{self, assemble_with, How, Lookup, Outcome, RootListing, RunCx};
-use crate::trace::Trace;
+use crate::run::{self, How, Lookup, Outcome, RunCx};
 use std::ffi::OsString;
 use std::fmt;
 use std::io;
 use std::path::Path;
 
-/// Runs the attribution pass when every condition of spec 3.1 holds. `None` leaves the run to the
-/// legacy path, which then runs exactly as it did before this module existed.
+/// The output the pass names when it disables a suite for an over-budget set of proofs (spec 3.6).
+const OVER_BUDGET: &str = "unit proofs exceed 8 MiB";
+
+/// Runs the attribution pass when every condition of spec 3.1 holds. `None` leaves the run to the legacy path,
+/// which then runs exactly as it did before this module existed.
 pub(crate) fn pass(
     cx: &RunCx<'_>,
     config: &Config,
@@ -62,18 +67,26 @@ pub(crate) fn pass(
         }
         Start::No => return None,
     };
+    let units = pending.units();
     say(
         quiet,
         format!(
             "stoop: attribution pass: {} units, one launch each",
-            pending.units().len()
+            units.len()
         ),
     );
     let real_root = std::fs::canonicalize(cx.root).unwrap_or_else(|_| cx.root.clone());
     let forms = expand::list_forms(hook);
+    let roster = Roster::new(units);
+    // What this run's launches have written, and what the proofs stored so far name (spec 3.3).
+    let mut written = Written::default();
+    let mut named = Named::default();
     let mut status = 0;
+    let mut ran = 0;
     let mut over_budget = 0;
-    for unit in pending.units() {
+    // The first launch that breaks an independence check, by its roster index, and what it breaks.
+    let mut stopped: Option<(usize, Violation)> = None;
+    for (index, unit) in units.iter().enumerate() {
         let unit_name = safe(unit);
         // The launch's list files live in its own folder, which is removed when this iteration ends.
         let mut folder = match bundle_pass.scratch() {
@@ -102,6 +115,8 @@ pub(crate) fn pass(
         std::env::set_var("STOOP_CHANGED_FILE", &lists.changed);
         std::env::set_var("STOOP_CHANGED_INPUTS", "");
         std::env::set_var("STOOP_CHANGED_INPUTS_FILE", &lists.inputs);
+        // The root listing before the launch, which the root guard compares with the one after it (spec 3.5).
+        let root_before = launch::root_names(cx.root);
         let unit_status =
             match run::launch_traced(cx, &launch.argv, &ignore, &real_root, false, false, false) {
                 // A trace that fails before the command starts has run nothing. The unit runs once
@@ -115,60 +130,121 @@ pub(crate) fn pass(
                             safe(&error.to_string())
                         ),
                     );
+                    ran += 1;
                     run::plain(&launch.argv, &[])
                 }
-                Ok(trace) if trace.status != 0 => trace.status,
-                Ok(trace) if !unit_evidence(cx.root, &real_root, &trace, &launch.unit) => {
-                    say(
-                        quiet,
-                        format!("stoop: no proof for {unit_name}: the launch never read it"),
-                    );
-                    0
-                }
                 Ok(trace) => {
-                    match assemble_with(cx.root, &real_root, &trace, &ignore, RootListing::Record) {
-                        Ok(kept) => {
+                    ran += 1;
+                    let observed = Observed::of(&trace, cx.root, &real_root, &ignore);
+                    let context = launch::Context {
+                        root: cx.root,
+                        real_root: &real_root,
+                        ignore: &ignore,
+                        roster: &roster,
+                        members: std::slice::from_ref(unit),
+                        written: &written,
+                        named: &named,
+                        root_before: &root_before,
+                    };
+                    match launch::judge(&context, &trace, &observed) {
+                        Verdict::Proven(kept) => {
                             let stored = bundle_pass.record(
                                 &launch.unit,
                                 &kept.inputs,
                                 &kept.outputs,
                                 now(),
                             );
-                            if let Stored::OverBudget = stored {
-                                over_budget += 1;
+                            match stored {
+                                Stored::OverBudget => over_budget += 1,
+                                Stored::Stored | Stored::WriteFailed => {
+                                    named.store(unit, &paths(&kept.inputs), &paths(&kept.outputs))
+                                }
                             }
                         }
-                        Err(why) => say(
+                        Verdict::Failed => {}
+                        Verdict::Unrecorded(why) => say(
                             quiet,
-                            format!(
-                                "stoop: not recorded for {unit_name}: {}",
-                                safe(&why.to_string())
-                            ),
+                            format!("stoop: not recorded for {unit_name}: {}", safe(&why)),
                         ),
+                        Verdict::Coupled(violation) => {
+                            if let Violation::NeverRan { .. } = violation {
+                                say(
+                                    quiet,
+                                    format!(
+                                        "stoop: no proof for {unit_name}: the launch never read it"
+                                    ),
+                                );
+                            }
+                            stopped = Some((index, violation));
+                        }
                     }
-                    0
+                    written.add(&observed.writes, unit);
+                    trace.status
                 }
             };
-        // The first nonzero status in catalog order. A failing unit never stops the pass.
+        // The first nonzero status in roster order. A failing unit never stops the pass (spec 3.9).
         status = keep(status, unit_status);
+        if stopped.is_some() {
+            break;
+        }
     }
     for name in run::HOOK_ENV {
         std::env::set_var(name, "");
     }
-    if over_budget > 0 {
+    let id = pending.suite();
+    // A violation disables the suite and keeps the proofs it already holds. An over-budget pass disables it with
+    // none (spec 3.6). Either way the state is stored under the lock this pass holds.
+    let disabling = match &stopped {
+        Some((_, violation)) => Some((violation.code(), violation.label(), true)),
+        None if over_budget > 0 => Some(("over_budget", OVER_BUDGET.to_owned(), false)),
+        None => None,
+    };
+    if let Some((code, label, keep_units)) = disabling {
+        let stored = if keep_units {
+            bundle_pass.disable(code, &label)
+        } else {
+            bundle_pass.disable_without_versions(code, &label)
+        };
+        if stored.is_ok() {
+            say(
+                quiet,
+                format!(
+                    "stoop: suite {id} disabled: {label}; run 'stoop forget --units {id}' after fixing it"
+                ),
+            );
+        } else {
+            // The state could not be stored, so no proof may stay usable under an enabled suite.
+            bundle_pass.remove_bundle();
+            say(
+                quiet,
+                format!(
+                    "stoop: suite {id} could not store that it is disabled; its unit proofs are removed"
+                ),
+            );
+        }
+    }
+    // A run that stopped before its last launch has no verdict when nothing failed (spec 3.7). It says how far it
+    // got (spec 3.12).
+    let planned = units.len();
+    if status == 0 && matches!(&stopped, Some((index, _)) if index + 1 < planned) {
         say(
             quiet,
             format!(
-                "stoop: suite {}: unit proofs exceed 8 MiB; {over_budget} units left without a proof",
-                pending.suite()
+                "stoop: this run has no verdict (exit 125): only {ran} of {planned} launches ran"
             ),
         );
+        status = 125;
     }
     Some(Outcome {
         status,
         key: key.to_owned(),
         how: How::Units,
     })
+}
+
+/// The paths of a list of inputs or outputs, in their order.
+fn paths(entries: &[Input]) -> Vec<String> {
+    entries.iter().map(|entry| entry.path.clone()).collect()
 }
 
 /// Why a changed run of a hooked suite starts no attribution pass (spec 3.1). The run and
@@ -210,8 +286,9 @@ pub(crate) enum Refusal {
     Unwritable,
     /// A unit of the roster already has a proof.
     Proven,
-    /// The last pass stored no unit proof for this roster.
-    NoEvidence,
+    /// The suite is disabled: a launch of an earlier pass broke an independence check, or its proofs were
+    /// over budget. `stoop forget --units` clears the state (spec 3.6).
+    SuiteDisabled,
 }
 
 impl fmt::Display for Refusal {
@@ -240,7 +317,7 @@ impl fmt::Display for Refusal {
             Self::NoBundle => "the suite has no current record of an earlier full run",
             Self::Unwritable => "the suite store cannot take a new entry",
             Self::Proven => "a unit of the roster already has a proof",
-            Self::NoEvidence => "the last pass stored no unit proof for this roster",
+            Self::SuiteDisabled => "the suite is disabled",
         })
     }
 }
@@ -333,6 +410,13 @@ pub(crate) fn explain_lines(
     );
     let decision = match decision {
         Ok(launches) => format!("stoop: would run an attribution pass: {launches} launches"),
+        Err(Refusal::SuiteDisabled) => match bundle::disabled(store, &suite.id) {
+            Some(label) => format!(
+                "stoop: no attribution pass: suite {} disabled: {label}; run 'stoop forget --units {}' after fixing it",
+                suite.id, suite.id
+            ),
+            None => format!("stoop: no attribution pass: {}", Refusal::SuiteDisabled),
+        },
         Err(refusal) => format!("stoop: no attribution pass: {refusal}"),
     };
     Some(vec![tracked, decision])
@@ -440,31 +524,10 @@ fn write_form(
         .into_os_string())
 }
 
-/// Whether the launch read the unit's own file: a content read of it under the name the unit has,
-/// or through a directory the launch reached by a link. A stat does not count. Neither does a read
-/// through a link whose own name differs from the unit, which is the conservative choice. The
-/// mapping is the one `build_inputs` uses for the same paths.
-pub(crate) fn unit_evidence(root: &Path, real_root: &Path, trace: &Trace, unit: &str) -> bool {
-    let mut phys = Physical::new(root, real_root);
-    trace.touched.iter().any(|(lex, touch)| {
-        touch.content
-            && (to_key(root, lex) == unit
-                || physical_key(&mut phys, lex).is_some_and(|key| key == unit))
-    })
-}
-
-/// The repository-relative name of the entry that `lex` names once its parent directories are
-/// resolved. A link as the last component is not followed, so it keeps its own name.
-fn physical_key(phys: &mut Physical, lex: &Path) -> Option<String> {
-    let location = phys.locate(lex)?;
-    let rel = phys.repo_rel(&location.path)?;
-    rel.to_str().map(str::to_owned)
-}
-
 #[cfg(all(test, unix))]
 mod tests {
-    use super::*;
-    use crate::trace::Touch;
+    use super::super::independence::unit_evidence;
+    use crate::trace::{Touch, Trace};
     use std::fs;
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
