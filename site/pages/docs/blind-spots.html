@@ -20,6 +20,9 @@ stoop: skip sh-c98f8f9c8fef6d65: 71 inputs unchanged since 0s ago (100ms)</code>
   <dd>Record it anyway. You are saying the network can't change the result, for example a download whose content is already pinned by a checksum the command verifies.</dd>
 </dl>
 
+<h2 id="root-listing">Listing the repository root</h2>
+<p>stoop does not record the entry list of the repository root as stoop resolves it. A command that depends only on which top-level names exist, and that does not open or stat a name that then appears or disappears, can be skipped after a top-level name appears or disappears.</p>
+
 <h2 id="clock">The clock and randomness</h2>
 <p>A test that depends on today's date, or on a random seed, reads nothing that a trace can see. Two settings bound how long that can hide:</p>
 <ul>
