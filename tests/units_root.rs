@@ -253,10 +253,10 @@ fn r5u_a_root_given_through_a_symlink_records_dot() {
     );
 }
 
-// R6u: a top-level name that appears during a's launch, after that launch listed the root, refuses a
-// with the root as the changed key. b and c launch after it, keep their proofs, and their `.` is the
-// listing that includes the new name. Fails on a tree without the switch: a keeps its proof and the
-// refusal line is missing.
+// R6u: a top-level name that appears during a's launch refuses a with the root as the changed key.
+// That holds when the launch wrote no top-level entry itself (R7u covers that case). b and c launch
+// after it, keep their proofs, and their `.` is the listing that includes the new name. Fails on a
+// tree without the switch: a keeps its proof and the refusal line is missing.
 #[test]
 fn r6u_a_top_level_name_created_during_a_launch_refuses_that_unit() {
     let s = Suite::new();
