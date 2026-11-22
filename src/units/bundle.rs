@@ -16,6 +16,7 @@ use std::path::Path;
 #[cfg(not(unix))]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 const VERSION: u32 = 1;
 const GENERATION: u32 = 1;
@@ -26,6 +27,9 @@ const MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// `forget --units` removes the lock file, so a process waiting on the old file can take a lock
 /// that no other process contends for. A lock is trusted only while it is still the named entry.
 const LOCK_ATTEMPTS: usize = 3;
+/// The least time between two writes of a pass's bundle. A killed pass loses at most this much of
+/// its proofs, and the units whose proofs are lost are attributed again on a later run.
+const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Serialize, Deserialize)]
@@ -986,6 +990,9 @@ pub(crate) struct Pass {
     /// The table index of each input, by its serialized form, so each input is stored once.
     interned: BTreeMap<String, u32>,
     budget: u64,
+    /// When the bundle was last written, and whether a proof is held that no write has stored yet.
+    last_write: Option<Instant>,
+    dirty: bool,
     #[cfg(test)]
     writes: usize,
 }
@@ -1024,16 +1031,34 @@ impl Pass {
             self.discard(unit, mark);
             return Stored::WriteFailed;
         }
-        match write_bytes(&self.area, &self.bundle.suite, &bytes) {
-            Ok(()) => {
-                #[cfg(test)]
-                {
-                    self.writes += 1;
-                }
-                Stored::Stored
-            }
+        self.dirty = true;
+        if !self.due(Instant::now()) {
+            return Stored::Stored;
+        }
+        match self.write(&bytes) {
+            Ok(()) => Stored::Stored,
             Err(_) => Stored::WriteFailed,
         }
+    }
+
+    /// Whether a write is due: the first proof's is, and then at most one write per `FLUSH_INTERVAL`.
+    fn due(&self, now: Instant) -> bool {
+        match self.last_write {
+            None => true,
+            Some(last) => now.duration_since(last) >= FLUSH_INTERVAL,
+        }
+    }
+
+    /// Writes the encoded bundle and records when, so the next write waits its interval.
+    fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        write_bytes(&self.area, &self.bundle.suite, bytes)?;
+        self.last_write = Some(Instant::now());
+        self.dirty = false;
+        #[cfg(test)]
+        {
+            self.writes += 1;
+        }
+        Ok(())
     }
 
     /// The table index of each input, sorted and without repeats.
@@ -1065,14 +1090,20 @@ impl Pass {
 }
 
 impl Drop for Pass {
-    /// A pass that stored no proof writes the marker for its roster, so the same roster is not
-    /// attributed again. A write that fails is ignored, as `record` ignores one.
+    /// Writes what the pass still holds when it ends, however it ends: the proofs that no write has
+    /// stored yet, or, when it stored none, the marker for its roster. A write that fails is ignored,
+    /// as `record` ignores one.
     fn drop(&mut self) {
-        if self.bundle.units.is_empty() {
-            self.bundle.no_evidence = Some(roster_digest(&self.bundle.roster));
-            if let Ok(bytes) = encode(&self.bundle) {
-                let _ = write_bytes(&self.area, &self.bundle.suite, &bytes);
-            }
+        if !self.dirty && !self.bundle.units.is_empty() {
+            return;
+        }
+        self.bundle.no_evidence = self
+            .bundle
+            .units
+            .is_empty()
+            .then(|| roster_digest(&self.bundle.roster));
+        if let Ok(bytes) = encode(&self.bundle) {
+            let _ = self.write(&bytes);
         }
     }
 }
@@ -1131,6 +1162,8 @@ fn start_with(
         bundle,
         interned: BTreeMap::new(),
         budget: MAX_BYTES,
+        last_write: None,
+        dirty: false,
         #[cfg(test)]
         writes: 0,
     })
