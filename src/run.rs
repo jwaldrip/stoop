@@ -1294,8 +1294,15 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         salt: &salt,
         remote,
     };
-    let pending = unit_bookkeeping(&cx, &config, config_invalid, independent_false);
     let lookup = legacy_lookup(&cx, &key);
+    // The roster is taken before the command launches. Only a run that launches takes it: a
+    // whole-command hit that is skipped never walks the tree. This is the skip legacy_finish applies.
+    let launches = cx.full_reason.is_some() || lookup.hit_idx.is_none();
+    let pending = if launches {
+        unit_bookkeeping(&cx, &config, config_invalid, independent_false)
+    } else {
+        None
+    };
     let outcome = legacy_finish(cx, key, lookup);
     if let (Some(pending), How::Recorded { proof: digest }) = (pending, &outcome.how) {
         if let Some(proof) = store
