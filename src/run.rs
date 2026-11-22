@@ -1730,9 +1730,21 @@ pub(crate) fn assemble(
     trace: &Trace,
     ignore: &Ignore,
 ) -> Result<Assembled, NotRecorded> {
+    assemble_with(root, real_root, trace, ignore, RootListing::Drop)
+}
+
+/// `assemble`, with the root listing decided by the caller (see `RootListing`).
+pub(crate) fn assemble_with(
+    root: &Path,
+    real_root: &Path,
+    trace: &Trace,
+    ignore: &Ignore,
+    root_listing: RootListing,
+) -> Result<Assembled, NotRecorded> {
     let mut phys = Physical::new(root, real_root);
     let written: BTreeSet<String> = trace.keys.values().cloned().collect();
-    let (mut inputs, read_reasons) = build_inputs(root, &mut phys, trace, ignore, &written)?;
+    let (mut inputs, read_reasons) =
+        build_inputs_with(root, &mut phys, trace, ignore, &written, root_listing)?;
     let (outputs, removed, write_reasons, verified) = build_outputs(real_root, &written, trace);
     let priors = build_priors(trace);
     if !verified.is_empty() {
@@ -1920,16 +1932,39 @@ fn compare_candidate(
     }
 }
 
+/// Whether a listed repository root is an input. Only unit proofs record it, so the legacy path and
+/// whole-command proofs keep their bytes (pin P10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RootListing {
+    /// A listed root is the input `.`, with the same `dl:` id a listed directory gets.
+    Record,
+    /// The root is never an input, as on the legacy path.
+    Drop,
+}
+
 /// What the run read, as comparable inputs, or why it cannot be trusted. A read of a path the
 /// run wrote is not an input: it reads the run's own output. A read through a link or a
 /// symlinked directory is also recorded under the key of the file it reached, so a change to
 /// that file is seen. The second value holds reasons the planner cannot replay the run.
+#[cfg(test)]
 pub fn build_inputs(
     root: &Path,
     phys: &mut Physical,
     trace: &Trace,
     ignore: &Ignore,
     written: &BTreeSet<String>,
+) -> Result<(Vec<Input>, Vec<String>), NotRecorded> {
+    build_inputs_with(root, phys, trace, ignore, written, RootListing::Drop)
+}
+
+/// `build_inputs`, with the root listing decided by the caller. Only unit proofs pass `Record`.
+pub(crate) fn build_inputs_with(
+    root: &Path,
+    phys: &mut Physical,
+    trace: &Trace,
+    ignore: &Ignore,
+    written: &BTreeSet<String>,
+    root_listing: RootListing,
 ) -> Result<(Vec<Input>, Vec<String>), NotRecorded> {
     if let Some(u) = trace.unsound.first() {
         return Err(u.clone().into());
@@ -2006,6 +2041,15 @@ pub fn build_inputs(
             .components()
             .any(|part| matches!(part, std::path::Component::ParentDir))
         {
+            continue;
+        }
+        // The repository root, under either spelling, is `.` for unit proofs. The tracer keys it as
+        // "" and keeps it only while that key is not ignored (`record_touch`), so the same test
+        // decides here. A root that was only stat'ed was never listed and records nothing.
+        if root_listing == RootListing::Record && (key.is_empty() || lex == &real_root) {
+            if touch.listed && !ignore.is_ignored(&key) {
+                cands.push((lex.clone(), ".".to_owned(), inside, true, None));
+            }
             continue;
         }
         if key.is_empty() || ignore.is_ignored(&key) {
