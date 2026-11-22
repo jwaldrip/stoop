@@ -660,17 +660,29 @@ fn attribution_pass_cost() {
         for index in 0..units - 3 {
             s.write(&format!("tests/u{index:05}.t"), "src/shared.src\n");
         }
+        // The same configuration in both modes, so the Git root is the only difference.
+        s.config("[units]\ndefault_branch = \"main\"\n");
         if git {
             s.write(".stoopignore", ".git\n");
             s.git("work");
         }
         success(&s.hook(&[]));
         edit(&s, 2);
+        s.clear_log();
         let started = std::time::Instant::now();
         let out = s.hook(&[]);
         let pass = started.elapsed();
         success(&out);
-        let launched = s.launches().len();
+        let launches = s.launches().len();
+        assert_eq!(launches, units, "one traced launch per unit");
+        let bundle = bundle(&s);
+        let proven = bundle["units"]
+            .as_object()
+            .unwrap()
+            .values()
+            .filter(|versions| versions.as_array().is_some_and(|list| !list.is_empty()))
+            .count();
+        assert_eq!(proven, units, "every unit stored its proof");
         let mut names: Vec<String> = ROSTER.iter().map(|unit| unit.to_string()).collect();
         for index in 0..units - 3 {
             names.push(format!("tests/u{index:05}.t"));
@@ -681,7 +693,7 @@ fn attribution_pass_cost() {
         }
         let direct = started.elapsed();
         println!(
-            "M2 git={git} units={units} launches={launched} pass_ms_per_launch={:.3} direct_ms_per_launch={:.3}",
+            "M2 git={git} units={units} launches={launches} proven={proven} pass_ms_per_launch={:.3} direct_ms_per_launch={:.3}",
             pass.as_secs_f64() * 1e3 / units as f64,
             direct.as_secs_f64() * 1e3 / units as f64,
         );
