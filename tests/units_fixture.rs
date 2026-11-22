@@ -608,11 +608,19 @@ fn f7_t_write_at_writes_only_for_the_named_test_before_its_reads() {
 #[test]
 fn f8_t_write_each_writes_each_tests_own_output_in_every_run_of_it() {
     let s = Suite::new();
+    // a.t lists its own output, so the output shows whether the write comes before the reads.
+    s.write("tests/a.t", "src/shared.src\ntests/a.out\n");
     let toggle = s.outside.join("write-each-toggle");
     // T_IF does not gate T_WRITE_EACH, so an absent toggle changes nothing.
     let env = [("T_WRITE_EACH", "1"), ("T_IF", toggle.to_str().unwrap())];
     let out = s.direct(&s.root, &["tests/a.t", "tests/c.t"], &env);
     assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    // The first run reads a.out before writing it, so the write must come after the reads.
+    assert!(
+        !text(&out.stdout).lines().any(|line| line == "written"),
+        "the write came before the reads: {}",
+        text(&out.stdout)
+    );
     assert_eq!(fs::read(s.path("tests/a.out")).unwrap(), b"written\n");
     assert_eq!(fs::read(s.path("tests/c.out")).unwrap(), b"written\n");
     assert!(
