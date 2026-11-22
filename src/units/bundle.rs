@@ -1824,13 +1824,15 @@ mod pass_tests {
             );
         };
         let dir = seed("preconditions", &bundle_for(pending_for(&roster), "key"));
-        assert!(matches!(
-            start(&dir, &pending_for(&roster), "key", guard()),
-            Start::Pass(_)
-        ));
+        // The key check comes before the first pass. A pass's drop writes the no-evidence marker,
+        // which would refuse this start for another reason and hide a missing key check.
         assert!(matches!(
             start(&dir, &pending_for(&roster), "another key", guard()),
             Start::No
+        ));
+        assert!(matches!(
+            start(&dir, &pending_for(&roster), "key", guard()),
+            Start::Pass(_)
         ));
         let wider = ["tests/a.t", "tests/b.t"];
         assert!(
