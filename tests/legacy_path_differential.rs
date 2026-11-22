@@ -1059,3 +1059,22 @@ fn legacy_paths_match_the_base() {
     attribution_not_dispatched();
     sync();
 }
+
+/// A listed root stays out of a whole-command proof: a recorded run that lists the root stores the
+/// base's proof, byte for byte, and skips the same way. Unit proofs record the root as `.`; this
+/// guards the legacy side on both binaries, where pin P10 checks only the head.
+#[test]
+#[ignore = "requires STOOP_BASE_BIN and a Linux tracer"]
+fn a_listed_root_stays_out_of_a_whole_command_proof() {
+    let pair = Pair::new("root-listing");
+    let script = "ls -a . > /dev/null && cat in.txt > /dev/null";
+    contains(
+        &pair.run("D16 record", "listed", &[], script, &[]),
+        "recorded",
+    );
+    contains(
+        &pair.run("D16 skip", "listed", &[], script, &[]),
+        "stoop: skip",
+    );
+    pair.compare_store(".stoop");
+}
