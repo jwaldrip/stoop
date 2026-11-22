@@ -7,7 +7,7 @@
 # <root>/lint when T_LINT=1. With test words it runs each one, relative to the cwd, after the
 # programs the no-argument form uses to list its roster (the purity rule, spec 3.2). Words
 # starting with '-' are logged and otherwise ignored. LOG (outside the root) gets the record.
-# The knobs marked (IF) in the table act only while the path named by T_IF exists.
+# The knobs marked (IF) in the table act unless T_IF names a path that does not exist.
 
 ROOT=$(cd "$(dirname "$0")" && pwd -P) || exit 2
 STATUS=0
