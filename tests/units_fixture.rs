@@ -1,7 +1,8 @@
 //! The fake hook runner `tests/fixtures/hook/t` is checked knob by knob (F1-F4 and F6-F12). Pins
 //! P1-P11 hold today's hooked-run behaviour: each condition that keeps the full form after the
-//! attribution pass. F5 checks the purity rule. The runner tests need a POSIX shell; the pins and
-//! F5 need the tracer, so they run on Linux x86-64 and arm64.
+//! attribution pass. F5 checks the purity rule, and the traced arm of F10 checks that a stat is an
+//! input. The runner tests need a POSIX shell; the pins, F5 and that arm need the tracer, so they
+//! run on Linux x86-64 and arm64.
 //!
 //! # The runner's contract (spec 3.2 and 3.6)
 //!
@@ -14,10 +15,10 @@
 //! | --- | --- |
 //! | no test word (no argument, or only words starting with `-`) | Runs every `*.t` under the root except `slow/`, plus every `*.u` when `T_U=1`, in `LC_ALL=C` sort order, listed by `find`, `sed` and `sort`. With `T_LINT=1` it first executes `<root>/lint`. |
 //! | test words | Words starting with `-` are logged only. Every other word is a test path relative to the cwd, run in order. Before the first test it runs `find /dev/null -prune`, `sed -n q` and `LC_ALL=C sort` on empty input: the programs the no-argument form runs to list its roster. So a unit launch traces every program the full form runs (purity). `lint` is the exception, and it is residue by design. |
-//! | running test P | With `T_WRITE_AT=P` (IF) and `T_WRITE` set, `written` goes to `T_WRITE` right before `cat P`. Then `cat P`. Then `cat <root>/<line>` for each non-empty line of P. Then `cat <root>/setup.src`. With `T_WRITE_EACH=1`, `written` goes to `${P%.*}.out` after those reads. Then the FIFO hold, if armed. Then the test fails if `${P%.*}.flag` contains `fail`, or, in the test-word form, if `T_FAIL_ALONE=P` (IF). Logs `ran=P`, and `failed=P` on failure. A missing P fails the test. |
-//! | `T_IGNORE=1` | With test words: reads nothing and exits 0. The no-argument form is unaffected. |
+//! | running test P | With `T_WRITE_AT=P` (IF) and `T_WRITE` set, `written` goes to `T_WRITE` right before `cat P`. Then `cat P`. Then `cat <root>/<line>` for each non-empty line of P. Then `cat <root>/setup.src`. With `T_WRITE_EACH=1`, `written` goes to `${P%.*}.out` after those reads. Then the FIFO hold, if `T_FIFO` is set. Then the test fails if `${P%.*}.flag` contains `fail`, or, in the test-word form, if `T_FAIL_ALONE=P` (IF). Logs `ran=P`, and `failed=P` on failure. A missing P fails the test. |
+//! | `T_IGNORE=1` | With test words: reads nothing and exits 0. It exits before the purity programs run, so it is the one exception to the purity rule: it models a launch that reads nothing. A plain `T_WRITE` still writes first. The no-argument form is unaffected. |
 //! | `T_STAT_UNIT=1` | With test words: `test -e P` instead of running it. Logs `statted=P`. |
-//! | `T_FIFO=<path>`, `T_FIFO_AT=<P>` | One `read < $T_FIFO` per invocation, after the first test (or after the test logged as `T_FIFO_AT`) has read its files. |
+//! | `T_FIFO=<path>`, `T_FIFO_AT=<P>` | One `read < $T_FIFO` per invocation, after the first test that reads its files (or after the test logged as `T_FIFO_AT` has read its files). |
 //! | `T_IF=<path>` | The toggle for the rows marked (IF). |
 //! | `T_WRITE=<path>` (IF) | Writes `written` to that path, relative to the cwd, once per invocation before any test. With `T_WRITE_AT` set it writes only in that test's invocation: see the next row. |
 //! | `T_WRITE_AT=<P>` (IF) | Narrows `T_WRITE` to the invocation that runs test P, written right before P's reads. P must exist and be run, not statted by `T_STAT_UNIT`. The path rules depend on the form. In the no-argument form the write runs after the runner has moved to the root, so a relative `T_WRITE` path is root-relative, as `T_WRITE_FULL` is, and P is spelled as the roster lists it: root-relative, for example `tests/b.t`. In the test-word form the write stays relative to the cwd, and P is spelled as the test word is: relative to the cwd, for example `../tests/b.t` from `docs`. |
