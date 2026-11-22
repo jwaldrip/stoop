@@ -12,7 +12,7 @@ mod units_common;
 
 use serde_json::Value;
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output, Stdio};
 use units_common::*;
@@ -23,6 +23,8 @@ const FILE: &str = "{changed:**/*.t|!slow/**:file}";
 const NUL: &str = "{changed:**/*.t|!slow/**:nul}";
 /// The response-file form: the list's path behind an `@`.
 const AT_FILE: &str = "@{changed:**/*.t|!slow/**:file}";
+/// The same units as a newline list of absolute paths, which a root whose path holds a newline cannot list.
+const FILE_ABS: &str = "{changed:**/*.t|!slow/**:file:abs}";
 
 /// The list runner, run by each suite as `./list-runner`. POSIX sh, so it runs under dash. Each
 /// launch logs what its list holds while it runs: the list's modes, its content and the unit it
@@ -72,6 +74,14 @@ run_unit() {
 
 list() {
 	note "list=$1"
+	case ${T_EXTRA:-} in
+		file) printf 'x\n' > "$(dirname "$1")/extra" ;;
+		dir)
+			mkdir "$(dirname "$1")/sub" &&
+				printf 'x\n' > "$(dirname "$1")/sub/file" &&
+				ln -s "$LOG" "$(dirname "$1")/sub/link"
+			;;
+	esac
 	note "list_dir_mode=$(stat -c %a "$(dirname "$1")")"
 	note "list_mode=$(stat -c %a "$1")"
 	note "list_newlines=$(tr -cd '\n' < "$1" | wc -c | tr -d ' ')"
@@ -184,12 +194,17 @@ fn spawn_list(s: &Suite, env: &[(&str, &str)]) -> Child {
 }
 
 /// Where the suite store sits: the default `.stoop`, a store named `cache` inside the root, or a
-/// store outside the root.
+/// store outside the root. The three others are inside the root too: `#cache`, a line the ignore
+/// parser reads as a comment; ` c?che `, whose spaces it trims and whose `?` it reads as a glob; and
+/// `c?che`, a glob that matches `cache`.
 #[derive(Clone, Copy, Debug)]
 enum Placement {
     Default,
     InRoot,
     Outside,
+    Hash,
+    Spaced,
+    Glob,
 }
 
 impl Placement {
@@ -198,6 +213,9 @@ impl Placement {
             Placement::Default => s.root.join(".stoop"),
             Placement::InRoot => s.root.join("cache"),
             Placement::Outside => outside_store(s),
+            Placement::Hash => s.root.join("#cache"),
+            Placement::Spaced => s.root.join(" c?che "),
+            Placement::Glob => s.root.join("c?che"),
         }
     }
 }
@@ -794,6 +812,250 @@ fn a13_explain_predicts_the_pass_a_list_hook_starts() {
         !text(&again.stderr).contains("stoop: attribution pass:"),
         "{}",
         text(&again.stderr)
+    );
+    assert_eq!(s.launches().len(), 1, "{:?}", s.launches());
+}
+
+/// The decision a changed run of a hook that cannot stand for its changed inputs gets in explain (spec 4.11).
+const CHANGED_INPUTS_REFUSAL: &str = "stoop: no attribution pass: the hook uses a form a single unit cannot stand for ({changed-inputs}, or a list with a join)";
+
+/// The decision for a newline list whose unit's absolute path holds a newline (spec 4.12).
+const NEWLINE_REFUSAL: &str = "stoop: no attribution pass: a unit's absolute path holds a newline, which a newline list cannot name";
+
+/// What `stoop explain` says a changed run would do: its decision line, the last line it prints.
+fn explain_decision(s: &Suite, words: &[&str]) -> String {
+    let mut command = s.stoop(&s.root);
+    command
+        .args(["explain", "--root"])
+        .arg(&s.root)
+        .arg("--")
+        .args(words);
+    let out = spawning(|| command.output()).unwrap();
+    text(&out.stderr)
+        .lines()
+        .last()
+        .unwrap_or_default()
+        .to_owned()
+}
+
+// A9 (store names): a store named `#cache`, or with spaces and a glob, is excluded under its own name.
+// Fails on a tree that reads the store's folder through the ignore-line parser, which drops a `#` line,
+// trims spaces and reads `?` as a glob: the list files and launch folders then become inputs.
+#[test]
+fn a9_a_store_named_with_a_hash_never_becomes_an_input() {
+    list_file_is_deleted_and_never_an_input(Placement::Hash);
+}
+
+#[test]
+fn a9_a_store_named_with_spaces_and_a_glob_never_becomes_an_input() {
+    list_file_is_deleted_and_never_an_input(Placement::Spaced);
+}
+
+// A9 (glob store): a store named `c?che` does not hide the real folder `cache/units/v1`, which the unit
+// reads. Fails on a tree that reads the store name as a glob: `c?che` matches `cache`, so the unit loses
+// its real input `cache/units/v1/data.src` from its proof.
+#[test]
+fn a9_a_store_name_with_a_glob_does_not_hide_a_real_folder() {
+    let s = list_suite();
+    s.write("cache/units/v1/data.src", "data\n");
+    s.write("tests/a.t", "src/shared.src\ncache/units/v1/data.src\n");
+    let store = Placement::Glob.store(&s);
+    let store_text = store.to_str().unwrap().to_owned();
+    let env = store_env(Placement::Glob, &store_text);
+    success(&changed_run(&s, &s.root, &["./list-runner", FILE], &env));
+    assert_eq!(s.launches().len(), 3, "{:?}", s.launches());
+    let inputs: Vec<String> = input_entries(&bundle_in(&store), "tests/a.t")
+        .iter()
+        .map(|input| input["path"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        inputs.contains(&"cache/units/v1/data.src".to_owned()),
+        "{inputs:?}"
+    );
+    assert!(inputs.contains(&"src/shared.src".to_owned()), "{inputs:?}");
+}
+
+// A9b (guard, passes on the current code): removing a killed launch's leftovers takes only this suite's
+// launch folders and never follows a link. The leftovers are this suite's names as a link to a folder, a
+// link to a file, and a folder holding a link. Kept: another suite's folder, a name with this suite's
+// prefix that is not a launch folder, and another dot folder. Every link target stays. It fails on a
+// mutant that widens the name check to any dot name, and on one that enters a leftover through a
+// following open.
+#[test]
+fn a9b_only_this_suites_launch_folders_are_removed_and_no_link_target_is() {
+    let s = list_suite();
+    success(&s.run(&s.root, &[], &["./list-runner", FILE], &[]));
+    let id = suite_id(&s);
+    let folders = s.root.join(".stoop/units/v1");
+    let target_dir = s.outside.join("target-dir");
+    fs::create_dir_all(&target_dir).unwrap();
+    fs::write(target_dir.join("keep.txt"), "kept\n").unwrap();
+    let target_file = s.outside.join("target-file.txt");
+    fs::write(&target_file, "kept\n").unwrap();
+    let nested_target = s.outside.join("nested-target.txt");
+    fs::write(&nested_target, "kept\n").unwrap();
+    let to_dir = folders.join(format!(".{id}-99999999-1.scratch"));
+    let to_file = folders.join(format!(".{id}-99999999-2.scratch"));
+    let holding = folders.join(format!(".{id}-99999999-3.scratch"));
+    symlink(&target_dir, &to_dir).unwrap();
+    symlink(&target_file, &to_file).unwrap();
+    fs::create_dir(&holding).unwrap();
+    fs::set_permissions(&holding, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(holding.join("changed"), "tests/a.t\n").unwrap();
+    symlink(&nested_target, holding.join("link")).unwrap();
+    let other = folders.join(".00112233445566778899aabbccddeeff-99999999-1.scratch");
+    fs::create_dir(&other).unwrap();
+    fs::write(other.join("changed"), "tests/b.t\n").unwrap();
+    let not_a_launch = folders.join(format!(".{id}-notes.scratch.keep"));
+    fs::write(&not_a_launch, "keep\n").unwrap();
+    let dot_other = folders.join(".hidden.scratch");
+    fs::create_dir(&dot_other).unwrap();
+    fs::write(dot_other.join("changed"), "tests/c.t\n").unwrap();
+    edit(&s, 2);
+    s.clear_log();
+    success(&s.run(&s.root, &[], &["./list-runner", FILE], &[]));
+    assert_eq!(s.launches().len(), 3, "{:?}", s.launches());
+    for leftover in [&to_dir, &to_file, &holding] {
+        assert!(
+            fs::symlink_metadata(leftover).is_err(),
+            "{leftover:?} survives the pass that takes the lock"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(target_dir.join("keep.txt")).unwrap(),
+        "kept\n"
+    );
+    assert_eq!(fs::read_to_string(&target_file).unwrap(), "kept\n");
+    assert_eq!(fs::read_to_string(&nested_target).unwrap(), "kept\n");
+    for kept in [
+        other.join("changed"),
+        not_a_launch,
+        dot_other.join("changed"),
+    ] {
+        assert!(kept.exists(), "{kept:?} was removed");
+    }
+}
+
+// A5b (guard): a launch folder goes whole when its runner leaves a file beside its list. Fails on a tree
+// that removes only the names stoop wrote: the folder then stays until the next pass takes the lock.
+#[test]
+fn a5b_a_file_the_runner_leaves_beside_its_list_goes_with_the_launch_folder() {
+    let s = list_suite();
+    success(&s.run(&s.root, &[], &["./list-runner", FILE], &[]));
+    edit(&s, 2);
+    s.clear_log();
+    let out = s.run(
+        &s.root,
+        &[],
+        &["./list-runner", FILE],
+        &[("T_EXTRA", "file")],
+    );
+    success(&out);
+    assert_eq!(s.launches().len(), 3, "{:?}", s.launches());
+    let store = s.root.join(".stoop");
+    assert!(
+        scratch_dirs(&store).is_empty(),
+        "{:?}",
+        scratch_dirs(&store)
+    );
+}
+
+// A5c (guard): a folder that the runner makes beside its list goes too, with the link it holds. The link's
+// target, the log outside the root, survives. Fails on a tree that cannot remove a folder with entries in
+// it, and on a tree that follows the link.
+#[test]
+fn a5c_a_folder_the_runner_leaves_beside_its_list_goes_without_following_its_links() {
+    let s = list_suite();
+    success(&s.run(&s.root, &[], &["./list-runner", FILE], &[]));
+    edit(&s, 2);
+    s.clear_log();
+    let out = s.run(
+        &s.root,
+        &[],
+        &["./list-runner", FILE],
+        &[("T_EXTRA", "dir")],
+    );
+    success(&out);
+    assert_eq!(s.launches().len(), 3, "{:?}", s.launches());
+    let store = s.root.join(".stoop");
+    assert!(
+        scratch_dirs(&store).is_empty(),
+        "{:?}",
+        scratch_dirs(&store)
+    );
+    assert!(
+        s.log.is_file(),
+        "the link's target, outside the root, was removed"
+    );
+}
+
+// G (guard): shell code that reads the changed inputs keeps the first-run form, as `{changed-inputs}`
+// does, and explain names that refusal. Fails on a tree that dispatches such a hook: each of its three
+// would-be launches runs every test.
+#[test]
+fn changed_inputs_in_shell_code_keeps_the_first_run_form() {
+    for code in [
+        "./list-runner --list \"${STOOP_CHANGED_INPUTS}\"; exit $?",
+        "./list-runner --list \"${STOOP_CHANGED_INPUTS_FILE}\"; exit $?",
+    ] {
+        let s = list_suite();
+        s.config(&format!(
+            "[[units.suite]]\nid = \"inputs\"\nmatch = ['sh', '-c', '{code}', 'sh']\nunits = ['tests/**/*.t']\n"
+        ));
+        let words = ["sh", "-c", code, "sh"];
+        success(&s.run(&s.root, &[], &words, &[]));
+        edit(&s, 2);
+        assert_eq!(
+            explain_decision(&s, &words),
+            CHANGED_INPUTS_REFUSAL,
+            "{code}"
+        );
+        s.clear_log();
+        let out = s.run(&s.root, &[], &words, &[]);
+        success(&out);
+        assert!(
+            !text(&out.stderr).contains("attribution pass"),
+            "{code}: {}",
+            text(&out.stderr)
+        );
+        assert_eq!(s.launches().len(), 1, "{code}: {:?}", s.launches());
+    }
+}
+
+// G2 (guard): `{changed-inputs}` gets the same explain refusal, and the run keeps the first-run form.
+#[test]
+fn a_changed_inputs_placeholder_is_explained_as_the_first_run_form() {
+    let s = list_suite();
+    let words = ["./list-runner", FILE, "{changed-inputs}"];
+    success(&s.run(&s.root, &[], &words, &[]));
+    edit(&s, 2);
+    assert_eq!(explain_decision(&s, &words), CHANGED_INPUTS_REFUSAL);
+    s.clear_log();
+    success(&s.run(&s.root, &[], &words, &[]));
+    assert_eq!(s.launches().len(), 1, "{:?}", s.launches());
+}
+
+// A10 (newline list): a newline list cannot name a unit whose absolute path holds a newline, so the
+// changed run keeps the full form, and explain names that refusal. The root's own name holds the
+// newline, as a `:abs` entry carries the root. Fails on a tree that dispatches it: the list reads two
+// entries that are not files, and the pass fails every unit.
+#[test]
+fn a10_a_newline_list_keeps_the_full_form_when_an_absolute_path_holds_a_newline() {
+    let mut s = list_suite();
+    let renamed = s.root.parent().unwrap().join("n\nl");
+    fs::rename(&s.root, &renamed).unwrap();
+    s.root = renamed;
+    let words = ["./list-runner", FILE_ABS];
+    success(&s.run(&s.root, &[], &words, &[]));
+    edit(&s, 2);
+    assert_eq!(explain_decision(&s, &words), NEWLINE_REFUSAL);
+    s.clear_log();
+    let out = s.run(&s.root, &[], &words, &[]);
+    success(&out);
+    assert!(
+        !text(&out.stderr).contains("attribution pass"),
+        "{}",
+        text(&out.stderr)
     );
     assert_eq!(s.launches().len(), 1, "{:?}", s.launches());
 }

@@ -418,4 +418,26 @@ mod tests {
             [(FileMode::File, Base::Cwd), (FileMode::Nul, Base::Root)]
         );
     }
+
+    #[test]
+    fn shell_code_that_reads_the_changed_inputs_is_not_supported() {
+        assert!(!supported(&hook(&[
+            "sh",
+            "-c",
+            "run.sh $STOOP_CHANGED_INPUTS; exit $?",
+            "sh"
+        ])));
+        assert!(!supported(&hook(&[
+            "sh",
+            "-c",
+            "run.sh \"${STOOP_CHANGED_INPUTS_FILE}\"; exit $?",
+            "sh"
+        ])));
+        assert!(supported(&hook(&[
+            "sh",
+            "-c",
+            "run.sh \"$STOOP_CHANGED\"; exit $?",
+            "sh"
+        ])));
+    }
 }
