@@ -1910,3 +1910,67 @@ fn direct_foreign_edit_before_write_keeps_foreign_prior() {
     assert_file_entry(&stored, "priors", "f", b"foreign\n");
     assert_file_entry(&stored, "outputs", "f", b"new\n");
 }
+
+#[test]
+fn direct_promotion_copies_the_git_oid_and_its_basis() {
+    for (key, aged) in [("direct-oid-aged", true), ("direct-oid-racy", false)] {
+        let case = Case::new(key);
+        case.file("f", b"start\n");
+        let home = case.dir.join("home");
+        let xdg = case.dir.join("xdg");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&xdg).unwrap();
+        let git = |args: &[&str]| {
+            let mut command = Command::new("git");
+            clean(&mut command);
+            let output = command
+                .current_dir(case.root())
+                .env("HOME", &home)
+                .env("XDG_CONFIG_HOME", &xdg)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}", stderr(&output));
+            String::from_utf8(output.stdout).unwrap().trim().to_owned()
+        };
+        git(&["init", "-q", "--object-format=sha1"]);
+        git(&["config", "core.autocrlf", "false"]);
+        git(&["add", "--", "f"]);
+        git(&[
+            "-c",
+            "user.name=Stoop Test",
+            "-c",
+            "user.email=stoop@example.org",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-qm",
+            "fixture",
+        ]);
+        let oid = format!("sha1:{}", git(&["hash-object", "--no-filters", "f"]));
+        if aged {
+            age();
+        }
+        let out = run(
+            &case,
+            key,
+            r#"exec python3 -c 'open("f").read(); open("f", "a").write("x\n")'"#,
+            &[("HOME", &home), ("XDG_CONFIG_HOME", &xdg)],
+        );
+        assert_recorded(&out, &case, key);
+        let stored = proof(&case, key);
+        assert_atomic_recording(&stored, "f", b"start\n", b"start\nx\n");
+        let entry = |field: &str| {
+            stored[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["path"] == "f")
+                .unwrap()
+        };
+        assert_eq!(entry("inputs"), entry("priors"));
+        assert_eq!(entry("inputs")["oid"].as_str(), Some(oid.as_str()));
+        assert!(entry("inputs")["oid_basis"].is_object());
+    }
+}
