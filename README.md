@@ -130,7 +130,7 @@ Mark where a test command accepts test files, and optionally identify those file
 stoop run -- npx jest '{changed:*.test.ts}'
 ```
 
-Always single-quote the placeholder. Stoop refuses the shell-mangled forms before anything runs. The command still runs in full, with the placeholder and its option removed; stoop does not yet run a subset. On Linux and macOS, `stoop explain` counts files matching the filter without launching the command or saving per-unit proofs. Windows reports an unknown unit universe. The [CLI reference](https://stoop.build/docs/cli.html#changed-hook) covers filters, quoting and option rules.
+Always single-quote the placeholder. Stoop refuses the shell-mangled forms before anything runs. On Linux x86-64 and arm64, a changed run of a recorded suite can launch the command once per unit, storing each unit's proof when its launch reads its own file; that pass runs once per suite until `stoop forget --units`. Otherwise the command runs in full, with the placeholder and its option removed. On Linux and macOS, `stoop explain` counts files matching the filter without launching the command or saving per-unit proofs. Windows reports an unknown unit universe. The [CLI reference](https://stoop.build/docs/cli.html#changed-hook) covers filters, quoting and option rules.
 
 ## What it sees, and what it can't
 

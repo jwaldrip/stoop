@@ -64,8 +64,9 @@ OPTIONS
   --quiet           print nothing about the decision
 
 CONFIGURATION
-  .stoop.toml       optional at the selected root; hook suites, option arity and
-                    full-verification policy. See https://stoop.build/docs/cli.html
+  .stoop.toml       optional at the selected root; hook suites, option arity,
+                    full-verification policy, and `enabled = false` to turn off
+                    attribution passes. See https://stoop.build/docs/cli.html
 
 ENVIRONMENT
   STOOP_FULL=1      never skip; still record (nightly runs)

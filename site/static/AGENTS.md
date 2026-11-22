@@ -78,7 +78,7 @@ Install stoop in an earlier step with the one-line installer. Pull request runs 
 
 ## The changed-unit placeholder
 
-Write `'{changed}'` where a test command accepts test files, and single-quote it. The environment spelling `'$STOOP_CHANGED'` works the same way. Stoop removes the placeholder and its owning option and runs the full command; it does not select changed test files. Ambiguous ownership is refused with exit 2. An unchanged tree can still skip through the whole-command proof. Default-branch pushes, sync writers, and configured verification runs do not skip.
+Write `'{changed}'` where a test command accepts test files, and single-quote it. The environment spelling `'$STOOP_CHANGED'` works the same way. On Linux x86-64 and arm64, a changed run of a recorded suite launches the command once per test file and stores each file's proof when its launch reads that file; that pass runs once per suite until `stoop forget --units`. Otherwise stoop removes the placeholder and its owning option and runs the full command. Ambiguous ownership is refused with exit 2. An unchanged tree can still skip through the whole-command proof. Default-branch pushes, sync writers, and configured verification runs do not skip.
 
 On Linux and macOS, `stoop explain -- ./test '{changed:*.t}'` counts matching files without launching the test command. It does not save per-unit proofs. The optional `.stoop.toml` supplies a default `units` filter for a matching suite; an inline filter overrides it. On Windows the unit universe is unknown. See https://stoop.build/docs/cli.html#changed-hook.
 
