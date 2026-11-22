@@ -62,6 +62,7 @@ fn tracer_for(rec: Rec<'_>) -> Tracer<'_> {
         landing_inodes: HashMap::new(),
         shared_context: false,
         initial_pid_namespace: is_initial_pid_namespace(fs::read_link("/proc/self/ns/pid")),
+        lock_table: LockTable::allocate(),
         live_tasks: HashSet::new(),
         syscall: 0,
         allow_network: false,
@@ -526,7 +527,8 @@ fn source_budget_boundary_admits_only_bytes_that_can_be_hashed() {
 #[test]
 fn lock_table_accepts_exact_cap_and_fails_closed_on_read_errors() {
     let stat = landing(42, 0o100644).stat;
-    let exact = vec![b' '; 1 << 20];
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+    let exact = vec![b' '; page - LOCK_TABLE_MARGIN];
     assert!(!lock_table_lists_from(Ok(io::Cursor::new(exact)), &stat));
     assert!(lock_table_lists_from::<io::Cursor<Vec<u8>>>(
         Err(io::Error::from(io::ErrorKind::PermissionDenied)),
@@ -649,5 +651,44 @@ fn disabled_read_witness_requests_no_stop_and_preserves_legacy_inputs() {
         recorded_input_bytes(&legacy, &root, &ignore),
         "the serialized legacy input and prior records must be byte-identical"
     );
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn exhausted_budget_and_unusable_table_request_no_read_stops() {
+    let root = scratch("disabled-read-conditions");
+    let path = root.join("f");
+    fs::write(&path, b"unchanged\n").unwrap();
+    let ignore = Ignore::new(&[], None, &[]);
+    let mut legacy = tracer_for(rec_for(&root, &ignore));
+    legacy.t.seen = Some(HashMap::new());
+    legacy.touch(path.clone(), true, true);
+    let expected = recorded_input_bytes(&legacy, &root, &ignore);
+    let pid = std::process::id() as i32;
+    let spelling = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let args = path_args(&spelling);
+
+    let mut enabled = tracer_for(rec_for(&root, &ignore));
+    enabled.initial_pid_namespace = true;
+    enabled.t.seen = Some(HashMap::new());
+    let before = READ_WITNESS_STOPS.with(|count| count.get());
+    enabled.open(pid, &args, None, 1, Some(2));
+    assert_eq!(READ_WITNESS_STOPS.with(|count| count.get()), before + 1);
+
+    for unusable_table in [false, true] {
+        let mut disabled = tracer_for(rec_for(&root, &ignore));
+        disabled.initial_pid_namespace = true;
+        disabled.t.seen = Some(HashMap::new());
+        if unusable_table {
+            disabled.lock_table = None;
+        } else {
+            disabled.rec.as_mut().unwrap().rewrite_budget.hashed = identity::READ_HASH_BUDGET;
+        }
+        let before = READ_WITNESS_STOPS.with(|count| count.get());
+        disabled.open(pid, &args, None, 1, Some(2));
+        assert_eq!(READ_WITNESS_STOPS.with(|count| count.get()), before);
+        assert!(!disabled.pending_witness.contains_key(&pid));
+        assert_eq!(recorded_input_bytes(&disabled, &root, &ignore), expected);
+    }
     fs::remove_dir_all(root).unwrap();
 }
