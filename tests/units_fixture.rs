@@ -773,6 +773,11 @@ fn f12_t_fail_alone_fails_its_test_in_the_test_word_form() {
         "b still runs"
     );
     assert_eq!(launches[0].failed(), ["tests/b.t"]);
+    // The failing test still reads its files: each test prints its own line, then the content of
+    // src/shared.src and setup.src, so stdout holds that trio once per test.
+    let stdout = text(&out.stdout);
+    let reads = ["src/shared.src", "shared", "setup"];
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), [reads, reads].concat());
 
     // The no-argument form runs b and does not fail it.
     s.clear_log();
