@@ -1122,6 +1122,42 @@ fn sync() {
     pair.compare_store("writer/.stoop");
 }
 
+/// D18: a clean pass, whose launches read their own files and nothing else, prints, exits and stores what the
+/// base does. This change bumps the bundle's generation, so only the store's file list is compared.
+fn clean_pass_matches_the_base() {
+    let pair = Pair::new("clean-pass");
+    pair.write(
+        "runner",
+        "#!/bin/sh\nfor word in \"$@\"; do\n\tcat \"$word\" >/dev/null\ndone\ncat in.txt >/dev/null\nprintf 'unit\\n'\n",
+    );
+    pair.write("tests/a.t", "in.txt\n");
+    pair.write("tests/b.t", "in.txt\n");
+    for root in &pair.roots {
+        fs::set_permissions(root.join("runner"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let run = [
+        "run",
+        "--key",
+        "clean",
+        "--",
+        "./runner",
+        "{changed:**/*.t}",
+    ];
+    contains(&pair.step("D18 cold", "", &run, &[]), "recorded");
+    pair.write("in.txt", "two\n");
+    contains(
+        &pair.step("D18 clean pass", "", &run, &[]),
+        "stoop: attribution pass: 2 units, one launch each",
+    );
+    let base = store_snapshot(&pair.roots[0].join(".stoop"));
+    let subject = store_snapshot(&pair.roots[1].join(".stoop"));
+    assert_eq!(
+        base.keys().collect::<Vec<_>>(),
+        subject.keys().collect::<Vec<_>>(),
+        "D18 store file list"
+    );
+}
+
 #[test]
 #[ignore = "requires STOOP_BASE_BIN and a Linux tracer"]
 fn legacy_paths_match_the_base() {
@@ -1135,6 +1171,7 @@ fn legacy_paths_match_the_base() {
     hooked();
     attribution_not_dispatched();
     explain_of_a_suite();
+    clean_pass_matches_the_base();
     sync();
 }
 
