@@ -2044,11 +2044,12 @@ pub(crate) fn build_inputs_with(
         {
             continue;
         }
-        // The repository root, under either spelling, is `.` for unit proofs. The tracer keys it as
-        // "" and keeps it only while that key is not ignored (`record_touch`), so the same test
-        // decides here. A root that was only stat'ed was never listed and records nothing.
-        if root_listing == RootListing::Record && (key.is_empty() || lex == &real_root) {
-            if touch.listed && !ignore.is_ignored(&key) {
+        // The repository root is `.` for unit proofs when its launch listed it. The tracer keeps it
+        // only while "" is not ignored (`record_touch`); the same test decides here. A root that was
+        // only stat'ed records nothing. A launch that wrote a top-level entry itself is not compared
+        // against the root (`identity::skip`), so `.` is the listing after that launch.
+        if root_listing == RootListing::Record && key.is_empty() {
+            if touch.listed && !ignore.is_ignored("") {
                 cands.push((lex.clone(), ".".to_owned(), inside, true, None));
             }
             continue;
