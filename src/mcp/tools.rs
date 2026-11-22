@@ -485,13 +485,17 @@ fn explain(root: &Path, args: &Args, cancelled: &mut dyn FnMut() -> bool) -> Ste
             reason = Some(r);
             in_proof = false;
         } else if let Some(rest) = line.strip_prefix("stoop: would run ") {
-            let rest = rest.strip_prefix("full ").unwrap_or(rest);
-            if rest.starts_with("without a proof") {
-                reason = Some(rest.to_string());
-            } else {
-                let (k, r) = split_key(rest);
-                key = Some(k);
-                reason = Some(r);
+            // The attribution pass line is a second decision about the same command, and it names no
+            // proof. The legacy line before it carries the key, so this line leaves key and reason alone.
+            if !rest.starts_with("an attribution pass:") {
+                let rest = rest.strip_prefix("full ").unwrap_or(rest);
+                if rest.starts_with("without a proof") {
+                    reason = Some(rest.to_string());
+                } else {
+                    let (k, r) = split_key(rest);
+                    key = Some(k);
+                    reason = Some(r);
+                }
             }
             in_proof = false;
         } else if line.starts_with("stoop:") {
