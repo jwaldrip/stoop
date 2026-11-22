@@ -12,7 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -25,6 +25,18 @@ pub const ROSTER: [&str; 3] = ["tests/a.t", "tests/b.t", "tests/c.t"];
 const RUNNER: &str = include_str!("../fixtures/hook/t");
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
+
+/// Writing an executable and spawning a child must not overlap. A child forked while a
+/// writer's descriptor is open inherits it, and exec of that file then fails with `ETXTBSY`
+/// until the child exits. Writers take the write side around the write, which closes the
+/// file before the lock is released. Every spawn takes the read side, which returns once the
+/// child has exec'd (Rust's `spawn` reports exec failure through a close-on-exec pipe).
+static EXEC: RwLock<()> = RwLock::new(());
+
+fn spawning<T>(spawn: impl FnOnce() -> T) -> T {
+    let _guard = EXEC.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+    spawn()
+}
 
 /// A suite under the system temporary folder: `root/` holds the runner and tree, `outside/`
 /// holds the log and FIFOs. Paths under the root are root-relative, so `/tmp` ignores never apply.
@@ -79,6 +91,9 @@ impl Suite {
 
     /// Write a root-relative file that is executable, as the runner and `lint` must be.
     pub fn executable(&self, rel: &str, body: &str) {
+        let _guard = EXEC
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.write(rel, body);
         fs::set_permissions(self.root.join(rel), fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -95,16 +110,18 @@ impl Suite {
     /// Make the root a Git repository on `branch`, committing everything in it.
     pub fn git(&self, branch: &str) {
         let run = |args: &[&str]| {
-            let status = Command::new("git")
-                .current_dir(&self.root)
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .env("HOME", &self.outside)
-                .env("GIT_CONFIG_NOSYSTEM", "1")
-                .env("GIT_CONFIG_GLOBAL", "/dev/null")
-                .args(args)
-                .status()
-                .unwrap();
+            let status = spawning(|| {
+                Command::new("git")
+                    .current_dir(&self.root)
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("HOME", &self.outside)
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .args(args)
+                    .status()
+            })
+            .unwrap();
             assert!(status.success(), "git {args:?}");
         };
         run(&["init", "-q"]);
@@ -126,11 +143,13 @@ impl Suite {
 
     /// Set a root-relative file's modification time to 2000-01-01, so it is older than any run.
     pub fn age(&self, rel: &str) {
-        let status = Command::new("touch")
-            .args(["-t", "200001010000"])
-            .arg(self.root.join(rel))
-            .status()
-            .unwrap();
+        let status = spawning(|| {
+            Command::new("touch")
+                .args(["-t", "200001010000"])
+                .arg(self.root.join(rel))
+                .status()
+        })
+        .unwrap();
         assert!(status.success(), "touch {rel}");
     }
 
@@ -162,7 +181,7 @@ impl Suite {
         for (name, value) in env {
             command.env(name, value);
         }
-        command.output().unwrap()
+        spawning(|| command.output()).unwrap()
     }
 
     /// The pinned hook, run from the root: `stoop run -- ./t '{changed:**/*.t|!slow/**}'`.
@@ -177,7 +196,7 @@ impl Suite {
             .args(["explain", "--root"])
             .arg(&self.root)
             .args(["--", "./t", HOOK]);
-        command.output().unwrap()
+        spawning(|| command.output()).unwrap()
     }
 
     /// The runner itself, run directly with `LOG` set and no stoop around it.
@@ -208,7 +227,7 @@ impl Suite {
         for (name, value) in env {
             command.env(name, value);
         }
-        command.spawn().unwrap()
+        spawning(|| command.spawn()).unwrap()
     }
 
     /// Every invocation the runner logged, in order.
