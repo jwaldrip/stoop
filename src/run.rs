@@ -823,6 +823,32 @@ pub fn learning_on(o: &Opts) -> bool {
     }
 }
 
+struct RunCx<'a> {
+    o: &'a Opts,
+    cwd: &'a PathBuf,
+    root: &'a PathBuf,
+    rel_cwd: &'a String,
+    scope: &'a Option<String>,
+    store: &'a Store,
+    hook: &'a Option<units::hook::Hook>,
+    full_reason: &'a Option<String>,
+    max_age: u64,
+    bypass: bool,
+    explain: bool,
+    observe_runners: bool,
+    env_now: BTreeMap<String, String>,
+    env_excluded: Vec<String>,
+    salt: &'a Option<Vec<u8>>,
+    remote: Option<Remote>,
+}
+
+struct Lookup {
+    proofs: Vec<Proof>,
+    hit_idx: Option<usize>,
+    why: String,
+    t0: Instant,
+}
+
 fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     let initial_key = o.key.clone().unwrap_or_default();
     if o.argv.is_empty() {
@@ -1168,7 +1194,6 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         .map(|(name, _)| name.clone())
         .collect();
     let env_now = env_hashes(&volatile.plan.counted, salt.as_deref());
-    let excluded_now: std::collections::BTreeSet<&String> = env_excluded.iter().collect();
 
     let remote = o
         .sync
@@ -1184,10 +1209,46 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 }
             }
         });
+    let cx = RunCx {
+        o: &o,
+        cwd: &cwd,
+        root: &root,
+        rel_cwd: &rel_cwd,
+        scope: &scope,
+        store: &store,
+        hook: &hook,
+        full_reason: &full_reason,
+        max_age,
+        bypass,
+        explain,
+        observe_runners,
+        env_now,
+        env_excluded,
+        salt: &salt,
+        remote,
+    };
+    let lookup = legacy_lookup(&cx, &key);
+    legacy_finish(cx, key, lookup)
+}
+
+fn legacy_lookup(cx: &RunCx<'_>, key: &str) -> Lookup {
+    let o = cx.o;
+    let cwd = cx.cwd;
+    let root = cx.root;
+    let rel_cwd = cx.rel_cwd;
+    let scope = cx.scope;
+    let store = cx.store;
+    let max_age = cx.max_age;
+    let bypass = cx.bypass;
+    let explain = cx.explain;
+    let env_now = &cx.env_now;
+    let env_excluded = &cx.env_excluded;
+    let remote = &cx.remote;
+    let excluded_now: std::collections::BTreeSet<&String> = env_excluded.iter().collect();
 
     // 1. Is there a proof whose inputs all still match?
     let t0 = Instant::now();
-    let mut proofs = if bypass { Vec::new() } else { store.load(&key) };
+    let mut proofs = if bypass { Vec::new() } else { store.load(key) };
     let mut pulled = false;
     let mut probe_now: Option<Option<BTreeMap<String, String>>> = None;
     let mut why;
@@ -1203,11 +1264,11 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 vec![("provenance".to_string(), "changed")]
             } else if p.cwd.as_deref() != Some(rel_cwd.as_str()) {
                 vec![("directory".to_string(), "changed")]
-            } else if p.scope != scope {
+            } else if &p.scope != scope {
                 vec![("repository".to_string(), "changed")]
             } else if expired {
                 vec![("proof".to_string(), "expired")]
-            } else if p.env != env_now {
+            } else if &p.env != env_now {
                 vec![("env".to_string(), "changed")]
             } else if p
                 .env_excluded
@@ -1217,13 +1278,13 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             {
                 vec![("env exclusions".to_string(), "changed")]
             } else {
-                let mut d: Vec<(String, &'static str)> = verify(&root, &p.inputs, explain)
+                let mut d: Vec<(String, &'static str)> = verify(root, &p.inputs, explain)
                     .into_iter()
                     .map(|m| (m.path, m.why))
                     .collect();
                 if d.is_empty() {
                     // Inputs match, but a skip also needs what the run produced to be in place.
-                    d = verify(&root, &p.outputs, explain)
+                    d = verify(root, &p.outputs, explain)
                         .into_iter()
                         .map(|m| {
                             (
@@ -1238,7 +1299,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             let mut diffs = diffs;
             if diffs.is_empty() && (!p.probes.is_empty() || !o.probes.is_empty()) {
                 // External state is checked last: it can be slow, and files rule most proofs out first.
-                let fresh = probe_now.get_or_insert_with(|| run_probes(&o.probes, &cwd, o.quiet));
+                let fresh = probe_now.get_or_insert_with(|| run_probes(&o.probes, cwd, o.quiet));
                 match fresh {
                     None => diffs.push(("probe".to_string(), "failed")),
                     Some(m) if *m != p.probes => {
@@ -1278,15 +1339,42 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             break;
         }
         pulled = true;
-        match remote.as_ref().map(|r| r.pull(&store, &key)) {
+        match remote.as_ref().map(|r| r.pull(store, key)) {
             Some(Ok(0)) | None => break,
-            Some(Ok(_)) => proofs = store.load(&key),
+            Some(Ok(_)) => proofs = store.load(key),
             Some(Err(e)) => {
                 eprintln!("stoop: sync: could not fetch proofs ({e}); continuing");
                 break;
             }
         }
     }
+    Lookup {
+        proofs,
+        hit_idx,
+        why,
+        t0,
+    }
+}
+
+fn legacy_finish(cx: RunCx<'_>, key: String, lookup: Lookup) -> Outcome {
+    let Lookup {
+        proofs,
+        hit_idx,
+        mut why,
+        t0,
+    } = lookup;
+    let o = cx.o;
+    let cwd = cx.cwd;
+    let root = cx.root;
+    let rel_cwd = cx.rel_cwd;
+    let scope = cx.scope;
+    let store = cx.store;
+    let hook = cx.hook;
+    let full_reason = cx.full_reason;
+    let explain = cx.explain;
+    let observe_runners = cx.observe_runners;
+    let salt = cx.salt;
+    let remote = &cx.remote;
     let hit: Option<&Proof> = hit_idx.map(|i| &proofs[i]);
     if let Some(p) = hit {
         if full_reason.is_none() {
@@ -1307,12 +1395,12 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         why = full_reason.clone().unwrap_or_else(|| why.clone());
     }
     if hook.is_some() {
-        if let Some(reason) = &full_reason {
+        if let Some(reason) = full_reason {
             why.clone_from(reason);
         }
     }
     if explain {
-        match &hook {
+        match hook {
             Some(h) => eprintln!(
                 "stoop: would run full {key} ({why}): removed {}, argv {}",
                 units::hook::show(&h.removed),
@@ -1327,7 +1415,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         };
     }
     if !o.quiet {
-        match &hook {
+        match hook {
             Some(h) => eprintln!(
                 "stoop: run full {key} ({why}): removed {}",
                 units::hook::show(&h.removed)
@@ -1340,27 +1428,18 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     let probes_before = if o.probes.is_empty() {
         Some(BTreeMap::new())
     } else {
-        run_probes(&o.probes, &cwd, o.quiet)
+        run_probes(&o.probes, cwd, o.quiet)
     };
     // Declaring a probe is declaring the external dependency, so network use is accepted.
     // The ignore set and the scope are fixed before the run: priors are recorded against them.
     let ignore = Ignore::new(&o.ignore, Some(&root.join(".stoopignore")), &o.transient);
-    let real_root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
-    let trace_scope = (!o.no_record).then(|| trace::Scope {
-        root: &root,
-        real_root: real_root.clone(),
-        ignore: &ignore,
-        // One attribute snapshot per run, taken before the command can change anything.
-        oid_epoch: trace::supported()
-            .then(|| crate::oid_attrs::capture(&real_root))
-            .flatten()
-            .map(Arc::new),
-    });
-    let trace = match trace::run(
+    let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
+    let trace = match launch_traced(
+        &cx,
         &o.argv,
-        &cwd,
+        &ignore,
+        &real_root,
         o.allow_network || !o.probes.is_empty(),
-        trace_scope.as_ref(),
         observe_runners && !o.no_record && !o.quiet,
     ) {
         Ok(t) => t,
@@ -1406,8 +1485,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             };
         }
         Some(before) => {
-            if !o.probes.is_empty()
-                && run_probes(&o.probes, &cwd, o.quiet).as_ref() != Some(&before)
+            if !o.probes.is_empty() && run_probes(&o.probes, cwd, o.quiet).as_ref() != Some(&before)
             {
                 if !o.quiet {
                     eprintln!("stoop: not recorded: a probe changed while the command ran");
@@ -1423,28 +1501,15 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     };
 
     // 3. It passed: write down what it read, what it wrote, and what each written path held before.
-    let mut phys = Physical::new(&root, &real_root);
-    let written: BTreeSet<String> = trace.keys.values().cloned().collect();
-    match build_inputs(&root, &mut phys, &trace, &ignore, &written) {
-        Ok((mut inputs, read_reasons)) => {
-            let (outputs, removed, write_reasons, verified) =
-                build_outputs(&real_root, &written, &trace);
-            let priors = build_priors(&trace);
-            if !verified.is_empty() {
-                let original_len = inputs.len();
-                for key in verified {
-                    if inputs[..original_len]
-                        .binary_search_by(|input| input.path.cmp(&key))
-                        .is_ok()
-                    {
-                        continue;
-                    }
-                    if let Ok(index) = priors.binary_search_by(|prior| prior.path.cmp(&key)) {
-                        inputs.push(priors[index].clone());
-                    }
-                }
-                inputs.sort_by(|a, b| a.path.cmp(&b.path));
-            }
+    match assemble(root, &real_root, &trace, &ignore) {
+        Ok(Assembled {
+            inputs,
+            outputs,
+            removed,
+            priors,
+            read_reasons,
+            write_reasons,
+        }) => {
             let n = inputs.len();
             let proof = Proof {
                 created: now(),
@@ -1456,8 +1521,8 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                 cwd: Some(rel_cwd.clone()),
                 scope: scope.clone(),
                 provenance: Some(trace::Provenance::current()),
-                env: env_now,
-                env_excluded,
+                env: cx.env_now,
+                env_excluded: cx.env_excluded,
                 inputs,
                 outputs,
                 probes,
@@ -1473,7 +1538,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             if let Some(r) = remote.as_ref().filter(|r| r.write) {
                 // Fold in anything other runs published since we looked, so a push never
                 // drops their proofs.
-                if let Err(e) = r.pull(&store, &key) {
+                if let Err(e) = r.pull(store, &key) {
                     eprintln!("stoop: sync: could not refresh from the remote ({e}); continuing");
                 }
             }
@@ -1500,7 +1565,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
                         "stoop: sync: publishing environment hashes without {SALT_VAR}. In a public repository set it from a repository secret so low-entropy values cannot be guessed offline."
                     );
                 }
-                match r.push(&store, &key) {
+                match r.push(store, &key) {
                     Ok(()) if !o.quiet => eprintln!("stoop: published {key} to the remote"),
                     Ok(()) => {}
                     Err(e) => eprintln!("stoop: sync: could not publish ({e}); continuing"),
@@ -1527,6 +1592,78 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         key,
         how: How::Unrecorded("inputs could not be recorded".into()),
     }
+}
+
+fn launch_traced(
+    cx: &RunCx<'_>,
+    argv: &[OsString],
+    ignore: &Ignore,
+    real_root: &Path,
+    allow_network: bool,
+    observe_execs: bool,
+) -> std::io::Result<Trace> {
+    let trace_scope = (!cx.o.no_record).then(|| trace::Scope {
+        root: cx.root,
+        real_root: real_root.to_path_buf(),
+        ignore,
+        // One attribute snapshot per run, taken before the command can change anything.
+        oid_epoch: trace::supported()
+            .then(|| crate::oid_attrs::capture(real_root))
+            .flatten()
+            .map(Arc::new),
+    });
+    trace::run(
+        argv,
+        cx.cwd,
+        allow_network,
+        trace_scope.as_ref(),
+        observe_execs,
+    )
+}
+
+struct Assembled {
+    inputs: Vec<Input>,
+    outputs: Vec<Input>,
+    removed: Vec<String>,
+    priors: Vec<Input>,
+    read_reasons: Vec<String>,
+    write_reasons: Vec<String>,
+}
+
+fn assemble(
+    root: &Path,
+    real_root: &Path,
+    trace: &Trace,
+    ignore: &Ignore,
+) -> Result<Assembled, NotRecorded> {
+    let mut phys = Physical::new(root, real_root);
+    let written: BTreeSet<String> = trace.keys.values().cloned().collect();
+    let (mut inputs, read_reasons) = build_inputs(root, &mut phys, trace, ignore, &written)?;
+    let (outputs, removed, write_reasons, verified) = build_outputs(real_root, &written, trace);
+    let priors = build_priors(trace);
+    if !verified.is_empty() {
+        let original_len = inputs.len();
+        for key in verified {
+            if inputs[..original_len]
+                .binary_search_by(|input| input.path.cmp(&key))
+                .is_ok()
+            {
+                continue;
+            }
+            if let Ok(index) = priors.binary_search_by(|prior| prior.path.cmp(&key)) {
+                inputs.push(priors[index].clone());
+            }
+        }
+        inputs.sort_by(|a, b| a.path.cmp(&b.path));
+    }
+    Ok(Assembled {
+        inputs,
+        outputs,
+        removed,
+        priors,
+        read_reasons,
+        write_reasons,
+    })
 }
 
 fn landing_verified(
