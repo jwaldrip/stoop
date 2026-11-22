@@ -177,7 +177,7 @@ pub(crate) fn argv_with(
 }
 
 /// `argv_with` for a hook without list paths: the argv the expansion tests pin for one unit.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn argv(hook: &Hook, unit: &str, root: &Path, cwd: &Path) -> Option<Vec<OsString>> {
     argv_with(hook, unit, root, cwd, &|_, _| None)
 }
@@ -208,7 +208,7 @@ pub(crate) fn expands(hook: &Hook, units: &[String], root: &Path, cwd: &Path) ->
 }
 
 /// The launch for every unit of the roster, in roster order, for a hook without list forms.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn launches(
     hook: &Hook,
     units: &[String],
