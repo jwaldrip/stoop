@@ -21,7 +21,7 @@ stoop: skip sh-c98f8f9c8fef6d65: 71 inputs unchanged since 0s ago (100ms)</code>
 </dl>
 
 <h2 id="root-listing">Listing the repository root</h2>
-<p>A proof does not record the entry list of the repository root. Other directory entry lists are recorded only when listed and not ignored or written by the run. If a command depends on which top-level names exist but only lists the root, the listing alone will not trigger a rerun when a file appears or disappears. If it also reads or looks up the file, its own recorded input can trigger a rerun when it disappears. A non-ignored top-level name looked up and not found can be recorded as absent, so creating it triggers a rerun.</p>
+<p>stoop does not record the entry list of the repository root as stoop resolves it. A command that depends only on which top-level names exist, and that does not open or stat a name that then appears or disappears, can be skipped after a top-level name appears or disappears.</p>
 
 <h2 id="clock">The clock and randomness</h2>
 <p>A test that depends on today's date, or on a random seed, reads nothing that a trace can see. Two settings bound how long that can hide:</p>
