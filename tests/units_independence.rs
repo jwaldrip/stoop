@@ -140,6 +140,7 @@ for word in \"$@\"; do
 	esac
 done
 cat setup.src > /dev/null
+cat src/shared.src > /dev/null
 ";
 
 // I0 (guard, passes on the base and on this tree): the glued value form expands to one launch per unit,
