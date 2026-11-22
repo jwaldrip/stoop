@@ -886,15 +886,20 @@ fn sync() {
     contains(&text, "recorded");
     assert!(!text.contains("stoop: published"), "{text}");
     let mut jobs = Vec::new();
+    let mut proofs = Vec::new();
     for root in &pair.roots {
         let remote = root.join("remote.git");
-        let job = remote_ref(&remote, "job-w5r");
+        let mut job = remote_ref(&remote, "job-w5r");
         assert_eq!(job["records"][0]["steps"][0]["key"], step_key);
+        without_created(&mut job);
+        jobs.push(job);
         let mut proof = remote_ref(&remote, &step_key);
         without_created(&mut proof);
-        jobs.push(proof);
+        proofs.push(proof);
     }
-    assert_eq!(jobs[0], jobs[1], "D14 deferred proof");
+    assert_eq!(jobs[0], jobs[1], "D14 deferred job");
+    assert_eq!(proofs[0], proofs[1], "D14 deferred proof");
+    pair.compare_store("source/.stoop");
     pair.compare_store("writer/.stoop");
 }
 
