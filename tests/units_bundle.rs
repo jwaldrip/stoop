@@ -131,19 +131,30 @@ fn success(out: &Output) {
     );
 }
 
-fn suite_id(scope: &str, cwd: &str, argv: &[&OsStr], label: &str) -> String {
+fn suite_id(scope: Option<&str>, cwd: &str, argv: &[&OsStr], label: Option<&str>) -> String {
+    fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
+        hash.update(&(bytes.len() as u64).to_le_bytes());
+        hash.update(bytes);
+    }
+    fn optional(hash: &mut blake3::Hasher, value: Option<&str>) {
+        match value {
+            None => {
+                hash.update(&[0]);
+            }
+            Some(value) => {
+                hash.update(&[1]);
+                field(hash, value.as_bytes());
+            }
+        }
+    }
     let mut hash = blake3::Hasher::new_derive_key("stoop suite id v1");
-    for field in [b"hook".as_slice(), scope.as_bytes(), cwd.as_bytes()] {
-        hash.update(&(field.len() as u64).to_le_bytes());
-        hash.update(field);
-    }
+    field(&mut hash, b"hook");
+    optional(&mut hash, scope);
+    field(&mut hash, cwd.as_bytes());
     for word in argv {
-        let field = word.as_bytes();
-        hash.update(&(field.len() as u64).to_le_bytes());
-        hash.update(field);
+        field(&mut hash, word.as_bytes());
     }
-    hash.update(&(label.len() as u64).to_le_bytes());
-    hash.update(label.as_bytes());
+    optional(&mut hash, label);
     hash.finalize().to_hex()[..32].to_string()
 }
 
@@ -180,6 +191,16 @@ struct SavedProof {
     provenance: Option<SavedProvenance>,
 }
 
+fn only_file(dir: &Path) -> PathBuf {
+    let mut files: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension() == Some(OsStr::new("json")))
+        .collect();
+    assert_eq!(files.len(), 1, "{files:?}");
+    files.remove(0)
+}
+
 fn digest_saved_proof(path: &Path) -> String {
     let file: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
     let proof: SavedProof = serde_json::from_value(file["proofs"][0].clone()).unwrap();
@@ -211,16 +232,15 @@ fn a_passing_hook_records_the_roster_and_saved_whole_proof_digest() {
     assert_eq!(
         id,
         suite_id(
-            "",
+            None,
             "",
             &[f.runner.as_os_str(), OsStr::new("{changed:*.t}")],
-            ""
+            None,
         )
     );
     assert_eq!(bundle["v"], 1);
     assert_eq!(bundle["generation"], 1);
     assert_eq!(bundle["suite"], id);
-    assert_eq!(bundle["roster"]["filter"], "*.t");
     assert_eq!(
         bundle["roster"]["units"],
         serde_json::json!(["tests/a.t", "tests/b.t"])
@@ -230,8 +250,10 @@ fn a_passing_hook_records_the_roster_and_saved_whole_proof_digest() {
     assert_eq!(bundle["units"], serde_json::json!({}));
     assert!(bundle.get("state").is_some());
     assert!(bundle.get("residue").is_some());
-    let key = bundle["whole_key"].as_str().unwrap();
-    let proof = f.root.join(".stoop/proofs").join(format!("{key}.json"));
+    assert!(bundle["roster"].get("filter").is_none());
+    assert!(bundle["origin"].get("argv").is_none());
+    assert!(bundle["origin"].get("label").is_none());
+    let proof = only_file(&f.root.join(".stoop/proofs"));
     assert_eq!(bundle["whole"], digest_saved_proof(&proof));
 }
 
@@ -337,10 +359,7 @@ fn forget_units_removes_the_bundle_and_its_lock_but_not_the_whole_proof() {
     success(&f.run(&[], Some("{changed:*.t}"), &[]));
     let (path, bundle) = f.one_bundle();
     let id = bundle["suite"].as_str().unwrap();
-    let proof = f
-        .root
-        .join(".stoop/proofs")
-        .join(format!("{}.json", bundle["whole_key"].as_str().unwrap()));
+    let proof = only_file(&f.root.join(".stoop/proofs"));
     let lock = path.with_extension("lock");
     assert!(lock.exists());
     success(&f.cli("forget", &["--units", id]));
@@ -440,16 +459,16 @@ fn suite_id_binds_cwd_scope_label_and_original_arguments() {
     assert_eq!(ids.len(), 4, "{ids:?}");
     assert!(ids.contains(&id));
     assert!(ids.contains(&suite_id(
-        "",
+        None,
         "",
         &[f.runner.as_os_str(), OsStr::new("{changed:*.t}")],
-        "named"
+        Some("named")
     )));
     assert!(ids.contains(&suite_id(
-        "",
+        None,
         "sub",
         &[f.runner.as_os_str(), OsStr::new("{changed:*.t}")],
-        ""
+        None
     )));
     let store = f.root.join("other-store");
     success(&f.run(
@@ -468,10 +487,10 @@ fn suite_id_binds_cwd_scope_label_and_original_arguments() {
     assert_eq!(
         other["suite"],
         suite_id(
-            scope,
+            Some(scope),
             "",
             &[f.runner.as_os_str(), OsStr::new("{changed:*.t}")],
-            ""
+            None,
         )
     );
 }

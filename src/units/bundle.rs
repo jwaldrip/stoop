@@ -23,16 +23,16 @@ static NEXT: AtomicU64 = AtomicU64::new(0);
 #[derive(Serialize, Deserialize)]
 struct Origin {
     kind: String,
-    argv: Vec<String>,
     cwd: String,
     scope: Option<String>,
-    label: Option<String>,
+    /// A digest of the argument words and the label, bound to the suite ID. The words themselves
+    /// are never stored: a secret passed as an argument must not reach the suite store.
+    invocation: String,
 }
 
 #[derive(Serialize, Deserialize)]
 struct Roster {
     source: String,
-    filter: String,
     units: Vec<String>,
 }
 
@@ -106,7 +106,8 @@ struct SuiteBundleV1 {
     suite: String,
     provenance: Provenance,
     origin: Origin,
-    whole_key: String,
+    /// A digest of the legacy whole-command key, which names the program as typed.
+    whole_key_digest: String,
     whole: Option<String>,
     policy: String,
     guard: LaunchGuard,
@@ -189,6 +190,23 @@ fn suite_id(argv: &[OsString], cwd: &str, scope: Option<&str>, label: Option<&st
     hash.finalize().to_hex()[..32].to_string()
 }
 
+/// A domain-separated digest of the invocation. It stands in for the argument text, which is
+/// never persisted: the suite ID binds the same inputs.
+fn invocation_digest(argv: &[OsString], label: Option<&str>) -> String {
+    let mut hash = blake3::Hasher::new_derive_key("stoop suite invocation v1");
+    for word in argv {
+        field(&mut hash, word.as_encoded_bytes());
+    }
+    optional(&mut hash, label);
+    hash.finalize().to_hex().to_string()
+}
+
+fn digest_text(context: &str, text: &str) -> String {
+    let mut hash = blake3::Hasher::new_derive_key(context);
+    field(&mut hash, text.as_bytes());
+    hash.finalize().to_hex().to_string()
+}
+
 pub(crate) struct PendingSpec<'a> {
     pub argv: &'a [OsString],
     pub cwd: &'a str,
@@ -217,10 +235,9 @@ pub(crate) fn pending(spec: PendingSpec<'_>) -> Option<Pending> {
     if units.is_empty() || units.len() > MAX_UNITS || !valid_roster(&units) {
         return None;
     }
-    let words = argv
-        .iter()
-        .map(|word| word.to_str().map(str::to_owned))
-        .collect::<Option<Vec<_>>>()?;
+    if argv.iter().any(|word| word.to_str().is_none()) {
+        return None;
+    }
     let mut hash = blake3::Hasher::new_derive_key("stoop suite policy v1");
     field(&mut hash, source.as_bytes());
     field(&mut hash, filter.as_bytes());
@@ -230,14 +247,12 @@ pub(crate) fn pending(spec: PendingSpec<'_>) -> Option<Pending> {
         suite: suite_id(argv, cwd, scope, label),
         origin: Origin {
             kind: "hook".into(),
-            argv: words,
             cwd: cwd.into(),
             scope: scope.map(str::to_owned),
-            label: label.map(str::to_owned),
+            invocation: invocation_digest(argv, label),
         },
         roster: Roster {
             source: source.into(),
-            filter: filter.into(),
             units,
         },
         policy: hash.finalize().to_hex().to_string(),
@@ -433,7 +448,7 @@ pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, pr
         suite: pending.suite,
         provenance,
         origin: pending.origin,
-        whole_key: key.into(),
+        whole_key_digest: digest_text("stoop whole key v1", key),
         whole: Some(digest.into()),
         policy: pending.policy,
         guard,
@@ -577,7 +592,7 @@ mod tests {
             suite: pending.suite,
             provenance: Provenance::current(),
             origin: pending.origin,
-            whole_key: "hook-key".into(),
+            whole_key_digest: "key".into(),
             whole: Some("p-123".into()),
             policy: pending.policy,
             guard: LaunchGuard {
