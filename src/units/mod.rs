@@ -1,3 +1,4 @@
+pub(crate) mod bundle;
 pub(crate) mod config;
 pub(crate) mod filter;
 pub(crate) mod hook;

@@ -38,8 +38,8 @@ USAGE
   stoop run [options] -- <command> [args...]    skip or run (the default)
   stoop explain [options] -- <command> [args...] say what would run and why
   stoop sh <script> [args...]                   shell mode for CI (see below)
-  stoop ls [--store DIR]                        list recorded proofs
-  stoop forget [--volatile] <key> [--store DIR]  drop a proof (--volatile: what was learned)
+  stoop ls [--store DIR]                        list recorded proofs and suites
+  stoop forget [--volatile | --units] <key>     drop a proof, learned names, or a suite
   stoop plan [options]                          plan experimental job skips
   stoop mcp [--allow-run] [--root DIR]          serve stoop to AI agents (stoop mcp --help)
   stoop pull | prune [--sync git[:remote]]       fetch or expire shared proofs
@@ -225,6 +225,12 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
                 }
                 Err(error) => eprintln!("{error}"),
             }
+            for (line, warning) in run::units::bundle::list(&suite_store_for(&o)) {
+                println!("{line}");
+                if let Some(warning) = warning {
+                    eprintln!("{warning}");
+                }
+            }
             0
         }
         "forget" => {
@@ -241,6 +247,23 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
                 return 1;
             };
             let key = key.as_str();
+            if o.units_forget && o.volatile_forget {
+                eprintln!("stoop: --units and --volatile cannot be combined");
+                return 2;
+            }
+            if o.units_forget {
+                return match run::units::bundle::forget(&suite_store_for(&o), key) {
+                    Ok(true) => 0,
+                    Ok(false) => {
+                        eprintln!("stoop: no suite named {}", run::safe(key));
+                        1
+                    }
+                    Err(error) => {
+                        eprintln!("stoop: cannot forget suite: {error}");
+                        1
+                    }
+                };
+            }
             if o.volatile_forget {
                 return match run::forget_volatile(&o, &proof::sanitize(key)) {
                     Ok(true) => 0,
@@ -349,6 +372,12 @@ fn store_for(o: &Opts) -> proof::Store {
     proof::Store::new(run::store_for(o, &cwd, &root))
 }
 
+fn suite_store_for(o: &Opts) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let root = run::root_for(o, &cwd);
+    run::store_for(o, &cwd, &root)
+}
+
 fn jobs_for(o: &Opts) -> job::JobStore {
     let cwd = std::env::current_dir().unwrap_or_default();
     let root = run::root_for(o, &cwd);
@@ -397,6 +426,7 @@ fn parse(args: &[OsString]) -> Result<(Opts, Vec<OsString>), String> {
             "--ignore-env" => o.ignore_env.push(val("--ignore-env")?),
             "--no-learn-volatile" => o.no_learn_volatile = true,
             "--volatile" => o.volatile_forget = true,
+            "--units" => o.units_forget = true,
             "--max-age" => o.max_age = Some(run::parse_age(&val("--max-age")?)?),
             "--probe" => o.probes.push(val("--probe")?),
             "--sync" => o.sync = Some(val("--sync")?),
