@@ -529,3 +529,62 @@ mod recorded {
         m.finish();
     }
 }
+
+/// A hooked suite after a change: the MCP `explain` tool reports the proof key of the legacy decision,
+/// not the first word of the attribution pass line that follows it (spec 4.16). Linux only, because
+/// the pass needs the tracer.
+#[cfg(target_os = "linux")]
+#[test]
+fn explain_of_a_hooked_suite_after_a_change_reports_the_proof_key() {
+    let dir = temp_dir("suite-key");
+    fs::create_dir_all(dir.join("tests")).unwrap();
+    fs::write(dir.join("tests/a.t"), "one\n").unwrap();
+    fs::write(dir.join("tests/b.t"), "two\n").unwrap();
+    let words = [
+        "sh",
+        "-c",
+        "for f in \"$@\"; do cat \"$f\" > /dev/null; done",
+        "sh",
+        "{changed:**/*.t}",
+    ];
+    let run = std::process::Command::new(env!("CARGO_BIN_EXE_stoop"))
+        .current_dir(&dir)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &dir)
+        .env("STOOP_LEARN_VOLATILE", "0")
+        .args(["run", "--root"])
+        .arg(&dir)
+        .arg("--")
+        .args(words)
+        .output()
+        .unwrap();
+    assert_eq!(
+        run.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let proofs: Vec<PathBuf> = fs::read_dir(dir.join(".stoop/proofs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(proofs.len(), 1, "{proofs:?}");
+    let proof: Value = serde_json::from_slice(&fs::read(&proofs[0]).unwrap()).unwrap();
+    let key = proof["key"].as_str().unwrap().to_owned();
+    fs::write(dir.join("tests/a.t"), "one, edited\n").unwrap();
+    let mut m = Mcp::spawn(&[], &dir);
+    let r = call(&mut m, 1, "explain", json!({ "argv": words }));
+    let res = result(&r);
+    assert_eq!(res["isError"], false, "{r}");
+    assert_eq!(sc(res)["decision"], "run", "{r}");
+    assert!(
+        sc(res)["lines"]
+            .to_string()
+            .contains("stoop: would run an attribution pass"),
+        "the pass line is printed: {r}"
+    );
+    assert_eq!(sc(res)["key"], key.as_str(), "{r}");
+    m.finish();
+    fs::remove_dir_all(&dir).unwrap();
+}

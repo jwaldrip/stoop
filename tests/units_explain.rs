@@ -14,6 +14,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Output;
 use units_common::*;
@@ -42,6 +43,8 @@ const NO_PASS_OPTIONS: &str = "stoop: no attribution pass: --no-record, --allow-
 const NO_PASS_FORCED: &str = "stoop: no attribution pass: the run is forced to the full command";
 const NO_PASS_OFF: &str =
     "stoop: no attribution pass: STOOP_OFF turns tracing off, so the run is the full command";
+const NO_PASS_UNWRITABLE: &str =
+    "stoop: no attribution pass: the suite store cannot take a new entry";
 const NO_PASS_NO_BUNDLE: &str =
     "stoop: no attribution pass: the suite has no current record of an earlier full run";
 const NO_PASS_NO_UNITS: &str = "stoop: no attribution pass: the filter selects no unit";
@@ -82,10 +85,26 @@ fn id_of(tracked: &str) -> String {
         .to_owned()
 }
 
-/// Distinct inputs the suite's bundle knows: its table's length, and 0 with no bundle.
+/// The distinct inputs the roster's unit proofs name, read from the bundle's stored deltas. The table
+/// also holds outputs, so its length is not this count.
 fn inputs(s: &Suite) -> usize {
-    s.bundle()
-        .map_or(0, |bundle| bundle["table"].as_array().unwrap().len())
+    let Some(bundle) = s.bundle() else {
+        return 0;
+    };
+    let mut indices: Vec<u64> = Vec::new();
+    for unit in ROSTER {
+        for version in bundle["units"][unit].as_array().into_iter().flatten() {
+            let mut index = 0;
+            for (at, step) in version["inputs"].as_array().unwrap().iter().enumerate() {
+                let step = step.as_u64().unwrap();
+                index = if at == 0 { step } else { index + step };
+                indices.push(index);
+            }
+        }
+    }
+    indices.sort_unstable();
+    indices.dedup();
+    indices.len()
 }
 
 /// The tracked line for `proven` of the three units, with the bundle's current input count.
@@ -210,20 +229,25 @@ fn a_recorded_suite_after_a_change_predicts_the_pass() {
     assert_eq!(decision, WOULD_PASS);
 }
 
-// E4: after the pass, three units are proven. Explain counts them and names the proof that keeps the
-// full command: a unit already has one.
+// E4: after the pass, three units are proven. Each unit also writes out.txt, an output, so the bundle's
+// table holds that entry as well. The tracked line counts the distinct inputs the proofs name, which is
+// fewer than the table's entries.
 #[test]
 fn a_suite_after_its_pass_counts_three_proven() {
     let s = Suite::new();
-    success(&s.hook(&[]));
+    let writes = [("T_WRITE", "out.txt")];
+    success(&s.hook(&writes));
     edit(&s, 2);
-    success(&s.hook(&[]));
-    let out = explain_is_read_only(&s, &PINNED, &[], &[]);
+    success(&s.hook(&writes));
+    let table = s.bundle().unwrap()["table"].as_array().unwrap().len();
+    assert!(
+        table > inputs(&s),
+        "the table also holds the output: {table} entries"
+    );
+    let out = explain_is_read_only(&s, &PINNED, &writes, &[]);
     assert_eq!(code(&out), 1, "{}", err(&out));
     let (tracked_line, decision) = tail(&out);
-    let id = id_of(&tracked_line);
-    assert_eq!(tracked_line, tracked(&s, &id, TRACKED));
-    assert!(inputs(&s) > 0, "the proofs name their inputs");
+    assert_eq!(tracked_line, tracked(&s, &id_of(&tracked_line), TRACKED));
     assert_eq!(decision, NO_PASS_PROVEN);
 }
 
@@ -485,4 +509,71 @@ fn an_argument_that_is_not_utf8_is_explained_as_unrecordable() {
     assert_eq!(tracked_line, tracked(&s, &id_of(&tracked_line), 0));
     assert_eq!(decision, NO_PASS_UNRECORDABLE);
     assert_eq!(store_tree(&s), tree, "explain changed the store");
+}
+
+// E17: a unit proof counts only in a bundle of the current generation. Another generation is no
+// record, so explain counts no proofs and names the missing record.
+#[test]
+fn a_bundle_of_another_generation_counts_no_proofs() {
+    let s = Suite::new();
+    success(&s.hook(&[]));
+    edit(&s, 2);
+    success(&s.hook(&[]));
+    let path = s.bundle_path().expect("a suite bundle");
+    let mut bundle: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        bundle["units"].as_object().unwrap().len(),
+        TRACKED,
+        "{bundle}"
+    );
+    bundle["generation"] = serde_json::Value::from(0);
+    fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+    let out = explain_is_read_only(&s, &PINNED, &[], &[]);
+    let (tracked_line, decision) = tail(&out);
+    let id = id_of(&tracked_line);
+    assert_eq!(
+        tracked_line,
+        format!("stoop: tracked {TRACKED} units, 0 inputs; 0 proven, {TRACKED} without a proof (suite {id})")
+    );
+    assert_eq!(decision, NO_PASS_NO_BUNDLE);
+}
+
+// E18: a suite directory that cannot take a new entry starts no pass. Explain says so and creates
+// nothing, and the run takes the full command. Permissions refuse the write, so a root user skips it.
+#[test]
+fn an_unwritable_suite_store_is_explained_as_no_pass() {
+    let s = Suite::new();
+    success(&s.hook(&[]));
+    edit(&s, 2);
+    let dir = s
+        .bundle_path()
+        .expect("a suite bundle")
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let out = explain_is_read_only(&s, &PINNED, &[], &[]);
+    let decision = tail(&out).1;
+    let run = s.hook(&[]);
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(decision, NO_PASS_UNWRITABLE, "{}", err(&out));
+    success(&run);
+    assert!(!started_pass(&run), "{}", err(&run));
+}
+
+// E19: STOOP_OFF is the reason whatever else holds. With the whole command's proof still holding, and
+// with the full form forced as well, explain names it, because the run is untraced and starts no pass.
+#[test]
+fn stoop_off_is_named_before_the_unchanged_and_forced_refusals() {
+    let s = Suite::new();
+    success(&s.hook(&[]));
+    let off = [("STOOP_OFF", "1")];
+    let out = explain_is_read_only(&s, &PINNED, &off, &[]);
+    assert_eq!(tail(&out).1, NO_PASS_OFF, "{}", err(&out));
+    let both = [("STOOP_OFF", "1"), ("STOOP_FULL", "1")];
+    let out = explain_is_read_only(&s, &PINNED, &both, &[]);
+    assert_eq!(tail(&out).1, NO_PASS_OFF, "{}", err(&out));
+    let run = s.hook(&off);
+    success(&run);
+    assert!(!started_pass(&run), "{}", err(&run));
 }
