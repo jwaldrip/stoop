@@ -786,14 +786,6 @@ fn attribution_not_dispatched() {
         "./runner",
         "{changed:**/*.t}",
     ];
-    let explain = [
-        "explain",
-        "--key",
-        "units",
-        "--",
-        "./runner",
-        "{changed:**/*.t}",
-    ];
     let no_record = [
         "run",
         "--key",
@@ -817,8 +809,6 @@ fn attribution_not_dispatched() {
         &pair.step("D15 CI outside Git", "", &run, &[("CI", "true")]),
         "unknown CI branch context",
     );
-    pair.write("in.txt", "four\n");
-    pair.step("D15 explain", "", &explain, &[]);
     pair.write("in.txt", "five\n");
     pair.step("D15 no-record", "", &no_record, &[]);
     pair.compare_store(".stoop");
@@ -850,6 +840,68 @@ fn attribution_not_dispatched() {
     newer.write("in.txt", "two\n");
     newer.step("D15 newer bundle change", "", &run, &[]);
     newer.compare_store(".stoop");
+}
+
+/// Explain of a recorded, filtered suite after a change appends two lines to the base's output (spec
+/// 4.16). The base prints the same decision and nothing after it, so the subject's stderr starts with
+/// the base's. Its stdout, its status and the store are the base's.
+fn explain_of_a_suite() {
+    let pair = Pair::new("suite-explain");
+    pair.write(
+        "runner",
+        "#!/bin/sh\ncat in.txt >/dev/null\nprintf 'unit\\n'\n",
+    );
+    pair.write("tests/a.t", "in.txt\n");
+    pair.write("tests/b.t", "in.txt\n");
+    for root in &pair.roots {
+        fs::set_permissions(root.join("runner"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let run = [
+        "run",
+        "--key",
+        "units",
+        "--",
+        "./runner",
+        "{changed:**/*.t}",
+    ];
+    let explain = [
+        "explain",
+        "--key",
+        "units",
+        "--",
+        "./runner",
+        "{changed:**/*.t}",
+    ];
+    contains(&pair.step("D16 cold", "", &run, &[]), "recorded");
+    pair.write("in.txt", "two\n");
+    let outputs: Vec<Output> = (0..2)
+        .map(|side| pair.command(side, "", &explain, &[]).output().unwrap())
+        .collect();
+    assert_eq!(
+        outputs[0].status.code(),
+        outputs[1].status.code(),
+        "D16 explain: status"
+    );
+    assert_eq!(outputs[0].stdout, outputs[1].stdout, "D16 explain: stdout");
+    let base = normalize(&String::from_utf8_lossy(&outputs[0].stderr), &pair.roots[0]);
+    let subject = normalize(&String::from_utf8_lossy(&outputs[1].stderr), &pair.roots[1]);
+    assert!(
+        subject.starts_with(&base),
+        "D16 explain: the base's lines come first\n{base}\n{subject}"
+    );
+    let mut added = subject[base.len()..].lines();
+    let tracked = added.next().unwrap_or_default();
+    assert!(
+        tracked
+            .starts_with("stoop: tracked 2 units, 0 inputs; 0 proven, 2 without a proof (suite "),
+        "{tracked}"
+    );
+    assert_eq!(
+        added.next(),
+        Some("stoop: would run an attribution pass: 2 launches")
+    );
+    assert_eq!(added.next(), None);
+    pair.compare_store(".stoop");
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
@@ -1057,5 +1109,6 @@ fn legacy_paths_match_the_base() {
     readonly_and_full();
     hooked();
     attribution_not_dispatched();
+    explain_of_a_suite();
     sync();
 }
