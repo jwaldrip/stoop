@@ -17,12 +17,17 @@ class SingleTraceeSed(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.raw = Path(self.tmp.name) / "raw"
+        self.old = Path(self.tmp.name) / "old"
         self.out = Path(self.tmp.name) / "out"
         (self.raw / "sed-exec").mkdir(parents=True)
+        (self.old / "sed-exec").mkdir(parents=True)
+        reference = copy.deepcopy(self.original)
+        reference["proofs"][0]["provenance"]["version"] = 11
+        (self.old / "sed-exec" / "proof.json").write_text(json.dumps(reference))
 
     def normalize(self, proof):
         (self.raw / "sed-exec" / "proof.json").write_text(json.dumps(proof))
-        normalizer.single_tracee_sed(FIXTURES, self.raw, self.out)
+        normalizer.single_tracee_sed(self.old, self.raw, self.out)
 
     def test_real_recording_is_accepted(self):
         self.normalize(self.original)
@@ -104,6 +109,17 @@ class SingleTraceeSed(unittest.TestCase):
     def test_environment_keys_must_be_strings(self):
         with self.assertRaisesRegex(SystemExit, "environment"):
             normalizer.environment_changes({}, {1: "value"})
+
+    def test_wrong_reference_version_is_rejected(self):
+        path = self.old / "sed-exec" / "proof.json"
+        reference = json.loads(path.read_text())
+        for version in (10, 12, 13):
+            with self.subTest(version=version):
+                reference["proofs"][0]["provenance"]["version"] = version
+                path.write_text(json.dumps(reference))
+                with self.assertRaisesRegex(SystemExit, "versions 11 and 12"):
+                    self.normalize(self.original)
+                self.assertFalse((self.out / "sed-exec" / "proof.json").exists())
 
 
 if __name__ == "__main__":

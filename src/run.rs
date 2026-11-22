@@ -1767,7 +1767,13 @@ fn build_outputs(
     let mut reasons = Vec::new();
     let mut verified = Vec::new();
     for (key, (id, post)) in keys.into_iter().zip(ids) {
-        if landing_verified(trace, key, id.as_ref().map(|(id, _)| id.as_str()), &post) {
+        let output_id = id.as_ref().map(|(id, _)| id.as_str());
+        let direct = trace.bound_priors.contains(key)
+            && output_id.is_some_and(|id| {
+                (id.starts_with("f:") || id.starts_with("x:"))
+                    && trace.priors.get(key).is_some_and(|prior| prior != id)
+            });
+        if direct || landing_verified(trace, key, output_id, &post) {
             verified.push(key.clone());
         }
         match id.map(|(id, _)| id) {
@@ -2930,5 +2936,44 @@ mod landing_witness_tests {
         };
         let id = crate::input::file_id(false, "final-output-hash");
         assert!(landing_verified(&landed, "f", Some(&id), &post));
+    }
+}
+
+#[cfg(test)]
+mod direct_promotion_tests {
+    use super::*;
+
+    #[test]
+    fn promotion_needs_a_bound_prior_and_a_different_regular_output() {
+        let root = std::env::temp_dir().join(format!("stoop-direct-output-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("f");
+        std::fs::write(&path, b"after\n").unwrap();
+        let written = BTreeSet::from(["f".to_string()]);
+        let mut trace = Trace::default();
+        trace.priors.insert("f".into(), "f:before".into());
+
+        let (outputs, _, _, verified) = build_outputs(&root, &written, &trace);
+        assert!(verified.is_empty());
+        trace.bound_priors.insert("f".into());
+        let (_, _, _, verified) = build_outputs(&root, &written, &trace);
+        assert_eq!(verified, ["f"]);
+
+        trace.priors.insert("f".into(), outputs[0].id.clone());
+        let (_, _, _, verified) = build_outputs(&root, &written, &trace);
+        assert!(verified.is_empty(), "equal IDs retain the legacy proof");
+        trace.priors.remove("f");
+        let (_, _, _, verified) = build_outputs(&root, &written, &trace);
+        assert!(verified.is_empty(), "a missing prior cannot be promoted");
+
+        trace.priors.insert("f".into(), "f:before".into());
+        std::fs::remove_file(&path).unwrap();
+        let (_, removed, _, verified) = build_outputs(&root, &written, &trace);
+        assert_eq!(removed, ["f"]);
+        assert!(verified.is_empty(), "a removed output cannot be promoted");
+        std::fs::create_dir(&path).unwrap();
+        let (_, _, _, verified) = build_outputs(&root, &written, &trace);
+        assert!(verified.is_empty(), "a directory cannot be promoted");
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

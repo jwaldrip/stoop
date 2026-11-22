@@ -2959,6 +2959,47 @@ impl Tracer<'_> {
         }
     }
 
+    /// Bind a direct writable open's prior to an earlier confirmed content open.
+    fn write_open(
+        &mut self,
+        pid: i32,
+        args: &[u64; 6],
+        dirfd: Option<usize>,
+        argument: usize,
+        path: &Path,
+        follows: bool,
+    ) {
+        let binding = self.confirmed_reads.get(path).cloned().and_then(|seen| {
+            if !plain_argument(pid, args, dirfd, argument) {
+                return None;
+            }
+            let lexical = self.lexical_path(pid, args, dirfd, argument)?;
+            if lexical != path
+                || !self
+                    .rec
+                    .as_ref()
+                    .is_some_and(|rec| plain_route(rec.phys.real(), &lexical))
+            {
+                return None;
+            }
+            Some(PriorBinding {
+                key: self.exact_key(path)?,
+                seen,
+                verified: false,
+            })
+        });
+        if let Some(rec) = self.rec.as_mut() {
+            rec.prior_binding = binding;
+        }
+        let key = self.write(path, follows);
+        let binding = self.rec.as_mut().and_then(|rec| rec.prior_binding.take());
+        if let Some(binding) = binding
+            .filter(|binding| binding.verified && key.as_deref() == Some(binding.key.as_str()))
+        {
+            self.t.bound_priors.insert(binding.key);
+        }
+    }
+
     fn open(
         &mut self,
         pid: i32,
@@ -2993,13 +3034,13 @@ impl Tracer<'_> {
             }
             // creat truncates the named file.
             None => {
-                self.write(&p, true);
+                self.write_open(pid, args, dirfd, path, &p, true);
             }
             Some(f) => {
                 if writes {
                     let creates_exclusively = f & libc::O_CREAT != 0 && f & libc::O_EXCL != 0;
                     let follows = f & libc::O_NOFOLLOW == 0 && !creates_exclusively;
-                    self.write(&p, follows);
+                    self.write_open(pid, args, dirfd, path, &p, follows);
                 } else if content
                     && self
                         .rec
