@@ -126,6 +126,11 @@ struct SuiteBundleV1 {
     units: BTreeMap<String, Vec<UnitVersion>>,
     residue: Residue,
     state: SuiteState,
+    /// The digest of the roster that an attribution pass found no unit evidence for. While it is
+    /// the current roster, no pass starts, so a suite whose runner gives no evidence keeps the full
+    /// form until its roster changes or `forget --units` removes the bundle.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    no_evidence: Option<String>,
 }
 
 /// A JSON object with a repeated key is ambiguous, so the whole file is refused as corrupt.
@@ -222,6 +227,15 @@ fn invocation_digest(argv: &[OsString], label: Option<&str>) -> String {
 fn digest_text(context: &str, text: &str) -> String {
     let mut hash = blake3::Hasher::new_derive_key(context);
     field(&mut hash, text.as_bytes());
+    hash.finalize().to_hex().to_string()
+}
+
+/// A digest of a roster's units, in order. It names the roster that a pass found no evidence for.
+fn roster_digest(roster: &Roster) -> String {
+    let mut hash = blake3::Hasher::new_derive_key("stoop roster units v1");
+    for unit in &roster.units {
+        field(&mut hash, unit.as_bytes());
+    }
     hash.finalize().to_hex().to_string()
 }
 
@@ -882,6 +896,13 @@ pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, pr
         return;
     };
     let guard_digest = blake3::hash(&bytes).to_hex().to_string();
+    // A marker survives a full run of the same roster: the run stores a legacy proof, and the
+    // roster is still silent.
+    let no_evidence = previous
+        .as_ref()
+        .filter(|old| old.generation == GENERATION && old.provenance == provenance)
+        .and_then(|old| old.no_evidence.clone())
+        .filter(|digest| *digest == roster_digest(&pending.roster));
     let (table, units, residue, state) = match previous {
         Some(old) if old.generation == GENERATION && old.provenance == provenance => {
             (old.table, old.units, old.residue, old.state)
@@ -912,6 +933,7 @@ pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, pr
         units,
         residue,
         state,
+        no_evidence,
     };
     let _ = write_bundle(&area, &bundle);
 }
@@ -1024,6 +1046,19 @@ impl Pass {
     }
 }
 
+impl Drop for Pass {
+    /// A pass that stored no proof writes the marker for its roster, so the same roster is not
+    /// attributed again. A write that fails is ignored, as `record` ignores one.
+    fn drop(&mut self) {
+        if self.bundle.units.is_empty() {
+            self.bundle.no_evidence = Some(roster_digest(&self.bundle.roster));
+            if let Ok(bytes) = encode(&self.bundle) {
+                let _ = write_bytes(&self.area, &self.bundle.suite, &bytes);
+            }
+        }
+    }
+}
+
 /// Starts an attribution pass for `pending` when its bundle is current, holds no unit proof for
 /// the roster, and the suite lock is free. The bundle is checked again under the lock, and then
 /// reset to the current roster and guard with no versions. Nothing is written here.
@@ -1068,6 +1103,7 @@ fn start_with(
     };
     bundle.units.clear();
     bundle.table.clear();
+    bundle.no_evidence = None;
     Start::Pass(Pass {
         area,
         _lock: held,
@@ -1079,8 +1115,8 @@ fn start_with(
     })
 }
 
-/// The bundle as a pass needs it: current, ready, recorded for this command, and with no unit
-/// proof for any unit of the roster.
+/// The bundle as a pass needs it: current, ready, recorded for this command, with no unit proof
+/// for any unit of the roster, and not silent for this roster.
 fn ready(area: &Area, pending: &Pending, digest: &str) -> Option<SuiteBundleV1> {
     let ReadBundle::Current(bundle) = read_bundle(area, &pending.suite) else {
         return None;
@@ -1091,12 +1127,14 @@ fn ready(area: &Area, pending: &Pending, digest: &str) -> Option<SuiteBundleV1> 
             .get(unit)
             .is_some_and(|versions| !versions.is_empty())
     });
+    let silent = bundle.no_evidence.as_deref() == Some(roster_digest(&pending.roster).as_str());
     (bundle.generation == GENERATION
         && bundle.provenance == Provenance::current()
         && matches!(bundle.state, SuiteState::Ready)
         && bundle.whole.is_some()
         && bundle.whole_key_digest == digest
-        && !proven)
+        && !proven
+        && !silent)
         .then_some(bundle)
 }
 
@@ -1329,6 +1367,7 @@ mod tests {
             units: BTreeMap::new(),
             residue: Residue::default(),
             state: SuiteState::Ready,
+            no_evidence: None,
         };
         let bytes = serde_json::to_vec(&bundle).unwrap();
         let decoded: SuiteBundleV1 = serde_json::from_slice(&bytes).unwrap();
@@ -1533,6 +1572,7 @@ mod pass_tests {
             units: BTreeMap::new(),
             residue: Residue::default(),
             state: SuiteState::Ready,
+            no_evidence: None,
         }
     }
 
@@ -1641,7 +1681,7 @@ mod pass_tests {
     }
 
     #[test]
-    fn a_version_over_the_budget_is_dropped_and_nothing_is_written() {
+    fn a_version_over_the_budget_is_dropped_and_leaves_only_the_marker() {
         let roster = ["tests/a.t"];
         let id = pending_for(&roster).suite;
         let dir = seed("budget", &bundle_for(pending_for(&roster), "key"));
@@ -1659,7 +1699,40 @@ mod pass_tests {
         assert!(pass.bundle.table.is_empty());
         assert!(pass.interned.is_empty());
         drop(pass);
-        assert_eq!(fs::read(bundle_file(&dir, &id)).unwrap(), before);
+        // The dropped version is not on disk. The pass stored nothing, so the bundle carries the
+        // marker for its roster, and that is the only change.
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        let ReadBundle::Current(stored) = read_bundle(&area, &id) else {
+            panic!("the bundle is not current after an over-budget pass");
+        };
+        assert!(stored.units.is_empty());
+        assert!(stored.table.is_empty());
+        assert_eq!(
+            stored.no_evidence,
+            Some(roster_digest(&pending_for(&roster).roster))
+        );
+    }
+
+    #[test]
+    fn a_pass_that_stores_no_proof_marks_its_roster_silent_until_the_roster_changes() {
+        let roster = ["tests/a.t"];
+        let dir = seed("marker", &bundle_for(pending_for(&roster), "key"));
+        drop(pass_of(start(&dir, &pending_for(&roster), "key", guard())));
+        assert!(
+            matches!(
+                start(&dir, &pending_for(&roster), "key", guard()),
+                Start::No
+            ),
+            "the same roster is silent"
+        );
+        let wider = ["tests/a.t", "tests/b.t"];
+        assert!(
+            matches!(
+                start_after_release(&dir, &pending_for(&wider), "key"),
+                Start::Pass(_)
+            ),
+            "a new roster starts a pass"
+        );
     }
 
     /// Takes the suite lock again after this test released it. Another test thread can fork a
@@ -1967,6 +2040,7 @@ mod cost_tests {
             units,
             residue: Residue::default(),
             state: SuiteState::Ready,
+            no_evidence: None,
         }
     }
 
