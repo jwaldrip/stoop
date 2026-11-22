@@ -81,6 +81,11 @@ list() {
 				printf 'x\n' > "$(dirname "$1")/sub/file" &&
 				ln -s "$LOG" "$(dirname "$1")/sub/link"
 			;;
+		dirlink)
+			mkdir "$(dirname "$1")/sub" &&
+				ln -s ../.. "$(dirname "$1")/sub/back" &&
+				ln -s "$T_OUTSIDE" "$(dirname "$1")/outlink"
+			;;
 	esac
 	note "list_dir_mode=$(stat -c %a "$(dirname "$1")")"
 	note "list_mode=$(stat -c %a "$1")"
@@ -960,9 +965,10 @@ fn a5b_a_file_the_runner_leaves_beside_its_list_goes_with_the_launch_folder() {
     );
 }
 
-// A5c (guard): a folder that the runner makes beside its list goes too, with the link it holds. The link's
-// target, the log outside the root, survives. Fails on a tree that cannot remove a folder with entries in
-// it, and on a tree that follows the link.
+// A5c (guard): a folder that the runner makes beside its list goes too, with a file link it holds. The
+// link's target, the log outside the root, survives. Fails on a tree that cannot remove a folder with
+// entries in it, and on a tree that removes a link's target. It plants a file link only; a directory
+// link is A5d's case.
 #[test]
 fn a5c_a_folder_the_runner_leaves_beside_its_list_goes_without_following_its_links() {
     let s = list_suite();
@@ -987,6 +993,54 @@ fn a5c_a_folder_the_runner_leaves_beside_its_list_goes_without_following_its_lin
         s.log.is_file(),
         "the link's target, outside the root, was removed"
     );
+}
+
+// A5d (guard): the links a runner leaves in its launch folder are removed as themselves, and nothing
+// they name is touched. `sub/back` is a directory link to the store's unit folder, which holds the
+// bundle, the lock and every suite's launch folders; `outlink` is a directory link to an outside folder
+// that holds a file. The launch folder goes. The outside file, the bundle, the lock, the other suite's
+// folder and the root's files all survive. Fails on a tree that opens a directory link through a
+// following open before it unlinks the link.
+#[test]
+fn a5d_a_directory_link_the_runner_leaves_is_removed_as_itself_and_never_entered() {
+    let s = list_suite();
+    success(&s.run(&s.root, &[], &["./list-runner", FILE], &[]));
+    let store = s.root.join(".stoop");
+    let id = suite_id(&s);
+    // Another suite's launch folder, which this suite's cleanup must leave alone.
+    let other = store.join("units/v1/.0123456789abcdef0123456789abcdef-99999-0.scratch");
+    fs::create_dir(&other).unwrap();
+    fs::set_permissions(&other, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(other.join("keep"), "left\n").unwrap();
+    let outside = s.outside.join("linked");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("keep.txt"), "keep\n").unwrap();
+    let outside_text = outside.to_str().unwrap().to_owned();
+    edit(&s, 2);
+    s.clear_log();
+    let out = s.run(
+        &s.root,
+        &[],
+        &["./list-runner", FILE],
+        &[("T_EXTRA", "dirlink"), ("T_OUTSIDE", outside_text.as_str())],
+    );
+    success(&out);
+    assert_eq!(s.launches().len(), 3, "{:?}", s.launches());
+    let left: Vec<String> = scratch_dirs(&store)
+        .iter()
+        .map(|path| path.file_name().unwrap().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(left, [".0123456789abcdef0123456789abcdef-99999-0.scratch"]);
+    assert_eq!(fs::read_to_string(other.join("keep")).unwrap(), "left\n");
+    assert_eq!(
+        fs::read_to_string(outside.join("keep.txt")).unwrap(),
+        "keep\n"
+    );
+    assert!(store.join("units/v1").join(format!("{id}.lock")).is_file());
+    let bundle = bundle_in(&store);
+    assert!(bundle["units"]["tests/a.t"][0].is_object(), "{bundle}");
+    assert!(s.root.join("tests/a.t").is_file());
+    assert!(s.root.join("src/shared.src").is_file());
 }
 
 // G (guard): shell code that reads the changed inputs keeps the first-run form, as `{changed-inputs}`
