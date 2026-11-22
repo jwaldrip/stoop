@@ -656,7 +656,8 @@ fn legacy_key(s: &Suite) -> String {
 
 // A24: a pass that stores no proof leaves a marker for its roster, so the later changed runs of
 // that roster take the full form until the roster changes or `forget --units` clears the suite.
-// Fails on a tree without the marker: the second changed run starts a pass again.
+// Fails on a tree without the marker: the second changed run starts a pass again. The unchanged
+// run after the marker's full form skips, the end-to-end proof that the marker restores skipping.
 #[test]
 fn a_pass_that_stores_no_proof_is_not_repeated_for_the_same_roster() {
     let s = Suite::new();
@@ -672,6 +673,13 @@ fn a_pass_that_stores_no_proof_is_not_repeated_for_the_same_roster() {
     s.clear_log();
     success(&s.hook(&[("T_IGNORE", "1")]));
     full_form(&s.launches());
+    // Unchanged after that full form: its whole-command proof is a hit, so nothing launches.
+    s.clear_log();
+    success(&s.hook(&[("T_IGNORE", "1")]));
+    assert!(
+        s.launches().is_empty(),
+        "an unchanged run after the marker's full form skips"
+    );
     // The runner reads its units now, but this roster stayed silent, so the full form still runs.
     edit(&s, 4);
     s.clear_log();
