@@ -706,6 +706,18 @@ fn f10_t_stat_other_stats_its_path_once_per_invocation() {
         assert_eq!(launches.len(), 1);
         assert_eq!(stats(&launches[0].lines), 1, "{:?}", launches[0].lines);
     }
+
+    // T_IF unset: the knob acts, so one invocation logs one stat line.
+    s.clear_log();
+    let out = s.direct(
+        &s.root,
+        &["tests/a.t", "tests/c.t"],
+        &[("T_STAT_OTHER", "tests/none.t")],
+    );
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    let launches = s.launches();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(stats(&launches[0].lines), 1, "{:?}", launches[0].lines);
 }
 
 #[test]
@@ -730,6 +742,12 @@ fn f11_t_fail_full_fails_the_full_form_after_its_tests() {
     let out = s.direct(&s.root, &["tests/a.t"], &env);
     assert_eq!(code(&out), 0, "{}", text(&out.stderr));
     assert!(s.launches()[0].failed().is_empty());
+
+    // T_IF unset: the knob acts, so the no-argument form exits 1 after its tests.
+    s.clear_log();
+    let out = s.direct(&s.root, &[], &[("T_FAIL_FULL", "1")]);
+    assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+    assert_eq!(s.launches()[0].ran(), ROSTER);
 }
 
 #[test]
@@ -761,6 +779,16 @@ fn f12_t_fail_alone_fails_its_test_in_the_test_word_form() {
     let out = s.direct(&s.root, &[], &env);
     assert_eq!(code(&out), 0, "{}", text(&out.stderr));
     assert!(s.launches()[0].failed().is_empty());
+
+    // T_IF unset: the knob acts, so b fails in the test-word form.
+    s.clear_log();
+    let out = s.direct(
+        &s.root,
+        &["tests/a.t", "tests/b.t"],
+        &[("T_FAIL_ALONE", "tests/b.t")],
+    );
+    assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+    assert_eq!(s.launches()[0].failed(), ["tests/b.t"]);
 }
 
 // Pins of today's hooked-run behaviour. Each one holds on the base and must still hold after the
