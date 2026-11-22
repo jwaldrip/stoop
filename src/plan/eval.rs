@@ -763,13 +763,16 @@ fn evaluate(
         let mut pair_answers: BTreeMap<&str, Answer> = BTreeMap::new();
         let mut pending_input: Option<(Decision, &Input)> = None;
         macro_rules! stop {
-            ($result:expr) => {
-                return if let Some((miss, _)) = pending_input.take() {
+            ($result:expr) => {{
+                let result = $result;
+                return if result.code == Code::Error {
+                    result
+                } else if let Some((miss, _)) = pending_input.take() {
                     miss
                 } else {
-                    $result
-                }
-            };
+                    result
+                };
+            }};
         }
         for input in &proof.inputs {
             if input.path.contains('\u{fffd}')
