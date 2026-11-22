@@ -262,6 +262,10 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
                         eprintln!("stoop: no suite named {}", run::safe(key));
                         1
                     }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        eprintln!("stoop: suite {} is busy in another stoop", run::safe(key));
+                        1
+                    }
                     Err(error) => {
                         eprintln!("stoop: cannot forget suite: {error}");
                         1

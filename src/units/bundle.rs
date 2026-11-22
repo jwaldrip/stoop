@@ -363,18 +363,46 @@ fn lock(dir: &Path, id: &str) -> io::Result<File> {
     lock_with(dir, id, || {})
 }
 
+/// `forget --units` removes the lock file, so a process waiting on the old file can take a lock
+/// that no other process contends for. A lock is trusted only while it is still the named entry.
+const LOCK_ATTEMPTS: usize = 3;
+
 fn lock_with(dir: &Path, id: &str, mut after_open: impl FnMut()) -> io::Result<File> {
     fs::create_dir_all(dir)?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .private()
-        .open(lock_path(dir, id))?;
-    after_open();
-    file.try_lock().map_err(io::Error::from)?;
-    Ok(file)
+    for _ in 0..LOCK_ATTEMPTS {
+        let path = lock_path(dir, id);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .private()
+            .open(&path)?;
+        after_open();
+        file.try_lock().map_err(io::Error::from)?;
+        if same_entry(&file, &path) {
+            return Ok(file);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "the suite lock was replaced while it was taken",
+    ))
+}
+
+#[cfg(unix)]
+fn same_entry(file: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (file.metadata(), fs::symlink_metadata(path)) {
+        (Ok(held), Ok(named)) => held.dev() == named.dev() && held.ino() == named.ino(),
+        _ => false,
+    }
+}
+
+/// Std offers no file identity on Windows, so the lock is trusted as opened there.
+#[cfg(not(unix))]
+fn same_entry(_file: &File, _path: &Path) -> bool {
+    true
 }
 
 fn clear_temps(dir: &Path, id: &str) {
