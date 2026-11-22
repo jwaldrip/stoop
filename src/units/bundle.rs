@@ -307,6 +307,9 @@ fn lock_path(dir: &Path, id: &str) -> PathBuf {
 #[allow(clippy::large_enum_variant)]
 enum ReadBundle {
     Missing,
+    /// The file could not be read, so it is left as it is.
+    Unreadable,
+    /// The file was read and its content is malformed or too large.
     Corrupt,
     OtherVersion,
     Current(SuiteBundleV1),
@@ -319,10 +322,23 @@ struct Header {
 }
 
 fn read_bundle(dir: &Path, id: &str) -> ReadBundle {
-    let bytes = match super::config::read_regular_bounded(&bundle_path(dir, id), MAX_BYTES) {
-        Ok(bytes) => bytes,
+    let path = bundle_path(dir, id);
+    let metadata = match fs::metadata(&path) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return ReadBundle::Missing,
-        Err(_) => return ReadBundle::Corrupt,
+        Err(_) => return ReadBundle::Unreadable,
+    };
+    if !metadata.is_file() {
+        return ReadBundle::Unreadable;
+    }
+    if metadata.len() > MAX_BYTES {
+        return ReadBundle::Corrupt;
+    }
+    let bytes = match super::config::read_regular_bounded(&path, MAX_BYTES) {
+        Ok(bytes) => bytes,
+        // It grew past the limit after the check above.
+        Err(error) if error.kind() == io::ErrorKind::InvalidData => return ReadBundle::Corrupt,
+        Err(_) => return ReadBundle::Unreadable,
     };
     let header: Header = match serde_json::from_slice(&bytes) {
         Ok(header) => header,
@@ -412,7 +428,7 @@ pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, pr
     };
     clear_temps(&dir, &pending.suite);
     let previous = match read_bundle(&dir, &pending.suite) {
-        ReadBundle::OtherVersion => return,
+        ReadBundle::OtherVersion | ReadBundle::Unreadable => return,
         ReadBundle::Current(bundle) => Some(bundle),
         ReadBundle::Missing | ReadBundle::Corrupt => None,
     };
@@ -481,6 +497,10 @@ pub(crate) fn list(store: &Path) -> Vec<(String, Option<String>)> {
     ids.into_iter()
         .filter_map(|id| match read_bundle(&dir, &id) {
             ReadBundle::Missing => None,
+            ReadBundle::Unreadable => Some((
+                format!("suite\t{id}\tunreadable"),
+                Some(format!("stoop: cannot read suite bundle: {id}")),
+            )),
             ReadBundle::Corrupt => Some((
                 format!("suite\t{id}\tunreadable"),
                 Some(format!("stoop: ignoring a corrupt suite bundle: {id}")),
