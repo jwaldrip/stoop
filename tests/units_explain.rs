@@ -11,7 +11,9 @@
 mod units_common;
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::Output;
 use units_common::*;
@@ -40,6 +42,12 @@ const NO_PASS_OPTIONS: &str = "stoop: no attribution pass: --no-record, --allow-
 const NO_PASS_FORCED: &str = "stoop: no attribution pass: the run is forced to the full command";
 const NO_PASS_OFF: &str =
     "stoop: no attribution pass: STOOP_OFF turns tracing off, so the run is the full command";
+const NO_PASS_NO_BUNDLE: &str =
+    "stoop: no attribution pass: the suite has no current record of an earlier full run";
+const NO_PASS_NO_UNITS: &str = "stoop: no attribution pass: the filter selects no unit";
+const NO_PASS_JOIN: &str =
+    "stoop: no attribution pass: a unit's text contains the separator of a joined placeholder";
+const NO_PASS_UNRECORDABLE: &str = "stoop: no attribution pass: the roster cannot be recorded: an argument is not UTF-8, a unit name is not valid, or there are more than 4,096 units";
 
 /// Writes `n` copies of the line the pinned roster reads, so each `n` is a different size.
 fn edit(s: &Suite, n: usize) {
@@ -236,7 +244,11 @@ fn explain_does_not_take_the_suite_lock() {
     let locked = explain_is_read_only(&s, &PINNED, &[], &[]);
     drop(held);
     assert_eq!(code(&locked), 1, "{}", err(&locked));
-    assert_eq!(err(&locked), err(&unlocked), "a held lock changes explain");
+    assert_eq!(
+        tail(&locked),
+        tail(&unlocked),
+        "a held lock changes explain"
+    );
     assert!(!err(&locked).contains("busy"), "{}", err(&locked));
     assert_eq!(tail(&locked).1, WOULD_PASS);
 }
@@ -374,4 +386,102 @@ fn explain_agrees_with_the_next_run_in_each_state() {
     assert!(!started_pass(&s.hook(&[])), "proven");
     assert!(!predicts_pass(&s.explain()), "recorded again");
     assert!(!started_pass(&s.hook(&[])), "recorded again");
+}
+
+// E13: a suite whose bundle was forgotten has a legacy proof but no current record, so no pass can
+// start. Explain names the missing record, and the run takes the full form.
+#[test]
+fn a_forgotten_suite_is_explained_as_having_no_record() {
+    let s = Suite::new();
+    success(&s.hook(&[]));
+    let id = s
+        .bundle_path()
+        .unwrap()
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let mut forget = s.stoop(&s.root);
+    forget
+        .args(["forget", "--root"])
+        .arg(&s.root)
+        .args(["--units", id.as_str()]);
+    success(&spawning(|| forget.output()).unwrap());
+    assert!(s.bundle_path().is_none(), "the suite bundle is gone");
+    edit(&s, 2);
+    let out = explain_is_read_only(&s, &PINNED, &[], &[]);
+    assert_eq!(code(&out), 1, "{}", err(&out));
+    let (tracked_line, decision) = tail(&out);
+    assert_eq!(
+        tracked_line,
+        format!("stoop: tracked {TRACKED} units, 0 inputs; 0 proven, {TRACKED} without a proof (suite {id})")
+    );
+    assert_eq!(decision, NO_PASS_NO_BUNDLE);
+    let run = s.hook(&[]);
+    success(&run);
+    assert!(!started_pass(&run), "{}", err(&run));
+}
+
+// E14: a filter that selects no unit leaves an empty roster. Explain counts zero units and names the
+// filter, and the run takes the full command.
+#[test]
+fn a_filter_that_selects_no_unit_is_explained() {
+    let s = Suite::new();
+    let words = ["./t", "{changed:*.none}"];
+    success(&s.run(&s.root, &[], &words, &[]));
+    let out = explain_is_read_only(&s, &words, &[], &[]);
+    assert_eq!(code(&out), 1, "{}", err(&out));
+    let (tracked_line, decision) = tail(&out);
+    let id = id_of(&tracked_line);
+    assert_eq!(
+        tracked_line,
+        format!("stoop: tracked 0 units, 0 inputs; 0 proven, 0 without a proof (suite {id})")
+    );
+    assert_eq!(decision, NO_PASS_NO_UNITS);
+    success(&s.run(&s.root, &[], &words, &[]));
+}
+
+// E15: a unit whose name holds the separator of a joined placeholder cannot be one launch's word.
+// Explain names it, and the run takes the full form.
+#[test]
+fn a_unit_with_a_join_separator_is_explained() {
+    let s = Suite::new();
+    s.write("tests/x,y.t", "src/shared.src\n");
+    let words = ["./t", "{changed:**/*.t|!slow/**:comma}"];
+    success(&s.run(&s.root, &[], &words, &[]));
+    edit(&s, 2);
+    let out = explain_is_read_only(&s, &words, &[], &[]);
+    assert_eq!(code(&out), 1, "{}", err(&out));
+    let (tracked_line, decision) = tail(&out);
+    let id = id_of(&tracked_line);
+    assert_eq!(
+        tracked_line,
+        format!("stoop: tracked 4 units, 0 inputs; 0 proven, 4 without a proof (suite {id})")
+    );
+    assert_eq!(decision, NO_PASS_JOIN);
+    let run = s.run(&s.root, &[], &words, &[]);
+    success(&run);
+    assert!(!started_pass(&run), "{}", err(&run));
+}
+
+// E16: an argument that is not UTF-8 cannot be written to a bundle, so no roster is recordable.
+// Explain names the refusal, and writes nothing.
+#[test]
+fn an_argument_that_is_not_utf8_is_explained_as_unrecordable() {
+    let s = Suite::new();
+    let tree = store_tree(&s);
+    let mut command = s.stoop(&s.root);
+    command
+        .args(["explain", "--root"])
+        .arg(&s.root)
+        .args(["--", "./t"])
+        .arg(OsStr::from_bytes(b"\xff"))
+        .arg(HOOK);
+    let out = spawning(|| command.output()).unwrap();
+    assert_eq!(code(&out), 1, "{}", err(&out));
+    let (tracked_line, decision) = tail(&out);
+    assert_eq!(tracked_line, tracked(&s, &id_of(&tracked_line), 0));
+    assert_eq!(decision, NO_PASS_UNRECORDABLE);
+    assert_eq!(store_tree(&s), tree, "explain changed the store");
 }
