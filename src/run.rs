@@ -1529,6 +1529,7 @@ fn legacy_finish(cx: RunCx<'_>, key: String, lookup: Lookup) -> Outcome {
         &real_root,
         o.allow_network || !o.probes.is_empty(),
         observe_runners && !o.no_record && !o.quiet,
+        true,
     ) {
         Ok(t) => t,
         Err(e) => {
@@ -1682,6 +1683,9 @@ fn legacy_finish(cx: RunCx<'_>, key: String, lookup: Lookup) -> Outcome {
     }
 }
 
+/// One traced launch of `argv`. `capture_blob_ids` takes the repository's attribute snapshot, which
+/// gives each input its Git blob id. A unit launch passes `false`: its proof carries no blob id, and
+/// the snapshot costs several Git probes per launch (spec T2).
 pub(crate) fn launch_traced(
     cx: &RunCx<'_>,
     argv: &[OsString],
@@ -1689,13 +1693,15 @@ pub(crate) fn launch_traced(
     real_root: &Path,
     allow_network: bool,
     observe_execs: bool,
+    capture_blob_ids: bool,
 ) -> std::io::Result<Trace> {
     let trace_scope = (!cx.o.no_record).then(|| trace::Scope {
         root: cx.root,
         real_root: real_root.to_path_buf(),
         ignore,
-        // One attribute snapshot per run, taken before the command can change anything.
-        oid_epoch: trace::supported()
+        // One attribute snapshot per run, taken before the command can change anything. A unit
+        // launch takes none, because its proof records no blob id and nothing reads one (spec T2).
+        oid_epoch: (capture_blob_ids && trace::supported())
             .then(|| crate::oid_attrs::capture(real_root))
             .flatten()
             .map(Arc::new),

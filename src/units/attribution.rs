@@ -84,7 +84,7 @@ pub(crate) fn pass(
         std::env::set_var("STOOP_UNITS", &launch.value);
         let unit = safe(&launch.unit);
         let unit_status =
-            match run::launch_traced(cx, &launch.argv, &ignore, &real_root, false, false) {
+            match run::launch_traced(cx, &launch.argv, &ignore, &real_root, false, false, false) {
                 // A trace that fails before the command starts has run nothing. The unit runs once
                 // untraced and keeps no proof. It is never retried traced, because that could run it
                 // a second time.
