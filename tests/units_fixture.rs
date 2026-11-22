@@ -401,13 +401,17 @@ mod pins {
         assert_eq!(launches[0].ran(), ROSTER);
     }
 
-    /// A cold run records the legacy proof and the suite bundle.
+    /// A cold run records the legacy proof and the suite bundle. Dispatch needs both: a stored
+    /// legacy proof (check 3) and a bundle with `whole` set (check 8), so each is asserted.
     fn cold(s: &Suite) {
         success(&s.hook(&[]));
         assert!(
             !s.proofs().is_empty(),
             "the cold run stored no legacy proof"
         );
+        let bundle = s.bundle().expect("the cold run stored no suite bundle");
+        assert!(bundle["whole"].is_string(), "{bundle}");
+        assert_eq!(bundle["roster"]["units"], json!(ROSTER));
     }
 
     // P1: the first run of a suite is the full form, and its bundle records the roster with
@@ -444,13 +448,10 @@ mod pins {
         // could hide a history change. The existing Git fixtures ignore it the same way.
         s.write(".stoopignore", ".git\n");
         s.git("work");
-        let env = [("CI", "true"), ("CI_COMMIT_BRANCH", "work")];
-        success(&s.hook(&env));
-        assert!(
-            !s.proofs().is_empty(),
-            "the cold run stored no legacy proof"
-        );
+        // The cold run has no CI, so the changed run's CI is the only variable.
+        cold(&s);
         change(&s);
+        let env = [("CI", "true"), ("CI_COMMIT_BRANCH", "work")];
         s.clear_log();
         success(&s.hook(&env));
         full_form(&s);
@@ -485,8 +486,9 @@ mod pins {
         }
     }
 
-    // P6: explain never records or persists, `run.rs:1060` and `:1228`, so it launches nothing and
-    // leaves every file under `.stoop` byte-identical.
+    // P6: explain never records or persists, `run.rs:852` (eligibility excludes explain),
+    // `run.rs:1060` and `:1228`, and it returns at `run.rs:1476-1490` with status 1 and the
+    // decision line. It launches nothing and leaves every file under `.stoop` byte-identical.
     #[test]
     fn p6_explain_after_a_change_launches_nothing_and_writes_nothing() {
         let s = Suite::new();
@@ -494,7 +496,11 @@ mod pins {
         change(&s);
         s.clear_log();
         let before = s.store_snapshot();
-        s.explain();
+        let out = s.explain();
+        assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+        let err = text(&out.stderr);
+        assert!(err.contains("would run full"), "{err}");
+        assert!(err.contains("src/shared.src changed"), "{err}");
         assert!(s.launches().is_empty());
         assert_eq!(s.store_snapshot(), before);
     }
