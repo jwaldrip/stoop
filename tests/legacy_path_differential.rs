@@ -872,7 +872,7 @@ fn explain_of_a_suite() {
         "./runner",
         "{changed:**/*.t}",
     ];
-    contains(&pair.step("D16 cold", "", &run, &[]), "recorded");
+    contains(&pair.step("D17 cold", "", &run, &[]), "recorded");
     pair.write("in.txt", "two\n");
     let outputs: Vec<Output> = (0..2)
         .map(|side| pair.command(side, "", &explain, &[]).output().unwrap())
@@ -880,14 +880,14 @@ fn explain_of_a_suite() {
     assert_eq!(
         outputs[0].status.code(),
         outputs[1].status.code(),
-        "D16 explain: status"
+        "D17 explain: status"
     );
-    assert_eq!(outputs[0].stdout, outputs[1].stdout, "D16 explain: stdout");
+    assert_eq!(outputs[0].stdout, outputs[1].stdout, "D17 explain: stdout");
     let base = normalize(&String::from_utf8_lossy(&outputs[0].stderr), &pair.roots[0]);
     let subject = normalize(&String::from_utf8_lossy(&outputs[1].stderr), &pair.roots[1]);
     assert!(
         subject.starts_with(&base),
-        "D16 explain: the base's lines come first\n{base}\n{subject}"
+        "D17 explain: the base's lines come first\n{base}\n{subject}"
     );
     let added = &subject[base.len()..];
     if prints_suite_lines(&base) {
@@ -895,7 +895,7 @@ fn explain_of_a_suite() {
         // with this binary, and so does an A/A run that uses a byte-identical copy of this binary.
         assert_eq!(
             added, "",
-            "D16 explain: a base that prints the suite lines adds none\n{subject}"
+            "D17 explain: a base that prints the suite lines adds none\n{subject}"
         );
     } else {
         let mut lines = added.lines();
