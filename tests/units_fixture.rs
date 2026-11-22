@@ -472,6 +472,28 @@ mod purity {
             "the full form reads what no unit launch reads: {stray:?}"
         );
     }
+
+    // F10, traced: a stat of T_STAT_OTHER is an input of its launch. `test -e` only looks at the
+    // path, so only the tracer can show it. The test fails if the runner never runs `test -e`, or
+    // runs it only when T_IF is set. The untraced F10 tests see the log line and nothing else.
+    #[test]
+    fn f10_t_stat_other_is_an_input_of_its_launch() {
+        let s = Suite::new();
+        let out = s.run(
+            &s.root,
+            &["--key", "stat"],
+            &["./t", "tests/a.t"],
+            &[("T_STAT_OTHER", "tests/b.t")],
+        );
+        assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+        let inputs = stored_inputs(&s, "stat");
+        assert!(
+            inputs
+                .iter()
+                .any(|(path, id)| path == "tests/b.t" && id.starts_with("f:")),
+            "the stat of tests/b.t is not an input of its launch: {inputs:?}"
+        );
+    }
 }
 
 #[test]
