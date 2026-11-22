@@ -475,3 +475,230 @@ fn suite_id_binds_cwd_scope_label_and_original_arguments() {
         )
     );
 }
+
+fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    fn walk(base: &Path, dir: &Path, out: &mut BTreeMap<PathBuf, Vec<u8>>) {
+        for entry in fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let key = path.strip_prefix(base).unwrap().to_path_buf();
+            let kind = entry.file_type().unwrap();
+            if kind.is_symlink() {
+                let target = fs::read_link(&path).unwrap();
+                out.insert(key, target.as_os_str().as_bytes().to_vec());
+            } else if kind.is_dir() {
+                out.insert(key, Vec::new());
+                walk(base, &path, out);
+            } else {
+                out.insert(key, fs::read(&path).unwrap());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(root, root, &mut out);
+    out
+}
+
+type Observed = (
+    BTreeMap<PathBuf, Vec<u8>>,
+    BTreeMap<PathBuf, Vec<u8>>,
+    Option<Vec<u8>>,
+);
+
+fn observe(f: &Fixture, outside: &Path, units: &Path, id: &str) -> Observed {
+    let bundle = f.root.join(".stoop/units/v1").join(format!("{id}.json"));
+    (snapshot(outside), snapshot(units), fs::read(bundle).ok())
+}
+
+fn symlink_case(component: &str, action: &str) {
+    use std::os::unix::fs::symlink;
+
+    let f = Fixture::new();
+    success(&f.run(&[], Some("{changed:*.t}"), &[]));
+    let (bundle, value) = f.one_bundle();
+    let id = value["suite"].as_str().unwrap().to_owned();
+    // A roster that differs from the stored one makes any write through the link visible.
+    fs::write(f.root.join("tests/c.t"), "c\n").unwrap();
+    let outside = f.root.join("outside");
+    fs::create_dir(&outside).unwrap();
+    let units = f.root.join(".stoop/units");
+    let (link, target) = match component {
+        "units" => (units.clone(), outside.join("units")),
+        "version" => (units.join("v1"), outside.join("v1")),
+        "lock" => (bundle.with_extension("lock"), outside.join("lock")),
+        "bundle" => (bundle.clone(), outside.join("bundle.json")),
+        _ => unreachable!("unknown component {component}"),
+    };
+    fs::rename(&link, &target).unwrap();
+    symlink(&target, &link).unwrap();
+    let before = observe(&f, &outside, &units, &id);
+    match action {
+        "run" => {
+            let out = f.run(&[], Some("{changed:*.t}"), &[]);
+            success(&out);
+            assert!(
+                out.stderr.is_empty(),
+                "{component}: run printed {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        "ls" => {
+            let out = f.cli("ls", &[]);
+            success(&out);
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(text.contains("unreadable"), "{component}: {text}");
+        }
+        "forget" => {
+            let out = f.cli("forget", &["--units", id.as_str()]);
+            assert!(!out.status.success(), "{component}: forget followed a link");
+            assert!(!out.stderr.is_empty(), "{component}: forget gave no reason");
+        }
+        _ => unreachable!("unknown action {action}"),
+    }
+    let still_link = fs::symlink_metadata(&link).is_ok_and(|meta| meta.file_type().is_symlink());
+    assert!(still_link, "{component}: {action} replaced the link");
+    assert_eq!(
+        observe(&f, &outside, &units, &id),
+        before,
+        "{component}: {action} changed a file through the link"
+    );
+}
+
+#[test]
+fn a_symlinked_units_directory_is_never_followed() {
+    for action in ["run", "ls", "forget"] {
+        symlink_case("units", action);
+    }
+}
+
+#[test]
+fn a_symlinked_version_directory_is_never_followed() {
+    for action in ["run", "ls", "forget"] {
+        symlink_case("version", action);
+    }
+}
+
+#[test]
+fn a_symlinked_lock_file_is_never_followed() {
+    for action in ["run", "ls", "forget"] {
+        symlink_case("lock", action);
+    }
+}
+
+#[test]
+fn a_symlinked_bundle_file_is_never_followed() {
+    for action in ["run", "ls", "forget"] {
+        symlink_case("bundle", action);
+    }
+}
+
+fn assert_tree_omits(path: &Path, secret: &[u8]) {
+    for entry in fs::read_dir(path).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_dir() {
+            assert_tree_omits(&entry.path(), secret);
+        } else {
+            let bytes = fs::read(entry.path()).unwrap();
+            assert!(!bytes.windows(secret.len()).any(|window| window == secret));
+        }
+    }
+}
+
+#[test]
+fn argument_text_is_not_persisted_under_the_suite_store() {
+    let f = Fixture::new();
+    let secret = "W5A-SENTINEL-argument-9f2c";
+    let out = f
+        .command(&f.root)
+        .args(["run", "--quiet", "--root"])
+        .arg(&f.root)
+        .arg("--")
+        .arg(&f.runner)
+        .arg(secret)
+        .arg("{changed:*.t}")
+        .output()
+        .unwrap();
+    success(&out);
+    f.one_bundle();
+    assert_tree_omits(&f.root.join(".stoop/units"), secret.as_bytes());
+    let listing = f.cli("ls", &[]);
+    success(&listing);
+    assert!(!String::from_utf8_lossy(&listing.stdout).contains(secret));
+    assert!(!String::from_utf8_lossy(&listing.stderr).contains(secret));
+}
+
+#[test]
+fn units_flag_outside_forget_is_refused_before_anything_runs() {
+    let f = Fixture::new();
+    let marker = f.root.join("ran");
+    let out = f
+        .command(&f.root)
+        .args(["run", "--units", "--", "sh", "-c"])
+        .arg(format!("touch '{}'", marker.display()))
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!marker.exists());
+    let listing = f.command(&f.root).args(["ls", "--units"]).output().unwrap();
+    assert_eq!(listing.status.code(), Some(2));
+}
+
+#[test]
+fn a_bundle_that_cannot_be_read_is_never_replaced() {
+    let f = Fixture::new();
+    success(&f.run(&[], Some("{changed:*.t}"), &[]));
+    let (path, _) = f.one_bundle();
+    let before = fs::read(&path).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+    let listing = f.cli("ls", &[]);
+    success(&listing);
+    assert!(String::from_utf8_lossy(&listing.stdout).contains("unreadable"));
+    fs::write(f.root.join("tests/c.t"), "c\n").unwrap();
+    let out = f.run(&[], Some("{changed:*.t}"), &[]);
+    success(&out);
+    assert!(
+        out.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), before);
+}
+
+#[test]
+fn an_explicit_empty_key_has_its_own_suite() {
+    let f = Fixture::new();
+    success(&f.run(&[], Some("{changed:*.t}"), &[]));
+    success(&f.run(&["--key", ""], Some("{changed:*.t}"), &[]));
+    assert_eq!(f.bundles().len(), 2);
+}
+
+#[test]
+fn duplicate_unit_keys_make_a_bundle_unreadable() {
+    let f = Fixture::new();
+    success(&f.run(&[], Some("{changed:*.t}"), &[]));
+    let (path, _) = f.one_bundle();
+    let original = fs::read_to_string(&path).unwrap();
+    assert_eq!(original.matches("\"units\":{}").count(), 1, "{original}");
+    let duplicated = original.replace(
+        "\"units\":{}",
+        "\"units\":{\"tests/a.t\":[],\"tests/a.t\":[]}",
+    );
+    fs::write(&path, duplicated).unwrap();
+    let listing = f.cli("ls", &[]);
+    success(&listing);
+    assert!(String::from_utf8_lossy(&listing.stdout).contains("unreadable"));
+    let warnings = String::from_utf8_lossy(&listing.stderr)
+        .matches("ignoring a corrupt suite bundle")
+        .count();
+    assert_eq!(warnings, 1);
+}

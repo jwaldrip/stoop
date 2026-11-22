@@ -282,6 +282,10 @@ fn read_bundle(dir: &Path, id: &str) -> ReadBundle {
 }
 
 fn lock(dir: &Path, id: &str) -> io::Result<File> {
+    lock_with(dir, id, || {})
+}
+
+fn lock_with(dir: &Path, id: &str, mut after_open: impl FnMut()) -> io::Result<File> {
     fs::create_dir_all(dir)?;
     let file = OpenOptions::new()
         .read(true)
@@ -290,6 +294,7 @@ fn lock(dir: &Path, id: &str) -> io::Result<File> {
         .truncate(false)
         .private()
         .open(lock_path(dir, id))?;
+    after_open();
     file.try_lock().map_err(io::Error::from)?;
     Ok(file)
 }
@@ -571,5 +576,59 @@ mod tests {
         assert_eq!(bounded.roster.units.len(), MAX_UNITS);
         bounded.roster.units.push("zzzz".into());
         assert!(!valid_bundle(&bounded, &bundle.suite));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod lock_identity_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    const ID: &str = "0123456789abcdef0123456789abcdef";
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("stoop-lock-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(lock_path(&dir, ID), b"").unwrap();
+        dir
+    }
+
+    fn replace_lock(dir: &Path) {
+        let path = lock_path(dir, ID);
+        let _ = fs::remove_file(&path);
+        fs::write(&path, b"").unwrap();
+    }
+
+    fn held_identity(file: &File) -> (u64, u64) {
+        let meta = file.metadata().unwrap();
+        (meta.dev(), meta.ino())
+    }
+
+    fn path_identity(dir: &Path) -> (u64, u64) {
+        let meta = fs::symlink_metadata(lock_path(dir, ID)).unwrap();
+        (meta.dev(), meta.ino())
+    }
+
+    #[test]
+    fn a_lock_replaced_while_it_is_taken_is_not_trusted() {
+        let dir = scratch("replaced-once");
+        let mut first = true;
+        let file = lock_with(&dir, ID, || {
+            if std::mem::take(&mut first) {
+                replace_lock(&dir);
+            }
+        })
+        .unwrap();
+        assert_eq!(held_identity(&file), path_identity(&dir));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_lock_replaced_on_every_attempt_is_reported_busy() {
+        let dir = scratch("replaced-always");
+        let result = lock_with(&dir, ID, || replace_lock(&dir));
+        assert!(result.is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
