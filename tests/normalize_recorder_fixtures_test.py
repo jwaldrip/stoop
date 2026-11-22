@@ -101,6 +101,10 @@ class SingleTraceeSed(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "environment"):
             normalizer.environment_changes({}, {"EXTRA": None})
 
+    def test_environment_keys_must_be_strings(self):
+        with self.assertRaisesRegex(SystemExit, "environment"):
+            normalizer.environment_changes({}, {1: "value"})
+
 
 if __name__ == "__main__":
     unittest.main()
