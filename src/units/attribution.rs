@@ -33,14 +33,15 @@ pub(crate) fn pass(
     // Checks 1 to 7 are decided by `screen`, which `stoop explain` calls too.
     let pending = screen(cx, hook, config, lookup, Ok(pending)).ok()?;
     // 8 and 9: the bundle is checked without the lock, then again under it. The store's unit folder is
-    // transient: no trace of it becomes an input, wherever the store sits (spec 4.7).
-    let mut transient = cx.o.transient.clone();
-    transient.extend(store_patterns(cx.root, store));
-    let ignore = Ignore::new(
+    // excluded by its literal name, wherever the store sits, so no trace of it becomes an input (spec 4.7).
+    let mut ignore = Ignore::new(
         &cx.o.ignore,
         Some(&cx.root.join(".stoopignore")),
-        &transient,
+        &cx.o.transient,
     );
+    for folder in store_folders(cx.root, store) {
+        ignore.exclude_folder(&folder);
+    }
     let guard = LaunchGuard {
         env: cx.env_now.clone(),
         env_excluded: cx.env_excluded.clone(),
@@ -354,10 +355,12 @@ fn keep(status: i32, unit: i32) -> i32 {
     }
 }
 
-/// The transient exclusion of a store's unit folder (spec 4.7). A pattern with a slash matches only that
-/// folder and what it holds, so a folder that merely shares the store's name is still an input. The folder
-/// is named by its absolute path, and by its root-relative key when the store sits inside the root.
-fn store_patterns(root: &Path, store: &Path) -> Vec<String> {
+/// The store's unit folder, excluded from every launch's inputs (spec 4.7): its absolute path, and its
+/// root-relative key when the store sits inside the root. Each is excluded by its literal text, so a
+/// store name that the ignore-line parser would read as a comment, a glob or with trimmed spaces is still
+/// its own folder. A pattern with a slash matches only that folder and what it holds, so a folder that
+/// merely shares the store's name is still an input.
+fn store_folders(root: &Path, store: &Path) -> Vec<String> {
     let folder = store.join("units").join("v1");
     let absolute = folder.to_string_lossy().into_owned();
     let key = to_key(root, &folder);
