@@ -222,6 +222,21 @@ pub(crate) fn expands(hook: &Hook, units: &[String], root: &Path, cwd: &Path) ->
         .all(|unit| argv_with(hook, unit, root, cwd, &stand_in).is_some())
 }
 
+/// Whether every unit of the roster fits the newline lists of the hook: no unit's entry holds a newline.
+/// Only an absolute entry can, because the root's own path can hold one. A newline list has one entry per
+/// line, so it cannot name such a unit and the run keeps the full form (spec 4.12). A NUL list has no such
+/// limit: its entries end at NUL.
+pub(crate) fn lines_fit(hook: &Hook, units: &[String], root: &Path, cwd: &Path) -> bool {
+    units.iter().all(|unit| {
+        hook.placeholders.iter().flatten().all(|placeholder| {
+            placeholder.file != Some(FileMode::File)
+                || !entry(root, cwd, unit, placeholder.base)
+                    .as_encoded_bytes()
+                    .contains(&b'\n')
+        })
+    })
+}
+
 /// The launch for every unit of the roster, in roster order, for a hook without list forms.
 #[cfg(all(test, unix))]
 pub(crate) fn launches(
@@ -454,5 +469,33 @@ mod tests {
             "run.sh \"$STOOP_CHANGED\"; exit $?",
             "sh"
         ])));
+    }
+
+    #[test]
+    fn a_newline_list_cannot_name_an_absolute_path_that_holds_a_newline() {
+        let root = Path::new("/r\nx");
+        let units = ["tests/a.t".to_string()];
+        assert!(!lines_fit(
+            &hook(&["t", "{changed:file:abs}"]),
+            &units,
+            root,
+            root
+        ));
+        assert!(lines_fit(
+            &hook(&["t", "{changed:file}"]),
+            &units,
+            root,
+            root
+        ));
+        assert!(lines_fit(
+            &hook(&["t", "{changed:nul:abs}"]),
+            &units,
+            root,
+            root
+        ));
+        assert_eq!(
+            list_bytes(root, root, "tests/a.t", FileMode::Nul, Base::Abs),
+            b"/r\nx/tests/a.t\0"
+        );
     }
 }

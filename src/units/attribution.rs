@@ -202,6 +202,8 @@ pub(crate) enum Refusal {
     Form,
     /// A unit's text holds the separator of a joined placeholder.
     Join,
+    /// A unit's absolute path holds a newline, which a newline list cannot name.
+    Line,
     /// The suite has no current record of an earlier full run.
     NoBundle,
     /// The suite directory cannot take a new entry, so a pass could not store its first proof.
@@ -234,6 +236,7 @@ impl fmt::Display for Refusal {
                 "the hook uses a form a single unit cannot stand for ({changed-inputs}, or a list with a join)"
             }
             Self::Join => "a unit's text contains the separator of a joined placeholder",
+            Self::Line => "a unit's absolute path holds a newline, which a newline list cannot name",
             Self::NoBundle => "the suite has no current record of an earlier full run",
             Self::Unwritable => "the suite store cannot take a new entry",
             Self::Proven => "a unit of the roster already has a proof",
@@ -293,6 +296,9 @@ fn screen<'p>(
     }
     if !expand::expands(hook, pending.units(), cx.root, cx.cwd) {
         return Err(Refusal::Join);
+    }
+    if !expand::lines_fit(hook, pending.units(), cx.root, cx.cwd) {
+        return Err(Refusal::Line);
     }
     Ok(pending)
 }
