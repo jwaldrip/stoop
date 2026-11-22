@@ -1947,6 +1947,7 @@ pub(crate) enum RootListing {
 /// symlinked directory is also recorded under the key of the file it reached, so a change to
 /// that file is seen. The second value holds reasons the planner cannot replay the run.
 #[cfg(test)]
+#[cfg_attr(not(any(target_os = "linux", target_os = "macos")), allow(dead_code))]
 pub fn build_inputs(
     root: &Path,
     phys: &mut Physical,
