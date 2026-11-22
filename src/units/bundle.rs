@@ -38,6 +38,7 @@ struct Roster {
 
 #[derive(Serialize, Deserialize)]
 struct LaunchGuard {
+    #[serde(deserialize_with = "unique_map")]
     env: BTreeMap<String, String>,
     env_excluded: Vec<String>,
     ignore: Vec<String>,
@@ -112,9 +113,42 @@ struct SuiteBundleV1 {
     guard_digest: String,
     roster: Roster,
     table: Vec<Input>,
+    #[serde(deserialize_with = "unique_map")]
     units: BTreeMap<String, Vec<UnitVersion>>,
     residue: Residue,
     state: SuiteState,
+}
+
+/// A JSON object with a repeated key is ambiguous, so the whole file is refused as corrupt.
+fn unique_map<'de, D, V>(deserializer: D) -> Result<BTreeMap<String, V>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    struct Unique<V>(std::marker::PhantomData<V>);
+
+    impl<'de, V: Deserialize<'de>> serde::de::Visitor<'de> for Unique<V> {
+        type Value = BTreeMap<String, V>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a JSON object")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut map: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, V>()? {
+                if out.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("a key is repeated"));
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_map(Unique(std::marker::PhantomData))
 }
 
 /// A roster and invocation identity, captured before the whole command runs.
