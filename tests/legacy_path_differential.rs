@@ -643,7 +643,7 @@ fn readonly_and_full() {
     readonly.compare_store(".stoop");
 
     let pair = Pair::new("full");
-    let script = "cat in.txt >/dev/null";
+    let script = "cat in.txt >/dev/null; printf 'ran\\n' >> invocation.log";
     contains(
         &pair.run("D12 record", "full", &[], script, &[]),
         "recorded",
@@ -659,15 +659,50 @@ fn readonly_and_full() {
     assert!(pair
         .run("D12 quiet hit", "full", &["--quiet"], script, &[])
         .is_empty());
+    pair.compare_file("invocation.log");
+    assert_eq!(
+        fs::read_to_string(pair.roots[0].join("invocation.log")).unwrap(),
+        "ran\nran\n",
+        "D12 quiet hit must not run the child"
+    );
+    pair.edit_proof("full", |value| {
+        let proofs = value["proofs"].as_array_mut().unwrap();
+        assert_eq!(proofs.len(), 2, "D12 proofs before quiet forced run");
+        for (index, proof) in proofs.iter_mut().enumerate() {
+            proof["created"] = Value::from(index as u64 + 1);
+        }
+    });
     assert!(pair
         .run(
             "D12 quiet full",
             "full",
-            &["--quiet"],
+            &["--quiet", "--max-age", "0"],
             script,
             &[("STOOP_FULL", "1")]
         )
         .is_empty());
+    let mut normalized = Vec::new();
+    for root in &pair.roots {
+        assert_eq!(
+            fs::read_to_string(root.join("invocation.log")).unwrap(),
+            "ran\nran\nran\n",
+            "D12 quiet forced child must run exactly once"
+        );
+        let path = root.join(".stoop/proofs/full.json");
+        let mut value: Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        let proofs = value["proofs"].as_array_mut().unwrap();
+        assert_eq!(proofs.len(), 3, "D12 quiet forced proof count");
+        assert!(proofs[0]["created"].as_u64().unwrap() > 2);
+        assert_eq!(proofs[1]["created"], 1);
+        assert_eq!(proofs[2]["created"], 2);
+        proofs[0]["created"] = Value::from(3);
+        normalized.push(value);
+    }
+    assert_eq!(
+        normalized[0], normalized[1],
+        "D12 normalized proof creation order"
+    );
+    pair.compare_file("invocation.log");
     pair.compare_store(".stoop");
 }
 
