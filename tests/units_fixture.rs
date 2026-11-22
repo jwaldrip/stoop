@@ -1,22 +1,32 @@
-//! The fake hook runner `tests/fixtures/hook/t` is checked knob by knob (F1-F4). Pins P1-P11
-//! hold today's hooked-run behaviour: each condition that keeps the full form after the
-//! attribution pass. The runner tests need a POSIX shell; the pins need the tracer, so they run
-//! on Linux x86-64 and arm64.
+//! The fake hook runner `tests/fixtures/hook/t` is checked knob by knob (F1-F4 and F6-F12). Pins
+//! P1-P11 hold today's hooked-run behaviour: each condition that keeps the full form after the
+//! attribution pass. F5 checks the purity rule. The runner tests need a POSIX shell; the pins and
+//! F5 need the tracer, so they run on Linux x86-64 and arm64.
 //!
-//! # The runner's contract (spec 3.6)
+//! # The runner's contract (spec 3.2 and 3.6)
 //!
-//! The runner header points here. Change the runner and this table together.
+//! The runner header points here. Change the runner and this table together. A row marked (IF)
+//! acts while `T_IF` is unset or names a path that exists; with `T_IF` set to an absent path it
+//! does nothing. The `T_IF` path lives outside the root, under `/tmp`, because the `T_*` variables
+//! are fingerprinted and cannot change partway through a sequence of runs.
 //!
 //! | Input | Behaviour |
 //! | --- | --- |
-//! | no test word (no argument, or only words starting with `-`) | Runs every `*.t` under the root except `slow/`, plus every `*.u` when `T_U=1`, in `LC_ALL=C` sort order. With `T_LINT=1` it first executes `<root>/lint`. |
-//! | test words | Words starting with `-` are logged only. Every other word is a test path relative to the cwd, run in order. |
-//! | running test P | `cat P`. Then `cat <root>/<line>` for each non-empty line of P. Then `cat <root>/setup.src`. Then the FIFO hold, if armed. Then the test fails if `${P%.*}.flag` contains `fail`. Logs `ran=P`, and `failed=P` on failure. A missing P fails the test. |
+//! | no test word (no argument, or only words starting with `-`) | Runs every `*.t` under the root except `slow/`, plus every `*.u` when `T_U=1`, in `LC_ALL=C` sort order, listed by `find`, `sed` and `sort`. With `T_LINT=1` it first executes `<root>/lint`. |
+//! | test words | Words starting with `-` are logged only. Every other word is a test path relative to the cwd, run in order. Before the first test it runs `find /dev/null -prune`, `sed -n q` and `LC_ALL=C sort` on empty input: the programs the no-argument form runs to list its roster. So a unit launch traces every program the full form runs (purity). `lint` is the exception, and it is residue by design. |
+//! | running test P | With `T_WRITE_AT=P` (IF) and `T_WRITE` set, `written` goes to `T_WRITE` right before `cat P`. Then `cat P`. Then `cat <root>/<line>` for each non-empty line of P. Then `cat <root>/setup.src`. With `T_WRITE_EACH=1`, `written` goes to `${P%.*}.out` after those reads. Then the FIFO hold, if armed. Then the test fails if `${P%.*}.flag` contains `fail`, or, in the test-word form, if `T_FAIL_ALONE=P` (IF). Logs `ran=P`, and `failed=P` on failure. A missing P fails the test. |
 //! | `T_IGNORE=1` | With test words: reads nothing and exits 0. The no-argument form is unaffected. |
 //! | `T_STAT_UNIT=1` | With test words: `test -e P` instead of running it. Logs `statted=P`. |
 //! | `T_FIFO=<path>`, `T_FIFO_AT=<P>` | One `read < $T_FIFO` per invocation, after the first test (or after the test logged as `T_FIFO_AT`) has read its files. |
-//! | `T_WRITE=<path>` | Writes `written` to that path once per invocation, before any test. |
-//! | `T_READ_OTHER=<path>` | Reads that path once per invocation. |
+//! | `T_IF=<path>` | The toggle for the rows marked (IF). |
+//! | `T_WRITE=<path>` (IF) | Writes `written` to that path once per invocation, before any test, unless `T_WRITE_AT` is set (then see the running-test row). |
+//! | `T_WRITE_AT=<P>` (IF) | Narrows `T_WRITE` to the invocation that runs test P, written right before P's reads. |
+//! | `T_WRITE_EACH=1` | Each test P writes `written` to `${P%.*}.out` after its reads, in every invocation that runs it. Not (IF). |
+//! | `T_WRITE_FULL=<path>` | The no-argument form writes `written` to the path after it moves to the root and before its first test, so a relative path is root-relative. Not (IF). |
+//! | `T_READ_OTHER=<path>` (IF) | Reads that path once per invocation, relative to the cwd. |
+//! | `T_STAT_OTHER=<path>` (IF) | Runs `test -e <path>` once per invocation, relative to the cwd, and logs `stat_other=<path>`. The answer does not change the exit status. |
+//! | `T_FAIL_FULL=1` (IF) | The no-argument form exits 1 after its tests. |
+//! | `T_FAIL_ALONE=<P>` (IF) | In the test-word form, test P fails after it has run. Its reads and the other tests are unchanged. |
 //! | `T_LS_ROOT=1` / `T_STAT_ROOT=1` | `ls -a <root>` (logs `ls_root`) / `test -d <root>` (logs `stat_root`), once per invocation. |
 //! | `LOG=<path>` (outside the root) | Per invocation it logs `launch`, then `arg=<w>` for each argument, then `changed=`, `units=`, `changed_file=`, `changed_inputs=`, `changed_inputs_file=` (newlines inside a value logged as `\|`), then the per-test lines. |
 //! | exit | 1 if any test failed, else 0. |
