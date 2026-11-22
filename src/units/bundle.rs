@@ -1640,6 +1640,25 @@ mod pass_tests {
         assert_eq!(fs::read(bundle_file(&dir, &id)).unwrap(), before);
     }
 
+    /// Takes the suite lock again after this test released it. Another test thread can fork a
+    /// child that holds a copy of the lock descriptor until it execs, so the lock can stay held
+    /// briefly. Busy is retried for up to 2 s; a lock still held after that fails the test.
+    fn start_after_release(store: &std::path::Path, pending: &Pending, key: &str) -> Start {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match start(store, pending, key, guard()) {
+                Start::Busy => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the suite lock stayed busy for 2 s after this test released it"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                other => return other,
+            }
+        }
+    }
+
     #[test]
     fn start_takes_a_pass_only_when_every_precondition_holds() {
         let roster = ["tests/a.t"];
@@ -1667,7 +1686,7 @@ mod pass_tests {
         let wider = ["tests/a.t", "tests/b.t"];
         assert!(
             matches!(
-                start(&dir, &pending_for(&wider), "key", guard()),
+                start_after_release(&dir, &pending_for(&wider), "key"),
                 Start::Pass(_)
             ),
             "a new roster for the same suite starts a pass"
@@ -1717,7 +1736,7 @@ mod pass_tests {
         ));
         fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(matches!(
-            start(&dir, &pending_for(&roster), "key", guard()),
+            start_after_release(&dir, &pending_for(&roster), "key"),
             Start::Pass(_)
         ));
     }
