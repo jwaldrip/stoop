@@ -1,0 +1,121 @@
+#!/bin/sh
+# Fake hook runner for stoop's unit tests. Its contract is the table in
+# tests/units_fixture.rs; change both together. POSIX sh: it must run under dash.
+#
+# No test arguments: run every *.t under the root except slow/ (and every *.u with
+# T_U=1), in LC_ALL=C order. With T_LINT=1 it runs <root>/lint first.
+# Test arguments: run each one, relative to the cwd. Words starting with '-' are logged only.
+# LOG (a file outside the root) receives one block of lines per invocation.
+
+ROOT=$(cd "$(dirname "$0")" && pwd -P) || exit 2
+ARGS=$#
+STATUS=0
+HELD=
+
+note() {
+	if [ -n "${LOG:-}" ]; then
+		printf '%s\n' "$1" >> "$LOG"
+	fi
+}
+
+# One log line for a value: newlines become '|'.
+flat() {
+	printf '%s' "$1" | tr '\n' '|'
+}
+
+# The FIFO hold: one read per invocation, after the first test, or after the test named by T_FIFO_AT.
+hold() {
+	if [ -n "${T_FIFO:-}" ] && [ -z "$HELD" ]; then
+		if [ -z "${T_FIFO_AT:-}" ] || [ "$T_FIFO_AT" = "$1" ]; then
+			HELD=1
+			read -r _ < "$T_FIFO" || true
+		fi
+	fi
+}
+
+run_test() {
+	if [ "$ARGS" -gt 0 ] && [ "${T_STAT_UNIT:-}" = 1 ]; then
+		note "statted=$1"
+		if [ ! -e "$1" ]; then
+			note "failed=$1"
+			STATUS=1
+		fi
+		return
+	fi
+	note "ran=$1"
+	if [ ! -f "$1" ]; then
+		note "failed=$1"
+		STATUS=1
+		return
+	fi
+	cat "$1"
+	while IFS= read -r line || [ -n "$line" ]; do
+		if [ -n "$line" ]; then
+			cat "$ROOT/$line"
+		fi
+	done < "$1"
+	cat "$ROOT/setup.src"
+	hold "$1"
+	flag=${1%.*}.flag
+	if [ -f "$flag" ] && grep -q fail "$flag"; then
+		note "failed=$1"
+		STATUS=1
+	fi
+}
+
+list_tests() {
+	if [ "${T_U:-}" = 1 ]; then
+		find . \( -name '.?*' -o -path ./slow \) -prune -o -type f \( -name '*.t' -o -name '*.u' \) -print
+	else
+		find . \( -name '.?*' -o -path ./slow \) -prune -o -type f -name '*.t' -print
+	fi | sed 's|^\./||' | LC_ALL=C sort
+}
+
+note launch
+for word in "$@"; do
+	note "arg=$word"
+done
+note "changed=$(flat "${STOOP_CHANGED:-}")"
+note "units=$(flat "${STOOP_UNITS:-}")"
+note "changed_file=$(flat "${STOOP_CHANGED_FILE:-}")"
+note "changed_inputs=$(flat "${STOOP_CHANGED_INPUTS:-}")"
+note "changed_inputs_file=$(flat "${STOOP_CHANGED_INPUTS_FILE:-}")"
+
+if [ -n "${T_WRITE:-}" ]; then
+	printf 'written\n' > "$T_WRITE"
+fi
+if [ "$ARGS" -gt 0 ] && [ "${T_IGNORE:-}" = 1 ]; then
+	exit 0
+fi
+if [ "$ARGS" -eq 0 ] && [ "${T_LINT:-}" = 1 ]; then
+	"$ROOT/lint"
+fi
+if [ "${T_LS_ROOT:-}" = 1 ]; then
+	ls -a "$ROOT" > /dev/null
+	note ls_root
+fi
+if [ "${T_STAT_ROOT:-}" = 1 ]; then
+	test -d "$ROOT"
+	note stat_root
+fi
+if [ -n "${T_READ_OTHER:-}" ]; then
+	cat "$T_READ_OTHER" > /dev/null
+fi
+
+if [ "$ARGS" -eq 0 ]; then
+	cd "$ROOT" || exit 2
+	set -f
+	for P in $(list_tests); do
+		run_test "$P"
+	done
+	set +f
+else
+	for P in "$@"; do
+		case $P in
+			-*) ;;
+			*) run_test "$P" ;;
+		esac
+	done
+fi
+
+exit "$STATUS"
