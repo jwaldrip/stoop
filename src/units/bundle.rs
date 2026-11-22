@@ -488,6 +488,10 @@ mod tests {
 
     #[test]
     fn unit_ids_and_roster_obey_the_bounds() {
+        assert_eq!(MAX_UNITS, 4096);
+        assert_eq!(MAX_UNIT_BYTES, 4096);
+        assert_eq!(MAX_VERSIONS, 8);
+        assert_eq!(MAX_BYTES, 8 * 1024 * 1024);
         for invalid in ["", "/a", "./a", "a/../b", "a//b", "a\nb", "a\0b"] {
             assert!(!valid_unit(invalid), "{invalid:?}");
         }
