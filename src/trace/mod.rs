@@ -1,7 +1,7 @@
 //! Observing what a command reads and writes.
 
 use crate::ignore::Ignore;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -104,6 +104,8 @@ pub struct Trace {
     pub footprint: identity::Footprint,
     /// Transient verified atomic replacements, keyed by the destination's existing proof key.
     pub atomic_landings: BTreeMap<String, AtomicLanding>,
+    /// Direct writable opens whose content prior was bound to a confirmed read.
+    pub bound_priors: BTreeSet<String>,
     /// Repository symlinks whose targets passed through a proc magic link at entry.
     pub magic_links: HashSet<PathBuf>,
     /// Paths the run wrote, renamed, removed or created, as the run named them.

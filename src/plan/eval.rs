@@ -760,15 +760,9 @@ fn evaluate(
                 }
             }
         }
-        let mut pair_answers: BTreeMap<&str, Answer> = BTreeMap::new();
-        let mut pending_input: Option<(Decision, &Input)> = None;
         macro_rules! stop {
             ($result:expr) => {
-                return if let Some((miss, _)) = pending_input.take() {
-                    miss
-                } else {
-                    $result
-                }
+                return $result
             };
         }
         for input in &proof.inputs {
@@ -813,6 +807,10 @@ fn evaluate(
                     .strip_prefix("f:")
                     .or_else(|| input.id.strip_prefix("x:"))
                     .is_some_and(|hash| lower_hex(hash, 64));
+            if exact_pair {
+                // The prior loop sees the same virtual tree before this step's outputs apply.
+                continue;
+            }
             let answer = match tree.compare(input, shortcut) {
                 Ok(answer) => answer,
                 Err(err) => {
@@ -850,15 +848,7 @@ fn evaluate(
                 result
                     .mismatches
                     .push((*index, input.path.clone(), why.into()));
-                if exact_pair && pending_input.is_none() {
-                    pending_input = Some((result, input));
-                    pair_answers.insert(input.path.as_str(), answer);
-                    continue;
-                }
                 stop!(result);
-            }
-            if exact_pair {
-                pair_answers.insert(input.path.as_str(), answer);
             }
         }
         // The recorder left these names out, so the planner checks no value for them. A name in
@@ -981,26 +971,20 @@ fn evaluate(
                     }
                 }
                 evidence.priors += 1;
-                let compared;
-                let answer = if let Some(answer) = pair_answers.get(prior.path.as_str()) {
-                    answer
-                } else {
-                    compared = match tree.compare(prior, shortcut) {
-                        Ok(answer) => answer,
-                        Err(err) => {
-                            stop!(decision(
-                                if err.starts_with("git:") {
-                                    Code::Error
-                                } else {
-                                    Code::Unplannable
-                                },
-                                err,
-                            ));
-                        }
-                    };
-                    &compared
+                let answer = match tree.compare(prior, shortcut) {
+                    Ok(answer) => answer,
+                    Err(err) => {
+                        stop!(decision(
+                            if err.starts_with("git:") {
+                                Code::Error
+                            } else {
+                                Code::Unplannable
+                            },
+                            err,
+                        ));
+                    }
                 };
-                count(evidence, notes, explain, *index, &prior.path, answer);
+                count(evidence, notes, explain, *index, &prior.path, &answer);
                 let actual = answer.id.as_str();
                 let expected = prior.id.as_str();
                 let actual_kind = if actual == "a" {
@@ -1049,12 +1033,6 @@ fn evaluate(
                 if let Some(why) = why {
                     let mut result = decision(Code::PriorChanged, format!("{}: {why}", prior.path));
                     result.mismatches.push((*index, prior.path.clone(), why));
-                    if pending_input
-                        .as_ref()
-                        .is_some_and(|(_, input)| *input == prior)
-                    {
-                        return result;
-                    }
                     stop!(result);
                 }
                 if expected == "d" {
@@ -1090,9 +1068,6 @@ fn evaluate(
                     }
                 }
             }
-        }
-        if let Some((miss, _)) = pending_input {
-            return miss;
         }
         for out in &proof.outputs {
             if out.id != "d" && !out.id.starts_with("dl:") {
@@ -2075,56 +2050,6 @@ mod tests {
             assert_eq!(plan_key(&duplicate), plan_key(&original), "{mode:?}");
             p.inputs.clear();
             replace_first(&mut f, p.clone());
-        }
-    }
-
-    #[test]
-    fn input_prior_pair_requires_identical_unique_evidence_and_a_reached_prior() {
-        let mut f = Fixture::new();
-        let old = input("dir/a", &file_id(b"old"));
-        let mut p = proof(vec![old.clone()]);
-        p.outputs.push(input("dir/a", &file_id(b"new")));
-        p.priors = Some(vec![old.clone()]);
-        f.install(vec![p.clone()]);
-
-        let mut cases = Vec::new();
-        let mut different_id = p.clone();
-        different_id.priors.as_mut().unwrap()[0].id = file_id(b"different");
-        cases.push(different_id);
-        let mut different_oid = p.clone();
-        different_oid.priors.as_mut().unwrap()[0].oid = Some("sha1:1234".into());
-        cases.push(different_oid);
-        let mut different_basis = p.clone();
-        different_basis.priors.as_mut().unwrap()[0].oid_basis = Some(clean_basis());
-        cases.push(different_basis);
-        let mut ambiguous = p.clone();
-        ambiguous.priors.as_mut().unwrap().push(old);
-        cases.push(ambiguous);
-        let mut blocked = p.clone();
-        blocked.unplannable.push("blocked before priors".into());
-        cases.push(blocked);
-        let mut earlier_prior = p.clone();
-        earlier_prior
-            .priors
-            .as_mut()
-            .unwrap()
-            .insert(0, input("dir", "a"));
-        cases.push(earlier_prior);
-        let mut no_matching_output = p;
-        no_matching_output.outputs = vec![];
-        cases.push(no_matching_output);
-
-        for (case, candidate) in cases.into_iter().enumerate() {
-            replace_first(&mut f, candidate);
-            for mode in [Prefilter::On, Prefilter::Off, Prefilter::Check] {
-                let result = plan(&f, &f.spec, mode);
-                assert_eq!(result.code, Code::InputChanged, "case {case}, {mode:?}");
-                assert_eq!(
-                    result.mismatches,
-                    vec![(1, "dir/a".into(), "changed".into())],
-                    "case {case}, {mode:?}"
-                );
-            }
         }
     }
 
@@ -4476,5 +4401,458 @@ mod tests {
             proved >= cases / 8,
             "seed {seed:#x}: only {proved} proved records in {cases}"
         );
+    }
+
+    /// Compare a newer record with and without its exact prior input, with an older matching
+    /// record available. The optional missing blob is encountered first in the newer priors.
+    fn compare_two_record_prior_pair(atomic: bool, missing: bool, with_oid: bool) {
+        let mut f = Fixture::new();
+        fs::write(f.root.join("a"), b"unavailable content\n").unwrap();
+        fs::write(f.root.join("config.txt"), b"current\n").unwrap();
+        commit_all(&f.root, "two-record tree");
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+
+        let (mut prior, output, prior_bytes) = if atomic {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/recorder/sed-exec/proof.json");
+            let document: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            let recorded: Proof = serde_json::from_value(document["proofs"][0].clone()).unwrap();
+            let prior = recorded
+                .priors
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|entry| entry.path == "config.txt")
+                .unwrap()
+                .clone();
+            assert_eq!(
+                recorded
+                    .inputs
+                    .iter()
+                    .find(|entry| entry.path == "config.txt"),
+                Some(&prior)
+            );
+            let output = recorded
+                .outputs
+                .iter()
+                .find(|entry| entry.path == "config.txt")
+                .unwrap()
+                .clone();
+            (prior, output, b"foo\n".as_slice())
+        } else {
+            (
+                input("config.txt", &file_id(b"old\n")),
+                input("config.txt", &file_id(b"new\n")),
+                b"old\n".as_slice(),
+            )
+        };
+        if with_oid {
+            prior.oid = Some(blob_oid_of(&f.root, prior_bytes));
+            prior.oid_basis = Some(clean_basis());
+        }
+
+        let older = proof(vec![input("config.txt", &file_id(b"current\n"))]);
+        f.install(vec![older]);
+        let mut newer_record = f.jobs.load("job-test").remove(0);
+        newer_record.started = 101;
+        newer_record.run = Some("2/1".into());
+        if missing {
+            let oid = tree_oid(&f.root, "a");
+            drop_loose_blob(&f.root, &oid);
+        }
+        for mode in [Prefilter::On, Prefilter::Off, Prefilter::Check] {
+            assert!(
+                plan(&f, &f.spec, mode).skip,
+                "the older record alone must prove: atomic={atomic}, {mode:?}"
+            );
+        }
+
+        let mut newer = proof(vec![]);
+        newer.outputs = vec![input("a", &file_id(b"written\n")), output];
+        newer.priors = Some(vec![
+            input("a", &file_id(b"unavailable content\n")),
+            prior.clone(),
+        ]);
+        f.proofs.save("sh-0", newer.clone()).unwrap();
+        newer_record.steps[0].proof = newer.digest();
+        f.jobs.save("job-test", newer_record.clone()).unwrap();
+
+        let modes = [Prefilter::On, Prefilter::Off, Prefilter::Check];
+        let baseline: Vec<_> = modes.iter().map(|mode| plan(&f, &f.spec, *mode)).collect();
+        for (mode, result) in modes.iter().zip(&baseline) {
+            assert_eq!(
+                result.code,
+                if missing { Code::Error } else { Code::Proved },
+                "baseline atomic={atomic}, missing={missing}, oid={with_oid}, {mode:?}: {}",
+                result.detail
+            );
+        }
+
+        newer.inputs.push(prior);
+        f.proofs.save("sh-0", newer.clone()).unwrap();
+        newer_record.steps[0].proof = newer.digest();
+        f.jobs.save("job-test", newer_record).unwrap();
+        for (mode, original) in modes.iter().zip(&baseline) {
+            let promoted = plan(&f, &f.spec, *mode);
+            assert_eq!(
+                plan_key(&promoted),
+                plan_key(original),
+                "atomic={atomic}, missing={missing}, oid={with_oid}, {mode:?}"
+            );
+            assert!(
+                original.skip || !promoted.skip,
+                "a prior miss became a skip"
+            );
+        }
+    }
+
+    #[test]
+    fn promoted_input_cannot_hide_a_fatal_prior_error_with_an_older_record() {
+        compare_two_record_prior_pair(false, true, false);
+    }
+
+    #[test]
+    fn atomic_recorded_input_cannot_hide_a_fatal_prior_error() {
+        compare_two_record_prior_pair(true, true, false);
+    }
+
+    #[test]
+    fn two_record_prior_pair_equivalence_corpus() {
+        for atomic in [false, true] {
+            for missing in [true, false] {
+                for with_oid in [false, true] {
+                    compare_two_record_prior_pair(atomic, missing, with_oid);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn two_promoted_misses_cannot_hide_an_earlier_fatal_prior() {
+        let mut f = Fixture::new();
+        for (name, bytes) in [
+            ("a", b"missing blob\n".as_slice()),
+            ("f", b"current f\n".as_slice()),
+            ("g", b"current g\n".as_slice()),
+        ] {
+            fs::write(f.root.join(name), bytes).unwrap();
+        }
+        commit_all(&f.root, "two promoted paths");
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        f.install(vec![proof(vec![
+            input("f", &file_id(b"current f\n")),
+            input("g", &file_id(b"current g\n")),
+        ])]);
+        let mut newer_record = f.jobs.load("job-test").remove(0);
+        newer_record.started = 101;
+        newer_record.run = Some("2/1".into());
+        let first = input("f", &file_id(b"old f\n"));
+        let second = input("g", &file_id(b"old g\n"));
+        let mut newer = proof(vec![]);
+        newer.outputs = vec![
+            input("a", &file_id(b"new a\n")),
+            input("f", &file_id(b"new f\n")),
+            input("g", &file_id(b"new g\n")),
+        ];
+        newer.priors = Some(vec![
+            input("a", &file_id(b"missing blob\n")),
+            first.clone(),
+            second.clone(),
+        ]);
+        f.proofs.save("sh-0", newer.clone()).unwrap();
+        newer_record.steps[0].proof = newer.digest();
+        f.jobs.save("job-test", newer_record.clone()).unwrap();
+        drop_loose_blob(&f.root, &tree_oid(&f.root, "a"));
+        let modes = [Prefilter::On, Prefilter::Off, Prefilter::Check];
+        let baseline: Vec<_> = modes.iter().map(|mode| plan(&f, &f.spec, *mode)).collect();
+        assert!(baseline.iter().all(|d| !d.skip && d.code == Code::Error));
+
+        newer.inputs = vec![first, second];
+        f.proofs.save("sh-0", newer.clone()).unwrap();
+        newer_record.steps[0].proof = newer.digest();
+        f.jobs.save("job-test", newer_record).unwrap();
+        for (mode, expected) in modes.iter().zip(&baseline) {
+            let actual = plan(&f, &f.spec, *mode);
+            assert_eq!(plan_key(&actual), plan_key(expected), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn promoted_input_does_not_fetch_before_a_changed_environment() {
+        let mut f = Fixture::new();
+        fs::write(f.root.join("f"), b"unavailable input\n").unwrap();
+        commit_all(&f.root, "missing promoted input");
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        f.install(vec![proof(vec![])]);
+        let mut newer_record = f.jobs.load("job-test").remove(0);
+        newer_record.started = 101;
+        newer_record.run = Some("2/1".into());
+        let prior = input("f", &file_id(b"old input\n"));
+        let mut newer = proof(vec![]);
+        newer.outputs = vec![input("f", &file_id(b"new output\n"))];
+        newer.priors = Some(vec![prior.clone()]);
+        newer.env.insert(
+            "GITHUB_REF".into(),
+            crate::run::env_hash("GITHUB_REF", "refs/heads/old", None),
+        );
+        f.proofs.save("sh-0", newer.clone()).unwrap();
+        newer_record.steps[0].proof = newer.digest();
+        f.jobs.save("job-test", newer_record.clone()).unwrap();
+        drop_loose_blob(&f.root, &tree_oid(&f.root, "f"));
+        let modes = [Prefilter::On, Prefilter::Off, Prefilter::Check];
+        let baseline: Vec<_> = modes.iter().map(|mode| plan(&f, &f.spec, *mode)).collect();
+        assert!(baseline.iter().all(|d| d.skip && d.code == Code::Proved));
+
+        newer.inputs.push(prior);
+        f.proofs.save("sh-0", newer.clone()).unwrap();
+        newer_record.steps[0].proof = newer.digest();
+        f.jobs.save("job-test", newer_record).unwrap();
+        for (mode, expected) in modes.iter().zip(&baseline) {
+            let actual = plan(&f, &f.spec, *mode);
+            assert_eq!(plan_key(&actual), plan_key(expected), "{mode:?}");
+        }
+    }
+
+    fn evaluate_saved_record(f: &Fixture, spec: &JobSpec, mode: Prefilter) -> Decision {
+        let record = f.jobs.load(spec.key.as_deref().unwrap()).remove(0);
+        let mut tree = GitTree::load(&f.root, "HEAD").unwrap();
+        evaluate_record(
+            spec,
+            &mut PlanCtx {
+                tree: &mut tree,
+                proofs: &f.proofs,
+                jobs: &f.jobs,
+                now: 100,
+                max_age: 50,
+                github_vars: BTreeMap::new(),
+                check: &Accept,
+                salt: None,
+                event_path: None,
+                event: None,
+                explain: false,
+                prefilter: mode,
+            },
+            &record,
+        )
+        .decision
+    }
+
+    fn assert_exact_pair_record_equivalence(
+        f: &Fixture,
+        label: &str,
+        original: Vec<Proof>,
+        promoted: Vec<Input>,
+    ) {
+        let mut paired = original.clone();
+        let inputs = &mut paired.last_mut().unwrap().inputs;
+        inputs.extend(promoted);
+        inputs.sort_by(|a, b| a.path.cmp(&b.path));
+        let base_key = format!("job-{label}-base");
+        let paired_key = format!("job-{label}-paired");
+        let base_spec = JobSpec {
+            key: Some(base_key.clone()),
+            steps: save_record(f, &base_key, original),
+            ..f.spec.clone()
+        };
+        let paired_spec = JobSpec {
+            key: Some(paired_key.clone()),
+            steps: save_record(f, &paired_key, paired),
+            ..f.spec.clone()
+        };
+        for mode in [Prefilter::On, Prefilter::Off, Prefilter::Check] {
+            let baseline = evaluate_saved_record(f, &base_spec, mode);
+            let actual = evaluate_saved_record(f, &paired_spec, mode);
+            assert_eq!(plan_key(&actual), plan_key(&baseline), "{label}, {mode:?}");
+        }
+    }
+
+    #[test]
+    fn promoted_prior_exact_record_equivalence_corpus() {
+        for (label, count, changed, missing, guard, overlay) in [
+            ("single-match", 1, false, "", "", false),
+            ("single-change", 1, true, "", "", false),
+            ("two-changes", 2, true, "", "", false),
+            ("three-changes", 3, true, "", "", false),
+            ("unread-missing", 2, true, "a", "", false),
+            ("env-missing", 1, true, "f", "env", false),
+            ("reason-missing", 1, true, "f", "reason", false),
+            ("output-missing", 1, true, "f", "output", false),
+            ("overlay", 1, false, "", "", true),
+        ] {
+            let mut f = Fixture::new();
+            for (name, bytes) in [
+                ("a", b"unread a\n".as_slice()),
+                ("f", b"current f\n".as_slice()),
+                ("g", b"current g\n".as_slice()),
+                ("h", b"current h\n".as_slice()),
+            ] {
+                fs::write(f.root.join(name), bytes).unwrap();
+            }
+            commit_all(&f.root, label);
+            f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+            let mut earlier = Vec::new();
+            if overlay {
+                let mut step = proof(vec![]);
+                step.outputs = vec![input("f", &file_id(b"overlay\n"))];
+                step.priors = Some(vec![input("f", &file_id(b"current f\n"))]);
+                earlier.push(step);
+            }
+            let mut step = proof(vec![input("dir/a", &file_id(b"tracked"))]);
+            let mut priors = Vec::new();
+            if missing == "a" {
+                step.outputs.push(input("a", &file_id(b"written a\n")));
+                priors.push(input("a", &file_id(b"unread a\n")));
+            }
+            let mut pairs = Vec::new();
+            for (path, current) in [
+                ("f", b"current f\n".as_slice()),
+                ("g", b"current g\n".as_slice()),
+                ("h", b"current h\n".as_slice()),
+            ]
+            .into_iter()
+            .take(count)
+            {
+                let before = if overlay {
+                    b"overlay\n".as_slice()
+                } else if changed {
+                    b"old\n".as_slice()
+                } else {
+                    current
+                };
+                let prior = input(path, &file_id(before));
+                step.outputs.push(input(path, &file_id(b"written\n")));
+                priors.push(prior.clone());
+                pairs.push(prior);
+            }
+            step.priors = Some(priors);
+            match guard {
+                "env" => {
+                    step.env.insert(
+                        "GITHUB_REF".into(),
+                        crate::run::env_hash("GITHUB_REF", "refs/heads/old", None),
+                    );
+                }
+                "reason" => step.unplannable.push("recorded refusal".into()),
+                "output" => step.outputs.push(input("../invalid", &file_id(b"bad"))),
+                _ => {}
+            }
+            earlier.push(step);
+            if !missing.is_empty() {
+                drop_loose_blob(&f.root, &tree_oid(&f.root, missing));
+            }
+            assert_exact_pair_record_equivalence(&f, label, earlier, pairs);
+        }
+
+        for (case, path, contents, executable) in [
+            ("chmod", "s.sh", b"echo hi\n".as_slice(), true),
+            ("sed", "config.txt", b"foo\n".as_slice(), false),
+            ("sed-exec", "config.txt", b"foo\n".as_slice(), false),
+            ("proc", "config.txt", b"old content".as_slice(), false),
+        ] {
+            use std::os::unix::fs::PermissionsExt;
+            let f = Fixture::new();
+            fs::write(f.root.join(path), contents).unwrap();
+            if executable {
+                fs::set_permissions(f.root.join(path), fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            commit_all(&f.root, case);
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/recorder")
+                .join(case)
+                .join("proof.json");
+            let document: serde_json::Value =
+                serde_json::from_slice(&fs::read(fixture).unwrap()).unwrap();
+            let mut recorded: Proof =
+                serde_json::from_value(document["proofs"][0].clone()).unwrap();
+            recorded.created = 90;
+            recorded.provenance = proof(vec![]).provenance;
+            recorded.env.clear();
+            recorded.env_excluded.clear();
+            let prior = recorded
+                .priors
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap()
+                .clone();
+            assert!(recorded.outputs.iter().any(|entry| entry.path == path));
+            recorded.inputs.retain(|entry| entry != &prior);
+            assert_exact_pair_record_equivalence(&f, case, vec![recorded], vec![prior]);
+        }
+
+        compare_two_record_prior_pair(false, true, false);
+        compare_two_record_prior_pair(true, true, true);
+        two_promoted_misses_cannot_hide_an_earlier_fatal_prior();
+        promoted_input_does_not_fetch_before_a_changed_environment();
+    }
+
+    fn assert_nonqualifying_input_is_compared(case: &str) {
+        let mut f = Fixture::new();
+        let mut observed = input("dir/a", &file_id(b"old"));
+        let mut prior = observed.clone();
+        match case {
+            "id" => prior.id = file_id(b"different"),
+            "oid" => prior.oid = Some("sha1:1234".into()),
+            "basis" => prior.oid_basis = Some(clean_basis()),
+            "malformed" => {
+                observed.id = "f:bad".into();
+                prior.id = observed.id.clone();
+            }
+            _ => {}
+        }
+        let mut p = proof(vec![observed]);
+        if case != "no-output" {
+            p.outputs.push(input("dir/a", &file_id(b"new")));
+        }
+        p.priors = if case == "no-priors" {
+            None
+        } else if case == "duplicate" {
+            Some(vec![prior.clone(), prior])
+        } else {
+            Some(vec![prior])
+        };
+        p.env.insert(
+            "GITHUB_REF".into(),
+            crate::run::env_hash("GITHUB_REF", "refs/heads/old", None),
+        );
+        f.install(vec![p]);
+        for mode in [Prefilter::On, Prefilter::Off, Prefilter::Check] {
+            let result = plan(&f, &f.spec, mode);
+            assert_eq!(
+                result.code,
+                Code::InputChanged,
+                "{case}, {mode:?}: {}",
+                result.detail
+            );
+        }
+    }
+
+    #[test]
+    fn nonqualifying_inputs_still_compare_before_prior_guards() {
+        for case in ["duplicate", "no-output", "malformed"] {
+            assert_nonqualifying_input_is_compared(case);
+        }
+    }
+
+    #[test]
+    fn different_id_is_not_an_exact_pair() {
+        assert_nonqualifying_input_is_compared("id");
+    }
+
+    #[test]
+    fn different_oid_is_not_an_exact_pair() {
+        assert_nonqualifying_input_is_compared("oid");
+    }
+
+    #[test]
+    fn different_oid_basis_is_not_an_exact_pair() {
+        assert_nonqualifying_input_is_compared("basis");
+    }
+
+    #[test]
+    fn no_prior_rail_cannot_skip_the_input_comparison() {
+        assert_nonqualifying_input_is_compared("no-priors");
     }
 }
