@@ -640,6 +640,101 @@ fn a_shell_environment_hook_never_dispatches() {
     full_form(&s.launches());
 }
 
+/// The legacy key of the one proof file under `.stoop/proofs`.
+fn legacy_key(s: &Suite) -> String {
+    let mut keys: Vec<String> = fs::read_dir(s.root.join(".stoop/proofs"))
+        .unwrap()
+        .map(|entry| {
+            let file: Value =
+                serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap();
+            file["key"].as_str().unwrap().to_owned()
+        })
+        .collect();
+    assert_eq!(keys.len(), 1, "{keys:?}");
+    keys.pop().unwrap()
+}
+
+// A24: a pass that stores no proof leaves a marker for its roster, so the later changed runs of
+// that roster take the full form until the roster changes or `forget --units` clears the suite.
+// Fails on a tree without the marker: the second changed run starts a pass again.
+#[test]
+fn a_pass_that_stores_no_proof_is_not_repeated_for_the_same_roster() {
+    let s = Suite::new();
+    success(&s.hook(&[]));
+    // The runner exits 0 without reading its units, so no unit gets a proof.
+    edit(&s, 2);
+    s.clear_log();
+    success(&s.hook(&[("T_IGNORE", "1")]));
+    one_per_unit(&s.launches(), &ROSTER);
+    assert!(bundle(&s)["units"].as_object().unwrap().is_empty());
+    // The same roster, changed again: the full form, which records the whole command.
+    edit(&s, 3);
+    s.clear_log();
+    success(&s.hook(&[("T_IGNORE", "1")]));
+    full_form(&s.launches());
+    // The runner reads its units now, but this roster stayed silent, so the full form still runs.
+    edit(&s, 4);
+    s.clear_log();
+    success(&s.hook(&[]));
+    full_form(&s.launches());
+    // A new unit changes the roster, so the next change starts a pass again.
+    s.write("tests/d.t", "src/shared.src\n");
+    s.clear_log();
+    success(&s.hook(&[]));
+    one_per_unit(
+        &s.launches(),
+        &["tests/a.t", "tests/b.t", "tests/c.t", "tests/d.t"],
+    );
+}
+
+// A26: a unit launch captures no Git blob id, so a unit proof carries none, while the legacy proof
+// of the same suite still records them. Fails on a tree without the cut: the unit proofs carry
+// object ids.
+#[test]
+fn unit_proofs_carry_no_blob_ids_while_the_legacy_proof_keeps_them() {
+    let s = Suite::new();
+    s.write(".stoopignore", ".git\n");
+    s.config("[units]\ndefault_branch = \"main\"\n");
+    s.git("work");
+    success(&s.hook(&[]));
+    assert!(
+        s.proofs().iter().any(|proof| proof["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|input| input["oid"].is_string())),
+        "the legacy proof records a blob id in a Git root"
+    );
+    edit(&s, 2);
+    s.clear_log();
+    success(&s.hook(&[]));
+    one_per_unit(&s.launches(), &ROSTER);
+    for input in bundle(&s)["table"].as_array().unwrap() {
+        assert!(
+            input["oid"].is_null(),
+            "a unit proof carries a blob id: {input}"
+        );
+    }
+}
+
+// A27: `stoop forget <key>` removes the legacy proof and keeps the bundle, so the next change finds
+// no legacy proof and takes the full form, not a pass. Passes on a tree that has the check.
+#[test]
+fn forgetting_the_legacy_proof_keeps_the_next_change_on_the_full_form() {
+    let s = Suite::new();
+    success(&s.hook(&[]));
+    let key = legacy_key(&s);
+    let mut command = s.stoop(&s.root);
+    command.args(["forget", "--root"]).arg(&s.root).arg(&key);
+    success(&spawning(|| command.output()).unwrap());
+    assert!(s.proofs().is_empty(), "the legacy proof is gone");
+    assert!(s.bundle_path().is_some(), "the bundle stays");
+    edit(&s, 2);
+    s.clear_log();
+    success(&s.hook(&[]));
+    full_form(&s.launches());
+}
+
 /// M2 (ignored, a measurement). The milliseconds one attribution launch costs in a Git root and in
 /// a plain directory, against the same runner run directly. `STOOP_BENCH_UNITS` sets the roster
 /// size, from 3 to 4096. Run it in release:

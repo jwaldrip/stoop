@@ -946,6 +946,8 @@ pub(crate) struct Pass {
     /// The table index of each input, by its serialized form, so each input is stored once.
     interned: BTreeMap<String, u32>,
     budget: u64,
+    #[cfg(test)]
+    writes: usize,
 }
 
 impl Pass {
@@ -983,7 +985,13 @@ impl Pass {
             return Stored::WriteFailed;
         }
         match write_bytes(&self.area, &self.bundle.suite, &bytes) {
-            Ok(()) => Stored::Stored,
+            Ok(()) => {
+                #[cfg(test)]
+                {
+                    self.writes += 1;
+                }
+                Stored::Stored
+            }
             Err(_) => Stored::WriteFailed,
         }
     }
@@ -1020,6 +1028,18 @@ impl Pass {
 /// the roster, and the suite lock is free. The bundle is checked again under the lock, and then
 /// reset to the current roster and guard with no versions. Nothing is written here.
 pub(crate) fn start(store: &Path, pending: &Pending, key: &str, guard: LaunchGuard) -> Start {
+    start_with(store, pending, key, guard, || {})
+}
+
+/// `start`, with `after_open` called once the lock entry is open and before it is locked. Tests
+/// use it to change the bundle between the unlocked check and the lock.
+fn start_with(
+    store: &Path,
+    pending: &Pending,
+    key: &str,
+    guard: LaunchGuard,
+    after_open: impl FnMut(),
+) -> Start {
     let Ok(Some(area)) = Area::open(store, false) else {
         return Start::No;
     };
@@ -1027,7 +1047,7 @@ pub(crate) fn start(store: &Path, pending: &Pending, key: &str, guard: LaunchGua
     if ready(&area, pending, &digest).is_none() {
         return Start::No;
     }
-    let held = match lock(&area, &pending.suite) {
+    let held = match lock_with(&area, &pending.suite, after_open) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Start::Busy,
         Err(_) => return Start::No,
@@ -1054,6 +1074,8 @@ pub(crate) fn start(store: &Path, pending: &Pending, key: &str, guard: LaunchGua
         bundle,
         interned: BTreeMap::new(),
         budget: MAX_BYTES,
+        #[cfg(test)]
+        writes: 0,
     })
 }
 
@@ -1739,6 +1761,144 @@ mod pass_tests {
             start_after_release(&dir, &pending_for(&roster), "key"),
             Start::Pass(_)
         ));
+    }
+
+    /// `count` unit names, in roster order.
+    fn roster_of(count: usize) -> Vec<String> {
+        (0..count)
+            .map(|index| format!("tests/u{index:02}.t"))
+            .collect()
+    }
+
+    fn pending_of(units: &[String]) -> Pending {
+        pending(PendingSpec {
+            argv: &["runner".into(), "{changed:*.t}".into()],
+            cwd: "",
+            scope: None,
+            label: None,
+            source: "filter",
+            filter: "*.t",
+            units: units.to_vec(),
+            config: None,
+            config_suite: None,
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_pass_writes_its_bundle_once_for_many_quick_proofs() {
+        let units = roster_of(20);
+        let dir = seed("coalesce", &bundle_for(pending_of(&units), "key"));
+        let mut pass = pass_of(start(&dir, &pending_of(&units), "key", guard()));
+        for unit in &units {
+            assert!(matches!(
+                pass.record(unit, &[input("src/shared.src")], &[], 1),
+                Stored::Stored
+            ));
+        }
+        // The first proof is written at once. The others wait for a second to pass or for the end.
+        assert!(
+            pass.writes <= 3,
+            "{} writes for 20 quick proofs",
+            pass.writes
+        );
+    }
+
+    #[test]
+    fn a_pass_writes_every_proof_it_holds_when_it_ends() {
+        let units = roster_of(3);
+        let id = pending_of(&units).suite;
+        let dir = seed("final-flush", &bundle_for(pending_of(&units), "key"));
+        let mut pass = pass_of(start(&dir, &pending_of(&units), "key", guard()));
+        for unit in &units {
+            pass.record(unit, &[input("src/shared.src")], &[], 1);
+        }
+        drop(pass);
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        let ReadBundle::Current(stored) = read_bundle(&area, &id) else {
+            panic!("the stored bundle is not current");
+        };
+        assert_eq!(
+            stored.units.len(),
+            3,
+            "every proof held at the end is on disk"
+        );
+    }
+
+    #[test]
+    fn a_pass_killed_mid_run_leaves_a_current_bundle_with_its_first_proof() {
+        let units = roster_of(3);
+        let id = pending_of(&units).suite;
+        let dir = seed("killed", &bundle_for(pending_of(&units), "key"));
+        let mut pass = pass_of(start(&dir, &pending_of(&units), "key", guard()));
+        pass.record(&units[0], &[input("src/shared.src")], &[], 1);
+        pass.record(&units[1], &[input("src/shared.src")], &[], 1);
+        // A kill ends the process without running the pass's end, so nothing more is written.
+        std::mem::forget(pass);
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        let ReadBundle::Current(stored) = read_bundle(&area, &id) else {
+            panic!("a killed pass left a bundle that is not current");
+        };
+        assert!(stored.units.contains_key(&units[0]));
+    }
+
+    #[test]
+    fn a_store_that_cannot_take_a_new_entry_starts_no_pass() {
+        let roster = ["tests/a.t"];
+        let id = pending_for(&roster).suite;
+        let dir = seed("read-only", &bundle_for(pending_for(&roster), "key"));
+        // The lock entry exists already, so only the new proof entry can be refused.
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        drop(lock(&area, &id).unwrap());
+        let suite_dir = dir.join("units/v1");
+        fs::set_permissions(&suite_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let started = start(&dir, &pending_for(&roster), "key", guard());
+        fs::set_permissions(&suite_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(
+            matches!(started, Start::No),
+            "a pass starts only when its proofs can be stored"
+        );
+    }
+
+    #[test]
+    fn a_held_lock_on_a_suite_with_unit_proofs_starts_no_pass_and_is_silent() {
+        let roster = ["tests/a.t"];
+        let id = pending_for(&roster).suite;
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.table = vec![input("setup.src")];
+        bundle
+            .units
+            .insert("tests/a.t".into(), vec![version(vec![0])]);
+        let dir = seed("held-proven", &bundle);
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        let held = lock(&area, &id).unwrap();
+        // Busy would print the busy line for a run that starts no pass.
+        assert!(matches!(
+            start(&dir, &pending_for(&roster), "key", guard()),
+            Start::No
+        ));
+        drop(held);
+    }
+
+    #[test]
+    fn the_bundle_is_checked_again_under_the_lock() {
+        let roster = ["tests/a.t"];
+        let pending = pending_for(&roster);
+        let dir = seed("recheck", &bundle_for(pending_for(&roster), "key"));
+        let mut proven = bundle_for(pending_for(&roster), "key");
+        proven.table = vec![input("setup.src")];
+        proven
+            .units
+            .insert("tests/a.t".into(), vec![version(vec![0])]);
+        let started = start_with(&dir, &pending, "key", guard(), || {
+            // Another stoop records a proof after this run's unlocked check and before its lock.
+            let area = Area::open(&dir, false).unwrap().unwrap();
+            write_bundle(&area, &proven).unwrap();
+        });
+        assert!(
+            matches!(started, Start::No),
+            "a proof recorded before the lock is seen under it"
+        );
     }
 }
 
