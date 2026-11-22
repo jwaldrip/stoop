@@ -170,6 +170,10 @@ fn real_main(mut args: Vec<OsString>) -> i32 {
         eprintln!("stoop: --status-fd is for stoop run only");
         return 2;
     }
+    if o.units_forget && cmd != "forget" {
+        eprintln!("stoop: --units is for stoop forget only");
+        return 2;
+    }
     if matches!(cmd.as_str(), "run" | "explain" | "sh") {
         match run::parse_pass_env(
             std::env::var_os("STOOP_PASS_ENV").as_deref(),
