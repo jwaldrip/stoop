@@ -221,6 +221,13 @@ impl Journal {
                 self.record.failed = Some(outcome.key.clone());
                 false
             }
+            // `stoop sh` never activates hooks, so a unit outcome cannot reach the journal. If one
+            // did, it would be blocked like any unrecorded step.
+            How::Units => {
+                self.blocked = true;
+                self.save()?;
+                return Ok(());
+            }
             How::Unrecorded(reason) => {
                 let _ = reason;
                 self.blocked = true;

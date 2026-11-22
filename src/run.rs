@@ -540,7 +540,7 @@ fn ago(created: u64) -> String {
     }
 }
 
-fn plain(argv: &[std::ffi::OsString], pass_env: &[&str]) -> i32 {
+pub(crate) fn plain(argv: &[std::ffi::OsString], pass_env: &[&str]) -> i32 {
     let mut command = std::process::Command::new(&argv[0]);
     command.args(&argv[1..]);
     for name in pass_env {
@@ -587,11 +587,18 @@ fn dtrace_diagnostic(o: &Opts, cwd: &Path, key: &str) -> Option<Outcome> {
 }
 
 pub enum How {
-    Skipped { proof: String },
-    Recorded { proof: String },
+    Skipped {
+        proof: String,
+    },
+    Recorded {
+        proof: String,
+    },
     Unrecorded(String),
     Failed,
     Untraced,
+    /// A unit launch of an attribution pass (spec 3.3). Each unit's proof is kept apart from the
+    /// whole-command proof, so this outcome is never a step proof.
+    Units,
 }
 
 pub struct Outcome {
@@ -749,7 +756,7 @@ pub fn hook_refusal(o: &Opts) -> Option<String> {
 }
 
 /// The variables that carry a placeholder's value (spec section 4.7). Stoop owns them for each run.
-const HOOK_ENV: [&str; 5] = [
+pub(crate) const HOOK_ENV: [&str; 5] = [
     "STOOP_CHANGED",
     "STOOP_CHANGED_FILE",
     "STOOP_CHANGED_INPUTS",
@@ -825,21 +832,21 @@ pub fn learning_on(o: &Opts) -> bool {
     }
 }
 
-struct RunCx<'a> {
-    o: &'a Opts,
-    cwd: &'a PathBuf,
-    root: &'a PathBuf,
-    rel_cwd: &'a String,
+pub(crate) struct RunCx<'a> {
+    pub(crate) o: &'a Opts,
+    pub(crate) cwd: &'a PathBuf,
+    pub(crate) root: &'a PathBuf,
+    pub(crate) rel_cwd: &'a String,
     scope: &'a Option<String>,
     store: &'a Store,
-    hook: &'a Option<units::hook::Hook>,
-    full_reason: &'a Option<String>,
+    pub(crate) hook: &'a Option<units::hook::Hook>,
+    pub(crate) full_reason: &'a Option<String>,
     max_age: u64,
     bypass: bool,
     explain: bool,
     observe_runners: bool,
-    env_now: BTreeMap<String, String>,
-    env_excluded: Vec<String>,
+    pub(crate) env_now: BTreeMap<String, String>,
+    pub(crate) env_excluded: Vec<String>,
     salt: &'a Option<Vec<u8>>,
     remote: Option<Remote>,
 }
@@ -898,9 +905,9 @@ fn unit_bookkeeping(
     })
 }
 
-struct Lookup {
-    proofs: Vec<Proof>,
-    hit_idx: Option<usize>,
+pub(crate) struct Lookup {
+    pub(crate) proofs: Vec<Proof>,
+    pub(crate) hit_idx: Option<usize>,
     why: String,
     t0: Instant,
 }
@@ -1668,7 +1675,7 @@ fn legacy_finish(cx: RunCx<'_>, key: String, lookup: Lookup) -> Outcome {
     }
 }
 
-fn launch_traced(
+pub(crate) fn launch_traced(
     cx: &RunCx<'_>,
     argv: &[OsString],
     ignore: &Ignore,
@@ -1695,16 +1702,16 @@ fn launch_traced(
     )
 }
 
-struct Assembled {
-    inputs: Vec<Input>,
-    outputs: Vec<Input>,
+pub(crate) struct Assembled {
+    pub(crate) inputs: Vec<Input>,
+    pub(crate) outputs: Vec<Input>,
     removed: Vec<String>,
     priors: Vec<Input>,
     read_reasons: Vec<String>,
     write_reasons: Vec<String>,
 }
 
-fn assemble(
+pub(crate) fn assemble(
     root: &Path,
     real_root: &Path,
     trace: &Trace,
