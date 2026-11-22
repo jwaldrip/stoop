@@ -1,10 +1,11 @@
-//! One unit's launch: the hook's argv with each placeholder replaced by that unit (spec 3.2).
+//! One unit's launch: the hook's argv with each placeholder replaced by that unit (spec 3.2), and
+//! each list form replaced by the path of the list file that holds the unit (spec 4.12).
 //!
-//! Only a single unit is expanded. A hook whose placeholders need more than one unit's worth of
-//! state (a list file, the changed-inputs variable, shell environment code) runs its first-run
-//! form instead, and `supported` refuses it before any launch.
+//! `{changed-inputs}` and a joined list form name more than one unit's worth of state, so a hook that
+//! uses one runs its first-run form, and `supported` refuses it before any launch. Shell environment
+//! code needs no placeholder: its words stay as written, and the variables are exported for each unit.
 
-use super::hook::{Base, Hook, Join, Placeholder, PlaceholderName};
+use super::hook::{Base, FileMode, Hook, Join, Placeholder, PlaceholderName};
 use std::ffi::OsString;
 use std::path::{Component, Path, PathBuf};
 
@@ -15,12 +16,74 @@ pub(crate) struct Launch {
     pub value: OsString,
 }
 
-/// Whether every placeholder of `hook` reduces to one unit's text.
+/// Whether every placeholder of `hook` can stand for one unit. `{changed-inputs}` names changed inputs
+/// that no one unit has, so a hook that reads them takes the first-run form, in its placeholder spelling
+/// and in shell code alike (spec 4.11). A list has no join, so a joined list runs the first-run form too
+/// (spec 4.12). Other shell environment code needs no placeholder: its variables are exported for each
+/// unit (spec 4.7).
 pub(crate) fn supported(hook: &Hook) -> bool {
-    !hook.shell_env_code
+    let reads_changed_inputs = hook.shell_env_code
+        && hook
+            .original
+            .iter()
+            .any(|word| has_bytes(word.as_encoded_bytes(), b"STOOP_CHANGED_INPUTS"));
+    !reads_changed_inputs
         && hook.placeholders.iter().flatten().all(|placeholder| {
-            placeholder.file.is_none() && placeholder.name != PlaceholderName::ChangedInputs
+            placeholder.name != PlaceholderName::ChangedInputs
+                && (placeholder.file.is_none() || placeholder.join.is_none())
         })
+}
+
+/// Whether `needle` occurs in `haystack`. It also finds `STOOP_CHANGED_INPUTS_FILE`, which holds it.
+fn has_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// The list forms a launch of `hook` reads, each once, in placeholder order (spec 4.12).
+pub(crate) fn list_forms(hook: &Hook) -> Vec<(FileMode, Base)> {
+    let mut forms: Vec<(FileMode, Base)> = Vec::new();
+    for placeholder in hook.placeholders.iter().flatten() {
+        if let Some(mode) = placeholder.file {
+            let form = (mode, placeholder.base);
+            if !forms.contains(&form) {
+                forms.push(form);
+            }
+        }
+    }
+    forms
+}
+
+/// The name a list form is written under in a launch's directory. `changed` is the newline list of
+/// the unit's cwd-relative path, the one `STOOP_CHANGED_FILE` names.
+pub(crate) fn list_name(mode: FileMode, base: Base) -> &'static str {
+    match (mode, base) {
+        (FileMode::File, Base::Cwd) => "changed",
+        (FileMode::File, Base::Root) => "changed-root",
+        (FileMode::File, Base::Abs) => "changed-abs",
+        (FileMode::Nul, Base::Cwd) => "nul",
+        (FileMode::Nul, Base::Root) => "nul-root",
+        (FileMode::Nul, Base::Abs) => "nul-abs",
+    }
+}
+
+/// One unit's list in a form: the unit's text as its argument shows it, then the form's terminator, a
+/// newline or a NUL (spec 4.12). A unit never holds a newline or a NUL (plan 3.3), so each entry is one
+/// line or one NUL-terminated record.
+pub(crate) fn list_bytes(
+    root: &Path,
+    cwd: &Path,
+    unit: &str,
+    mode: FileMode,
+    base: Base,
+) -> Vec<u8> {
+    let mut bytes = entry(root, cwd, unit, base).as_encoded_bytes().to_vec();
+    bytes.push(match mode {
+        FileMode::File => b'\n',
+        FileMode::Nul => 0,
+    });
+    bytes
 }
 
 /// `to` as seen from `from`, both absolute: a `..` for each component of `from` below their
@@ -49,34 +112,59 @@ fn render(root: &Path, cwd: &Path, unit: &str, base: Base) -> OsString {
     }
 }
 
-/// The text a placeholder becomes in an argument. A relative result that begins with `-` gets
-/// `./`, so the runner reads it as a path and not as an option. None when the text holds the
-/// separator the placeholder joins with, because one unit's text would then read as several.
-fn argument(root: &Path, cwd: &Path, unit: &str, placeholder: &Placeholder) -> Option<OsString> {
-    let text = render(root, cwd, unit, placeholder.base);
-    let bytes = text.as_encoded_bytes();
+/// The text a unit shows in an argument or a list. A relative result that begins with `-` gets `./`, so
+/// the runner reads it as a path and not as an option.
+fn entry(root: &Path, cwd: &Path, unit: &str, base: Base) -> OsString {
+    let text = render(root, cwd, unit, base);
+    if base != Base::Abs && text.as_encoded_bytes().first() == Some(&b'-') {
+        let mut dotted = OsString::from("./");
+        dotted.push(&text);
+        return dotted;
+    }
+    text
+}
+
+/// The argument one placeholder becomes for one unit. A list form is the path `lists` names for it,
+/// because the unit lives in that file. A joined placeholder is refused when its unit's text holds the
+/// separator it joins with, because one unit's text would then read as several.
+fn argument(
+    root: &Path,
+    cwd: &Path,
+    unit: &str,
+    placeholder: &Placeholder,
+    lists: &dyn Fn(FileMode, Base) -> Option<OsString>,
+) -> Option<OsString> {
+    if let Some(mode) = placeholder.file {
+        // A list has no join: its entries are one per line or one per NUL, so a joined list is refused.
+        if placeholder.join.is_some() {
+            return None;
+        }
+        return lists(mode, placeholder.base);
+    }
+    let text = entry(root, cwd, unit, placeholder.base);
     if let Some(join) = placeholder.join {
         let separator = match join {
             Join::Comma => b',',
             Join::Space => b' ',
             Join::Newline => b'\n',
         };
-        if bytes.contains(&separator) {
+        if text.as_encoded_bytes().contains(&separator) {
             return None;
         }
-    }
-    if placeholder.base != Base::Abs && bytes.first() == Some(&b'-') {
-        let mut dotted = OsString::from("./");
-        dotted.push(&text);
-        return Some(dotted);
     }
     Some(text)
 }
 
-/// The argv for one unit: each word with every placeholder replaced by its text for that unit.
-/// The words come from `hook.original`, so an option that the full form removes stays in place.
-/// None when a placeholder cannot take the unit.
-pub(crate) fn argv(hook: &Hook, unit: &str, root: &Path, cwd: &Path) -> Option<Vec<OsString>> {
+/// The argv for one unit: each word with every placeholder replaced by its text for that unit, and each
+/// list form by the path `lists` names for it. The words come from `hook.original`, so an option that the
+/// full form removes stays in place. None when a placeholder cannot take the unit.
+pub(crate) fn argv_with(
+    hook: &Hook,
+    unit: &str,
+    root: &Path,
+    cwd: &Path,
+    lists: &dyn Fn(FileMode, Base) -> Option<OsString>,
+) -> Option<Vec<OsString>> {
     hook.original
         .iter()
         .enumerate()
@@ -94,7 +182,7 @@ pub(crate) fn argv(hook: &Hook, unit: &str, root: &Path, cwd: &Path) -> Option<V
             let mut at = 0;
             for (&(start, end), placeholder) in spans.iter().zip(placeholders) {
                 out.push(text.get(at..start)?);
-                out.push(argument(root, cwd, unit, placeholder)?);
+                out.push(argument(root, cwd, unit, placeholder, lists)?);
                 at = end;
             }
             out.push(text.get(at..)?);
@@ -103,8 +191,54 @@ pub(crate) fn argv(hook: &Hook, unit: &str, root: &Path, cwd: &Path) -> Option<V
         .collect()
 }
 
-/// The launch for every unit of the roster, in roster order. None when any unit cannot be
-/// expanded, and then the whole command runs its first-run form.
+/// `argv_with` for a hook without list paths: the argv the expansion tests pin for one unit.
+#[cfg(all(test, unix))]
+pub(crate) fn argv(hook: &Hook, unit: &str, root: &Path, cwd: &Path) -> Option<Vec<OsString>> {
+    argv_with(hook, unit, root, cwd, &|_, _| None)
+}
+
+/// One unit's launch: its argv with each list form named by `lists`, and the value `STOOP_CHANGED` and
+/// `STOOP_UNITS` hold for it. None when a placeholder cannot take the unit.
+pub(crate) fn launch(
+    hook: &Hook,
+    unit: &str,
+    root: &Path,
+    cwd: &Path,
+    lists: &dyn Fn(FileMode, Base) -> Option<OsString>,
+) -> Option<Launch> {
+    Some(Launch {
+        unit: unit.to_owned(),
+        argv: argv_with(hook, unit, root, cwd, lists)?,
+        value: render(root, cwd, unit, Base::Cwd),
+    })
+}
+
+/// Whether every unit of the roster expands (spec 3.1, check 7). The list files of a launch do not exist
+/// until the launch makes them, and the check reads no list's text, so any path stands in for them.
+pub(crate) fn expands(hook: &Hook, units: &[String], root: &Path, cwd: &Path) -> bool {
+    let stand_in = |_: FileMode, _: Base| Some(OsString::from("list"));
+    units
+        .iter()
+        .all(|unit| argv_with(hook, unit, root, cwd, &stand_in).is_some())
+}
+
+/// Whether every unit of the roster fits the newline lists of the hook: no unit's entry holds a newline.
+/// Only an absolute entry can, because the root's own path can hold one. A newline list has one entry per
+/// line, so it cannot name such a unit and the run keeps the full form (spec 4.12). A NUL list has no such
+/// limit: its entries end at NUL.
+pub(crate) fn lines_fit(hook: &Hook, units: &[String], root: &Path, cwd: &Path) -> bool {
+    units.iter().all(|unit| {
+        hook.placeholders.iter().flatten().all(|placeholder| {
+            placeholder.file != Some(FileMode::File)
+                || !entry(root, cwd, unit, placeholder.base)
+                    .as_encoded_bytes()
+                    .contains(&b'\n')
+        })
+    })
+}
+
+/// The launch for every unit of the roster, in roster order, for a hook without list forms.
+#[cfg(all(test, unix))]
 pub(crate) fn launches(
     hook: &Hook,
     units: &[String],
@@ -113,13 +247,7 @@ pub(crate) fn launches(
 ) -> Option<Vec<Launch>> {
     units
         .iter()
-        .map(|unit| {
-            Some(Launch {
-                unit: unit.clone(),
-                argv: argv(hook, unit, root, cwd)?,
-                value: render(root, cwd, unit, Base::Cwd),
-            })
-        })
+        .map(|unit| launch(hook, unit, root, cwd, &|_, _| None))
         .collect()
 }
 
@@ -238,15 +366,11 @@ mod tests {
 
     #[test]
     fn the_first_run_form_is_kept_for_the_shapes_one_unit_cannot_stand_for() {
-        assert!(!supported(&hook(&["t", "@{changed:file}"])));
-        assert!(!supported(&hook(&["t", "{changed:nul}"])));
+        assert!(supported(&hook(&["t", "@{changed:file}"])));
+        assert!(supported(&hook(&["t", "{changed:nul}"])));
         assert!(!supported(&hook(&["t", "{changed-inputs}"])));
-        assert!(!supported(&hook(&[
-            "sh",
-            "-c",
-            "echo $STOOP_CHANGED",
-            "sh"
-        ])));
+        assert!(!supported(&hook(&["t", "{changed:file:comma}"])));
+        assert!(supported(&hook(&["sh", "-c", "echo $STOOP_CHANGED", "sh"])));
         assert!(supported(&hook(&["t", "{changed:each}"])));
     }
 
@@ -277,6 +401,101 @@ mod tests {
         assert_eq!(
             launches[1].argv,
             [OsString::from("t"), OsString::from("b.t")]
+        );
+    }
+
+    #[test]
+    fn a_list_holds_each_unit_as_its_argument_shows_it_with_its_terminator() {
+        let root = Path::new("/r");
+        assert_eq!(
+            list_bytes(root, root, "tests/a.t", FileMode::File, Base::Cwd),
+            b"tests/a.t\n"
+        );
+        assert_eq!(
+            list_bytes(root, root, "tests/a.t", FileMode::Nul, Base::Cwd),
+            b"tests/a.t\0"
+        );
+        assert_eq!(
+            list_bytes(root, root, "-x.t", FileMode::File, Base::Cwd),
+            b"./-x.t\n"
+        );
+        assert_eq!(
+            list_bytes(
+                root,
+                Path::new("/r/sub"),
+                "tests/a.t",
+                FileMode::File,
+                Base::Cwd
+            ),
+            b"../tests/a.t\n"
+        );
+        assert_eq!(
+            list_bytes(root, root, "tests/a.t", FileMode::File, Base::Abs),
+            b"/r/tests/a.t\n"
+        );
+    }
+
+    #[test]
+    fn each_list_form_is_named_once_in_placeholder_order() {
+        let forms = list_forms(&hook(&[
+            "t",
+            "{changed:file}",
+            "{changed:nul:root}",
+            "--files={changed:file}",
+        ]));
+        assert_eq!(
+            forms,
+            [(FileMode::File, Base::Cwd), (FileMode::Nul, Base::Root)]
+        );
+    }
+
+    #[test]
+    fn shell_code_that_reads_the_changed_inputs_is_not_supported() {
+        assert!(!supported(&hook(&[
+            "sh",
+            "-c",
+            "run.sh $STOOP_CHANGED_INPUTS; exit $?",
+            "sh"
+        ])));
+        assert!(!supported(&hook(&[
+            "sh",
+            "-c",
+            "run.sh \"${STOOP_CHANGED_INPUTS_FILE}\"; exit $?",
+            "sh"
+        ])));
+        assert!(supported(&hook(&[
+            "sh",
+            "-c",
+            "run.sh \"$STOOP_CHANGED\"; exit $?",
+            "sh"
+        ])));
+    }
+
+    #[test]
+    fn a_newline_list_cannot_name_an_absolute_path_that_holds_a_newline() {
+        let root = Path::new("/r\nx");
+        let units = ["tests/a.t".to_string()];
+        assert!(!lines_fit(
+            &hook(&["t", "{changed:file:abs}"]),
+            &units,
+            root,
+            root
+        ));
+        assert!(lines_fit(
+            &hook(&["t", "{changed:file}"]),
+            &units,
+            root,
+            root
+        ));
+        assert!(lines_fit(
+            &hook(&["t", "{changed:nul:abs}"]),
+            &units,
+            root,
+            root
+        ));
+        assert_eq!(
+            list_bytes(root, root, "tests/a.t", FileMode::Nul, Base::Abs),
+            b"/r\nx/tests/a.t\0"
         );
     }
 }

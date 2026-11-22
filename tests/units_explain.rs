@@ -38,7 +38,6 @@ const NO_PASS_EVIDENCE: &str =
 const NO_PASS_CI: &str = "stoop: no attribution pass: CI is set, so the run keeps the full command";
 const NO_PASS_DISABLED: &str =
     "stoop: no attribution pass: splitting is turned off by enabled = false";
-const NO_PASS_FORM: &str = "stoop: no attribution pass: the hook uses a form a single unit cannot stand for (a list file, {changed-inputs} or shell code)";
 const NO_PASS_OPTIONS: &str = "stoop: no attribution pass: --no-record, --allow-network, --probe, --ignore or --ignore-env keeps the full command";
 const NO_PASS_FORCED: &str = "stoop: no attribution pass: the run is forced to the full command";
 const NO_PASS_OFF: &str =
@@ -338,10 +337,13 @@ fn explain_names_disabled_splitting_at_either_level() {
     }
 }
 
-// E9: a hook whose shell code reads $STOOP_CHANGED has a roster from config, and no unit form. Explain
-// names the form, and the run takes the full command.
+// E9: a hook whose shell code reads $STOOP_CHANGED takes its roster from config and needs no unit
+// form, so explain predicts the attribution pass for a changed suite, and the changed run starts it,
+// one launch per unit. Once that pass has stored proofs, explain and the run both decline a pass.
+// Fails on a tree that refuses shell environment code: explain names the form, and the run takes the
+// full command with no pass.
 #[test]
-fn explain_names_a_shell_environment_hook() {
+fn explain_predicts_a_shell_environment_pass() {
     let s = Suite::new();
     s.config(SHELL_SUITE);
     success(&s.run(&s.root, &[], &SHELL_WORDS, &[]));
@@ -350,10 +352,19 @@ fn explain_names_a_shell_environment_hook() {
     assert_eq!(code(&out), 1, "{}", err(&out));
     let (tracked_line, decision) = tail(&out);
     assert_eq!(tracked_line, tracked(&s, &id_of(&tracked_line), 0));
-    assert_eq!(decision, NO_PASS_FORM);
+    assert_eq!(decision, "stoop: would run an attribution pass: 3 launches");
     let run = s.run(&s.root, &[], &SHELL_WORDS, &[]);
     success(&run);
-    assert!(!started_pass(&run), "{}", err(&run));
+    assert!(started_pass(&run), "{}", err(&run));
+    assert_eq!(s.launches().len(), TRACKED, "{:?}", s.launches());
+    let declined = explain_words(&s, &SHELL_WORDS, &[], &[]);
+    assert!(!predicts_pass(&declined), "{}", err(&declined));
+    s.clear_log();
+    edit(&s, 3);
+    let again = s.run(&s.root, &[], &SHELL_WORDS, &[]);
+    success(&again);
+    assert!(!started_pass(&again), "{}", err(&again));
+    assert_eq!(s.launches().len(), 1, "{:?}", s.launches());
 }
 
 // E10: the options, the forced full run and tracing turned off by STOOP_OFF keep a recorded, changed

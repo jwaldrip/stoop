@@ -14,7 +14,6 @@ use std::fs::OpenOptions;
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::Path;
-#[cfg(not(unix))]
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
@@ -361,6 +360,9 @@ struct Stat {
 pub(crate) struct Area {
     #[cfg(unix)]
     dir: std::os::fd::OwnedFd,
+    /// The suite directory's own path, which each launch's list files are named under (spec 3.7).
+    #[cfg(unix)]
+    path: PathBuf,
     #[cfg(not(unix))]
     dir: PathBuf,
 }
@@ -409,7 +411,10 @@ impl Area {
             let Some(dir) = at::open_dir(&units, "v1", create)? else {
                 return Ok(None);
             };
-            Ok(Some(Area { dir }))
+            Ok(Some(Area {
+                dir,
+                path: store.join("units").join("v1"),
+            }))
         }
         #[cfg(not(unix))]
         {
@@ -603,6 +608,31 @@ impl Area {
         }
     }
 
+    /// Removes a launch directory that a killed run left, with the files it holds. A name that is
+    /// not a directory is removed as an entry. Only a pass that holds the suite lock calls this.
+    fn clear_scratch(&self, name: &str) {
+        #[cfg(unix)]
+        {
+            match at::open_dir(&self.dir, name, false) {
+                Ok(Some(dir)) => {
+                    at::empty(&dir);
+                    drop(dir);
+                    let _ = at::rmdir(&self.dir, name);
+                }
+                _ => {
+                    let _ = at::unlink(&self.dir, name);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let path = self.dir.join(name);
+            if fs::remove_dir_all(&path).is_err() {
+                let _ = fs::remove_file(&path);
+            }
+        }
+    }
+
     /// Whether the open lock file is still the entry the name refers to. Windows offers no file
     /// identity through std, so the lock is trusted as opened there.
     fn same_entry(&self, file: &File, name: &str) -> bool {
@@ -727,6 +757,23 @@ mod at {
         Ok(())
     }
 
+    /// Makes a private directory below `dir`, with `mode`. A name that something else holds fails.
+    pub(super) fn mkdir(dir: &OwnedFd, text: &str, mode: libc::mode_t) -> io::Result<()> {
+        let text = name(text)?;
+        // SAFETY: `text` is NUL-terminated and relative to an open directory.
+        check(unsafe { libc::mkdirat(dir.as_raw_fd(), text.as_ptr(), mode) })?;
+        Ok(())
+    }
+
+    /// Removes an empty directory below `dir`. Without `AT_REMOVEDIR` unlinkat would refuse a
+    /// directory, and a directory that still holds entries makes this fail.
+    pub(super) fn rmdir(dir: &OwnedFd, text: &str) -> io::Result<()> {
+        let text = name(text)?;
+        // SAFETY: `text` is NUL-terminated and relative to an open directory.
+        check(unsafe { libc::unlinkat(dir.as_raw_fd(), text.as_ptr(), libc::AT_REMOVEDIR) })?;
+        Ok(())
+    }
+
     pub(super) fn stat(dir: &OwnedFd, text: &str) -> io::Result<Option<Stat>> {
         let text = name(text)?;
         let mut buf = std::mem::MaybeUninit::<libc::stat>::uninit();
@@ -788,6 +835,22 @@ mod at {
         // SAFETY: the stream is open and not used after this call.
         unsafe { libc::closedir(stream) };
         Ok(names)
+    }
+
+    /// Removes every entry of a directory, so the directory is empty. An entry is unlinked as itself, so a
+    /// link is removed and never followed. An entry that will not unlink is a folder: it is emptied the same
+    /// way and then removed. An entry that still cannot go is left, and so is the folder that holds it.
+    pub(super) fn empty(dir: &OwnedFd) {
+        for name in names(dir).unwrap_or_default() {
+            if unlink(dir, &name).is_ok() {
+                continue;
+            }
+            if let Ok(Some(child)) = open_dir(dir, &name, false) {
+                empty(&child);
+                drop(child);
+                let _ = rmdir(dir, &name);
+            }
+        }
     }
 }
 
@@ -873,11 +936,18 @@ fn lock_with(area: &Area, id: &str, mut after_open: impl FnMut()) -> io::Result<
     ))
 }
 
+/// Removes the temporary files and the launch directories that a killed run left for this suite.
+/// Only a pass or a record that holds the suite lock calls this.
 fn clear_temps(area: &Area, id: &str) {
     let prefix = format!(".{id}-");
     for name in area.names().unwrap_or_default() {
-        if name.starts_with(&prefix) && name.ends_with(".tmp") {
+        if !name.starts_with(&prefix) {
+            continue;
+        }
+        if name.ends_with(".tmp") {
             let _ = area.unlink(&name);
+        } else if name.ends_with(".scratch") {
+            area.clear_scratch(&name);
         }
     }
 }
@@ -1008,6 +1078,117 @@ pub(crate) enum Stored {
     WriteFailed,
 }
 
+/// One launch's directory of list files (spec 3.7 and 4.7): `.<suite>-<pid>-<n>.scratch`, made under
+/// the suite lock with mode 0700, and its files with mode 0600. Dropping it removes every entry the
+/// launch left in it, then the directory, so a launch leaves nothing behind unless the process is killed.
+/// The next pass or record that takes the suite lock clears what a kill left (`clear_temps`).
+#[cfg(unix)]
+pub(crate) struct Scratch {
+    /// The suite directory, which holds the launch directory's entry.
+    parent: std::os::fd::OwnedFd,
+    name: String,
+    dir: std::os::fd::OwnedFd,
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Scratch {
+    fn create(area: &Area, suite: &str) -> io::Result<Scratch> {
+        let name = format!(
+            ".{suite}-{}-{}.scratch",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        at::mkdir(&area.dir, &name, 0o700)?;
+        let dir = match at::open_dir(&area.dir, &name, false) {
+            Ok(Some(dir)) => dir,
+            Ok(None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "the launch directory vanished",
+                ))
+            }
+            Err(error) => {
+                let _ = at::rmdir(&area.dir, &name);
+                return Err(error);
+            }
+        };
+        Ok(Scratch {
+            parent: area.dir.try_clone()?,
+            path: area.path.join(&name),
+            name,
+            dir,
+        })
+    }
+
+    /// Writes `bytes` to a new file named `file` in the directory, mode 0600, and returns its path.
+    pub(crate) fn write(&mut self, file: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+        let mut handle = at::open_file(
+            &self.dir,
+            file,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+        )?;
+        handle.write_all(bytes)?;
+        Ok(self.path.join(file))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Scratch {
+    /// Removes every entry the launch left in its directory, whatever the runner wrote there, and then the
+    /// directory. Nothing is followed: a link is removed as itself (`at::empty`).
+    fn drop(&mut self) {
+        at::empty(&self.dir);
+        let _ = at::rmdir(&self.parent, &self.name);
+    }
+}
+
+#[cfg(not(unix))]
+pub(crate) struct Scratch {
+    path: PathBuf,
+    files: Vec<PathBuf>,
+}
+
+#[cfg(not(unix))]
+impl Scratch {
+    fn create(area: &Area, suite: &str) -> io::Result<Scratch> {
+        let name = format!(
+            ".{suite}-{}-{}.scratch",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let path = area.dir.join(name);
+        fs::create_dir(&path)?;
+        Ok(Scratch {
+            path,
+            files: Vec::new(),
+        })
+    }
+
+    /// Writes `bytes` to a new file named `file` in the directory, private, and returns its path.
+    pub(crate) fn write(&mut self, file: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+        let path = self.path.join(file);
+        let mut handle = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .private()
+            .open(&path)?;
+        self.files.push(path.clone());
+        handle.write_all(bytes)?;
+        Ok(path)
+    }
+}
+
+#[cfg(not(unix))]
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        for file in &self.files {
+            let _ = fs::remove_file(file);
+        }
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
 /// One attribution pass. It holds the suite lock until it is dropped, so no other stoop changes
 /// the suite meanwhile, and it rewrites the bundle after each stored proof.
 pub(crate) struct Pass {
@@ -1025,6 +1206,11 @@ pub(crate) struct Pass {
 }
 
 impl Pass {
+    /// A new launch directory for one launch's list files, made under the suite lock (spec 3.7).
+    pub(crate) fn scratch(&self) -> io::Result<Scratch> {
+        Scratch::create(&self.area, &self.bundle.suite)
+    }
+
     /// Keeps one unit's proof as its only version. The bundle is written when a write is due (see
     /// `FLUSH_INTERVAL`). A version that would exceed the budget is dropped with the table entries
     /// it added.

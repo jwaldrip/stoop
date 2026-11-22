@@ -13,6 +13,8 @@ use std::path::Path;
 
 pub struct Ignore {
     rules: Vec<Rule>,
+    /// Folders excluded by their literal text (`exclude_folder`). Never stored with a proof.
+    folders: Vec<Vec<u8>>,
     /// The patterns a proof stores: defaults, file lines and flags, never transient ones.
     patterns: Vec<String>,
 }
@@ -70,12 +72,29 @@ impl Ignore {
         for t in transient {
             add(t, false);
         }
-        Ignore { rules, patterns }
+        Ignore {
+            rules,
+            folders: Vec::new(),
+            patterns,
+        }
     }
 
     /// `key` is the root-relative or absolute text from `pathutil::to_key`.
     pub fn is_ignored(&self, key: &str) -> bool {
+        let k = key.as_bytes();
         self.rules.iter().any(|r| r.matches(key))
+            || self.folders.iter().any(|folder| {
+                k.starts_with(folder) && (k.len() == folder.len() || k[folder.len()] == b'/')
+            })
+    }
+
+    /// Excludes a folder and everything below it, matched by its literal text: no trimming, comment or
+    /// glob handling, so `#cache`, ` c?che ` and `c?che` are each matched under their own name. Like a
+    /// transient pattern, it is never stored with a proof. An empty folder excludes nothing.
+    pub fn exclude_folder(&mut self, folder: &str) {
+        if !folder.is_empty() {
+            self.folders.push(folder.as_bytes().to_vec());
+        }
     }
 
     /// The patterns a proof records. Transient patterns are excluded.
@@ -199,5 +218,23 @@ mod tests {
         assert!(stored.iter().any(|p| p == "target"));
         assert!(stored.iter().any(|p| p == "/tmp"));
         assert!(!stored.iter().any(|p| p.contains("step-7f3")));
+    }
+
+    #[test]
+    fn an_excluded_folder_is_matched_by_its_literal_text() {
+        let mut i = ig(&[]);
+        i.exclude_folder("#cache/units/v1");
+        i.exclude_folder(" c?che /units/v1");
+        i.exclude_folder("c?che/units/v1");
+        i.exclude_folder("/work/#store/units/v1");
+        assert!(i.is_ignored("#cache/units/v1"));
+        assert!(i.is_ignored("#cache/units/v1/.x.scratch/changed"));
+        assert!(!i.is_ignored("#cache/units/v10/x"));
+        assert!(i.is_ignored(" c?che /units/v1/x"));
+        assert!(i.is_ignored("c?che/units/v1/x"));
+        assert!(!i.is_ignored("cache/units/v1/x"));
+        assert!(!i.is_ignored("c?che/units/v1x"));
+        assert!(i.is_ignored("/work/#store/units/v1/x"));
+        assert!(i.patterns().iter().all(|p| !p.contains("units/v1")));
     }
 }
