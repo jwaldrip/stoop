@@ -731,3 +731,58 @@ fn a15_an_environment_form_hook_dispatches_per_unit_and_exports_values_without_s
         assert!(bundle["units"][unit][0].is_object(), "{unit}: {bundle}");
     }
 }
+
+/// Explain of `words` from the suite's root. It reads the store and launches nothing.
+fn explain_words(s: &Suite, words: &[&str]) -> Output {
+    let mut command = s.stoop(&s.root);
+    command
+        .args(["explain", "--root"])
+        .arg(&s.root)
+        .arg("--")
+        .args(words);
+    spawning(|| command.output()).unwrap()
+}
+
+// A13: explain predicts the pass that a list hook's changed run starts, with the same launch count.
+// Once that pass has stored proofs, explain and a changed run both decline a pass. Fails on a tree
+// without the list forms: explain names the form, the run takes the full command, and no pass starts.
+#[test]
+fn a13_explain_predicts_the_pass_a_list_hook_starts() {
+    let s = list_suite();
+    success(&s.run(&s.root, &[], &["./list-runner", FILE], &[]));
+    edit(&s, 2);
+    let explained = explain_words(&s, &["./list-runner", FILE]);
+    assert_eq!(code(&explained), 1, "{}", text(&explained.stderr));
+    let stderr = text(&explained.stderr);
+    assert_eq!(
+        stderr.lines().last().unwrap(),
+        "stoop: would run an attribution pass: 3 launches",
+        "{stderr}"
+    );
+    s.clear_log();
+    let run = s.run(&s.root, &[], &["./list-runner", FILE], &[]);
+    success(&run);
+    assert!(
+        text(&run.stderr).contains("stoop: attribution pass: 3 units, one launch each"),
+        "{}",
+        text(&run.stderr)
+    );
+    assert_eq!(s.launches().len(), 3, "{:?}", s.launches());
+    let declined = explain_words(&s, &["./list-runner", FILE]);
+    let stderr = text(&declined.stderr);
+    assert_eq!(
+        stderr.lines().last().unwrap(),
+        "stoop: no attribution pass: a unit of the roster already has a proof",
+        "{stderr}"
+    );
+    s.clear_log();
+    edit(&s, 3);
+    let again = s.run(&s.root, &[], &["./list-runner", FILE], &[]);
+    success(&again);
+    assert!(
+        !text(&again.stderr).contains("stoop: attribution pass:"),
+        "{}",
+        text(&again.stderr)
+    );
+    assert_eq!(s.launches().len(), 1, "{:?}", s.launches());
+}
