@@ -227,6 +227,11 @@ fn screen<'p>(
     lookup: &Lookup,
     pending: Result<&'p Pending, Refusal>,
 ) -> Result<(&'p Pending, Vec<expand::Launch>), Refusal> {
+    // STOOP_OFF makes the run untraced before it looks at anything else. Explain names it first, even
+    // when the whole command's proof still holds or the full form is forced.
+    if run::env_switch("STOOP_OFF", true) {
+        return Err(Refusal::Off);
+    }
     // 1 and 2: a forced full run, and a whole-command proof that still holds.
     if cx.full_reason.is_some() {
         return Err(Refusal::Forced);

@@ -851,18 +851,15 @@ pub(crate) struct RunCx<'a> {
     remote: Option<Remote>,
 }
 
-/// Why the options and the environment keep a hooked command from an attribution pass (spec 3.1),
-/// if they do. They also govern the later unit-execution path. Explain asks the same question, so
-/// this does not look at explain itself.
+/// Why the options keep a hooked command from an attribution pass (spec 3.1), if they do. They also
+/// govern the later unit-execution path. Explain asks the same question, so this does not look at
+/// explain itself. `STOOP_OFF` is not here: `screen` names it before any other refusal.
 fn units_refusal(
     cx: &RunCx<'_>,
     config_invalid: bool,
     independent_false: bool,
 ) -> Option<units::attribution::Refusal> {
     let o = cx.o;
-    if env_switch("STOOP_OFF", true) {
-        return Some(units::attribution::Refusal::Off);
-    }
     let allowed = cx.hook.is_some()
         && !cx.bypass
         && cx.observe_runners
