@@ -1299,6 +1299,13 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     } else {
         None
     };
+    // The one call that dispatches an attribution pass (spec 3.1). Removing this statement
+    // returns every hooked run to the legacy path.
+    if let Some(outcome) = pending.as_ref().and_then(|pending| {
+        units::attribution::pass(&cx, &config, &lookup, pending, &volatile_store, &key)
+    }) {
+        return outcome;
+    }
     let outcome = legacy_finish(cx, key, lookup);
     if let (Some(pending), How::Recorded { proof: digest }) = (pending, &outcome.how) {
         if let Some(proof) = store
