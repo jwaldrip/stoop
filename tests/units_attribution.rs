@@ -588,3 +588,54 @@ fn a_launch_that_cannot_be_traced_runs_untraced_once() {
     assert!(bundle["units"]["tests/a.t"][0].is_object(), "{bundle}");
     assert!(bundle["units"].get("tests/b.t").is_none(), "{bundle}");
 }
+
+// A20 (guard: passes on the base and must stay green). A filter that selects no unit never
+// dispatches. Removing the three roster tests leaves only slow/s.t, which the pinned filter
+// excludes, so the changed run is the full form with no roster and writes no unit proof.
+#[test]
+fn a_filter_that_selects_no_unit_never_dispatches() {
+    let s = Suite::new();
+    success(&s.hook(&[]));
+    let bundle_before = s.bundle_bytes();
+    s.remove("tests/a.t");
+    s.remove("tests/b.t");
+    s.remove("tests/c.t");
+    s.clear_log();
+    let out = s.hook(&[]);
+    success(&out);
+    assert!(
+        !text(&out.stderr).contains("attribution pass"),
+        "{}",
+        text(&out.stderr)
+    );
+    let launches = s.launches();
+    assert_eq!(launches.len(), 1, "{launches:?}");
+    assert!(launches[0].args.is_empty(), "{:?}", launches[0].args);
+    assert!(launches[0].ran().is_empty(), "{:?}", launches[0].lines);
+    assert_eq!(launches[0].env("changed"), "");
+    assert_eq!(s.bundle_bytes(), bundle_before, "no unit proof is written");
+}
+
+/// A21's suite: the shell hook is its match, and its roster is the tree's tests.
+const SHELL_SUITE: &str = "[[units.suite]]\nid = \"shell\"\nmatch = ['sh', '-c', './t; s=$?; : \"$STOOP_CHANGED\"; exit $s', 'sh']\nunits = ['tests/**/*.t']\n";
+
+// A21 (guard: passes on the base and must stay green). A hook whose shell code reads
+// $STOOP_CHANGED keeps the first-run form even with a roster: `expand::supported` refuses shell
+// environment code, so the changed run is the full command with one runner launch and no pass.
+#[test]
+fn a_shell_environment_hook_never_dispatches() {
+    let s = Suite::new();
+    s.config(SHELL_SUITE);
+    let words = ["sh", "-c", "./t; s=$?; : \"$STOOP_CHANGED\"; exit $s", "sh"];
+    success(&s.run(&s.root, &[], &words, &[]));
+    edit(&s, 2);
+    s.clear_log();
+    let out = s.run(&s.root, &[], &words, &[]);
+    success(&out);
+    assert!(
+        !text(&out.stderr).contains("attribution pass"),
+        "{}",
+        text(&out.stderr)
+    );
+    full_form(&s.launches());
+}
