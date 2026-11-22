@@ -735,6 +735,31 @@ fn forgetting_the_legacy_proof_keeps_the_next_change_on_the_full_form() {
     full_form(&s.launches());
 }
 
+// A28: a suite that already holds unit proofs and is locked by another stoop starts no pass, so the
+// changed run prints no busy line: nothing new is printed for a run that starts no pass. Passes on
+// a tree that has the pre-check, and fails without it, because the busy line is printed then.
+#[test]
+fn a_proven_suite_locked_elsewhere_prints_no_busy_line() {
+    let s = Suite::new();
+    success(&s.hook(&[]));
+    edit(&s, 2);
+    success(&s.hook(&[]));
+    one_per_unit(&s.launches(), &ROSTER);
+    let held = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(lock_file(&s))
+        .unwrap();
+    held.try_lock().unwrap();
+    edit(&s, 3);
+    s.clear_log();
+    let out = s.hook(&[]);
+    success(&out);
+    assert!(!text(&out.stderr).contains("busy"), "{}", text(&out.stderr));
+    full_form(&s.launches());
+    drop(held);
+}
+
 /// M2 (ignored, a measurement). The milliseconds one attribution launch costs in a Git root and in
 /// a plain directory, against the same runner run directly. `STOOP_BENCH_UNITS` sets the roster
 /// size, from 3 to 4096. Run it in release:
