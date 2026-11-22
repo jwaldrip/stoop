@@ -2030,7 +2030,8 @@ mod pass_tests {
 }
 
 /// M1 (ignored, a measurement). The cost of encoding, writing (with fsync and rename) and parsing a
-/// full-roster bundle at 1, 2, 4 and 8 MiB. Run it in release:
+/// full-roster bundle at 1, 2, 4 and 8 MiB. `stored` is encoding plus writing, the cost of one stored
+/// proof that spec T1 judges. Run it in release:
 /// `cargo test --release --bin stoop bundle_write_cost -- --ignored --nocapture`.
 #[cfg(all(test, unix))]
 mod cost_tests {
@@ -2142,6 +2143,7 @@ mod cost_tests {
             let bundle = sized(target);
             let id = bundle.suite.clone();
             let (mut encode_ms, mut write_ms, mut parse_ms) = (Vec::new(), Vec::new(), Vec::new());
+            let mut stored_ms = Vec::new();
             let mut size = 0;
             for _ in 0..20 {
                 let started = Instant::now();
@@ -2154,10 +2156,13 @@ mod cost_tests {
                 size = bytes.len();
                 encode_ms.push((encoded - started).as_secs_f64() * 1e3);
                 write_ms.push((written - encoded).as_secs_f64() * 1e3);
+                stored_ms.push((written - started).as_secs_f64() * 1e3);
                 parse_ms.push((parsed - written).as_secs_f64() * 1e3);
             }
             println!(
-                "M1 size={size} encode_p50={:.2}ms encode_p95={:.2}ms write_p50={:.2}ms write_p95={:.2}ms parse_p50={:.2}ms parse_p95={:.2}ms",
+                "M1 size={size} stored_p50={:.2}ms stored_p95={:.2}ms encode_p50={:.2}ms encode_p95={:.2}ms write_p50={:.2}ms write_p95={:.2}ms parse_p50={:.2}ms parse_p95={:.2}ms",
+                at(&mut stored_ms, 0.5),
+                at(&mut stored_ms, 0.95),
                 at(&mut encode_ms, 0.5),
                 at(&mut encode_ms, 0.95),
                 at(&mut write_ms, 0.5),
