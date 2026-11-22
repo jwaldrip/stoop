@@ -426,23 +426,41 @@ impl Area {
         }
     }
 
-    /// Opens the lock entry, creating it if needed.
+    /// Opens the lock entry, creating it if needed. Only a regular file with one name is taken. A
+    /// FIFO, device or directory is refused before it is locked, and a hard-linked file is shared
+    /// with another name.
     fn lock_file(&self, name: &str) -> io::Result<File> {
         #[cfg(unix)]
         {
-            at::open_file(&self.dir, name, libc::O_RDWR | libc::O_CREAT)
+            use std::os::unix::fs::MetadataExt;
+            let file = at::open_file(
+                &self.dir,
+                name,
+                libc::O_RDWR | libc::O_CREAT | libc::O_NONBLOCK,
+            )?;
+            let meta = file.metadata()?;
+            if !meta.is_file() || meta.nlink() != 1 {
+                return Err(io::Error::other(
+                    "the suite lock is not a regular file with one name",
+                ));
+            }
+            Ok(file)
         }
         #[cfg(not(unix))]
         {
             let path = self.dir.join(name);
             refuse_link(&path)?;
-            OpenOptions::new()
+            let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .truncate(false)
                 .private()
-                .open(path)
+                .open(path)?;
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::other("the suite lock is not a regular file"));
+            }
+            Ok(file)
         }
     }
 
@@ -528,7 +546,9 @@ impl Area {
         {
             use std::os::unix::fs::MetadataExt;
             match (file.metadata(), self.stat(name)) {
-                (Ok(held), Ok(Some(named))) => (held.dev(), held.ino()) == named.id,
+                (Ok(held), Ok(Some(named))) => {
+                    named.regular && (held.dev(), held.ino()) == named.id
+                }
                 _ => false,
             }
         }
