@@ -1,5 +1,6 @@
 //! Bounded, local suite rosters. A bundle does not itself confer a proof hit.
 
+use super::attribution::Refusal;
 use crate::input::Input;
 use crate::proof::Proof;
 #[cfg(not(unix))]
@@ -207,7 +208,12 @@ fn optional(hash: &mut blake3::Hasher, value: Option<&str>) {
     }
 }
 
-fn suite_id(argv: &[OsString], cwd: &str, scope: Option<&str>, label: Option<&str>) -> String {
+pub(crate) fn suite_id(
+    argv: &[OsString],
+    cwd: &str,
+    scope: Option<&str>,
+    label: Option<&str>,
+) -> String {
     let mut hash = blake3::Hasher::new_derive_key("stoop suite id v1");
     field(&mut hash, b"hook");
     optional(&mut hash, scope);
@@ -258,7 +264,7 @@ pub(crate) struct PendingSpec<'a> {
 }
 
 /// The caller supplies the catalog rebuilt for this invocation, never its listing inputs.
-pub(crate) fn pending(spec: PendingSpec<'_>) -> Option<Pending> {
+pub(crate) fn pending(spec: PendingSpec<'_>) -> Result<Pending, Refusal> {
     let PendingSpec {
         argv,
         cwd,
@@ -270,18 +276,21 @@ pub(crate) fn pending(spec: PendingSpec<'_>) -> Option<Pending> {
         config,
         config_suite,
     } = spec;
-    if units.is_empty() || units.len() > MAX_UNITS || !valid_roster(&units) {
-        return None;
+    if units.is_empty() {
+        return Err(Refusal::NoUnits);
     }
-    if argv.iter().any(|word| word.to_str().is_none()) {
-        return None;
+    if units.len() > MAX_UNITS
+        || !valid_roster(&units)
+        || argv.iter().any(|word| word.to_str().is_none())
+    {
+        return Err(Refusal::Unrecordable);
     }
     let mut hash = blake3::Hasher::new_derive_key("stoop suite policy v1");
     field(&mut hash, source.as_bytes());
     field(&mut hash, filter.as_bytes());
     field(&mut hash, config_suite.unwrap_or("").as_bytes());
     field(&mut hash, config.unwrap_or_default());
-    Some(Pending {
+    Ok(Pending {
         suite: suite_id(argv, cwd, scope, label),
         origin: Origin {
             kind: "hook".into(),
@@ -575,6 +584,22 @@ impl Area {
                 true
             }
             Err(_) => false,
+        }
+    }
+
+    /// Whether a new entry can be made in the suite directory, checked without making one: the
+    /// directory's write permission. Explain uses this, so it creates nothing. Windows has no such
+    /// check here, and explain prints no suite lines there, because the tracer is unavailable.
+    fn writable_dir(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the descriptor is an open directory, and "." is a valid C string.
+            unsafe { libc::faccessat(self.dir.as_raw_fd(), c".".as_ptr(), libc::W_OK, 0) == 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            true
         }
     }
 
@@ -1132,7 +1157,7 @@ fn start_with(
         return Start::No;
     };
     let digest = digest_text("stoop whole key v1", key);
-    if ready(&area, pending, &digest).is_none() {
+    if ready(&area, pending, &digest).is_err() {
         return Start::No;
     }
     let held = match lock_with(&area, &pending.suite, after_open) {
@@ -1141,7 +1166,7 @@ fn start_with(
         Err(_) => return Start::No,
     };
     clear_temps(&area, &pending.suite);
-    let Some(mut bundle) = ready(&area, pending, &digest) else {
+    let Ok(mut bundle) = ready(&area, pending, &digest) else {
         return Start::No;
     };
     if !area.writable(&pending.suite) {
@@ -1173,27 +1198,84 @@ fn start_with(
     })
 }
 
+/// Whether a bundle was recorded for this command and provenance, in the current generation, and is
+/// ready to be used. A pass and `stoop explain` judge a bundle with this one test, so they agree.
+fn recorded(bundle: &SuiteBundleV1, digest: &str) -> bool {
+    bundle.generation == GENERATION
+        && bundle.provenance == Provenance::current()
+        && matches!(bundle.state, SuiteState::Ready)
+        && bundle.whole.is_some()
+        && bundle.whole_key_digest == digest
+}
+
 /// The bundle as a pass needs it: current, ready, recorded for this command, with no unit proof
-/// for any unit of the roster, and not silent for this roster.
-fn ready(area: &Area, pending: &Pending, digest: &str) -> Option<SuiteBundleV1> {
+/// for any unit of the roster, and not silent for this roster. The refusal names the first
+/// condition that fails.
+fn ready(area: &Area, pending: &Pending, digest: &str) -> Result<SuiteBundleV1, Refusal> {
     let ReadBundle::Current(bundle) = read_bundle(area, &pending.suite) else {
-        return None;
+        return Err(Refusal::NoBundle);
     };
+    if !recorded(&bundle, digest) {
+        return Err(Refusal::NoBundle);
+    }
     let proven = pending.roster.units.iter().any(|unit| {
         bundle
             .units
             .get(unit)
             .is_some_and(|versions| !versions.is_empty())
     });
+    if proven {
+        return Err(Refusal::Proven);
+    }
     let silent = bundle.no_evidence.as_deref() == Some(roster_digest(&pending.roster).as_str());
-    (bundle.generation == GENERATION
-        && bundle.provenance == Provenance::current()
-        && matches!(bundle.state, SuiteState::Ready)
-        && bundle.whole.is_some()
-        && bundle.whole_key_digest == digest
-        && !proven
-        && !silent)
-        .then_some(bundle)
+    if silent {
+        return Err(Refusal::NoEvidence);
+    }
+    Ok(bundle)
+}
+
+/// Check 8 of spec 3.1 without the lock, for `stoop explain`: `Ok` when `start` would find the
+/// bundle ready. It reads the store and creates nothing.
+pub(crate) fn probe(store: &Path, pending: &Pending, key: &str) -> Result<(), Refusal> {
+    let Ok(Some(area)) = Area::open(store, false) else {
+        return Err(Refusal::NoBundle);
+    };
+    ready(&area, pending, &digest_text("stoop whole key v1", key))?;
+    area.writable_dir().then_some(()).ok_or(Refusal::Unwritable)
+}
+
+/// What `stoop explain` counts for a suite: the distinct inputs that the roster's unit proofs name,
+/// and how many roster units hold one. Only a bundle that `ready` would accept counts, so a bundle
+/// of another generation holds no proofs. The table also holds outputs, so its length is not the
+/// count. Nothing is created.
+pub(crate) fn counts(store: &Path, id: &str, units: &[String], key: &str) -> (usize, usize) {
+    let Ok(Some(area)) = Area::open(store, false) else {
+        return (0, 0);
+    };
+    let ReadBundle::Current(bundle) = read_bundle(&area, id) else {
+        return (0, 0);
+    };
+    if !recorded(&bundle, &digest_text("stoop whole key v1", key)) {
+        return (0, 0);
+    }
+    let mut proven = 0;
+    let mut inputs: Vec<u32> = Vec::new();
+    for unit in units {
+        let Some(versions) = bundle
+            .units
+            .get(unit)
+            .filter(|versions| !versions.is_empty())
+        else {
+            continue;
+        };
+        proven += 1;
+        for version in versions {
+            inputs.extend(undelta(&version.inputs, bundle.table.len()).unwrap_or_default());
+        }
+    }
+    inputs.sort_unstable();
+    inputs.dedup();
+    (inputs.len(), proven)
 }
 
 /// Checked on read only: each version's indices must lie below the table and strictly increase.

@@ -16,7 +16,8 @@ use std::time::{Duration, Instant};
 pub const MODERN: &str = "2026-07-28";
 
 /// Variables that would change what stoop does. Tests start from none of them.
-const CLEARED: [&str; 11] = [
+const CLEARED: [&str; 12] = [
+    "CI",
     "STOOP_STORE",
     "STOOP_SYNC",
     "STOOP_SYNC_WRITE",

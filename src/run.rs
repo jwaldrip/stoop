@@ -851,12 +851,17 @@ pub(crate) struct RunCx<'a> {
     remote: Option<Remote>,
 }
 
-/// These constraints also govern the later unit-execution path.
-fn eligible_for_units(cx: &RunCx<'_>, config_invalid: bool, independent_false: bool) -> bool {
+/// Why the options keep a hooked command from an attribution pass (spec 3.1), if they do. They also
+/// govern the later unit-execution path. Explain asks the same question, so this does not look at
+/// explain itself. `STOOP_OFF` is not here: `screen` names it before any other refusal.
+fn units_refusal(
+    cx: &RunCx<'_>,
+    config_invalid: bool,
+    independent_false: bool,
+) -> Option<units::attribution::Refusal> {
     let o = cx.o;
-    cx.hook.is_some()
+    let allowed = cx.hook.is_some()
         && !cx.bypass
-        && !cx.explain
         && cx.observe_runners
         && !config_invalid
         && !independent_false
@@ -864,18 +869,19 @@ fn eligible_for_units(cx: &RunCx<'_>, config_invalid: bool, independent_false: b
         && !o.allow_network
         && o.probes.is_empty()
         && o.ignore.is_empty()
-        && o.ignore_env.is_empty()
+        && o.ignore_env.is_empty();
+    (!allowed).then_some(units::attribution::Refusal::Options)
 }
 
-fn unit_bookkeeping(
+/// The suite a hooked command names: its filter, the roster discovery finds for it, and the record
+/// a pass would write for that roster. `None` when the command names no filter or the tree cannot be
+/// read. A run passes no refusal, because it asks only when the options allow units. Explain passes
+/// the refusal it found, and reports it through the record.
+fn unit_suite(
     cx: &RunCx<'_>,
     config: &units::config::Config,
-    config_invalid: bool,
-    independent_false: bool,
-) -> Option<units::bundle::Pending> {
-    if !eligible_for_units(cx, config_invalid, independent_false) {
-        return None;
-    }
+    refusal: Option<units::attribution::Refusal>,
+) -> Option<units::attribution::Suite> {
     let hook = cx.hook.as_ref()?;
     let suite = config.select(&hook.original, cx.rel_cwd).ok().flatten();
     let configured = suite
@@ -892,17 +898,44 @@ fn unit_bookkeeping(
     let filter = inline.or(configured.as_ref())?;
     let ignore = units::universe::catalog_ignore(cx.root, &cx.o.ignore, &cx.o.transient).ok()?;
     let catalog = units::universe::discover(cx.root, &ignore, filter, configured.as_ref()).ok()?;
-    units::bundle::pending(units::bundle::PendingSpec {
-        argv: &hook.original,
-        cwd: cx.rel_cwd,
-        scope: cx.scope.as_deref(),
-        label: cx.o.key.as_deref(),
-        source: if inline.is_some() { "filter" } else { "config" },
-        filter: filter.text(),
-        units: catalog.units.into_iter().map(|unit| unit.0).collect(),
-        config: config.key_source(),
-        config_suite: suite.map(|suite| suite.id.as_str()),
+    let roster: Vec<String> = catalog.units.into_iter().map(|unit| unit.0).collect();
+    let id = units::bundle::suite_id(
+        &hook.original,
+        cx.rel_cwd,
+        cx.scope.as_deref(),
+        cx.o.key.as_deref(),
+    );
+    let pending = match refusal {
+        Some(refusal) => Err(refusal),
+        None => units::bundle::pending(units::bundle::PendingSpec {
+            argv: &hook.original,
+            cwd: cx.rel_cwd,
+            scope: cx.scope.as_deref(),
+            label: cx.o.key.as_deref(),
+            source: if inline.is_some() { "filter" } else { "config" },
+            filter: filter.text(),
+            units: roster.clone(),
+            config: config.key_source(),
+            config_suite: suite.map(|suite| suite.id.as_str()),
+        }),
+    };
+    Some(units::attribution::Suite {
+        id,
+        units: roster,
+        pending,
     })
+}
+
+fn unit_bookkeeping(
+    cx: &RunCx<'_>,
+    config: &units::config::Config,
+    config_invalid: bool,
+    independent_false: bool,
+) -> Option<units::bundle::Pending> {
+    if cx.explain || units_refusal(cx, config_invalid, independent_false).is_some() {
+        return None;
+    }
+    unit_suite(cx, config, None)?.pending.ok()
 }
 
 pub(crate) struct Lookup {
@@ -1306,7 +1339,26 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     }) {
         return outcome;
     }
+    // Explain adds two lines to a suite's decision (spec 4.16). They are computed while the context
+    // is whole, and printed after the lines the legacy path prints.
+    let suite_lines = (explain && !o.quiet)
+        .then(|| {
+            let refusal = units_refusal(&cx, config_invalid, independent_false);
+            let suite = unit_suite(&cx, &config, refusal);
+            units::attribution::explain_lines(
+                &cx,
+                &config,
+                &lookup,
+                suite.as_ref(),
+                &volatile_store,
+                &key,
+            )
+        })
+        .flatten();
     let outcome = legacy_finish(cx, key, lookup);
+    for line in suite_lines.into_iter().flatten() {
+        eprintln!("{line}");
+    }
     if let (Some(pending), How::Recorded { proof: digest }) = (pending, &outcome.how) {
         if let Some(proof) = store
             .load(&outcome.key)
