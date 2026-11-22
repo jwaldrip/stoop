@@ -1643,3 +1643,269 @@ fn sed_exec_normalizer_rejects_corrupted_recordings() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+fn direct_promotion_case(name: &str, script: &str, after: &[u8]) {
+    for (suffix, aged) in [("aged", true), ("racy", false)] {
+        let key = format!("{name}-{suffix}");
+        let case = Case::new(&key);
+        case.file("f", b"start\n");
+        if aged {
+            age();
+        }
+        let out = run(&case, &key, script, &[]);
+        assert_recorded(&out, &case, &key);
+        let stored = proof(&case, &key);
+        assert_atomic_recording(&stored, "f", b"start\n", after);
+        let entry = |field: &str| {
+            stored[field]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["path"] == "f")
+                .unwrap()
+        };
+        assert_eq!(entry("inputs"), entry("priors"));
+    }
+}
+
+#[test]
+fn direct_append_promotes_the_prior_and_runs_again() {
+    let script = r#"exec python3 -c 'open("f").read(); open("f", "a").write("x\n")'"#;
+    direct_promotion_case("direct-append", script, b"start\nx\n");
+    for (key, aged) in [("direct-retry-aged", true), ("direct-retry-racy", false)] {
+        let case = Case::new(key);
+        case.file("f", b"start\n");
+        if aged {
+            age();
+        }
+        for (before, after) in [
+            (b"start\n".as_slice(), b"start\nx\n".as_slice()),
+            (b"start\nx\n".as_slice(), b"start\nx\nx\n".as_slice()),
+        ] {
+            let out = run(&case, key, script, &[]);
+            assert_recorded(&out, &case, key);
+            assert!(stderr(&out).contains("stoop: run "), "{}", stderr(&out));
+            assert_atomic_recording(&proof(&case, key), "f", before, after);
+            assert_eq!(fs::read(case.root().join("f")).unwrap(), after);
+        }
+    }
+}
+
+#[test]
+fn direct_truncate_promotes_the_prior() {
+    direct_promotion_case(
+        "direct-truncate",
+        r#"exec python3 -c 'open("f").read(); open("f", "w").write("new\n")'"#,
+        b"new\n",
+    );
+}
+
+#[test]
+fn direct_creat_promotes_the_prior() {
+    direct_promotion_case(
+        "direct-creat",
+        r#"exec python3 -c 'import ctypes, os; open("f").read(); fd = ctypes.CDLL(None).creat(b"f", 0o600); assert fd >= 0; os.write(fd, b"new\n"); os.close(fd)'"#,
+        b"new\n",
+    );
+}
+
+#[test]
+fn direct_wronly_promotes_the_prior() {
+    direct_promotion_case(
+        "direct-wronly",
+        r#"exec python3 -c 'import os; open("f").read(); fd = os.open("f", os.O_WRONLY); os.write(fd, b"NEW"); os.close(fd)'"#,
+        b"NEWrt\n",
+    );
+}
+
+#[test]
+fn direct_second_rdwr_open_promotes_the_prior() {
+    direct_promotion_case(
+        "direct-rdwr",
+        r#"exec python3 -c 'import os; open("f").read(); fd = os.open("f", os.O_RDWR); os.write(fd, b"NEW"); os.close(fd)'"#,
+        b"NEWrt\n",
+    );
+}
+
+#[test]
+fn direct_foreign_append_after_open_keeps_the_read_preimage() {
+    for (key, aged) in [("direct-after-aged", true), ("direct-after-racy", false)] {
+        let case = Case::new(key);
+        let path = case.file("f", b"start\n");
+        if aged {
+            age();
+        }
+        let fifo = case.fifo("direct-after.fifo");
+        let script = r#"exec python3 -c 'import os; open("f").read(); out = open("f", "a"); open(os.environ["FIFO"]).read(); out.write("command\n"); out.close()'"#;
+        let child = spawn(&case, key, script, &[("FIFO", &fifo)]);
+        let release = meet(&fifo);
+        OpenOptions::new()
+            .append(true)
+            .open(path)
+            .unwrap()
+            .write_all(b"foreign\n")
+            .unwrap();
+        drop(release);
+        let out = child.wait_with_output().unwrap();
+        assert_recorded(&out, &case, key);
+        assert_atomic_recording(
+            &proof(&case, key),
+            "f",
+            b"start\n",
+            b"start\nforeign\ncommand\n",
+        );
+    }
+}
+
+fn direct_legacy_case(name: &str, script: &str) {
+    let case = Case::new(name);
+    case.file("f", b"start\n");
+    let out = run(&case, name, script, &[]);
+    assert_recorded(&out, &case, name);
+    assert_no_input(&proof(&case, name), "f");
+}
+
+#[test]
+fn direct_stat_only_then_write_keeps_legacy_recording() {
+    direct_legacy_case(
+        "direct-stat-only",
+        r#"exec python3 -c 'import os; os.stat("f"); open("f", "w").write("new\n")'"#,
+    );
+}
+
+#[test]
+fn direct_proc_route_write_keeps_legacy_recording() {
+    direct_legacy_case(
+        "direct-proc-write",
+        r#"exec python3 -c 'open("f").read(); open("/proc/self/cwd/f", "w").write("new\n")'"#,
+    );
+}
+
+#[test]
+fn direct_alias_read_keeps_legacy_recording() {
+    let case = Case::new("direct-alias-read");
+    case.file("f", b"start\n");
+    symlink("f", case.root().join("alias")).unwrap();
+    let out = run(
+        &case,
+        "direct-alias-read",
+        r#"exec python3 -c 'open("alias").read(); open("f", "w").write("new\n")'"#,
+        &[],
+    );
+    assert_recorded(&out, &case, "direct-alias-read");
+    assert_no_input(&proof(&case, "direct-alias-read"), "f");
+}
+
+#[test]
+fn direct_hard_link_keeps_legacy_recording() {
+    let case = Case::new("direct-hard-link");
+    let path = case.file("f", b"start\n");
+    fs::hard_link(path, case.root().join("other")).unwrap();
+    let out = run(
+        &case,
+        "direct-hard-link",
+        r#"exec python3 -c 'open("f").read(); open("f", "w").write("new\n")'"#,
+        &[],
+    );
+    assert_recorded(&out, &case, "direct-hard-link");
+    assert_no_input(&proof(&case, "direct-hard-link"), "f");
+}
+
+#[test]
+fn direct_write_before_read_keeps_legacy_recording() {
+    direct_legacy_case(
+        "direct-write-first",
+        r#"exec python3 -c 'open("f", "a").write("x"); open("f").read(); open("f", "a").write("y")'"#,
+    );
+}
+
+#[test]
+fn direct_rdwr_only_keeps_legacy_recording() {
+    direct_legacy_case(
+        "direct-rdwr-only",
+        r#"exec python3 -c 'import os; fd = os.open("f", os.O_RDWR); os.read(fd, 100); os.write(fd, b"x"); os.close(fd)'"#,
+    );
+}
+
+#[test]
+fn direct_thread_before_read_keeps_legacy_recording() {
+    direct_legacy_case(
+        "direct-thread-first",
+        r#"exec python3 -c 'import threading; t = threading.Thread(target=lambda: None); t.start(); t.join(); open("f").read(); open("f", "w").write("new\n")'"#,
+    );
+}
+
+#[test]
+fn direct_oversized_prior_keeps_legacy_recording() {
+    let case = Case::new("direct-oversized");
+    case.file("f", &vec![b'x'; 9 * 1024 * 1024]);
+    let out = run(
+        &case,
+        "direct-oversized",
+        r#"exec python3 -c 'open("f").read(); open("f", "w").write("new\n")'"#,
+        &[],
+    );
+    assert_recorded(&out, &case, "direct-oversized");
+    assert_no_input(&proof(&case, "direct-oversized"), "f");
+    assert!(
+        stderr(&out).contains("stoop: recorded "),
+        "{}",
+        stderr(&out)
+    );
+}
+
+#[test]
+fn direct_append_then_unlink_keeps_legacy_recording() {
+    let case = Case::new("direct-unlink");
+    case.file("f", b"start\n");
+    let out = run(
+        &case,
+        "direct-unlink",
+        r#"exec python3 -c 'import os; open("f").read(); open("f", "a").write("x"); os.unlink("f")'"#,
+        &[],
+    );
+    assert_recorded(&out, &case, "direct-unlink");
+    let stored = proof(&case, "direct-unlink");
+    assert_no_input(&stored, "f");
+    assert!(stored["removed"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p == "f"));
+}
+
+#[test]
+fn direct_empty_append_keeps_legacy_recording() {
+    let case = Case::new("direct-empty-append");
+    case.file("f", b"start\n");
+    let out = run(
+        &case,
+        "direct-empty-append",
+        r#"exec python3 -c 'open("f").read(); open("f", "a").close()'"#,
+        &[],
+    );
+    assert_recorded(&out, &case, "direct-empty-append");
+    let stored = proof(&case, "direct-empty-append");
+    assert_no_input(&stored, "f");
+    assert_file_entry(&stored, "priors", "f", b"start\n");
+    assert_file_entry(&stored, "outputs", "f", b"start\n");
+}
+
+#[test]
+fn direct_foreign_edit_before_write_keeps_foreign_prior() {
+    let case = Case::new("direct-before-foreign");
+    let path = case.file("f", b"start\n");
+    age();
+    let fifo = case.fifo("direct-before.fifo");
+    let script = r#"exec python3 -c 'import os; open("f").read(); open(os.environ["FIFO"]).read(); open("f", "w").write("new\n")'"#;
+    let child = spawn(&case, "direct-before-foreign", script, &[("FIFO", &fifo)]);
+    let release = meet(&fifo);
+    fs::write(path, b"foreign\n").unwrap();
+    drop(release);
+    let out = child.wait_with_output().unwrap();
+    assert_recorded(&out, &case, "direct-before-foreign");
+    let stored = proof(&case, "direct-before-foreign");
+    assert_no_input(&stored, "f");
+    assert_file_entry(&stored, "priors", "f", b"foreign\n");
+    assert_file_entry(&stored, "outputs", "f", b"new\n");
+}
