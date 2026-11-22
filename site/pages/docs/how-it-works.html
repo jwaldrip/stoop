@@ -17,7 +17,7 @@
 <table>
   <thead><tr><th>Part</th><th>What is stored</th></tr></thead>
   <tbody>
-    <tr><td>Inputs</td><td>Each path with an id: a hash of every byte for a file, prefixed <code>x:</code> when any execute bit is set and <code>f:</code> when none is, a hash of the entry list for a directory the command listed, apart from the repository root as stoop resolves it, the target for a symlink, and "absent" for a path inside the repository that was looked for and not found.</td></tr>
+    <tr><td>Inputs</td><td>Each path with an id: a hash of every byte for a file, prefixed <code>x:</code> when any execute bit is set and <code>f:</code> when none is, a hash of the entry list for a listed directory, the target for a symlink, and "absent" for a path inside the repository that was looked for and not found.</td></tr>
     <tr><td>Environment</td><td>A hash of each variable's value. See <a href="#env">the environment</a> below.</td></tr>
     <tr><td>Outputs</td><td>What the run left inside the repository, with hashes. A skip needs them still in place. Paths the run created and then removed again are listed as removed.</td></tr>
     <tr><td>Probes</td><td>For each <code>--probe</code> command, a hash of what it printed.</td></tr>
