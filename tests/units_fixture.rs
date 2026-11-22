@@ -1,25 +1,36 @@
-//! The fake hook runner `tests/fixtures/hook/t` is checked knob by knob (F1-F4). Pins P1-P11
-//! hold today's hooked-run behaviour: each condition that keeps the full form after the
-//! attribution pass. The runner tests need a POSIX shell; the pins need the tracer, so they run
-//! on Linux x86-64 and arm64.
+//! The fake hook runner `tests/fixtures/hook/t` is checked knob by knob (F1-F4 and F6-F12). Pins
+//! P1-P11 hold today's hooked-run behaviour: each condition that keeps the full form after the
+//! attribution pass. F5 checks the purity rule, and the traced arm of F10 checks that a stat is an
+//! input. The runner tests need a POSIX shell; the pins, F5 and that arm need the tracer, so they
+//! run on Linux x86-64 and arm64.
 //!
-//! # The runner's contract (spec 3.6)
+//! # The runner's contract (spec 3.2 and 3.6)
 //!
-//! The runner header points here. Change the runner and this table together.
+//! The runner header points here. Change the runner and this table together. A row marked (IF)
+//! acts while `T_IF` is unset or names a path that exists; with `T_IF` set to an absent path it
+//! does nothing. The `T_IF` path lives outside the root, under `/tmp`, because the `T_*` variables
+//! are fingerprinted and cannot change partway through a sequence of runs.
 //!
 //! | Input | Behaviour |
 //! | --- | --- |
-//! | no test word (no argument, or only words starting with `-`) | Runs every `*.t` under the root except `slow/`, plus every `*.u` when `T_U=1`, in `LC_ALL=C` sort order. With `T_LINT=1` it first executes `<root>/lint`. |
-//! | test words | Words starting with `-` are logged only. Every other word is a test path relative to the cwd, run in order. |
-//! | running test P | `cat P`. Then `cat <root>/<line>` for each non-empty line of P. Then `cat <root>/setup.src`. Then the FIFO hold, if armed. Then the test fails if `${P%.*}.flag` contains `fail`. Logs `ran=P`, and `failed=P` on failure. A missing P fails the test. |
-//! | `T_IGNORE=1` | With test words: reads nothing and exits 0. The no-argument form is unaffected. |
+//! | no test word (no argument, or only words starting with `-`) | Runs every `*.t` under the root except `slow/`, plus every `*.u` when `T_U=1`, in `LC_ALL=C` sort order, listed by `find`, `sed` and `sort`. With `T_LINT=1` it first executes `<root>/lint`. |
+//! | test words | Words starting with `-` are logged only. Every other word is a test path relative to the cwd, run in order. Before the first test it runs `find /dev/null -prune`, `sed -n q` and `LC_ALL=C sort` on empty input: the programs the no-argument form runs to list its roster. So a unit launch traces every program the full form runs (purity). `T_LINT` (in the full form) and `T_IGNORE` and `T_STAT_UNIT` (in a unit launch) are the exceptions; none of these launches produce unit proofs. |
+//! | running test P | With `T_WRITE_AT=P` (IF) and `T_WRITE` set, `written` goes to `T_WRITE` right before `cat P`. Then `cat P`. Then `cat <root>/<line>` for each non-empty line of P. Then `cat <root>/setup.src`. With `T_WRITE_EACH=1`, `written` goes to `${P%.*}.out` after those reads. Then the FIFO hold, if `T_FIFO` is set. Then the test fails if `${P%.*}.flag` contains `fail`, or, in the test-word form, if `T_FAIL_ALONE=P` (IF). Logs `ran=P`, and `failed=P` on failure. A missing P fails the test. |
+//! | `T_IGNORE=1` | With test words: reads nothing and exits 0. It exits before the purity programs run (see the test-words row). A plain `T_WRITE` still writes first. The no-argument form is unaffected. |
 //! | `T_STAT_UNIT=1` | With test words: `test -e P` instead of running it. Logs `statted=P`. |
-//! | `T_FIFO=<path>`, `T_FIFO_AT=<P>` | One `read < $T_FIFO` per invocation, after the first test (or after the test logged as `T_FIFO_AT`) has read its files. |
-//! | `T_WRITE=<path>` | Writes `written` to that path once per invocation, before any test. |
-//! | `T_READ_OTHER=<path>` | Reads that path once per invocation. |
+//! | `T_FIFO=<path>`, `T_FIFO_AT=<P>` | One `read < $T_FIFO` per invocation, after the first test that reads its files (or after the test logged as `T_FIFO_AT` has read its files). |
+//! | `T_IF=<path>` | The toggle for the rows marked (IF). |
+//! | `T_WRITE=<path>` (IF) | Writes `written` to that path, relative to the cwd, once per invocation before any test. With `T_WRITE_AT` set it writes only in that test's invocation: see the next row. |
+//! | `T_WRITE_AT=<P>` (IF) | Narrows `T_WRITE` to the invocation that runs test P, written right before P's reads. P must exist and be run, not statted by `T_STAT_UNIT`. The path rules depend on the form. In the no-argument form the write runs after the runner has moved to the root, so a relative `T_WRITE` path is root-relative, as `T_WRITE_FULL` is, and P is spelled as the roster lists it: root-relative, for example `tests/b.t`. In the test-word form the write stays relative to the cwd, and P is spelled as the test word is: relative to the cwd, for example `../tests/b.t` from `docs`. |
+//! | `T_WRITE_EACH=1` | Each test P writes `written` to `${P%.*}.out` after its reads, in every invocation that runs it. Not (IF). |
+//! | `T_WRITE_FULL=<path>` | The no-argument form writes `written` to the path after it moves to the root and before its first test, so a relative path is root-relative. Not (IF). |
+//! | `T_READ_OTHER=<path>` (IF) | Reads that path once per invocation, relative to the cwd. |
+//! | `T_STAT_OTHER=<path>` (IF) | Runs `test -e <path>` once per invocation, relative to the cwd, and logs `stat_other=<path>`. The answer does not change the exit status. |
+//! | `T_FAIL_FULL=1` (IF) | The no-argument form exits 1 after its tests. |
+//! | `T_FAIL_ALONE=<P>` (IF) | In the test-word form, test P fails after it has run. Its reads and the other tests are unchanged. |
 //! | `T_LS_ROOT=1` / `T_STAT_ROOT=1` | `ls -a <root>` (logs `ls_root`) / `test -d <root>` (logs `stat_root`), once per invocation. |
 //! | `LOG=<path>` (outside the root) | Per invocation it logs `launch`, then `arg=<w>` for each argument, then `changed=`, `units=`, `changed_file=`, `changed_inputs=`, `changed_inputs_file=` (newlines inside a value logged as `\|`), then the per-test lines. |
-//! | exit | 1 if any test failed, else 0. |
+//! | exit | 1 if any test failed, or if `T_FAIL_FULL` (IF) fails the no-argument form after its tests; else 0. |
 //!
 //! `T_RECORDS` comes in W8 and writes to `$STOOP_RESULT_FILE`.
 //!
@@ -398,6 +409,422 @@ fn f4_t_ls_root_and_t_stat_root_log_once_each() {
     let out = s.direct(&s.root, &["tests/a.t"], &[]);
     assert_eq!(code(&out), 0);
     assert!(!s.launches()[0].lines.iter().any(|line| line == "ls_root"));
+}
+
+// W6-0 (spec 3.2): the purity rule of the runner and its knobs. Each knob has a test that drives
+// the runner directly and reads its log or its files. A knob with a T_IF gate also shows that an
+// absent path turns it off.
+
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod purity {
+    use super::*;
+    use serde_json::Value;
+    use std::collections::BTreeSet;
+
+    /// The (path, id) pairs of the newest legacy proof stored under `key`.
+    fn stored_inputs(s: &Suite, key: &str) -> BTreeSet<(String, String)> {
+        let file = s.root.join(".stoop/proofs").join(format!("{key}.json"));
+        let json: Value = serde_json::from_slice(&fs::read(file).expect("a stored proof")).unwrap();
+        assert_eq!(json["key"], key);
+        json["proofs"][0]["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|input| {
+                (
+                    input["path"].as_str().unwrap().to_owned(),
+                    input["id"].as_str().unwrap().to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    // F5: the full form reads nothing a unit launch does not read. The residue rule (W6-2) would
+    // otherwise count such an input as residue forever. The roster comes from find, sed and sort,
+    // so the test-word form must run those programs too. Directory inputs are excluded: the full
+    // form lists directories, and a unit launch lists none.
+    #[test]
+    fn f5_the_full_form_reads_nothing_a_test_launch_does_not() {
+        let s = Suite::new();
+        let runs: [(&str, &[&str]); 4] = [
+            ("full", &["./t"]),
+            ("a", &["./t", "tests/a.t"]),
+            ("b", &["./t", "tests/b.t"]),
+            ("c", &["./t", "tests/c.t"]),
+        ];
+        for (key, words) in runs {
+            let out = s.run(&s.root, &["--key", key], words, &[]);
+            assert_eq!(code(&out), 0, "{key}: {}", text(&out.stderr));
+        }
+        let units: BTreeSet<(String, String)> = ["a", "b", "c"]
+            .into_iter()
+            .flat_map(|key| stored_inputs(&s, key))
+            .collect();
+        let stray: Vec<(String, String)> = stored_inputs(&s, "full")
+            .into_iter()
+            .filter(|(_, id)| id != "d" && !id.starts_with("dl:"))
+            .filter(|input| !units.contains(input))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "the full form reads what no unit launch reads: {stray:?}"
+        );
+    }
+
+    // F10, traced: a stat of T_STAT_OTHER is an input of its launch. `test -e` only looks at the
+    // path, so only the tracer can show it. The test fails if the runner never runs `test -e`, or
+    // runs it only when T_IF is set. The untraced F10 tests see the log line and nothing else.
+    #[test]
+    fn f10_t_stat_other_is_an_input_of_its_launch() {
+        let s = Suite::new();
+        let out = s.run(
+            &s.root,
+            &["--key", "stat"],
+            &["./t", "tests/a.t"],
+            &[("T_STAT_OTHER", "tests/b.t")],
+        );
+        assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+        let inputs = stored_inputs(&s, "stat");
+        assert!(
+            inputs
+                .iter()
+                .any(|(path, id)| path == "tests/b.t" && id.starts_with("f:")),
+            "the stat of tests/b.t is not an input of its launch: {inputs:?}"
+        );
+    }
+}
+
+#[test]
+fn f6_t_if_absent_turns_off_t_write_and_t_read_other() {
+    let s = Suite::new();
+    let toggle = s.outside.join("toggle");
+    let written = s.outside.join("written");
+    let out = s.direct(
+        &s.root,
+        &["tests/a.t"],
+        &[
+            ("T_IF", toggle.to_str().unwrap()),
+            ("T_WRITE", written.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert!(!written.exists(), "T_WRITE wrote with T_IF absent");
+
+    // A read of a FIFO with no writer blocks, so `finish` fails the test if the read happens.
+    let fifo = s.fifo();
+    let child = s.direct_child(
+        &s.root,
+        &["tests/a.t"],
+        &[
+            ("T_IF", toggle.to_str().unwrap()),
+            ("T_READ_OTHER", fifo.to_str().unwrap()),
+        ],
+        Stdio::piped(),
+    );
+    assert_eq!(
+        code(&finish(child)),
+        0,
+        "T_READ_OTHER read with T_IF absent"
+    );
+
+    // Once the path exists, both act: the write lands before any test, and the read holds the
+    // runner until a writer releases it.
+    fs::write(&toggle, "").unwrap();
+    let fifo = s.fifo();
+    let mut child = s.direct_child(
+        &s.root,
+        &["tests/a.t"],
+        &[
+            ("T_IF", toggle.to_str().unwrap()),
+            ("T_WRITE", written.to_str().unwrap()),
+            ("T_READ_OTHER", fifo.to_str().unwrap()),
+        ],
+        Stdio::piped(),
+    );
+    let writer = meet(&fifo);
+    assert!(written.exists(), "T_WRITE did not write with T_IF present");
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "the read released early"
+    );
+    release(writer);
+    assert_eq!(code(&finish(child)), 0);
+}
+
+#[test]
+fn f6_a_directory_named_by_t_if_counts_as_present() {
+    let s = Suite::new();
+    // The table says T_IF names a path that exists. A directory exists too, so the knob acts.
+    let toggle = s.outside.join("toggle-dir");
+    fs::create_dir(&toggle).unwrap();
+    let written = s.outside.join("written");
+    let out = s.direct(
+        &s.root,
+        &["tests/a.t"],
+        &[
+            ("T_IF", toggle.to_str().unwrap()),
+            ("T_WRITE", written.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert_eq!(
+        fs::read(&written).expect("T_WRITE did not write with a directory as T_IF"),
+        b"written\n"
+    );
+}
+
+#[test]
+fn f7_t_write_at_writes_only_for_the_named_test_before_its_reads() {
+    let s = Suite::new();
+    // b reads out.src after its own inputs, so a write made before b's reads shows in its output.
+    s.write("tests/b.t", "src/shared.src\nout.src\n");
+    let target = s.path("out.src");
+    let toggle = s.outside.join("write-at-toggle");
+    let env = [
+        ("T_WRITE", target.to_str().unwrap()),
+        ("T_WRITE_AT", "tests/b.t"),
+    ];
+
+    // An invocation that does not run b writes nothing.
+    let out = s.direct(&s.root, &["tests/a.t", "tests/c.t"], &env);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert!(
+        !target.exists(),
+        "T_WRITE_AT wrote in an invocation without b"
+    );
+
+    // Running b writes before b reads, so its output shows the file it reads.
+    let out = s.direct(&s.root, &["tests/b.t"], &env);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert!(
+        text(&out.stdout).contains("written\n"),
+        "{}",
+        text(&out.stdout)
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"written\n");
+
+    // The full form runs b too, and the write happens once, before b.
+    fs::remove_file(&target).unwrap();
+    let out = s.direct(&s.root, &[], &env);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert!(text(&out.stdout).contains("written\n"));
+    assert!(target.exists());
+
+    // T_IF gates the write as it gates T_WRITE.
+    fs::remove_file(&target).unwrap();
+    let gated = [env[0], env[1], ("T_IF", toggle.to_str().unwrap())];
+    let out = s.direct(&s.root, &["tests/b.t"], &gated);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert!(!target.exists(), "T_WRITE_AT wrote with T_IF absent");
+    fs::write(&toggle, "").unwrap();
+    let out = s.direct(&s.root, &["tests/b.t"], &gated);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert!(
+        target.exists(),
+        "T_WRITE_AT did not write with T_IF present"
+    );
+}
+
+#[test]
+fn f8_t_write_each_writes_each_tests_own_output_in_every_run_of_it() {
+    let s = Suite::new();
+    // a.t lists its own output, so the output shows whether the write comes before the reads.
+    s.write("tests/a.t", "src/shared.src\ntests/a.out\n");
+    let toggle = s.outside.join("write-each-toggle");
+    // T_IF does not gate T_WRITE_EACH, so an absent toggle changes nothing.
+    let env = [("T_WRITE_EACH", "1"), ("T_IF", toggle.to_str().unwrap())];
+    let out = s.direct(&s.root, &["tests/a.t", "tests/c.t"], &env);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    // The first run reads a.out before writing it, so the write must come after the reads.
+    assert!(
+        !text(&out.stdout).lines().any(|line| line == "written"),
+        "the write came before the reads: {}",
+        text(&out.stdout)
+    );
+    assert_eq!(fs::read(s.path("tests/a.out")).unwrap(), b"written\n");
+    assert_eq!(fs::read(s.path("tests/c.out")).unwrap(), b"written\n");
+    assert!(
+        !s.path("tests/b.out").exists(),
+        "b did not run, so it wrote nothing"
+    );
+
+    let out = s.direct(&s.root, &[], &[("T_WRITE_EACH", "1")]);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    for name in ["tests/a.out", "tests/b.out", "tests/c.out"] {
+        assert_eq!(fs::read(s.path(name)).unwrap(), b"written\n", "{name}");
+    }
+}
+
+#[test]
+fn f9_t_write_full_writes_in_the_full_form_before_its_first_test() {
+    let s = Suite::new();
+    let toggle = s.outside.join("write-full-toggle");
+    // T_IF does not gate T_WRITE_FULL, so an absent toggle changes nothing.
+    let env = [
+        ("T_WRITE_FULL", "full.out"),
+        ("T_IF", toggle.to_str().unwrap()),
+    ];
+
+    // The full form moves to the root first, so a relative path is root-relative.
+    let out = s.direct(&s.root.join("docs"), &[], &env);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert_eq!(fs::read(s.path("full.out")).unwrap(), b"written\n");
+    assert!(
+        !s.path("docs/full.out").exists(),
+        "the path is not root-relative"
+    );
+
+    // The file exists when the first test holds, so it was written before the tests.
+    s.remove("full.out");
+    let fifo = s.fifo();
+    let child = s.direct_child(
+        &s.root,
+        &[],
+        &[
+            ("T_WRITE_FULL", "full.out"),
+            ("T_FIFO", fifo.to_str().unwrap()),
+            ("T_FIFO_AT", "tests/a.t"),
+        ],
+        Stdio::piped(),
+    );
+    let writer = meet(&fifo);
+    assert!(
+        s.path("full.out").exists(),
+        "the file came after the first test"
+    );
+    release(writer);
+    assert_eq!(code(&finish(child)), 0);
+
+    // The test-word form writes nothing.
+    s.remove("full.out");
+    let out = s.direct(&s.root, &["tests/a.t"], &[("T_WRITE_FULL", "full.out")]);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert!(
+        !s.path("full.out").exists(),
+        "the test-word form wrote the file"
+    );
+}
+
+#[test]
+fn f10_t_stat_other_stats_its_path_once_per_invocation() {
+    let s = Suite::new();
+    let toggle = s.outside.join("stat-other-toggle");
+    let env = [
+        ("T_STAT_OTHER", "tests/none.t"),
+        ("T_IF", toggle.to_str().unwrap()),
+    ];
+    let out = s.direct(&s.root, &["tests/a.t", "tests/c.t"], &env);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    let stats = |lines: &[String]| {
+        lines
+            .iter()
+            .filter(|l| *l == "stat_other=tests/none.t")
+            .count()
+    };
+    assert_eq!(stats(&s.launches()[0].lines), 0, "T_IF absent");
+
+    fs::write(&toggle, "").unwrap();
+    let runs: [&[&str]; 2] = [&["tests/a.t", "tests/c.t"], &[]];
+    for words in runs {
+        s.clear_log();
+        let out = s.direct(&s.root, words, &env);
+        // A missing path is not a failure: `test -e` only asks.
+        assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+        let launches = s.launches();
+        assert_eq!(launches.len(), 1);
+        assert_eq!(stats(&launches[0].lines), 1, "{:?}", launches[0].lines);
+    }
+
+    // T_IF unset: the knob acts, so one invocation logs one stat line.
+    s.clear_log();
+    let out = s.direct(
+        &s.root,
+        &["tests/a.t", "tests/c.t"],
+        &[("T_STAT_OTHER", "tests/none.t")],
+    );
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    let launches = s.launches();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(stats(&launches[0].lines), 1, "{:?}", launches[0].lines);
+}
+
+#[test]
+fn f11_t_fail_full_fails_the_full_form_after_its_tests() {
+    let s = Suite::new();
+    let toggle = s.outside.join("fail-full-toggle");
+    let env = [("T_FAIL_FULL", "1"), ("T_IF", toggle.to_str().unwrap())];
+    let out = s.direct(&s.root, &[], &env);
+    assert_eq!(code(&out), 0, "T_IF absent: {}", text(&out.stderr));
+    assert_eq!(s.launches()[0].ran(), ROSTER);
+
+    fs::write(&toggle, "").unwrap();
+    s.clear_log();
+    let out = s.direct(&s.root, &[], &env);
+    assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+    let launches = s.launches();
+    assert_eq!(launches[0].ran(), ROSTER, "the tests run first");
+    assert!(launches[0].failed().is_empty(), "{:?}", launches[0].lines);
+
+    // The test-word form is not affected.
+    s.clear_log();
+    let out = s.direct(&s.root, &["tests/a.t"], &env);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert!(s.launches()[0].failed().is_empty());
+
+    // T_IF unset: the knob acts, so the no-argument form exits 1 after its tests.
+    s.clear_log();
+    let out = s.direct(&s.root, &[], &[("T_FAIL_FULL", "1")]);
+    assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+    assert_eq!(s.launches()[0].ran(), ROSTER);
+}
+
+#[test]
+fn f12_t_fail_alone_fails_its_test_in_the_test_word_form() {
+    let s = Suite::new();
+    let toggle = s.outside.join("fail-alone-toggle");
+    let env = [
+        ("T_FAIL_ALONE", "tests/b.t"),
+        ("T_IF", toggle.to_str().unwrap()),
+    ];
+    let out = s.direct(&s.root, &["tests/a.t", "tests/b.t"], &env);
+    assert_eq!(code(&out), 0, "T_IF absent: {}", text(&out.stderr));
+    assert!(s.launches()[0].failed().is_empty());
+
+    fs::write(&toggle, "").unwrap();
+    s.clear_log();
+    let out = s.direct(&s.root, &["tests/a.t", "tests/b.t"], &env);
+    assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+    let launches = s.launches();
+    assert_eq!(
+        launches[0].ran(),
+        ["tests/a.t", "tests/b.t"],
+        "b still runs"
+    );
+    assert_eq!(launches[0].failed(), ["tests/b.t"]);
+    // The failing test still reads its files: each test prints its own line, then the content of
+    // src/shared.src and setup.src, so stdout holds that trio once per test.
+    let stdout = text(&out.stdout);
+    let reads = ["src/shared.src", "shared", "setup"];
+    assert_eq!(stdout.lines().collect::<Vec<_>>(), [reads, reads].concat());
+
+    // The no-argument form runs b and does not fail it.
+    s.clear_log();
+    let out = s.direct(&s.root, &[], &env);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert!(s.launches()[0].failed().is_empty());
+
+    // T_IF unset: the knob acts, so b fails in the test-word form.
+    s.clear_log();
+    let out = s.direct(
+        &s.root,
+        &["tests/a.t", "tests/b.t"],
+        &[("T_FAIL_ALONE", "tests/b.t")],
+    );
+    assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+    assert_eq!(s.launches()[0].failed(), ["tests/b.t"]);
 }
 
 // Pins of today's hooked-run behaviour. Each one holds on the base and must still hold after the
