@@ -1,18 +1,20 @@
 //! The attribution pass (spec 3.1 to 3.4). A changed run of a hooked suite launches each unit of its
 //! roster once, in roster order, under one traced launch each. A launch that exits 0 and read its
 //! own file stores that unit's proof. Nothing is skipped on the strength of a unit proof yet, so
-//! every run that does not dispatch is the legacy path, unchanged.
+//! every run that does not dispatch is the legacy path, unchanged. `stoop explain` asks the same
+//! checks, through `screen` and `probe`, so it predicts the decision made here.
 
 use super::bundle::{self, LaunchGuard, Pass, Pending, Start, Stored};
 use super::config::Config;
 use super::expand;
-use super::hook::safe;
+use super::hook::{safe, Hook};
 use super::policy;
 use crate::ignore::Ignore;
 use crate::pathutil::{to_key, Physical};
 use crate::proof::now;
 use crate::run::{self, assemble, How, Lookup, Outcome, RunCx};
 use crate::trace::Trace;
+use std::fmt;
 use std::path::Path;
 
 /// Runs the attribution pass when every condition of spec 3.1 holds. `None` leaves the run to the
@@ -26,23 +28,8 @@ pub(crate) fn pass(
     key: &str,
 ) -> Option<Outcome> {
     let hook = cx.hook.as_ref()?;
-    // 1 and 2: a forced full run and a whole-command hit are decided by the legacy path.
-    if cx.full_reason.is_some() || lookup.hit_idx.is_some() {
-        return None;
-    }
-    // 3: with no legacy proof at all, the first-run form runs.
-    if lookup.proofs.is_empty() {
-        return None;
-    }
-    // 4 and 5: a CI job and an opted-out suite keep the first-run form.
-    if policy::ci() || config.splitting_disabled(&hook.original, cx.rel_cwd) {
-        return None;
-    }
-    // 6 and 7: every placeholder must expand to one unit, for every unit of the roster.
-    if !expand::supported(hook) {
-        return None;
-    }
-    let launches = expand::launches(hook, pending.units(), cx.root, cx.cwd)?;
+    // Checks 1 to 7 are decided by `screen`, which `stoop explain` calls too.
+    let (_, launches) = screen(cx, hook, config, lookup, Ok(pending)).ok()?;
     // 8 and 9: the bundle is checked without the lock, then again under it.
     let ignore = Ignore::new(
         &cx.o.ignore,
@@ -149,6 +136,153 @@ pub(crate) fn pass(
         key: key.to_owned(),
         how: How::Units,
     })
+}
+
+/// Why a changed run of a hooked suite starts no attribution pass (spec 3.1). The run and
+/// `stoop explain` decide with the same checks, in the same order, and print the same text. The
+/// run's last check, the suite lock, has no reason here: explain takes no lock, so it could never
+/// print one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Refusal {
+    /// The run is forced to the full command: `STOOP_FULL`, a default branch, a verification run, or
+    /// a configuration that is invalid or not independent.
+    Forced,
+    /// The whole command's proof still holds, so the run launches nothing.
+    Unchanged,
+    /// An option keeps the suite whole: `--no-record`, `--allow-network`, `--probe`, `--ignore` or
+    /// `--ignore-env`.
+    Options,
+    /// The filter selects no unit.
+    NoUnits,
+    /// The roster cannot be recorded: an argument is not UTF-8, a unit name is not valid, or there
+    /// are more units than a bundle holds.
+    Unrecordable,
+    /// No earlier run left a proof for the command.
+    NoProof,
+    /// A CI job keeps the full command, and a CI reader never writes a suite.
+    Ci,
+    /// Splitting is turned off by `enabled = false`, at the top level or on the suite.
+    Disabled,
+    /// The hook uses a form one unit cannot stand for: a list file, `{changed-inputs}` or shell code.
+    Form,
+    /// A unit's text holds the separator of a joined placeholder.
+    Join,
+    /// The suite has no current record of an earlier full run.
+    NoBundle,
+    /// A unit of the roster already has a proof.
+    Proven,
+    /// The last pass stored no unit proof for this roster.
+    NoEvidence,
+}
+
+impl fmt::Display for Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Forced => "the run is forced to the full command",
+            Self::Unchanged => "the whole command's proof still holds",
+            Self::Options => {
+                "--no-record, --allow-network, --probe, --ignore or --ignore-env keeps the full command"
+            }
+            Self::NoUnits => "the filter selects no unit",
+            Self::Unrecordable => {
+                "the roster cannot be recorded: an argument is not UTF-8, a unit name is not valid, or there are more than 4,096 units"
+            }
+            Self::NoProof => {
+                "no earlier run left a proof for this command, so the first run is the full command"
+            }
+            Self::Ci => "CI is set, so the run keeps the full command",
+            Self::Disabled => "splitting is turned off by enabled = false",
+            Self::Form => {
+                "the hook uses a form a single unit cannot stand for (a list file, {changed-inputs} or shell code)"
+            }
+            Self::Join => "a unit's text contains the separator of a joined placeholder",
+            Self::NoBundle => "the suite has no current record of an earlier full run",
+            Self::Proven => "a unit of the roster already has a proof",
+            Self::NoEvidence => "the last pass stored no unit proof for this roster",
+        })
+    }
+}
+
+/// A hooked suite as one invocation names it: its roster as the filter and discovery give it, and
+/// the record a pass would write for that roster, or the refusal that keeps the record from being
+/// made.
+pub(crate) struct Suite {
+    /// The suite's ID, which names its bundle and its lock.
+    pub(crate) id: String,
+    /// The roster, in catalog order.
+    pub(crate) units: Vec<String>,
+    pub(crate) pending: Result<Pending, Refusal>,
+}
+
+/// Spec 3.1, checks 1 to 7: the decisions taken before the store is read or the lock is taken. The
+/// run and `stoop explain` both call it, so they cannot disagree on these checks.
+fn screen<'p>(
+    cx: &RunCx<'_>,
+    hook: &Hook,
+    config: &Config,
+    lookup: &Lookup,
+    pending: Result<&'p Pending, Refusal>,
+) -> Result<(&'p Pending, Vec<expand::Launch>), Refusal> {
+    // 1 and 2: a forced full run, and a whole-command proof that still holds.
+    if cx.full_reason.is_some() {
+        return Err(Refusal::Forced);
+    }
+    if lookup.hit_idx.is_some() {
+        return Err(Refusal::Unchanged);
+    }
+    let pending = pending?;
+    // 3: with no legacy proof at all, the first run is the full command.
+    if lookup.proofs.is_empty() {
+        return Err(Refusal::NoProof);
+    }
+    // 4 and 5: a CI job and an opted-out suite keep the full command.
+    if policy::ci() {
+        return Err(Refusal::Ci);
+    }
+    if config.splitting_disabled(&hook.original, cx.rel_cwd) {
+        return Err(Refusal::Disabled);
+    }
+    // 6 and 7: every placeholder must expand to one unit, for every unit of the roster.
+    if !expand::supported(hook) {
+        return Err(Refusal::Form);
+    }
+    let launches = expand::launches(hook, pending.units(), cx.root, cx.cwd).ok_or(Refusal::Join)?;
+    Ok((pending, launches))
+}
+
+/// The two lines `stoop explain` adds to a suite's decision (spec 4.16): the tracked counts, then
+/// whether a changed run would start a pass, or the reason it would not. It reads the store and
+/// takes no lock. Nothing is written, created or launched.
+pub(crate) fn explain_lines(
+    cx: &RunCx<'_>,
+    config: &Config,
+    lookup: &Lookup,
+    suite: Option<&Suite>,
+    store: &Path,
+    key: &str,
+) -> Option<Vec<String>> {
+    let suite = suite?;
+    let hook = cx.hook.as_ref()?;
+    let decision = screen(
+        cx,
+        hook,
+        config,
+        lookup,
+        suite.pending.as_ref().map_err(|refusal| *refusal),
+    )
+    .and_then(|(pending, launches)| bundle::probe(store, pending, key).map(|()| launches.len()));
+    let (inputs, proven) = bundle::counts(store, &suite.id, &suite.units);
+    let total = suite.units.len();
+    let tracked = format!(
+        "stoop: tracked {total} units, {inputs} inputs; {proven} proven, {} without a proof (suite {})",
+        total - proven,
+        suite.id
+    );
+    let decision = match decision {
+        Ok(launches) => format!("stoop: would run an attribution pass: {launches} launches"),
+        Err(refusal) => format!("stoop: no attribution pass: {refusal}"),
+    };
+    Some(vec![tracked, decision])
 }
 
 /// One line for the operator, unless `--quiet` asks for none.
