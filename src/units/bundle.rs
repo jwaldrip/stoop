@@ -1985,15 +1985,7 @@ mod pass_tests {
         let area = Area::open(&dir, false).unwrap().unwrap();
         drop(area.lock_file(&lock_name(&id)).unwrap());
         let suite_dir = dir.join("units/v1");
-        /// Restores the directory's mode when the test ends, even when an assertion fails first.
-        struct Restore(PathBuf);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
-            }
-        }
-        let _restore = Restore(suite_dir.clone());
-        fs::set_permissions(&suite_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let _mode = ModeGuard::set(&suite_dir, 0o500);
         let started = start(&dir, &pending_for(&roster), "key", guard());
         assert!(
             matches!(started, Start::No),
@@ -2039,6 +2031,86 @@ mod pass_tests {
         assert!(
             matches!(started, Start::No),
             "a proof recorded before the lock is seen under it"
+        );
+    }
+
+    /// Sets a directory's mode for the length of a test, and restores it to private when the guard
+    /// is dropped, so a failed assertion cannot leave the store unwritable.
+    struct ModeGuard(PathBuf);
+
+    impl ModeGuard {
+        fn set(path: &Path, mode: u32) -> ModeGuard {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+            ModeGuard(path.to_path_buf())
+        }
+    }
+
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// A kill after a due write keeps every proof that write held. The second proof is written
+    /// because a second has passed since the first write. The pass is then forgotten without
+    /// running its end, as a kill does.
+    #[test]
+    fn a_kill_after_a_due_write_keeps_every_proof_it_held() {
+        let units = roster_of(2);
+        let id = pending_of(&units).suite;
+        let dir = seed("due-write", &bundle_for(pending_of(&units), "key"));
+        let mut pass = pass_of(start(&dir, &pending_of(&units), "key", guard()));
+        assert!(matches!(
+            pass.record(&units[0], &[input("src/shared.src")], &[], 1),
+            Stored::Stored
+        ));
+        std::thread::sleep(FLUSH_INTERVAL);
+        assert!(matches!(
+            pass.record(&units[1], &[input("src/shared.src")], &[], 1),
+            Stored::Stored
+        ));
+        std::mem::forget(pass);
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        let ReadBundle::Current(stored) = read_bundle(&area, &id) else {
+            panic!("a killed pass left a bundle that is not current");
+        };
+        assert!(stored.units.contains_key(&units[0]));
+        assert!(
+            stored.units.contains_key(&units[1]),
+            "the due write held the second proof"
+        );
+    }
+
+    /// A due write that fails keeps its proof held, so the end of the pass writes it. A failed
+    /// write must not clear the dirty mark, or the proof is lost.
+    #[test]
+    fn a_failed_due_write_is_written_when_the_pass_ends() {
+        let units = roster_of(2);
+        let id = pending_of(&units).suite;
+        let dir = seed("failed-write", &bundle_for(pending_of(&units), "key"));
+        let suite_dir = dir.join("units/v1");
+        let mut pass = pass_of(start(&dir, &pending_of(&units), "key", guard()));
+        assert!(matches!(
+            pass.record(&units[0], &[input("src/shared.src")], &[], 1),
+            Stored::Stored
+        ));
+        std::thread::sleep(FLUSH_INTERVAL);
+        {
+            // The due write cannot create its temporary entry, so it fails.
+            let _mode = ModeGuard::set(&suite_dir, 0o500);
+            assert!(matches!(
+                pass.record(&units[1], &[input("src/shared.src")], &[], 1),
+                Stored::WriteFailed
+            ));
+        }
+        drop(pass);
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        let ReadBundle::Current(stored) = read_bundle(&area, &id) else {
+            panic!("the bundle is not current after the pass ended");
+        };
+        assert!(
+            stored.units.contains_key(&units[1]),
+            "the proof whose due write failed is written at the end"
         );
     }
 }
