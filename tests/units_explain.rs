@@ -23,8 +23,8 @@ use units_common::*;
 const PINNED: [&str; 2] = ["./t", HOOK];
 
 /// The shell hook of the attribution tests: its match is `SHELL_WORDS`, and its roster is `tests/**/*.t`.
-const SHELL_SUITE: &str = "[[units.suite]]\nid = \"shell\"\nmatch = ['sh', '-c', './t; s=$?; : \"$STOOP_CHANGED\"; exit $s', 'sh']\nunits = ['tests/**/*.t']\n";
-const SHELL_WORDS: [&str; 4] = ["sh", "-c", "./t; s=$?; : \"$STOOP_CHANGED\"; exit $s", "sh"];
+const SHELL_SUITE: &str = "[[units.suite]]\nid = \"shell\"\nmatch = ['sh', '-c', './t ${STOOP_CHANGED:+\"$STOOP_CHANGED\"}', 'sh']\nunits = ['tests/**/*.t']\n";
+const SHELL_WORDS: [&str; 4] = ["sh", "-c", "./t ${STOOP_CHANGED:+\"$STOOP_CHANGED\"}", "sh"];
 
 /// The pinned roster has three units, `tests/a.t`, `tests/b.t` and `tests/c.t`.
 const TRACKED: usize = 3;

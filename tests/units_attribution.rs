@@ -634,7 +634,7 @@ fn a_filter_that_selects_no_unit_never_dispatches() {
 }
 
 /// A21's suite: the shell hook is its match, and its roster is the tree's tests.
-const SHELL_SUITE: &str = "[[units.suite]]\nid = \"shell\"\nmatch = ['sh', '-c', './t; s=$?; : \"$STOOP_CHANGED\"; exit $s', 'sh']\nunits = ['tests/**/*.t']\n";
+const SHELL_SUITE: &str = "[[units.suite]]\nid = \"shell\"\nmatch = ['sh', '-c', './t ${STOOP_CHANGED:+\"$STOOP_CHANGED\"}', 'sh']\nunits = ['tests/**/*.t']\n";
 
 // A21: a hook whose shell code reads $STOOP_CHANGED dispatches like any other hook. The changed run
 // makes one launch per unit of the roster, and each launch exports its own unit, its own list file
@@ -644,7 +644,7 @@ const SHELL_SUITE: &str = "[[units.suite]]\nid = \"shell\"\nmatch = ['sh', '-c',
 fn a_shell_environment_hook_dispatches_per_unit() {
     let s = Suite::new();
     s.config(SHELL_SUITE);
-    let words = ["sh", "-c", "./t; s=$?; : \"$STOOP_CHANGED\"; exit $s", "sh"];
+    let words = ["sh", "-c", "./t ${STOOP_CHANGED:+\"$STOOP_CHANGED\"}", "sh"];
     success(&s.run(&s.root, &[], &words, &[]));
     edit(&s, 2);
     s.clear_log();
