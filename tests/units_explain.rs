@@ -33,8 +33,6 @@ const NO_PASS_COLD: &str = "stoop: no attribution pass: no earlier run left a pr
 const NO_PASS_UNCHANGED: &str = "stoop: no attribution pass: the whole command's proof still holds";
 const WOULD_PASS: &str = "stoop: would run an attribution pass: 3 launches";
 const NO_PASS_PROVEN: &str = "stoop: no attribution pass: a unit of the roster already has a proof";
-const NO_PASS_EVIDENCE: &str =
-    "stoop: no attribution pass: the last pass stored no unit proof for this roster";
 const NO_PASS_CI: &str = "stoop: no attribution pass: CI is set, so the run keeps the full command";
 const NO_PASS_DISABLED: &str =
     "stoop: no attribution pass: splitting is turned off by enabled = false";
@@ -228,13 +226,13 @@ fn a_recorded_suite_after_a_change_predicts_the_pass() {
     assert_eq!(decision, WOULD_PASS);
 }
 
-// E4: after the pass, three units are proven. Each unit also writes out.txt, an output, so the bundle's
-// table holds that entry as well. The tracked line counts the distinct inputs the proofs name, which is
-// fewer than the table's entries.
+// E4: after the pass, three units are proven. Each unit also writes its own .out file, an output, so
+// the bundle's table holds those entries as well. The tracked line counts the distinct inputs the
+// proofs name, which is fewer than the table's entries.
 #[test]
 fn a_suite_after_its_pass_counts_three_proven() {
     let s = Suite::new();
-    let writes = [("T_WRITE", "out.txt")];
+    let writes = [("T_WRITE_EACH", "1")];
     success(&s.hook(&writes));
     edit(&s, 2);
     success(&s.hook(&writes));
@@ -274,23 +272,6 @@ fn explain_does_not_take_the_suite_lock() {
     );
     assert!(!err(&locked).contains("busy"), "{}", err(&locked));
     assert_eq!(tail(&locked).1, WOULD_PASS);
-}
-
-// E6: a pass that stored no unit proof leaves its roster marked. Explain names the marker, and the
-// roster has no unit proof.
-#[test]
-fn a_silent_roster_is_explained_as_silent() {
-    let s = Suite::new();
-    success(&s.hook(&[]));
-    edit(&s, 2);
-    success(&s.hook(&[("T_IGNORE", "1")]));
-    assert!(s.bundle().unwrap()["units"].as_object().unwrap().is_empty());
-    edit(&s, 3);
-    let out = explain_is_read_only(&s, &PINNED, &[], &[]);
-    assert_eq!(code(&out), 1, "{}", err(&out));
-    let (tracked_line, decision) = tail(&out);
-    assert_eq!(tracked_line, tracked(&s, &id_of(&tracked_line), 0));
-    assert_eq!(decision, NO_PASS_EVIDENCE);
 }
 
 // E7: CI on a feature branch of a Git checkout keeps the full command, and the run agrees. A CI

@@ -303,7 +303,11 @@ fn r7u_a_launch_that_creates_its_own_root_entry_keeps_a_stable_proof() {
     let written = written.to_str().unwrap();
     edit(&s, 2);
     s.clear_log();
-    success(&s.hook(&[("T_LS_ROOT", "1"), ("T_WRITE", written)]));
+    success(&s.hook(&[
+        ("T_LS_ROOT", "1"),
+        ("T_WRITE", written),
+        ("T_WRITE_AT", "tests/a.t"),
+    ]));
     one_per_unit(&s.launches(), &ROSTER);
     let recorded = bundle(&s);
     let first = root_id(&recorded, "tests/a.t").expect("a root input");
@@ -317,10 +321,18 @@ fn r7u_a_launch_that_creates_its_own_root_entry_keeps_a_stable_proof() {
     }
     forget_units(&s);
     edit(&s, 3);
-    success(&s.hook(&[("T_LS_ROOT", "1"), ("T_WRITE", written)]));
+    success(&s.hook(&[
+        ("T_LS_ROOT", "1"),
+        ("T_WRITE", written),
+        ("T_WRITE_AT", "tests/a.t"),
+    ]));
     edit(&s, 4);
     s.clear_log();
-    success(&s.hook(&[("T_LS_ROOT", "1"), ("T_WRITE", written)]));
+    success(&s.hook(&[
+        ("T_LS_ROOT", "1"),
+        ("T_WRITE", written),
+        ("T_WRITE_AT", "tests/a.t"),
+    ]));
     one_per_unit(&s.launches(), &ROSTER);
     assert_eq!(
         root_id(&bundle(&s), "tests/a.t").as_deref(),

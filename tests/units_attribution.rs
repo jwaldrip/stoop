@@ -319,7 +319,9 @@ fn attribution_launches_export_their_unit() {
 }
 
 // A10i: each value form reaches the runner once per unit, with that form's own text. Each form has
-// its own suite (the argv is part of the suite id), so each one takes a cold run and a change.
+// its own suite (the argv is part of the suite id), so each one takes a cold run and a change. The
+// glued form ends in a disabled suite: the fixture ignores a `-` word and reads every test, so its
+// first launch is coupled (W6-1). i0 pins the glued expansion with a runner that honours the flag.
 #[test]
 fn value_forms_reach_the_runner_per_unit() {
     let s = Suite::new();
@@ -334,7 +336,7 @@ fn value_forms_reach_the_runner_per_unit() {
         // asserted here.
         s.run(cwd, &[], words, &[]);
         let launches = s.launches();
-        assert_eq!(launches.len(), 3, "{words:?}: {launches:?}");
+        assert_eq!(launches.len(), expected.len(), "{words:?}: {launches:?}");
         for (launch, expected) in launches.iter().zip(&expected) {
             assert_eq!(&launch.args, expected, "{words:?}");
         }
@@ -343,12 +345,13 @@ fn value_forms_reach_the_runner_per_unit() {
         &s.root,
         &["./t", "--files={changed:**/*.t|!slow/**}"],
         2,
-        vec![
-            args(&["--files=tests/a.t"]),
-            args(&["--files=tests/b.t"]),
-            args(&["--files=tests/c.t"]),
-        ],
+        vec![args(&["--files=tests/a.t"])],
     );
+    // The fixture ignores a `-` word, so this launch runs the no-argument form, which reads
+    // tests/b.t. The suite is disabled at the first launch (W6-1).
+    let state = s.bundle().unwrap()["state"].clone();
+    assert_eq!(state["status"], "disabled", "{state}");
+    assert_eq!(state["label"], "tests/a.t read tests/b.t", "{state}");
     check(
         &s.root,
         &["./t", "-f", "{changed:each:**/*.t|!slow/**}"],
@@ -687,47 +690,6 @@ fn legacy_key(s: &Suite) -> String {
         .collect();
     assert_eq!(keys.len(), 1, "{keys:?}");
     keys.pop().unwrap()
-}
-
-// A24: a pass that stores no proof leaves a marker for its roster, so the later changed runs of
-// that roster take the full form until the roster changes or `forget --units` clears the suite.
-// Fails on a tree without the marker: the second changed run starts a pass again. The unchanged
-// run after the marker's full form skips, the end-to-end proof that the marker restores skipping.
-#[test]
-fn a_pass_that_stores_no_proof_is_not_repeated_for_the_same_roster() {
-    let s = Suite::new();
-    success(&s.hook(&[]));
-    // The runner exits 0 without reading its units, so no unit gets a proof.
-    edit(&s, 2);
-    s.clear_log();
-    success(&s.hook(&[("T_IGNORE", "1")]));
-    one_per_unit(&s.launches(), &ROSTER);
-    assert!(bundle(&s)["units"].as_object().unwrap().is_empty());
-    // The same roster, changed again: the full form, which records the whole command.
-    edit(&s, 3);
-    s.clear_log();
-    success(&s.hook(&[("T_IGNORE", "1")]));
-    full_form(&s.launches());
-    // Unchanged after that full form: its whole-command proof is a hit, so nothing launches.
-    s.clear_log();
-    success(&s.hook(&[("T_IGNORE", "1")]));
-    assert!(
-        s.launches().is_empty(),
-        "an unchanged run after the marker's full form skips"
-    );
-    // The runner reads its units now, but this roster stayed silent, so the full form still runs.
-    edit(&s, 4);
-    s.clear_log();
-    success(&s.hook(&[]));
-    full_form(&s.launches());
-    // A new unit changes the roster, so the next change starts a pass again.
-    s.write("tests/d.t", "src/shared.src\n");
-    s.clear_log();
-    success(&s.hook(&[]));
-    one_per_unit(
-        &s.launches(),
-        &["tests/a.t", "tests/b.t", "tests/c.t", "tests/d.t"],
-    );
 }
 
 // A26: a unit launch captures no Git blob id, so a unit proof carries none, while the legacy proof

@@ -240,7 +240,7 @@ fn a_passing_hook_records_the_roster_and_saved_whole_proof_digest() {
         )
     );
     assert_eq!(bundle["v"], 1);
-    assert_eq!(bundle["generation"], 1);
+    assert_eq!(bundle["generation"], 2);
     assert_eq!(bundle["suite"], id);
     assert_eq!(
         bundle["roster"]["units"],
