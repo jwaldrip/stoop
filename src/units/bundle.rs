@@ -130,15 +130,28 @@ fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
     hash.update(bytes);
 }
 
+/// An absent value and an empty value are different inputs, so each carries a presence byte.
+fn optional(hash: &mut blake3::Hasher, value: Option<&str>) {
+    match value {
+        None => {
+            hash.update(&[0]);
+        }
+        Some(value) => {
+            hash.update(&[1]);
+            field(hash, value.as_bytes());
+        }
+    }
+}
+
 fn suite_id(argv: &[OsString], cwd: &str, scope: Option<&str>, label: Option<&str>) -> String {
     let mut hash = blake3::Hasher::new_derive_key("stoop suite id v1");
     field(&mut hash, b"hook");
-    field(&mut hash, scope.unwrap_or("").as_bytes());
+    optional(&mut hash, scope);
     field(&mut hash, cwd.as_bytes());
     for word in argv {
         field(&mut hash, word.as_encoded_bytes());
     }
-    field(&mut hash, label.unwrap_or("").as_bytes());
+    optional(&mut hash, label);
     hash.finalize().to_hex()[..32].to_string()
 }
 
@@ -630,5 +643,23 @@ mod lock_identity_tests {
         let result = lock_with(&dir, ID, || replace_lock(&dir));
         assert!(result.is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+
+    #[test]
+    fn an_absent_label_and_an_empty_label_identify_different_suites() {
+        let words = [OsString::from("runner")];
+        assert_ne!(
+            suite_id(&words, "", None, None),
+            suite_id(&words, "", None, Some(""))
+        );
+        assert_ne!(
+            suite_id(&words, "", None, None),
+            suite_id(&words, "", Some(""), None)
+        );
     }
 }
