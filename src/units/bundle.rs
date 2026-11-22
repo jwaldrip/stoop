@@ -540,5 +540,30 @@ mod tests {
         assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["roster"].get("inputs").is_none());
+        let mut bounded = decoded;
+        let versions = (0..=MAX_VERSIONS)
+            .map(|_| UnitVersion {
+                created: 1,
+                exact: true,
+                source: ResultSource::Exit,
+                guard: "guard".into(),
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+            })
+            .collect();
+        bounded.units.insert("tests/a.t".into(), versions);
+        assert!(!valid_bundle(&bounded, &bundle.suite));
+        bounded.units.get_mut("tests/a.t").unwrap().pop();
+        assert!(valid_bundle(&bounded, &bundle.suite));
+        let suffix = "a".repeat(2050);
+        bounded.roster.units = (0..MAX_UNITS)
+            .map(|index| format!("{index:04}{suffix}"))
+            .collect();
+        assert!(valid_bundle(&bounded, &bundle.suite));
+        let error = write_bundle(Path::new("/dev/null"), &bounded).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(bounded.roster.units.len(), MAX_UNITS);
+        bounded.roster.units.push("zzzz".into());
+        assert!(!valid_bundle(&bounded, &bundle.suite));
     }
 }
