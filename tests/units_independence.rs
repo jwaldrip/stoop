@@ -619,3 +619,53 @@ fn i15_a_full_run_under_another_provenance_keeps_the_suite_disabled() {
     full_form(&s.launches());
     assert_eq!(disabled(&s), (reason, label));
 }
+
+// I10: an unlaunched unit does not outrank a later failing launch. Spec 3.7 and decision C12: a failure is a verdict,
+// and 125 replaces only a 0. Each launch directory is `.<suite>-<pid>-<n>.scratch`, and every such name comes from one
+// counter that the bundle's writes share. While a's launch is held, the test takes b's directory name: a's first
+// stored proof takes n+1 for its bundle write, so b's directory would be n+2, and it cannot be made. b is not
+// launched, c launches and fails, and the run exits with c's status. Fails on a tree whose scratch branch sets 125 at
+// once (mutant L1): the run exits 125. If the counter's order changes, b launches and the first assertion fails,
+// rather than the test passing without reaching the branch.
+#[test]
+fn i10_an_unlaunched_unit_does_not_outrank_a_later_failing_launch() {
+    let s = Suite::new();
+    success(&s.hook(&[]));
+    s.write("tests/c.flag", "fail\n");
+    edit(&s, 2);
+    s.clear_log();
+    let fifo = s.fifo();
+    let child = spawn_hook(
+        &s,
+        &[
+            ("T_FIFO", fifo.to_str().unwrap()),
+            ("T_FIFO_AT", "tests/a.t"),
+        ],
+    );
+    let writer = meet(&fifo);
+    // a's launch is held, so its directory exists, and no other launch directory does.
+    let area = s.root.join(".stoop/units/v1");
+    let held: Vec<String> = fs::read_dir(&area)
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".scratch"))
+        .collect();
+    assert_eq!(held.len(), 1, "{held:?}");
+    let stem = held[0].strip_suffix(".scratch").unwrap();
+    let (prefix, number) = stem.rsplit_once('-').unwrap();
+    let number: u64 = number.parse().unwrap();
+    fs::create_dir(area.join(format!("{prefix}-{}.scratch", number + 2)))
+        .expect("the name of b's launch directory is free");
+    release(writer);
+    let out = finish(child);
+    let err = text(&out.stderr);
+    assert!(err.contains("stoop: not launched for tests/b.t: "), "{err}");
+    let launches = s.launches();
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    assert_eq!(launches[0].args, ["tests/a.t"], "{launches:?}");
+    assert_eq!(launches[1].args, ["tests/c.t"], "{launches:?}");
+    assert_eq!(launches[1].failed(), ["tests/c.t"], "{launches:?}");
+    assert_eq!(code(&out), 1, "{err}");
+    assert_eq!(proven(&s), ["tests/a.t"]);
+    assert_eq!(state(&s)["status"], "ready");
+}
