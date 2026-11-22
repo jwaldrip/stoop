@@ -4691,4 +4691,230 @@ mod tests {
             assert_eq!(plan_key(&actual), plan_key(expected), "{mode:?}");
         }
     }
+
+    fn evaluate_saved_record(f: &Fixture, spec: &JobSpec, mode: Prefilter) -> Decision {
+        let record = f.jobs.load(spec.key.as_deref().unwrap()).remove(0);
+        let mut tree = GitTree::load(&f.root, "HEAD").unwrap();
+        evaluate_record(
+            spec,
+            &mut PlanCtx {
+                tree: &mut tree,
+                proofs: &f.proofs,
+                jobs: &f.jobs,
+                now: 100,
+                max_age: 50,
+                github_vars: BTreeMap::new(),
+                check: &Accept,
+                salt: None,
+                event_path: None,
+                event: None,
+                explain: false,
+                prefilter: mode,
+            },
+            &record,
+        )
+        .decision
+    }
+
+    fn assert_exact_pair_record_equivalence(
+        f: &Fixture,
+        label: &str,
+        original: Vec<Proof>,
+        promoted: Vec<Input>,
+    ) {
+        let mut paired = original.clone();
+        let inputs = &mut paired.last_mut().unwrap().inputs;
+        inputs.extend(promoted);
+        inputs.sort_by(|a, b| a.path.cmp(&b.path));
+        let base_key = format!("job-{label}-base");
+        let paired_key = format!("job-{label}-paired");
+        let base_spec = JobSpec {
+            key: Some(base_key.clone()),
+            steps: save_record(f, &base_key, original),
+            ..f.spec.clone()
+        };
+        let paired_spec = JobSpec {
+            key: Some(paired_key.clone()),
+            steps: save_record(f, &paired_key, paired),
+            ..f.spec.clone()
+        };
+        for mode in [Prefilter::On, Prefilter::Off, Prefilter::Check] {
+            let baseline = evaluate_saved_record(f, &base_spec, mode);
+            let actual = evaluate_saved_record(f, &paired_spec, mode);
+            assert_eq!(plan_key(&actual), plan_key(&baseline), "{label}, {mode:?}");
+        }
+    }
+
+    #[test]
+    fn promoted_prior_exact_record_equivalence_corpus() {
+        for (label, count, changed, missing, guard, overlay) in [
+            ("single-match", 1, false, "", "", false),
+            ("single-change", 1, true, "", "", false),
+            ("two-changes", 2, true, "", "", false),
+            ("three-changes", 3, true, "", "", false),
+            ("unread-missing", 2, true, "a", "", false),
+            ("env-missing", 1, true, "f", "env", false),
+            ("reason-missing", 1, true, "f", "reason", false),
+            ("output-missing", 1, true, "f", "output", false),
+            ("overlay", 1, false, "", "", true),
+        ] {
+            let mut f = Fixture::new();
+            for (name, bytes) in [
+                ("a", b"unread a\n".as_slice()),
+                ("f", b"current f\n".as_slice()),
+                ("g", b"current g\n".as_slice()),
+                ("h", b"current h\n".as_slice()),
+            ] {
+                fs::write(f.root.join(name), bytes).unwrap();
+            }
+            commit_all(&f.root, label);
+            f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+            let mut earlier = Vec::new();
+            if overlay {
+                let mut step = proof(vec![]);
+                step.outputs = vec![input("f", &file_id(b"overlay\n"))];
+                step.priors = Some(vec![input("f", &file_id(b"current f\n"))]);
+                earlier.push(step);
+            }
+            let mut step = proof(vec![input("dir/a", &file_id(b"tracked"))]);
+            let mut priors = Vec::new();
+            if missing == "a" {
+                step.outputs.push(input("a", &file_id(b"written a\n")));
+                priors.push(input("a", &file_id(b"unread a\n")));
+            }
+            let mut pairs = Vec::new();
+            for (path, current) in [
+                ("f", b"current f\n".as_slice()),
+                ("g", b"current g\n".as_slice()),
+                ("h", b"current h\n".as_slice()),
+            ]
+            .into_iter()
+            .take(count)
+            {
+                let before = if overlay {
+                    b"overlay\n".as_slice()
+                } else if changed {
+                    b"old\n".as_slice()
+                } else {
+                    current
+                };
+                let prior = input(path, &file_id(before));
+                step.outputs.push(input(path, &file_id(b"written\n")));
+                priors.push(prior.clone());
+                pairs.push(prior);
+            }
+            step.priors = Some(priors);
+            match guard {
+                "env" => {
+                    step.env.insert(
+                        "GITHUB_REF".into(),
+                        crate::run::env_hash("GITHUB_REF", "refs/heads/old", None),
+                    );
+                }
+                "reason" => step.unplannable.push("recorded refusal".into()),
+                "output" => step.outputs.push(input("../invalid", &file_id(b"bad"))),
+                _ => {}
+            }
+            earlier.push(step);
+            if !missing.is_empty() {
+                drop_loose_blob(&f.root, &tree_oid(&f.root, missing));
+            }
+            assert_exact_pair_record_equivalence(&f, label, earlier, pairs);
+        }
+
+        for (case, path, contents, executable) in [
+            ("chmod", "s.sh", b"echo hi\n".as_slice(), true),
+            ("sed", "config.txt", b"foo\n".as_slice(), false),
+            ("sed-exec", "config.txt", b"foo\n".as_slice(), false),
+            ("proc", "config.txt", b"old content".as_slice(), false),
+        ] {
+            use std::os::unix::fs::PermissionsExt;
+            let f = Fixture::new();
+            fs::write(f.root.join(path), contents).unwrap();
+            if executable {
+                fs::set_permissions(f.root.join(path), fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            commit_all(&f.root, case);
+            let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/recorder")
+                .join(case)
+                .join("proof.json");
+            let document: serde_json::Value =
+                serde_json::from_slice(&fs::read(fixture).unwrap()).unwrap();
+            let mut recorded: Proof =
+                serde_json::from_value(document["proofs"][0].clone()).unwrap();
+            recorded.created = 90;
+            recorded.provenance = proof(vec![]).provenance;
+            recorded.env.clear();
+            recorded.env_excluded.clear();
+            let prior = recorded
+                .priors
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|entry| entry.path == path)
+                .unwrap()
+                .clone();
+            assert!(recorded.outputs.iter().any(|entry| entry.path == path));
+            recorded.inputs.retain(|entry| entry != &prior);
+            assert_exact_pair_record_equivalence(&f, case, vec![recorded], vec![prior]);
+        }
+
+        compare_two_record_prior_pair(false, true, false);
+        compare_two_record_prior_pair(true, true, true);
+        two_promoted_misses_cannot_hide_an_earlier_fatal_prior();
+        promoted_input_does_not_fetch_before_a_changed_environment();
+    }
+
+    #[test]
+    fn nonqualifying_inputs_still_compare_before_prior_guards() {
+        for case in [
+            "id",
+            "oid",
+            "basis",
+            "duplicate",
+            "no-output",
+            "no-priors",
+            "malformed",
+        ] {
+            let mut f = Fixture::new();
+            let mut observed = input("dir/a", &file_id(b"old"));
+            let mut prior = observed.clone();
+            match case {
+                "id" => prior.id = file_id(b"different"),
+                "oid" => prior.oid = Some("sha1:1234".into()),
+                "basis" => prior.oid_basis = Some(clean_basis()),
+                "malformed" => {
+                    observed.id = "f:bad".into();
+                    prior.id = observed.id.clone();
+                }
+                _ => {}
+            }
+            let mut p = proof(vec![observed]);
+            if case != "no-output" {
+                p.outputs.push(input("dir/a", &file_id(b"new")));
+            }
+            p.priors = if case == "no-priors" {
+                None
+            } else if case == "duplicate" {
+                Some(vec![prior.clone(), prior])
+            } else {
+                Some(vec![prior])
+            };
+            p.env.insert(
+                "GITHUB_REF".into(),
+                crate::run::env_hash("GITHUB_REF", "refs/heads/old", None),
+            );
+            f.install(vec![p]);
+            for mode in [Prefilter::On, Prefilter::Off, Prefilter::Check] {
+                let result = plan(&f, &f.spec, mode);
+                assert_eq!(
+                    result.code,
+                    Code::InputChanged,
+                    "{case}, {mode:?}: {}",
+                    result.detail
+                );
+            }
+        }
+    }
 }
