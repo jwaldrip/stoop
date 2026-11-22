@@ -73,8 +73,8 @@ def single_tracee_sed(old_dir, raw_dir, output_dir):
     generated = raw["proofs"][0]
     if raw["key"] != NEW_CASE or reference_document["key"] != NEW_CASE:
         raise SystemExit(f"{NEW_CASE}: unexpected proof key")
-    if generated["provenance"]["version"] != 12:
-        raise SystemExit(f"{NEW_CASE}: expected recorder version 12")
+    if reference["provenance"]["version"] != 11 or generated["provenance"]["version"] != 12:
+        raise SystemExit(f"{NEW_CASE}: expected recorder versions 11 and 12")
     if generated["argv"] != ["sh", "-c", "exec sed -i s/foo/bar/ config.txt"]:
         raise SystemExit(f"{NEW_CASE}: the recording is not the single-tracee exec form")
     changed = environment_changes(reference["env"], generated["env"])
