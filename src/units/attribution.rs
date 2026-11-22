@@ -171,6 +171,8 @@ pub(crate) enum Refusal {
     Join,
     /// The suite has no current record of an earlier full run.
     NoBundle,
+    /// The suite directory cannot take a new entry, so a pass could not store its first proof.
+    Unwritable,
     /// A unit of the roster already has a proof.
     Proven,
     /// The last pass stored no unit proof for this roster.
@@ -200,6 +202,7 @@ impl fmt::Display for Refusal {
             }
             Self::Join => "a unit's text contains the separator of a joined placeholder",
             Self::NoBundle => "the suite has no current record of an earlier full run",
+            Self::Unwritable => "the suite store cannot take a new entry",
             Self::Proven => "a unit of the roster already has a proof",
             Self::NoEvidence => "the last pass stored no unit proof for this roster",
         })

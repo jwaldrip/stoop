@@ -587,6 +587,22 @@ impl Area {
         }
     }
 
+    /// Whether a new entry can be made in the suite directory, checked without making one: the
+    /// directory's write permission. Explain uses this, so it creates nothing. Windows has no such
+    /// check here, and explain prints no suite lines there, because the tracer is unavailable.
+    fn writable_dir(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the descriptor is an open directory, and "." is a valid C string.
+            unsafe { libc::faccessat(self.dir.as_raw_fd(), c".".as_ptr(), libc::W_OK, 0) == 0 }
+        }
+        #[cfg(not(unix))]
+        {
+            true
+        }
+    }
+
     /// Whether the open lock file is still the entry the name refers to. Windows offers no file
     /// identity through std, so the lock is trusted as opened there.
     fn same_entry(&self, file: &File, name: &str) -> bool {
@@ -1224,7 +1240,8 @@ pub(crate) fn probe(store: &Path, pending: &Pending, key: &str) -> Result<(), Re
     let Ok(Some(area)) = Area::open(store, false) else {
         return Err(Refusal::NoBundle);
     };
-    ready(&area, pending, &digest_text("stoop whole key v1", key)).map(|_| ())
+    ready(&area, pending, &digest_text("stoop whole key v1", key))?;
+    area.writable_dir().then_some(()).ok_or(Refusal::Unwritable)
 }
 
 /// What `stoop explain` counts for a suite: the distinct inputs that the roster's unit proofs name,
