@@ -890,11 +890,12 @@ fn explain_of_a_suite() {
         "D16 explain: the base's lines come first\n{base}\n{subject}"
     );
     let added = &subject[base.len()..];
-    // An A/A run (both sides one binary) adds nothing. A comparison against the base adds the two lines.
-    if pair.bins[0] == pair.bins[1] {
+    if prints_suite_lines(&base) {
+        // A base that already prints the suite lines adds none. A later parity run compares such a base
+        // with this binary, and so does an A/A run that uses a byte-identical copy of this binary.
         assert_eq!(
             added, "",
-            "D16 explain: an A/A run must print the base's lines alone"
+            "D16 explain: a base that prints the suite lines adds none\n{subject}"
         );
     } else {
         let mut lines = added.lines();
@@ -913,6 +914,19 @@ fn explain_of_a_suite() {
         assert_eq!(lines.next(), None, "{added}");
     }
     pair.compare_store(".stoop");
+}
+
+/// Whether explain's output ends with the two suite lines (spec 4.16): the tracked counts, then a pass
+/// decision or a no-pass reason. A base binary built from this change prints them.
+fn prints_suite_lines(text: &str) -> bool {
+    let lines: Vec<&str> = text.lines().collect();
+    let [.., tracked, decision] = lines.as_slice() else {
+        return false;
+    };
+    tracked.starts_with("stoop: tracked ")
+        && tracked.contains(" (suite ")
+        && (decision.starts_with("stoop: would run an attribution pass: ")
+            || decision.starts_with("stoop: no attribution pass: "))
 }
 
 fn git(dir: &Path, args: &[&str]) -> String {
