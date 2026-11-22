@@ -51,6 +51,35 @@ fn f1_no_arguments_runs_every_t_except_slow_in_c_order() {
     );
 }
 
+/// A non-C UTF-8 locale this platform has, if any. `C.UTF-8` collates by code point, the same
+/// as `C`, so it cannot show a sort that ignores `LC_ALL=C`; only en_US does.
+fn en_us_locale() -> Option<&'static str> {
+    let out = std::process::Command::new("locale")
+        .arg("-a")
+        .output()
+        .ok()?;
+    let names = text(&out.stdout);
+    ["en_US.UTF-8", "en_US.utf8"]
+        .into_iter()
+        .find(|candidate| names.lines().any(|line| line == *candidate))
+}
+
+#[test]
+fn f1_a_non_c_locale_does_not_change_the_c_order() {
+    let Some(locale) = en_us_locale() else {
+        eprintln!("skipped: no en_US UTF-8 locale on this platform (locale -a)");
+        return;
+    };
+    let s = Suite::new();
+    s.write("tests/Z.t", "src/c.src\n");
+    let out = s.direct(&s.root, &[], &[("LC_ALL", locale)]);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert_eq!(
+        s.launches()[0].ran(),
+        ["tests/Z.t", "tests/a.t", "tests/b.t", "tests/c.t"]
+    );
+}
+
 #[test]
 fn f2_arguments_run_relative_to_the_cwd_and_log_the_environment() {
     let s = Suite::new();
