@@ -33,7 +33,7 @@ static NEXT: AtomicUsize = AtomicUsize::new(0);
 /// child has exec'd (Rust's `spawn` reports exec failure through a close-on-exec pipe).
 static EXEC: RwLock<()> = RwLock::new(());
 
-fn spawning<T>(spawn: impl FnOnce() -> T) -> T {
+pub fn spawning<T>(spawn: impl FnOnce() -> T) -> T {
     let _guard = EXEC.read().unwrap_or_else(|poisoned| poisoned.into_inner());
     spawn()
 }
