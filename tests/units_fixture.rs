@@ -1,7 +1,32 @@
-//! The fake hook runner (`fixtures/hook/t`) checked knob by knob (F1-F4), and the pins
-//! (P1-P10) of today's hooked-run behaviour: each condition that must still send a changed run
-//! to the full form after the attribution pass lands. The runner tests need a POSIX shell. The
-//! pins need the tracer, so they run on Linux x86-64 and arm64 only.
+//! The fake hook runner `tests/fixtures/hook/t` is checked knob by knob (F1-F4). Pins P1-P11
+//! hold today's hooked-run behaviour: each condition that keeps the full form after the
+//! attribution pass. The runner tests need a POSIX shell; the pins need the tracer, so they run
+//! on Linux x86-64 and arm64.
+//!
+//! # The runner's contract (spec 3.6)
+//!
+//! The runner header points here. Change the runner and this table together.
+//!
+//! | Input | Behaviour |
+//! | --- | --- |
+//! | no test word (no argument, or only words starting with `-`) | Runs every `*.t` under the root except `slow/`, plus every `*.u` when `T_U=1`, in `LC_ALL=C` sort order. With `T_LINT=1` it first executes `<root>/lint`. |
+//! | test words | Words starting with `-` are logged only. Every other word is a test path relative to the cwd, run in order. |
+//! | running test P | `cat P`. Then `cat <root>/<line>` for each non-empty line of P. Then `cat <root>/setup.src`. Then the FIFO hold, if armed. Then the test fails if `${P%.*}.flag` contains `fail`. Logs `ran=P`, and `failed=P` on failure. A missing P fails the test. |
+//! | `T_IGNORE=1` | With test words: reads nothing and exits 0. The no-argument form is unaffected. |
+//! | `T_STAT_UNIT=1` | With test words: `test -e P` instead of running it. Logs `statted=P`. |
+//! | `T_FIFO=<path>`, `T_FIFO_AT=<P>` | One `read < $T_FIFO` per invocation, after the first test (or after the test logged as `T_FIFO_AT`) has read its files. |
+//! | `T_WRITE=<path>` | Writes `written` to that path once per invocation, before any test. |
+//! | `T_READ_OTHER=<path>` | Reads that path once per invocation. |
+//! | `T_LS_ROOT=1` / `T_STAT_ROOT=1` | `ls -a <root>` (logs `ls_root`) / `test -d <root>` (logs `stat_root`), once per invocation. |
+//! | `LOG=<path>` (outside the root) | Per invocation it logs `launch`, then `arg=<w>` for each argument, then `changed=`, `units=`, `changed_file=`, `changed_inputs=`, `changed_inputs_file=` (newlines inside a value logged as `\|`), then the per-test lines. |
+//! | exit | 1 if any test failed, else 0. |
+//!
+//! `T_RECORDS` comes in W8 and writes to `$STOOP_RESULT_FILE`.
+//!
+//! Tree (built by `Suite::new`): `tests/a.t` and `tests/b.t` contain `src/shared.src`;
+//! `tests/c.t` contains `src/c.src`; `e2e/x.u` contains `src/shared.src`; `slow/s.t` contains
+//! `src/c.src`; plus `setup.src`, `src/{shared,c,dead}.src`, `docs/readme.md` and `lint`.
+//! The root and the outside directory both live under `temp_dir()`, where ignores never apply.
 #![cfg(unix)]
 
 mod units_common;
