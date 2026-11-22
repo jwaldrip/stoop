@@ -4477,4 +4477,129 @@ mod tests {
             "seed {seed:#x}: only {proved} proved records in {cases}"
         );
     }
+
+    /// Compare a newer record with and without its exact prior input, with an older matching
+    /// record available. The optional missing blob is encountered first in the newer priors.
+    fn compare_two_record_prior_pair(atomic: bool, missing: bool, with_oid: bool) {
+        let mut f = Fixture::new();
+        fs::write(f.root.join("a"), b"unavailable content\n").unwrap();
+        fs::write(f.root.join("config.txt"), b"current\n").unwrap();
+        commit_all(&f.root, "two-record tree");
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+
+        let (mut prior, output, prior_bytes) = if atomic {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/recorder/sed-exec/proof.json");
+            let document: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            let recorded: Proof = serde_json::from_value(document["proofs"][0].clone()).unwrap();
+            let prior = recorded
+                .priors
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|entry| entry.path == "config.txt")
+                .unwrap()
+                .clone();
+            assert_eq!(
+                recorded
+                    .inputs
+                    .iter()
+                    .find(|entry| entry.path == "config.txt"),
+                Some(&prior)
+            );
+            let output = recorded
+                .outputs
+                .iter()
+                .find(|entry| entry.path == "config.txt")
+                .unwrap()
+                .clone();
+            (prior, output, b"foo\n".as_slice())
+        } else {
+            (
+                input("config.txt", &file_id(b"old\n")),
+                input("config.txt", &file_id(b"new\n")),
+                b"old\n".as_slice(),
+            )
+        };
+        if with_oid {
+            prior.oid = Some(blob_oid_of(&f.root, prior_bytes));
+            prior.oid_basis = Some(clean_basis());
+        }
+
+        let older = proof(vec![input("config.txt", &file_id(b"current\n"))]);
+        f.install(vec![older]);
+        let mut newer_record = f.jobs.load("job-test").remove(0);
+        newer_record.started = 101;
+        newer_record.run = Some("2/1".into());
+        if missing {
+            let oid = tree_oid(&f.root, "a");
+            drop_loose_blob(&f.root, &oid);
+        }
+        for mode in [Prefilter::On, Prefilter::Off, Prefilter::Check] {
+            assert!(
+                plan(&f, &f.spec, mode).skip,
+                "the older record alone must prove: atomic={atomic}, {mode:?}"
+            );
+        }
+
+        let mut newer = proof(vec![]);
+        newer.outputs = vec![input("a", &file_id(b"written\n")), output];
+        newer.priors = Some(vec![
+            input("a", &file_id(b"unavailable content\n")),
+            prior.clone(),
+        ]);
+        f.proofs.save("sh-0", newer.clone()).unwrap();
+        newer_record.steps[0].proof = newer.digest();
+        f.jobs.save("job-test", newer_record.clone()).unwrap();
+
+        let modes = [Prefilter::On, Prefilter::Off, Prefilter::Check];
+        let baseline: Vec<_> = modes.iter().map(|mode| plan(&f, &f.spec, *mode)).collect();
+        for (mode, result) in modes.iter().zip(&baseline) {
+            assert_eq!(
+                result.code,
+                if missing { Code::Error } else { Code::Proved },
+                "baseline atomic={atomic}, missing={missing}, oid={with_oid}, {mode:?}: {}",
+                result.detail
+            );
+        }
+
+        newer.inputs.push(prior);
+        f.proofs.save("sh-0", newer.clone()).unwrap();
+        newer_record.steps[0].proof = newer.digest();
+        f.jobs.save("job-test", newer_record).unwrap();
+        for (mode, original) in modes.iter().zip(&baseline) {
+            let promoted = plan(&f, &f.spec, *mode);
+            assert_eq!(
+                plan_key(&promoted),
+                plan_key(original),
+                "atomic={atomic}, missing={missing}, oid={with_oid}, {mode:?}"
+            );
+            assert!(
+                original.skip || !promoted.skip,
+                "a prior miss became a skip"
+            );
+        }
+    }
+
+    #[test]
+    fn promoted_input_cannot_hide_a_fatal_prior_error_with_an_older_record() {
+        compare_two_record_prior_pair(false, true, false);
+    }
+
+    #[test]
+    fn atomic_recorded_input_cannot_hide_a_fatal_prior_error() {
+        compare_two_record_prior_pair(true, true, false);
+    }
+
+    #[test]
+    fn two_record_prior_pair_equivalence_corpus() {
+        for atomic in [false, true] {
+            for missing in [true, false] {
+                for with_oid in [false, true] {
+                    compare_two_record_prior_pair(atomic, missing, with_oid);
+                }
+            }
+        }
+    }
 }
