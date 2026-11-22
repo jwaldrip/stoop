@@ -4,8 +4,10 @@
 #
 # A word that does not start with '-' names a test. With no such word, the runner runs every
 # *.t under the root except slow/ (and every *.u with T_U=1), in LC_ALL=C order, after
-# <root>/lint when T_LINT=1. With test words it runs each one, relative to the cwd. Words
+# <root>/lint when T_LINT=1. With test words it runs each one, relative to the cwd, after the
+# programs the no-argument form uses to list its roster (the purity rule, spec 3.2). Words
 # starting with '-' are logged and otherwise ignored. LOG (outside the root) gets the record.
+# The knobs marked (IF) in the table act unless T_IF names a path that does not exist.
 
 ROOT=$(cd "$(dirname "$0")" && pwd -P) || exit 2
 STATUS=0
@@ -39,6 +41,11 @@ hold() {
 	fi
 }
 
+# The knobs marked (IF) act unless T_IF names a path that does not exist.
+armed() {
+	[ -z "${T_IF:-}" ] || [ -e "$T_IF" ]
+}
+
 run_test() {
 	if [ "$TESTS" = 1 ] && [ "${T_STAT_UNIT:-}" = 1 ]; then
 		note "statted=$1"
@@ -54,6 +61,9 @@ run_test() {
 		STATUS=1
 		return
 	fi
+	if [ -n "${T_WRITE:-}" ] && [ "${T_WRITE_AT:-}" = "$1" ] && armed; then
+		printf 'written\n' > "$T_WRITE"
+	fi
 	cat "$1"
 	while IFS= read -r line || [ -n "$line" ]; do
 		if [ -n "$line" ]; then
@@ -61,9 +71,16 @@ run_test() {
 		fi
 	done < "$1"
 	cat "$ROOT/setup.src"
+	if [ "${T_WRITE_EACH:-}" = 1 ]; then
+		printf 'written\n' > "${1%.*}.out"
+	fi
 	hold "$1"
 	flag=${1%.*}.flag
 	if [ -f "$flag" ] && grep -q fail "$flag"; then
+		note "failed=$1"
+		STATUS=1
+	fi
+	if [ "$TESTS" = 1 ] && [ -n "${T_FAIL_ALONE:-}" ] && [ "$1" = "$T_FAIL_ALONE" ] && armed; then
 		note "failed=$1"
 		STATUS=1
 	fi
@@ -87,7 +104,7 @@ note "changed_file=$(flat "${STOOP_CHANGED_FILE:-}")"
 note "changed_inputs=$(flat "${STOOP_CHANGED_INPUTS:-}")"
 note "changed_inputs_file=$(flat "${STOOP_CHANGED_INPUTS_FILE:-}")"
 
-if [ -n "${T_WRITE:-}" ]; then
+if [ -n "${T_WRITE:-}" ] && [ -z "${T_WRITE_AT:-}" ] && armed; then
 	printf 'written\n' > "$T_WRITE"
 fi
 if [ "$TESTS" = 1 ] && [ "${T_IGNORE:-}" = 1 ]; then
@@ -104,18 +121,31 @@ if [ "${T_STAT_ROOT:-}" = 1 ]; then
 	test -d "$ROOT"
 	note stat_root
 fi
-if [ -n "${T_READ_OTHER:-}" ]; then
+if [ -n "${T_READ_OTHER:-}" ] && armed; then
 	cat "$T_READ_OTHER" > /dev/null
+fi
+if [ -n "${T_STAT_OTHER:-}" ] && armed; then
+	test -e "$T_STAT_OTHER"
+	note "stat_other=$T_STAT_OTHER"
 fi
 
 if [ "$TESTS" = 0 ]; then
 	cd "$ROOT" || exit 2
+	if [ -n "${T_WRITE_FULL:-}" ]; then
+		printf 'written\n' > "$T_WRITE_FULL"
+	fi
 	set -f
 	for P in $(list_tests); do
 		run_test "$P"
 	done
 	set +f
+	if [ "${T_FAIL_FULL:-}" = 1 ] && armed; then
+		STATUS=1
+	fi
 else
+	find /dev/null -prune >/dev/null
+	sed -n q </dev/null
+	LC_ALL=C sort </dev/null >/dev/null
 	for P in "$@"; do
 		case $P in
 			-*) ;;
