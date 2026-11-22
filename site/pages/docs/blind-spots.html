@@ -21,7 +21,7 @@ stoop: skip sh-c98f8f9c8fef6d65: 71 inputs unchanged since 0s ago (100ms)</code>
 </dl>
 
 <h2 id="root-listing">Listing the repository root</h2>
-<p>stoop does not record the entry list of the repository root as stoop resolves it. A command that depends only on which top-level names exist, and that does not open or stat a name that then appears or disappears, can be skipped after a top-level name appears or disappears.</p>
+<p>A whole-command proof does not record the entry list of the repository root as stoop resolves it. A command that depends only on which top-level names exist, and that does not open or stat a name that then appears or disappears, can be skipped after a top-level name appears or disappears. A unit proof is different: when its launch lists the root, an attribution pass stores that listing, taken after the launch, as the input <code>.</code>, so a top-level name that appears or disappears afterwards no longer matches the proof.</p>
 
 <h2 id="clock">The clock and randomness</h2>
 <p>A test that depends on today's date, or on a random seed, reads nothing that a trace can see. Two settings bound how long that can hide:</p>
