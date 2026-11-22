@@ -45,11 +45,11 @@ struct Roster {
 }
 
 #[derive(Serialize, Deserialize)]
-struct LaunchGuard {
+pub(crate) struct LaunchGuard {
     #[serde(deserialize_with = "unique_map")]
-    env: BTreeMap<String, String>,
-    env_excluded: Vec<String>,
-    ignore: Vec<String>,
+    pub(crate) env: BTreeMap<String, String>,
+    pub(crate) env_excluded: Vec<String>,
+    pub(crate) ignore: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -166,6 +166,16 @@ pub(crate) struct Pending {
     origin: Origin,
     roster: Roster,
     policy: String,
+}
+
+impl Pending {
+    pub(crate) fn suite(&self) -> &str {
+        &self.suite
+    }
+
+    pub(crate) fn units(&self) -> &[String] {
+        &self.roster.units
+    }
 }
 
 fn field(hash: &mut blake3::Hasher, bytes: &[u8]) {
@@ -773,7 +783,9 @@ fn read_bundle(area: &Area, id: &str) -> ReadBundle {
         return ReadBundle::OtherVersion;
     }
     match serde_json::from_slice::<SuiteBundleV1>(&bytes) {
-        Ok(bundle) if valid_bundle(&bundle, id) => ReadBundle::Current(bundle),
+        Ok(bundle) if valid_bundle(&bundle, id) && valid_versions(&bundle) => {
+            ReadBundle::Current(bundle)
+        }
         _ => ReadBundle::Corrupt,
     }
 }
@@ -821,17 +833,22 @@ fn encode(bundle: &SuiteBundleV1) -> io::Result<Vec<u8>> {
 
 fn write_bundle(area: &Area, bundle: &SuiteBundleV1) -> io::Result<()> {
     let bytes = encode(bundle)?;
+    write_bytes(area, &bundle.suite, &bytes)
+}
+
+/// Writes already-checked bytes under a temporary name, then renames them over the bundle.
+fn write_bytes(area: &Area, suite: &str, bytes: &[u8]) -> io::Result<()> {
     let temp = format!(
         ".{}-{}-{}.tmp",
-        bundle.suite,
+        suite,
         std::process::id(),
         NEXT.fetch_add(1, Ordering::Relaxed)
     );
     let result = (|| {
         let mut file = area.create_temp(&temp)?;
-        file.write_all(&bytes)?;
+        file.write_all(bytes)?;
         file.sync_all()?;
-        area.rename(&temp, &bundle_name(&bundle.suite))
+        area.rename(&temp, &bundle_name(suite))
     })();
     if result.is_err() {
         let _ = area.unlink(&temp);
@@ -897,6 +914,211 @@ pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, pr
         state,
     };
     let _ = write_bundle(&area, &bundle);
+}
+
+/// What `start` decides for one invocation.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Start {
+    Pass(Pass),
+    /// Another stoop holds the suite lock, so this run takes the first-run form.
+    Busy,
+    /// No pass: the bundle is missing, unreadable, another version or for another command, it
+    /// holds a unit proof for this roster, or the suite is disabled.
+    No,
+}
+
+/// What storing one unit's proof did.
+#[allow(clippy::enum_variant_names)] // The variant names are the contract's (spec 3.4).
+pub(crate) enum Stored {
+    Stored,
+    /// The bundle would exceed its budget, so the proof is not kept.
+    OverBudget,
+    /// The bundle was not written. The proof stays in memory, and the next write carries it.
+    WriteFailed,
+}
+
+/// One attribution pass. It holds the suite lock until it is dropped, so no other stoop changes
+/// the suite meanwhile, and it rewrites the bundle after each stored proof.
+pub(crate) struct Pass {
+    area: Area,
+    _lock: File,
+    bundle: SuiteBundleV1,
+    /// The table index of each input, by its serialized form, so each input is stored once.
+    interned: BTreeMap<String, u32>,
+    budget: u64,
+}
+
+impl Pass {
+    /// Keeps one unit's proof as its only version, and writes the bundle with it. A version that
+    /// would exceed the budget is dropped with the table entries it added.
+    pub(crate) fn record(
+        &mut self,
+        unit: &str,
+        inputs: &[Input],
+        outputs: &[Input],
+        created: u64,
+    ) -> Stored {
+        let mark = self.bundle.table.len();
+        let inputs = self.indices(inputs);
+        let outputs = self.indices(outputs);
+        let version = UnitVersion {
+            created,
+            exact: true,
+            source: ResultSource::Exit,
+            guard: self.bundle.guard_digest.clone(),
+            inputs: delta(&inputs),
+            outputs: delta(&outputs),
+        };
+        self.bundle.units.insert(unit.to_owned(), vec![version]);
+        let Ok(bytes) = serde_json::to_vec(&self.bundle) else {
+            self.discard(unit, mark);
+            return Stored::WriteFailed;
+        };
+        if bytes.len() as u64 > self.budget {
+            self.discard(unit, mark);
+            return Stored::OverBudget;
+        }
+        if !valid_bundle(&self.bundle, &self.bundle.suite) {
+            self.discard(unit, mark);
+            return Stored::WriteFailed;
+        }
+        match write_bytes(&self.area, &self.bundle.suite, &bytes) {
+            Ok(()) => Stored::Stored,
+            Err(_) => Stored::WriteFailed,
+        }
+    }
+
+    /// The table index of each input, sorted and without repeats.
+    fn indices(&mut self, inputs: &[Input]) -> Vec<u32> {
+        let mut out: Vec<u32> = inputs.iter().map(|input| self.intern(input)).collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    fn intern(&mut self, input: &Input) -> u32 {
+        let key = serde_json::to_string(input).expect("an input always serializes");
+        if let Some(&index) = self.interned.get(&key) {
+            return index;
+        }
+        let index =
+            u32::try_from(self.bundle.table.len()).expect("the table is bounded by the budget");
+        self.bundle.table.push(input.clone());
+        self.interned.insert(key, index);
+        index
+    }
+
+    /// Drops what `record` added for `unit`, so memory matches what is stored.
+    fn discard(&mut self, unit: &str, mark: usize) {
+        self.bundle.units.remove(unit);
+        self.bundle.table.truncate(mark);
+        self.interned.retain(|_, index| (*index as usize) < mark);
+    }
+}
+
+/// Starts an attribution pass for `pending` when its bundle is current, holds no unit proof for
+/// the roster, and the suite lock is free. The bundle is checked again under the lock, and then
+/// reset to the current roster and guard with no versions. Nothing is written here.
+pub(crate) fn start(store: &Path, pending: &Pending, key: &str, guard: LaunchGuard) -> Start {
+    let Ok(Some(area)) = Area::open(store, false) else {
+        return Start::No;
+    };
+    let digest = digest_text("stoop whole key v1", key);
+    if ready(&area, pending, &digest).is_none() {
+        return Start::No;
+    }
+    let held = match lock(&area, &pending.suite) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Start::Busy,
+        Err(_) => return Start::No,
+    };
+    clear_temps(&area, &pending.suite);
+    let Some(mut bundle) = ready(&area, pending, &digest) else {
+        return Start::No;
+    };
+    let Ok(bytes) = serde_json::to_vec(&guard) else {
+        return Start::No;
+    };
+    bundle.guard_digest = blake3::hash(&bytes).to_hex().to_string();
+    bundle.guard = guard;
+    bundle.policy.clone_from(&pending.policy);
+    bundle.roster = Roster {
+        source: pending.roster.source.clone(),
+        units: pending.roster.units.clone(),
+    };
+    bundle.units.clear();
+    bundle.table.clear();
+    Start::Pass(Pass {
+        area,
+        _lock: held,
+        bundle,
+        interned: BTreeMap::new(),
+        budget: MAX_BYTES,
+    })
+}
+
+/// The bundle as a pass needs it: current, ready, recorded for this command, and with no unit
+/// proof for any unit of the roster.
+fn ready(area: &Area, pending: &Pending, digest: &str) -> Option<SuiteBundleV1> {
+    let ReadBundle::Current(bundle) = read_bundle(area, &pending.suite) else {
+        return None;
+    };
+    let proven = pending.roster.units.iter().any(|unit| {
+        bundle
+            .units
+            .get(unit)
+            .is_some_and(|versions| !versions.is_empty())
+    });
+    (bundle.generation == GENERATION
+        && bundle.provenance == Provenance::current()
+        && matches!(bundle.state, SuiteState::Ready)
+        && bundle.whole.is_some()
+        && bundle.whole_key_digest == digest
+        && !proven)
+        .then_some(bundle)
+}
+
+/// Checked on read only: each version's indices must lie below the table and strictly increase.
+/// A check on every write would make a pass quadratic in its indices.
+fn valid_versions(bundle: &SuiteBundleV1) -> bool {
+    let len = bundle.table.len();
+    bundle.units.values().all(|versions| {
+        versions.iter().all(|version| {
+            undelta(&version.inputs, len).is_some() && undelta(&version.outputs, len).is_some()
+        })
+    })
+}
+
+/// Strictly increasing indices, stored as the first index and then each gap from the one before.
+fn delta(indices: &[u32]) -> Vec<u32> {
+    let mut previous = 0;
+    indices
+        .iter()
+        .enumerate()
+        .map(|(at, &index)| {
+            let stored = if at == 0 { index } else { index - previous };
+            previous = index;
+            stored
+        })
+        .collect()
+}
+
+/// The indices a delta list holds, when each is below `len` and each gap after the first is
+/// positive. Anything else is `None`.
+fn undelta(deltas: &[u32], len: usize) -> Option<Vec<u32>> {
+    let mut out: Vec<u32> = Vec::with_capacity(deltas.len());
+    for &step in deltas {
+        let index = match out.last() {
+            None => step,
+            Some(&previous) if step > 0 => previous.checked_add(step)?,
+            Some(_) => return None,
+        };
+        if index as usize >= len {
+            return None;
+        }
+        out.push(index);
+    }
+    Some(out)
 }
 
 /// Listing is informational. A damaged file is reported and left untouched, and so is a suite
@@ -1224,5 +1446,279 @@ mod presence_tests {
             suite_id(&words, "", None, None),
             suite_id(&words, "", Some(""), None)
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod pass_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+
+    fn input(path: &str) -> Input {
+        Input {
+            path: path.into(),
+            id: "f:00".into(),
+            oid: None,
+            oid_basis: None,
+        }
+    }
+
+    fn guard() -> LaunchGuard {
+        LaunchGuard {
+            env: BTreeMap::new(),
+            env_excluded: Vec::new(),
+            ignore: Vec::new(),
+        }
+    }
+
+    fn pending_for(units: &[&str]) -> Pending {
+        pending(PendingSpec {
+            argv: &["runner".into(), "{changed:*.t}".into()],
+            cwd: "",
+            scope: None,
+            label: None,
+            source: "filter",
+            filter: "*.t",
+            units: units.iter().map(|unit| unit.to_string()).collect(),
+            config: None,
+            config_suite: None,
+        })
+        .unwrap()
+    }
+
+    fn store(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("stoop-pass-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// The bundle that `start` accepts for `pending` under `key`: current and ready, with no unit proof.
+    fn bundle_for(pending: Pending, key: &str) -> SuiteBundleV1 {
+        SuiteBundleV1 {
+            v: VERSION,
+            generation: GENERATION,
+            suite: pending.suite,
+            provenance: Provenance::current(),
+            origin: pending.origin,
+            whole_key_digest: digest_text("stoop whole key v1", key),
+            whole: Some("p-1".into()),
+            policy: pending.policy,
+            guard: guard(),
+            guard_digest: "guard".into(),
+            roster: pending.roster,
+            table: Vec::new(),
+            units: BTreeMap::new(),
+            residue: Residue::default(),
+            state: SuiteState::Ready,
+        }
+    }
+
+    /// Writes `bundle` into a new store and returns the store's directory.
+    fn seed(name: &str, bundle: &SuiteBundleV1) -> PathBuf {
+        let dir = store(name);
+        let area = Area::open(&dir, true).unwrap().unwrap();
+        write_bundle(&area, bundle).unwrap();
+        dir
+    }
+
+    fn pass_of(start: Start) -> Pass {
+        match start {
+            Start::Pass(pass) => pass,
+            Start::Busy => panic!("the suite lock was busy"),
+            Start::No => panic!("no pass was started"),
+        }
+    }
+
+    fn bundle_file(dir: &Path, id: &str) -> PathBuf {
+        dir.join("units/v1").join(bundle_name(id))
+    }
+
+    fn version(inputs: Vec<u32>) -> UnitVersion {
+        UnitVersion {
+            created: 1,
+            exact: true,
+            source: ResultSource::Exit,
+            guard: "g".into(),
+            inputs,
+            outputs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn delta_round_trips_and_decoding_refuses_out_of_range_and_unordered_indices() {
+        let indices = [0, 3, 4, 10];
+        let stored = delta(&indices);
+        assert_eq!(stored, [0, 3, 1, 6]);
+        assert_eq!(undelta(&stored, 11), Some(indices.to_vec()));
+        assert_eq!(undelta(&stored, 10), None, "an index past the table");
+        assert_eq!(undelta(&[2, 0], 5), None, "a repeated index");
+        assert_eq!(
+            undelta(&[u32::MAX, 1], usize::MAX),
+            None,
+            "an overflowing gap"
+        );
+        assert_eq!(undelta(&[], 0), Some(Vec::new()));
+    }
+
+    #[test]
+    fn a_version_index_past_the_table_makes_the_bundle_corrupt_on_read() {
+        let pending = pending_for(&["tests/a.t"]);
+        let id = pending.suite.clone();
+        let mut bundle = bundle_for(pending, "key");
+        bundle.table = vec![input("src/shared.src")];
+        bundle
+            .units
+            .insert("tests/a.t".into(), vec![version(vec![0, 1])]);
+        let dir = store("damaged");
+        let area = Area::open(&dir, true).unwrap().unwrap();
+        write_bytes(&area, &id, &serde_json::to_vec(&bundle).unwrap()).unwrap();
+        assert!(matches!(read_bundle(&area, &id), ReadBundle::Corrupt));
+        bundle.units.get_mut("tests/a.t").unwrap()[0] = version(vec![0]);
+        write_bytes(&area, &id, &serde_json::to_vec(&bundle).unwrap()).unwrap();
+        assert!(matches!(read_bundle(&area, &id), ReadBundle::Current(_)));
+    }
+
+    #[test]
+    fn a_unit_keeps_one_version_and_each_input_is_stored_once() {
+        let roster = ["tests/a.t", "tests/b.t"];
+        let dir = seed("one-version", &bundle_for(pending_for(&roster), "key"));
+        let id = pending_for(&roster).suite;
+        let mut pass = pass_of(start(&dir, &pending_for(&roster), "key", guard()));
+        let shared = input("src/shared.src");
+        let setup = input("setup.src");
+        let stored = |outcome: Stored| matches!(outcome, Stored::Stored);
+        assert!(stored(pass.record(
+            "tests/a.t",
+            &[shared.clone(), setup.clone(), shared.clone()],
+            &[],
+            1
+        )));
+        assert!(stored(pass.record(
+            "tests/b.t",
+            std::slice::from_ref(&setup),
+            &[],
+            2
+        )));
+        assert!(stored(pass.record(
+            "tests/a.t",
+            std::slice::from_ref(&setup),
+            &[],
+            3
+        )));
+        assert_eq!(pass.bundle.table.len(), 2, "shared and setup, once each");
+        assert_eq!(pass.bundle.units["tests/a.t"].len(), 1);
+        assert_eq!(pass.bundle.units["tests/a.t"][0].inputs, [1]);
+        drop(pass);
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        let ReadBundle::Current(stored) = read_bundle(&area, &id) else {
+            panic!("the stored bundle is not current");
+        };
+        assert_eq!(stored.units.len(), 2);
+        assert_eq!(stored.table.len(), 2);
+    }
+
+    #[test]
+    fn a_version_over_the_budget_is_dropped_and_nothing_is_written() {
+        let roster = ["tests/a.t"];
+        let id = pending_for(&roster).suite;
+        let dir = seed("budget", &bundle_for(pending_for(&roster), "key"));
+        let before = fs::read(bundle_file(&dir, &id)).unwrap();
+        let mut pass = pass_of(start(&dir, &pending_for(&roster), "key", guard()));
+        pass.budget = before.len() as u64;
+        assert!(matches!(
+            pass.record("tests/a.t", &[input("src/shared.src")], &[], 1),
+            Stored::OverBudget
+        ));
+        assert!(
+            pass.bundle.units.is_empty(),
+            "the dropped version left memory"
+        );
+        assert!(pass.bundle.table.is_empty());
+        assert!(pass.interned.is_empty());
+        drop(pass);
+        assert_eq!(fs::read(bundle_file(&dir, &id)).unwrap(), before);
+    }
+
+    #[test]
+    fn start_takes_a_pass_only_when_every_precondition_holds() {
+        let roster = ["tests/a.t"];
+        let refused = |name: &str, edit: fn(&mut SuiteBundleV1)| {
+            let mut bundle = bundle_for(pending_for(&roster), "key");
+            edit(&mut bundle);
+            let dir = seed(name, &bundle);
+            assert!(
+                matches!(
+                    start(&dir, &pending_for(&roster), "key", guard()),
+                    Start::No
+                ),
+                "{name}"
+            );
+        };
+        let dir = seed("preconditions", &bundle_for(pending_for(&roster), "key"));
+        assert!(matches!(
+            start(&dir, &pending_for(&roster), "key", guard()),
+            Start::Pass(_)
+        ));
+        assert!(matches!(
+            start(&dir, &pending_for(&roster), "another key", guard()),
+            Start::No
+        ));
+        let wider = ["tests/a.t", "tests/b.t"];
+        assert!(
+            matches!(
+                start(&dir, &pending_for(&wider), "key", guard()),
+                Start::Pass(_)
+            ),
+            "a new roster for the same suite starts a pass"
+        );
+        assert!(matches!(
+            start(&store("absent"), &pending_for(&roster), "key", guard()),
+            Start::No
+        ));
+        refused("disabled", |bundle| {
+            bundle.state = SuiteState::Disabled {
+                code: "c".into(),
+                phase: "p".into(),
+                label: "l".into(),
+                at: 1,
+            }
+        });
+        refused("other provenance", |bundle| {
+            bundle.provenance.version += 1;
+        });
+        refused("other generation", |bundle| bundle.generation = 0);
+        refused("no whole proof", |bundle| bundle.whole = None);
+        refused("a unit with a proof", |bundle| {
+            bundle.table = vec![input("setup.src")];
+            bundle
+                .units
+                .insert("tests/a.t".into(), vec![version(vec![0])]);
+        });
+    }
+
+    #[test]
+    fn start_reports_a_held_lock_as_busy_and_an_unreadable_bundle_as_no() {
+        let roster = ["tests/a.t"];
+        let id = pending_for(&roster).suite;
+        let dir = seed("busy", &bundle_for(pending_for(&roster), "key"));
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        let held = lock(&area, &id).unwrap();
+        assert!(matches!(
+            start(&dir, &pending_for(&roster), "key", guard()),
+            Start::Busy
+        ));
+        drop(held);
+        let file = bundle_file(&dir, &id);
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(matches!(
+            start(&dir, &pending_for(&roster), "key", guard()),
+            Start::No
+        ));
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(matches!(
+            start(&dir, &pending_for(&roster), "key", guard()),
+            Start::Pass(_)
+        ));
     }
 }
