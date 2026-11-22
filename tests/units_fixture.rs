@@ -343,6 +343,10 @@ mod pins {
     /// A cold run records the legacy proof and the suite bundle.
     fn cold(s: &Suite) {
         success(&s.hook(&[]));
+        assert!(
+            !s.proofs().is_empty(),
+            "the cold run stored no legacy proof"
+        );
     }
 
     // P1: the first run of a suite is the full form, and its bundle records the roster with
@@ -375,9 +379,16 @@ mod pins {
     fn p3_ci_on_a_feature_branch_runs_the_full_form_on_a_change() {
         let s = Suite::new();
         s.config("[units]\ndefault_branch = \"main\"\n");
+        // Without this, stoop refuses every legacy proof in a repository: its own reads of .git
+        // could hide a history change. The existing Git fixtures ignore it the same way.
+        s.write(".stoopignore", ".git\n");
         s.git("work");
         let env = [("CI", "true"), ("CI_COMMIT_BRANCH", "work")];
         success(&s.hook(&env));
+        assert!(
+            !s.proofs().is_empty(),
+            "the cold run stored no legacy proof"
+        );
         change(&s);
         s.clear_log();
         success(&s.hook(&env));
@@ -469,7 +480,7 @@ mod pins {
     }
 
     // P9: a bundle with a newer version is read as other and is never overwritten,
-    // `units/bundle.rs:766-774` and `:869-872`. The changed run is the full form.
+    // `units/bundle.rs:766-774` and `:851-852`. The changed run is the full form.
     #[test]
     fn p9_a_newer_bundle_version_runs_the_full_form_and_is_left_untouched() {
         let s = Suite::new();
