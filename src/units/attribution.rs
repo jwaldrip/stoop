@@ -437,6 +437,12 @@ fn say(quiet: bool, line: String) {
 
 /// Says why a unit was not launched. Such a unit has no status, so the run has no verdict unless a launch fails
 /// (spec 3.7). One line for the operator says why, unless `--quiet` asks for none.
+///
+/// Three branches reach this, and they set the same flag. The launch directory cannot be made when its name is already
+/// taken or the suite directory refuses a new entry. The name comes from a counter that the bundle's writes share, and
+/// I10 pins the taken-name case. The list files cannot be written into the directory this iteration has just made, so
+/// only an I/O error reaches that branch. The arguments cannot be expanded only if `screen` had not run `expands` on
+/// the same units, and it always has, so that branch is a guard for a later change to `screen`.
 fn not_launched(quiet: bool, unit: &str, why: &dyn fmt::Display) {
     say(quiet, format!("stoop: not launched for {unit}: {why}"));
 }
