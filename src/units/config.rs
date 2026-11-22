@@ -57,12 +57,14 @@ pub(crate) struct Suite {
     pub options: Vec<OptionDeclaration>,
     pub units: Option<Vec<String>>,
     pub independent: Option<bool>,
+    pub disabled: bool,
 }
 
 #[derive(Default)]
 pub(crate) struct Config {
     pub default_branch: Option<String>,
     pub verify_every: Option<u64>,
+    pub units_disabled: bool,
     suites: Vec<Suite>,
     source: String,
     present: bool,
@@ -296,10 +298,8 @@ pub(crate) fn load(root: &Path) -> Result<Config, ConfigError> {
                 arity,
             });
         }
-        // These opt out of splitting, which this slice never performs. They do not lift
-        // the wider opt-out, change option declarations, or confer proof authority.
-        let _splitting_enabled =
-            document.units.enabled.unwrap_or(true) && raw.enabled.unwrap_or(true);
+        // `enabled = false` at either level opts the suite out of attribution passes. It
+        // changes no option declaration and confers no proof authority.
         suites.push(Suite {
             id: raw.id,
             cwd: raw.cwd,
@@ -307,10 +307,12 @@ pub(crate) fn load(root: &Path) -> Result<Config, ConfigError> {
             options,
             units: raw.units,
             independent: raw.independent,
+            disabled: raw.enabled == Some(false),
         });
     }
     Ok(Config {
         default_branch: document.units.default_branch,
+        units_disabled: document.units.enabled == Some(false),
         verify_every: document.units.verify_every,
         suites,
         source,
@@ -321,6 +323,16 @@ pub(crate) fn load(root: &Path) -> Result<Config, ConfigError> {
 impl Config {
     pub(crate) fn key_source(&self) -> Option<&[u8]> {
         self.present.then_some(self.source.as_bytes())
+    }
+
+    /// Whether attribution passes are off for this command: globally, or by its suite.
+    pub(crate) fn splitting_disabled(&self, argv: &[OsString], cwd: &str) -> bool {
+        self.units_disabled
+            || self
+                .select(argv, cwd)
+                .ok()
+                .flatten()
+                .is_some_and(|suite| suite.disabled)
     }
 
     pub(crate) fn select(
