@@ -625,8 +625,8 @@ fn i15_a_full_run_under_another_provenance_keeps_the_suite_disabled() {
 // counter that the bundle's writes share. While a's launch is held, the test takes b's directory name: a's first
 // stored proof takes n+1 for its bundle write, so b's directory would be n+2, and it cannot be made. b is not
 // launched, c launches and fails, and the run exits with c's status. Fails on a tree whose scratch branch sets 125 at
-// once (mutant L1): the run exits 125. If the counter's order changes, b launches and the first assertion fails,
-// rather than the test passing without reaching the branch.
+// once (mutant L1): the run exits 125. If the counter's order changes, b launches, and the assertion that b was not
+// launched fails, rather than the test passing without reaching the branch.
 #[test]
 fn i10_an_unlaunched_unit_does_not_outrank_a_later_failing_launch() {
     let s = Suite::new();
