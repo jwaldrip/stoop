@@ -944,3 +944,49 @@ fn git(dir: &Path, args: &[&str]) {
         .unwrap();
     assert!(status.success(), "git {args:?} failed");
 }
+
+/// Linux `fcntl.h` values for leases: the command that sets one, and the write lease type.
+const F_SETLEASE: libc::c_int = 1024;
+const F_WRLCK: libc::c_int = 1;
+
+/// Takes a write lease on `file`. The lease lasts while `file` stays open, and only the sole open
+/// descriptor of the file in this process may take one.
+fn take_write_lease(file: &File) {
+    use std::os::unix::io::AsRawFd;
+    // SAFETY: `F_SETLEASE` reads only its integer argument.
+    let rc = unsafe { libc::fcntl(file.as_raw_fd(), F_SETLEASE, F_WRLCK) };
+    assert_eq!(rc, 0, "F_SETLEASE: {}", std::io::Error::last_os_error());
+}
+
+#[test]
+fn a_suite_lock_under_a_write_lease_never_blocks_a_run() {
+    let f = Fixture::new();
+    success(&f.run(&[], Some("{changed:*.t}"), &[]));
+    let (path, _) = f.one_bundle();
+    let lock = path.with_extension("lock");
+    let before = (identity(&path), fs::read(&path).unwrap());
+    // Another open file holds a write lease on the lock.
+    let lease = File::options().read(true).write(true).open(&lock).unwrap();
+    take_write_lease(&lease);
+    // Control: a plain open for writing waits for the lease, so `timeout` expires with status 124.
+    let waiting = Command::new("timeout")
+        .args(["2", "sh", "-c", ": >> \"$1\"", "sh"])
+        .arg(&lock)
+        .status()
+        .unwrap();
+    assert_eq!(
+        waiting.code(),
+        Some(124),
+        "a plain open did not wait for the lease"
+    );
+    // The run must refuse the lock at once. An open that waits for the lease would hold the run
+    // until the lease breaks, which the bound below reports as a failure.
+    let out = output_within(
+        &mut f.run_command(&[], Some("{changed:*.t}"), &[]),
+        Duration::from_secs(10),
+    );
+    success(&out);
+    assert_eq!(out.stdout, b"suite-run\n");
+    assert_eq!((identity(&path), fs::read(&path).unwrap()), before);
+    drop(lease);
+}
