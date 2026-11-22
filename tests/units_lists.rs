@@ -197,9 +197,20 @@ impl Placement {
         match self {
             Placement::Default => s.root.join(".stoop"),
             Placement::InRoot => s.root.join("cache"),
-            Placement::Outside => s.outside.join("store"),
+            Placement::Outside => outside_store(s),
         }
     }
+}
+
+/// A store outside the root that no default exclusion covers. The suite's own folders sit in the
+/// system temporary folder, which stoop excludes by default (`/tmp`), so an outside store there would
+/// hide every input the store holds from the test. The test binaries' target folder is not excluded.
+fn outside_store(s: &Suite) -> PathBuf {
+    let base = s.root.parent().unwrap().file_name().unwrap();
+    let folder = PathBuf::from(env!("CARGO_TARGET_TMPDIR"))
+        .join(format!("{}-store", base.to_string_lossy()));
+    let _ = fs::remove_dir_all(&folder);
+    folder
 }
 
 /// The environment that selects a placement's store: none for the default.
