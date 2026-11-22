@@ -536,6 +536,9 @@ fn exhausted_read_budget_requests_no_stops_and_preserves_legacy_inputs() {
 
     let mut disabled = tracer_for(rec_for(&root, &ignore));
     disabled.t.seen = Some(HashMap::new());
+    // Preserve an eligible observation before exhausting the budget, so this exercises the
+    // run-wide stop gate rather than only the fallback for a newly unhashable racy read.
+    disabled.touch(path.clone(), true, true);
     disabled.rec.as_mut().unwrap().read_budget.hashed = identity::READ_HASH_BUDGET;
     let before = READ_WITNESS_STOPS.with(|count| count.get());
     disabled.open(pid, &args, None, 1, Some(2));
