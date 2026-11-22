@@ -4605,4 +4605,90 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn two_promoted_misses_cannot_hide_an_earlier_fatal_prior() {
+        let mut f = Fixture::new();
+        for (name, bytes) in [
+            ("a", b"missing blob\n".as_slice()),
+            ("f", b"current f\n".as_slice()),
+            ("g", b"current g\n".as_slice()),
+        ] {
+            fs::write(f.root.join(name), bytes).unwrap();
+        }
+        commit_all(&f.root, "two promoted paths");
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        f.install(vec![proof(vec![
+            input("f", &file_id(b"current f\n")),
+            input("g", &file_id(b"current g\n")),
+        ])]);
+        let mut newer_record = f.jobs.load("job-test").remove(0);
+        newer_record.started = 101;
+        newer_record.run = Some("2/1".into());
+        let first = input("f", &file_id(b"old f\n"));
+        let second = input("g", &file_id(b"old g\n"));
+        let mut newer = proof(vec![]);
+        newer.outputs = vec![
+            input("a", &file_id(b"new a\n")),
+            input("f", &file_id(b"new f\n")),
+            input("g", &file_id(b"new g\n")),
+        ];
+        newer.priors = Some(vec![
+            input("a", &file_id(b"missing blob\n")),
+            first.clone(),
+            second.clone(),
+        ]);
+        f.proofs.save("sh-0", newer.clone()).unwrap();
+        newer_record.steps[0].proof = newer.digest();
+        f.jobs.save("job-test", newer_record.clone()).unwrap();
+        drop_loose_blob(&f.root, &tree_oid(&f.root, "a"));
+        let modes = [Prefilter::On, Prefilter::Off, Prefilter::Check];
+        let baseline: Vec<_> = modes.iter().map(|mode| plan(&f, &f.spec, *mode)).collect();
+        assert!(baseline.iter().all(|d| !d.skip && d.code == Code::Error));
+
+        newer.inputs = vec![first, second];
+        f.proofs.save("sh-0", newer.clone()).unwrap();
+        newer_record.steps[0].proof = newer.digest();
+        f.jobs.save("job-test", newer_record).unwrap();
+        for (mode, expected) in modes.iter().zip(&baseline) {
+            let actual = plan(&f, &f.spec, *mode);
+            assert_eq!(plan_key(&actual), plan_key(expected), "{mode:?}");
+        }
+    }
+
+    #[test]
+    fn promoted_input_does_not_fetch_before_a_changed_environment() {
+        let mut f = Fixture::new();
+        fs::write(f.root.join("f"), b"unavailable input\n").unwrap();
+        commit_all(&f.root, "missing promoted input");
+        f.tree = GitTree::load(&f.root, "HEAD").unwrap();
+        f.install(vec![proof(vec![])]);
+        let mut newer_record = f.jobs.load("job-test").remove(0);
+        newer_record.started = 101;
+        newer_record.run = Some("2/1".into());
+        let prior = input("f", &file_id(b"old input\n"));
+        let mut newer = proof(vec![]);
+        newer.outputs = vec![input("f", &file_id(b"new output\n"))];
+        newer.priors = Some(vec![prior.clone()]);
+        newer.env.insert(
+            "GITHUB_REF".into(),
+            crate::run::env_hash("GITHUB_REF", "refs/heads/old", None),
+        );
+        f.proofs.save("sh-0", newer.clone()).unwrap();
+        newer_record.steps[0].proof = newer.digest();
+        f.jobs.save("job-test", newer_record.clone()).unwrap();
+        drop_loose_blob(&f.root, &tree_oid(&f.root, "f"));
+        let modes = [Prefilter::On, Prefilter::Off, Prefilter::Check];
+        let baseline: Vec<_> = modes.iter().map(|mode| plan(&f, &f.spec, *mode)).collect();
+        assert!(baseline.iter().all(|d| d.skip && d.code == Code::Proved));
+
+        newer.inputs.push(prior);
+        f.proofs.save("sh-0", newer.clone()).unwrap();
+        newer_record.steps[0].proof = newer.digest();
+        f.jobs.save("job-test", newer_record).unwrap();
+        for (mode, expected) in modes.iter().zip(&baseline) {
+            let actual = plan(&f, &f.spec, *mode);
+            assert_eq!(plan_key(&actual), plan_key(expected), "{mode:?}");
+        }
+    }
 }
