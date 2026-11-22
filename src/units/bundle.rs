@@ -1157,6 +1157,36 @@ mod lock_identity_tests {
         assert!(result.is_err());
         let _ = fs::remove_dir_all(&store);
     }
+
+    fn make_fifo(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let text = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `text` is NUL-terminated and lives for the call.
+        assert_eq!(unsafe { libc::mkfifo(text.as_ptr(), 0o600) }, 0);
+    }
+
+    #[test]
+    fn a_lock_that_is_not_a_regular_file_with_one_name_is_never_taken() {
+        let (store, area) = scratch("one-name");
+        let name = lock_name(ID);
+        let path = lock_file(&store);
+        assert!(area.lock_file(&name).is_ok());
+        fs::remove_file(&path).unwrap();
+        make_fifo(&path);
+        assert!(area.lock_file(&name).is_err(), "a FIFO was taken");
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(area.lock_file(&name).is_err(), "a directory was taken");
+        fs::remove_dir(&path).unwrap();
+        let spare = store.join("units/v1/spare");
+        fs::write(&spare, b"").unwrap();
+        fs::hard_link(&spare, &path).unwrap();
+        assert!(
+            area.lock_file(&name).is_err(),
+            "a hard-linked file was taken"
+        );
+        let _ = fs::remove_dir_all(&store);
+    }
 }
 
 #[cfg(test)]

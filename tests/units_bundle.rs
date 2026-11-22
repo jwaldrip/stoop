@@ -10,10 +10,11 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
@@ -120,6 +121,7 @@ impl Fixture {
 impl Drop for Fixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
+        let _ = fs::remove_dir_all(self.outside());
     }
 }
 
@@ -720,4 +722,298 @@ fn duplicate_unit_keys_make_a_bundle_unreadable() {
         .matches("ignoring a corrupt suite bundle")
         .count();
     assert_eq!(warnings, 1);
+}
+
+impl Fixture {
+    /// Where a symlink test points its link. It sits beside the repository, never inside it.
+    fn outside(&self) -> PathBuf {
+        self.root.with_extension("outside")
+    }
+
+    /// The `stoop run` command for the fixture, left open for the caller to adjust.
+    fn run_command(&self, options: &[&str], hook: Option<&str>, env: &[(&str, &str)]) -> Command {
+        let mut command = self.command(&self.root);
+        command.args(["run", "--quiet", "--root"]).arg(&self.root);
+        command.args(options).arg("--").arg(&self.runner);
+        if let Some(hook) = hook {
+            command.arg(hook);
+        }
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        command
+    }
+}
+
+/// The arguments stoop's unit inventory passes to Git. Each probe also passes its `-C` and `-c`
+/// options first, so a logged line matches by its end.
+const INVENTORY: [&str; 2] = [
+    "ls-files -z --cached --others --exclude-standard",
+    "ls-files -z --others --ignored --exclude-standard --directory",
+];
+
+/// A directory holding a `git` that logs its arguments to `$STOOP_TEST_GIT_LOG`, then runs the
+/// real one. Returns the `PATH` that finds it first.
+fn git_shim(dir: &Path) -> String {
+    fs::create_dir_all(dir).unwrap();
+    let shim = dir.join("git");
+    fs::write(
+        &shim,
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$STOOP_TEST_GIT_LOG\"\nexec /usr/bin/git \"$@\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    format!("{}:/usr/bin:/bin", dir.display())
+}
+
+fn identity(path: &Path) -> (u64, u64) {
+    let meta = fs::metadata(path).unwrap();
+    (meta.dev(), meta.ino())
+}
+
+fn make_fifo(path: &Path) {
+    let status = Command::new("mkfifo").arg(path).status().unwrap();
+    assert!(status.success(), "mkfifo failed");
+}
+
+/// Runs a command to completion, and panics if it is still running after `limit`. A lock that
+/// blocked the run would otherwise hang the suite.
+fn output_within(command: &mut Command, limit: Duration) -> Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + limit;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("the command was still running after {limit:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Records one suite, then replaces its lock with what `make` creates. Returns the bundle path
+/// and the suite ID.
+fn suite_with_lock(f: &Fixture, make: impl FnOnce(&Path)) -> (PathBuf, String) {
+    success(&f.run(&[], Some("{changed:*.t}"), &[]));
+    let (path, bundle) = f.one_bundle();
+    let id = bundle["suite"].as_str().unwrap().to_owned();
+    let lock = path.with_extension("lock");
+    fs::remove_file(&lock).unwrap();
+    make(&lock);
+    (path, id)
+}
+
+#[test]
+fn an_implicit_store_that_is_a_link_is_never_written() {
+    let f = Fixture::new();
+    let outside = f.outside();
+    fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, f.root.join(".stoop")).unwrap();
+    // The run is unaffected: the command runs and suite bookkeeping is skipped.
+    let out = f.run(&[], Some("{changed:*.t}"), &[]);
+    success(&out);
+    assert_eq!(out.stdout, b"suite-run\n");
+    assert!(!outside.join("units").exists());
+    let listing = f.cli("ls", &[]);
+    success(&listing);
+    let stdout = String::from_utf8(listing.stdout).unwrap();
+    assert!(
+        stdout.lines().any(|line| line == "suite\t-\tunavailable"),
+        "{stdout}"
+    );
+    let mut forget = f.command(&f.root);
+    forget.args(["forget", "--units", "0123456789abcdef0123456789abcdef"]);
+    assert_eq!(forget.output().unwrap().status.code(), Some(1));
+    assert!(!outside.join("units").exists());
+}
+
+#[test]
+fn an_explicit_store_through_a_link_is_trusted() {
+    for via_env in [false, true] {
+        let f = Fixture::new();
+        let outside = f.outside();
+        fs::create_dir_all(&outside).unwrap();
+        let link_path = f.root.join("linked");
+        std::os::unix::fs::symlink(&outside, &link_path).unwrap();
+        let link = link_path.to_str().unwrap();
+        let (options, env): (Vec<&str>, Vec<(&str, &str)>) = if via_env {
+            (Vec::new(), vec![("STOOP_STORE", link)])
+        } else {
+            (vec!["--store", link], Vec::new())
+        };
+        success(&f.run(&options, Some("{changed:*.t}"), &env));
+        assert!(!f.root.join(".stoop").exists());
+        let bundle = only_file(&outside.join("units/v1"));
+        let id = bundle.file_stem().unwrap().to_str().unwrap().to_owned();
+        let mut ls = f.command(&f.root);
+        ls.arg("ls");
+        if via_env {
+            ls.env("STOOP_STORE", link);
+        } else {
+            ls.args(["--store", link]);
+        }
+        let listing = ls.output().unwrap();
+        success(&listing);
+        let stdout = String::from_utf8(listing.stdout).unwrap();
+        let prefix = format!("suite\t{id}\t");
+        assert!(
+            stdout.lines().any(|line| line.starts_with(prefix.as_str())),
+            "{stdout}"
+        );
+    }
+}
+
+#[test]
+fn an_implicit_store_that_is_a_file_lists_as_unavailable() {
+    let f = Fixture::new();
+    fs::write(f.root.join(".stoop"), b"not a store\n").unwrap();
+    let listing = f.cli("ls", &[]);
+    success(&listing);
+    let stdout = String::from_utf8(listing.stdout).unwrap();
+    assert!(
+        stdout.lines().any(|line| line == "suite\t-\tunavailable"),
+        "{stdout}"
+    );
+    assert_eq!(fs::read(f.root.join(".stoop")).unwrap(), b"not a store\n");
+}
+
+#[test]
+fn a_fifo_suite_lock_never_blocks_a_run_or_replaces_the_bundle() {
+    let f = Fixture::new();
+    let (path, id) = suite_with_lock(&f, make_fifo);
+    let before = (identity(&path), fs::read(&path).unwrap());
+    // The run is forced, so it tries to record. A blocking open of the FIFO would never return.
+    let run = output_within(
+        &mut f.run_command(&[], Some("{changed:*.t}"), &[]),
+        Duration::from_secs(60),
+    );
+    success(&run);
+    assert_eq!((identity(&path), fs::read(&path).unwrap()), before);
+    let lock = path.with_extension("lock");
+    assert!(fs::symlink_metadata(&lock).unwrap().file_type().is_fifo());
+    let mut forget = f.command(&f.root);
+    forget.args(["forget", "--units", id.as_str()]);
+    let forgot = output_within(&mut forget, Duration::from_secs(60));
+    assert_eq!(forgot.status.code(), Some(1));
+}
+
+#[test]
+fn a_directory_suite_lock_never_replaces_the_bundle() {
+    let f = Fixture::new();
+    let (path, id) = suite_with_lock(&f, |lock| fs::create_dir(lock).unwrap());
+    let before = (identity(&path), fs::read(&path).unwrap());
+    success(&f.run(&[], Some("{changed:*.t}"), &[]));
+    assert_eq!((identity(&path), fs::read(&path).unwrap()), before);
+    let mut forget = f.command(&f.root);
+    forget.args(["forget", "--units", id.as_str()]);
+    assert_eq!(forget.output().unwrap().status.code(), Some(1));
+    assert!(path.with_extension("lock").is_dir());
+}
+
+#[test]
+fn a_hard_linked_suite_lock_is_never_taken() {
+    let f = Fixture::new();
+    let (path, id) = suite_with_lock(&f, |lock| {
+        let spare = lock.with_file_name("spare");
+        fs::write(&spare, b"").unwrap();
+        fs::hard_link(&spare, lock).unwrap();
+    });
+    assert_eq!(
+        fs::metadata(path.with_extension("lock")).unwrap().nlink(),
+        2
+    );
+    let before = (identity(&path), fs::read(&path).unwrap());
+    success(&f.run(&[], Some("{changed:*.t}"), &[]));
+    assert_eq!((identity(&path), fs::read(&path).unwrap()), before);
+    let mut forget = f.command(&f.root);
+    forget.args(["forget", "--units", id.as_str()]);
+    assert_eq!(forget.output().unwrap().status.code(), Some(1));
+}
+
+#[test]
+fn a_warm_whole_command_hit_never_runs_the_suite_inventory() {
+    let f = Fixture::new();
+    // Inputs are committed, as in a real repository. An untracked input has no basis, so a run
+    // that reads one is never recorded and can never become a hit.
+    git(&f.root, &["init", "-q"]);
+    git(&f.root, &["add", "-A"]);
+    git(
+        &f.root,
+        &[
+            "-c",
+            "user.name=stoop",
+            "-c",
+            "user.email=stoop@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-q",
+            "-m",
+            "fixture",
+        ],
+    );
+    let path = git_shim(&f.root.with_extension("shims"));
+    let log = f.root.with_extension("git.log");
+    let log_text = log.to_str().unwrap();
+    let env = [("PATH", path.as_str()), ("STOOP_TEST_GIT_LOG", log_text)];
+    // The first run records a suite, so the inventory runs and the shim logs it.
+    success(&f.run(&[], Some("{changed:*.t}"), &env));
+    f.one_bundle();
+    let recorded = fs::read_to_string(&log).unwrap();
+    assert!(
+        INVENTORY
+            .iter()
+            .any(|argv| recorded.lines().any(|line| line.ends_with(*argv))),
+        "{recorded}"
+    );
+    fs::remove_file(&log).unwrap();
+    // Without STOOP_FULL the second run is a whole-command hit: it skips the command and takes
+    // no roster.
+    let mut command = f.run_command(&[], Some("{changed:*.t}"), &env);
+    command.env_remove("STOOP_FULL");
+    let warm = command.output().unwrap();
+    success(&warm);
+    assert!(warm.stdout.is_empty(), "the warm run launched the command");
+    let inventory = fs::read_to_string(&log).unwrap_or_default();
+    assert!(
+        !inventory
+            .lines()
+            .any(|line| INVENTORY.iter().any(|argv| line.ends_with(*argv))),
+        "{inventory}"
+    );
+}
+
+#[test]
+fn a_forced_full_hit_still_records_the_suite() {
+    let f = Fixture::new();
+    success(&f.run(&[], Some("{changed:*.t}"), &[]));
+    let (path, _) = f.one_bundle();
+    fs::remove_file(&path).unwrap();
+    // STOOP_FULL keeps the whole-command proof but still launches the command, so the suite is
+    // recorded again.
+    let out = f.run(&[], Some("{changed:*.t}"), &[]);
+    success(&out);
+    assert_eq!(out.stdout, b"suite-run\n");
+    let (_, bundle) = f.one_bundle();
+    assert_eq!(
+        bundle["roster"]["units"],
+        serde_json::json!(["tests/a.t", "tests/b.t"])
+    );
+}
+
+/// Runs Git in a fixture repository and requires it to succeed.
+fn git(dir: &Path, args: &[&str]) {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .status()
+        .unwrap();
+    assert!(status.success(), "git {args:?} failed");
 }
