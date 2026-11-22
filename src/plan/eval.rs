@@ -760,19 +760,10 @@ fn evaluate(
                 }
             }
         }
-        let mut pair_answers: BTreeMap<&str, Answer> = BTreeMap::new();
-        let mut pending_input: Option<(Decision, &Input)> = None;
         macro_rules! stop {
-            ($result:expr) => {{
-                let result = $result;
-                return if result.code == Code::Error {
-                    result
-                } else if let Some((miss, _)) = pending_input.take() {
-                    miss
-                } else {
-                    result
-                };
-            }};
+            ($result:expr) => {
+                return $result
+            };
         }
         for input in &proof.inputs {
             if input.path.contains('\u{fffd}')
@@ -816,6 +807,10 @@ fn evaluate(
                     .strip_prefix("f:")
                     .or_else(|| input.id.strip_prefix("x:"))
                     .is_some_and(|hash| lower_hex(hash, 64));
+            if exact_pair {
+                // The prior loop sees the same virtual tree before this step's outputs apply.
+                continue;
+            }
             let answer = match tree.compare(input, shortcut) {
                 Ok(answer) => answer,
                 Err(err) => {
@@ -853,15 +848,7 @@ fn evaluate(
                 result
                     .mismatches
                     .push((*index, input.path.clone(), why.into()));
-                if exact_pair && pending_input.is_none() {
-                    pending_input = Some((result, input));
-                    pair_answers.insert(input.path.as_str(), answer);
-                    continue;
-                }
                 stop!(result);
-            }
-            if exact_pair {
-                pair_answers.insert(input.path.as_str(), answer);
             }
         }
         // The recorder left these names out, so the planner checks no value for them. A name in
@@ -984,26 +971,20 @@ fn evaluate(
                     }
                 }
                 evidence.priors += 1;
-                let compared;
-                let answer = if let Some(answer) = pair_answers.get(prior.path.as_str()) {
-                    answer
-                } else {
-                    compared = match tree.compare(prior, shortcut) {
-                        Ok(answer) => answer,
-                        Err(err) => {
-                            stop!(decision(
-                                if err.starts_with("git:") {
-                                    Code::Error
-                                } else {
-                                    Code::Unplannable
-                                },
-                                err,
-                            ));
-                        }
-                    };
-                    &compared
+                let answer = match tree.compare(prior, shortcut) {
+                    Ok(answer) => answer,
+                    Err(err) => {
+                        stop!(decision(
+                            if err.starts_with("git:") {
+                                Code::Error
+                            } else {
+                                Code::Unplannable
+                            },
+                            err,
+                        ));
+                    }
                 };
-                count(evidence, notes, explain, *index, &prior.path, answer);
+                count(evidence, notes, explain, *index, &prior.path, &answer);
                 let actual = answer.id.as_str();
                 let expected = prior.id.as_str();
                 let actual_kind = if actual == "a" {
@@ -1052,12 +1033,6 @@ fn evaluate(
                 if let Some(why) = why {
                     let mut result = decision(Code::PriorChanged, format!("{}: {why}", prior.path));
                     result.mismatches.push((*index, prior.path.clone(), why));
-                    if pending_input
-                        .as_ref()
-                        .is_some_and(|(_, input)| *input == prior)
-                    {
-                        return result;
-                    }
                     stop!(result);
                 }
                 if expected == "d" {
@@ -1093,9 +1068,6 @@ fn evaluate(
                     }
                 }
             }
-        }
-        if let Some((miss, _)) = pending_input {
-            return miss;
         }
         for out in &proof.outputs {
             if out.id != "d" && !out.id.starts_with("dl:") {
@@ -2078,56 +2050,6 @@ mod tests {
             assert_eq!(plan_key(&duplicate), plan_key(&original), "{mode:?}");
             p.inputs.clear();
             replace_first(&mut f, p.clone());
-        }
-    }
-
-    #[test]
-    fn input_prior_pair_requires_identical_unique_evidence_and_a_reached_prior() {
-        let mut f = Fixture::new();
-        let old = input("dir/a", &file_id(b"old"));
-        let mut p = proof(vec![old.clone()]);
-        p.outputs.push(input("dir/a", &file_id(b"new")));
-        p.priors = Some(vec![old.clone()]);
-        f.install(vec![p.clone()]);
-
-        let mut cases = Vec::new();
-        let mut different_id = p.clone();
-        different_id.priors.as_mut().unwrap()[0].id = file_id(b"different");
-        cases.push(different_id);
-        let mut different_oid = p.clone();
-        different_oid.priors.as_mut().unwrap()[0].oid = Some("sha1:1234".into());
-        cases.push(different_oid);
-        let mut different_basis = p.clone();
-        different_basis.priors.as_mut().unwrap()[0].oid_basis = Some(clean_basis());
-        cases.push(different_basis);
-        let mut ambiguous = p.clone();
-        ambiguous.priors.as_mut().unwrap().push(old);
-        cases.push(ambiguous);
-        let mut blocked = p.clone();
-        blocked.unplannable.push("blocked before priors".into());
-        cases.push(blocked);
-        let mut earlier_prior = p.clone();
-        earlier_prior
-            .priors
-            .as_mut()
-            .unwrap()
-            .insert(0, input("dir", "a"));
-        cases.push(earlier_prior);
-        let mut no_matching_output = p;
-        no_matching_output.outputs = vec![];
-        cases.push(no_matching_output);
-
-        for (case, candidate) in cases.into_iter().enumerate() {
-            replace_first(&mut f, candidate);
-            for mode in [Prefilter::On, Prefilter::Off, Prefilter::Check] {
-                let result = plan(&f, &f.spec, mode);
-                assert_eq!(result.code, Code::InputChanged, "case {case}, {mode:?}");
-                assert_eq!(
-                    result.mismatches,
-                    vec![(1, "dir/a".into(), "changed".into())],
-                    "case {case}, {mode:?}"
-                );
-            }
         }
     }
 
@@ -4866,55 +4788,71 @@ mod tests {
         promoted_input_does_not_fetch_before_a_changed_environment();
     }
 
+    fn assert_nonqualifying_input_is_compared(case: &str) {
+        let mut f = Fixture::new();
+        let mut observed = input("dir/a", &file_id(b"old"));
+        let mut prior = observed.clone();
+        match case {
+            "id" => prior.id = file_id(b"different"),
+            "oid" => prior.oid = Some("sha1:1234".into()),
+            "basis" => prior.oid_basis = Some(clean_basis()),
+            "malformed" => {
+                observed.id = "f:bad".into();
+                prior.id = observed.id.clone();
+            }
+            _ => {}
+        }
+        let mut p = proof(vec![observed]);
+        if case != "no-output" {
+            p.outputs.push(input("dir/a", &file_id(b"new")));
+        }
+        p.priors = if case == "no-priors" {
+            None
+        } else if case == "duplicate" {
+            Some(vec![prior.clone(), prior])
+        } else {
+            Some(vec![prior])
+        };
+        p.env.insert(
+            "GITHUB_REF".into(),
+            crate::run::env_hash("GITHUB_REF", "refs/heads/old", None),
+        );
+        f.install(vec![p]);
+        for mode in [Prefilter::On, Prefilter::Off, Prefilter::Check] {
+            let result = plan(&f, &f.spec, mode);
+            assert_eq!(
+                result.code,
+                Code::InputChanged,
+                "{case}, {mode:?}: {}",
+                result.detail
+            );
+        }
+    }
+
     #[test]
     fn nonqualifying_inputs_still_compare_before_prior_guards() {
-        for case in [
-            "id",
-            "oid",
-            "basis",
-            "duplicate",
-            "no-output",
-            "no-priors",
-            "malformed",
-        ] {
-            let mut f = Fixture::new();
-            let mut observed = input("dir/a", &file_id(b"old"));
-            let mut prior = observed.clone();
-            match case {
-                "id" => prior.id = file_id(b"different"),
-                "oid" => prior.oid = Some("sha1:1234".into()),
-                "basis" => prior.oid_basis = Some(clean_basis()),
-                "malformed" => {
-                    observed.id = "f:bad".into();
-                    prior.id = observed.id.clone();
-                }
-                _ => {}
-            }
-            let mut p = proof(vec![observed]);
-            if case != "no-output" {
-                p.outputs.push(input("dir/a", &file_id(b"new")));
-            }
-            p.priors = if case == "no-priors" {
-                None
-            } else if case == "duplicate" {
-                Some(vec![prior.clone(), prior])
-            } else {
-                Some(vec![prior])
-            };
-            p.env.insert(
-                "GITHUB_REF".into(),
-                crate::run::env_hash("GITHUB_REF", "refs/heads/old", None),
-            );
-            f.install(vec![p]);
-            for mode in [Prefilter::On, Prefilter::Off, Prefilter::Check] {
-                let result = plan(&f, &f.spec, mode);
-                assert_eq!(
-                    result.code,
-                    Code::InputChanged,
-                    "{case}, {mode:?}: {}",
-                    result.detail
-                );
-            }
+        for case in ["duplicate", "no-output", "malformed"] {
+            assert_nonqualifying_input_is_compared(case);
         }
+    }
+
+    #[test]
+    fn different_id_is_not_an_exact_pair() {
+        assert_nonqualifying_input_is_compared("id");
+    }
+
+    #[test]
+    fn different_oid_is_not_an_exact_pair() {
+        assert_nonqualifying_input_is_compared("oid");
+    }
+
+    #[test]
+    fn different_oid_basis_is_not_an_exact_pair() {
+        assert_nonqualifying_input_is_compared("basis");
+    }
+
+    #[test]
+    fn no_prior_rail_cannot_skip_the_input_comparison() {
+        assert_nonqualifying_input_is_compared("no-priors");
     }
 }
