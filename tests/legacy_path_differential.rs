@@ -753,9 +753,9 @@ fn sync() {
             fs::write(
                 dir.join("in.txt"),
                 if checkout == "writer" {
-                    b"local\n"
+                    "local\n"
                 } else {
-                    b"remote\n"
+                    "remote\n"
                 },
             )
             .unwrap();
