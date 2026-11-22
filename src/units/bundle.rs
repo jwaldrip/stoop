@@ -1182,6 +1182,16 @@ fn start_with(
     })
 }
 
+/// Whether a bundle was recorded for this command and provenance, in the current generation, and is
+/// ready to be used. A pass and `stoop explain` judge a bundle with this one test, so they agree.
+fn recorded(bundle: &SuiteBundleV1, digest: &str) -> bool {
+    bundle.generation == GENERATION
+        && bundle.provenance == Provenance::current()
+        && matches!(bundle.state, SuiteState::Ready)
+        && bundle.whole.is_some()
+        && bundle.whole_key_digest == digest
+}
+
 /// The bundle as a pass needs it: current, ready, recorded for this command, with no unit proof
 /// for any unit of the roster, and not silent for this roster. The refusal names the first
 /// condition that fails.
@@ -1189,12 +1199,7 @@ fn ready(area: &Area, pending: &Pending, digest: &str) -> Result<SuiteBundleV1, 
     let ReadBundle::Current(bundle) = read_bundle(area, &pending.suite) else {
         return Err(Refusal::NoBundle);
     };
-    let recorded = bundle.generation == GENERATION
-        && bundle.provenance == Provenance::current()
-        && matches!(bundle.state, SuiteState::Ready)
-        && bundle.whole.is_some()
-        && bundle.whole_key_digest == digest;
-    if !recorded {
+    if !recorded(&bundle, digest) {
         return Err(Refusal::NoBundle);
     }
     let proven = pending.roster.units.iter().any(|unit| {
@@ -1222,25 +1227,38 @@ pub(crate) fn probe(store: &Path, pending: &Pending, key: &str) -> Result<(), Re
     ready(&area, pending, &digest_text("stoop whole key v1", key)).map(|_| ())
 }
 
-/// What `stoop explain` counts for a suite: the inputs its bundle knows, and how many of `units`
-/// hold a unit proof. A bundle that cannot be read counts as empty. Nothing is created.
-pub(crate) fn counts(store: &Path, id: &str, units: &[String]) -> (usize, usize) {
+/// What `stoop explain` counts for a suite: the distinct inputs that the roster's unit proofs name,
+/// and how many roster units hold one. Only a bundle that `ready` would accept counts, so a bundle
+/// of another generation holds no proofs. The table also holds outputs, so its length is not the
+/// count. Nothing is created.
+pub(crate) fn counts(store: &Path, id: &str, units: &[String], key: &str) -> (usize, usize) {
     let Ok(Some(area)) = Area::open(store, false) else {
         return (0, 0);
     };
     let ReadBundle::Current(bundle) = read_bundle(&area, id) else {
         return (0, 0);
     };
-    let proven = units
-        .iter()
-        .filter(|unit| {
-            bundle
-                .units
-                .get(*unit)
-                .is_some_and(|versions| !versions.is_empty())
-        })
-        .count();
-    (bundle.table.len(), proven)
+    if !recorded(&bundle, &digest_text("stoop whole key v1", key)) {
+        return (0, 0);
+    }
+    let mut proven = 0;
+    let mut inputs: Vec<u32> = Vec::new();
+    for unit in units {
+        let Some(versions) = bundle
+            .units
+            .get(unit)
+            .filter(|versions| !versions.is_empty())
+        else {
+            continue;
+        };
+        proven += 1;
+        for version in versions {
+            inputs.extend(undelta(&version.inputs, bundle.table.len()).unwrap_or_default());
+        }
+    }
+    inputs.sort_unstable();
+    inputs.dedup();
+    (inputs.len(), proven)
 }
 
 /// Checked on read only: each version's indices must lie below the table and strictly increase.

@@ -280,7 +280,7 @@ pub(crate) fn explain_lines(
         suite.pending.as_ref().map_err(|refusal| *refusal),
     )
     .and_then(|(pending, launches)| bundle::probe(store, pending, key).map(|()| launches.len()));
-    let (inputs, proven) = bundle::counts(store, &suite.id, &suite.units);
+    let (inputs, proven) = bundle::counts(store, &suite.id, &suite.units, key);
     let total = suite.units.len();
     let tracked = format!(
         "stoop: tracked {total} units, {inputs} inputs; {proven} proven, {} without a proof (suite {})",
