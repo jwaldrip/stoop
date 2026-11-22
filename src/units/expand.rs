@@ -17,13 +17,28 @@ pub(crate) struct Launch {
 }
 
 /// Whether every placeholder of `hook` can stand for one unit. `{changed-inputs}` names changed inputs
-/// that no one unit has, and a list has no join, so a joined list runs the first-run form (spec 4.12).
-/// Shell environment code needs no placeholder: its variables are exported for each unit (spec 4.7).
+/// that no one unit has, so a hook that reads them takes the first-run form, in its placeholder spelling
+/// and in shell code alike (spec 4.11). A list has no join, so a joined list runs the first-run form too
+/// (spec 4.12). Other shell environment code needs no placeholder: its variables are exported for each
+/// unit (spec 4.7).
 pub(crate) fn supported(hook: &Hook) -> bool {
-    hook.placeholders.iter().flatten().all(|placeholder| {
-        placeholder.name != PlaceholderName::ChangedInputs
-            && (placeholder.file.is_none() || placeholder.join.is_none())
-    })
+    let reads_changed_inputs = hook.shell_env_code
+        && hook
+            .original
+            .iter()
+            .any(|word| has_bytes(word.as_encoded_bytes(), b"STOOP_CHANGED_INPUTS"));
+    !reads_changed_inputs
+        && hook.placeholders.iter().flatten().all(|placeholder| {
+            placeholder.name != PlaceholderName::ChangedInputs
+                && (placeholder.file.is_none() || placeholder.join.is_none())
+        })
+}
+
+/// Whether `needle` occurs in `haystack`. It also finds `STOOP_CHANGED_INPUTS_FILE`, which holds it.
+fn has_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
 }
 
 /// The list forms a launch of `hook` reads, each once, in placeholder order (spec 4.12).
