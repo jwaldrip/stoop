@@ -83,11 +83,10 @@ pub struct ExecEvent {
     pub cwd: PathBuf,
 }
 
-/// A replacement source verified at rename entry and at the successful destination landing.
+/// The destination stat at a successful rename exit, verified against the source at entry.
 #[derive(Clone, Debug)]
 pub struct AtomicLanding {
     pub stat: identity::FileStat,
-    pub hash: String,
 }
 
 #[derive(Default)]

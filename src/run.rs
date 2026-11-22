@@ -1529,11 +1529,6 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     }
 }
 
-fn landing_matches(landing: &trace::AtomicLanding, post: &trace::identity::Post) -> bool {
-    matches!(post, trace::identity::Post::File { stat, hash }
-        if *stat == landing.stat && *hash == landing.hash)
-}
-
 fn landing_verified(
     trace: &Trace,
     key: &str,
@@ -1543,10 +1538,11 @@ fn landing_verified(
     !trace.footprint.unknown
         && !trace::identity::link_route_unknown(&trace.footprint)
         && trace.atomic_landings.get(key).is_some_and(|landing| {
-            landing_matches(landing, post)
+            matches!(post, trace::identity::Post::File { stat, hash }
+            if *stat == landing.stat
                 && id.is_some_and(|id| {
-                    id == crate::input::file_id(landing.stat.mode & 0o111 != 0, &landing.hash)
-                })
+                    id == crate::input::file_id(landing.stat.mode & 0o111 != 0, hash)
+                }))
         })
 }
 
@@ -2550,44 +2546,6 @@ mod read_identity_tests {
     use std::collections::HashMap;
 
     #[test]
-    fn atomic_landing_needs_the_exit_stat_and_the_source_digest() {
-        let stat = crate::trace::identity::FileStat {
-            dev: 1,
-            ino: 2,
-            size: 3,
-            mtime_ns: 4,
-            ctime_ns: 5,
-            mode: 0o100644,
-        };
-        let landing = trace::AtomicLanding {
-            stat,
-            hash: "source".into(),
-        };
-        assert!(landing_matches(
-            &landing,
-            &Post::File {
-                stat,
-                hash: "source".into()
-            }
-        ));
-        assert!(!landing_matches(
-            &landing,
-            &Post::File {
-                stat,
-                hash: "other".into()
-            }
-        ));
-        assert!(!landing_matches(
-            &landing,
-            &Post::File {
-                stat: crate::trace::identity::FileStat { ino: 9, ..stat },
-                hash: "source".into(),
-            }
-        ));
-        assert!(!landing_matches(&landing, &Post::FileStat(stat)));
-    }
-
-    #[test]
     fn synthetic_missing_and_unknown_observations_keep_v9_outcomes() {
         let path = Path::new("/work/input");
         let mut trace = Trace::default();
@@ -2691,13 +2649,9 @@ mod landing_witness_tests {
             mode: 0o100644,
         };
         let mut landed = Trace::default();
-        landed.atomic_landings.insert(
-            "f".into(),
-            trace::AtomicLanding {
-                stat,
-                hash: "h".into(),
-            },
-        );
+        landed
+            .atomic_landings
+            .insert("f".into(), trace::AtomicLanding { stat });
         let post = trace::identity::Post::File {
             stat,
             hash: "h".into(),
@@ -2716,6 +2670,40 @@ mod landing_witness_tests {
             !landing_verified(&landed, "f", None, &post),
             "P2-7: an unreadable output must not verify the landing"
         );
+        let wrong_hash = crate::input::file_id(false, "other");
+        assert!(!landing_verified(&landed, "f", Some(&wrong_hash), &post));
+        assert!(!landing_verified(
+            &landed,
+            "missing",
+            Some(&matching),
+            &post
+        ));
+        for changed in [
+            trace::identity::FileStat { ino: 9, ..stat },
+            trace::identity::FileStat {
+                ctime_ns: 9,
+                ..stat
+            },
+        ] {
+            let changed_post = trace::identity::Post::File {
+                stat: changed,
+                hash: "h".into(),
+            };
+            assert!(!landing_verified(
+                &landed,
+                "f",
+                Some(&matching),
+                &changed_post
+            ));
+        }
+        assert!(!landing_verified(
+            &landed,
+            "f",
+            Some(&matching),
+            &trace::identity::Post::FileStat(stat)
+        ));
+        landed.footprint.unknown = true;
+        assert!(!landing_verified(&landed, "f", Some(&matching), &post));
     }
 
     #[test]
@@ -2729,13 +2717,9 @@ mod landing_witness_tests {
             mode: 0o100644,
         };
         let mut landed = Trace::default();
-        landed.atomic_landings.insert(
-            "f".into(),
-            trace::AtomicLanding {
-                stat,
-                hash: "earlier-source-hash".into(),
-            },
-        );
+        landed
+            .atomic_landings
+            .insert("f".into(), trace::AtomicLanding { stat });
         let post = trace::identity::Post::File {
             stat,
             hash: "final-output-hash".into(),

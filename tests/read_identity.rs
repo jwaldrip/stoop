@@ -6,9 +6,6 @@
 //! command first looks at them.
 #![cfg(target_os = "linux")]
 
-#[path = "../src/trace/linux/namespace.rs"]
-mod namespace;
-
 use serde_json::Value;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
@@ -1353,43 +1350,14 @@ fn assert_no_input(stored: &Value, path: &str) {
     );
 }
 
-fn assert_atomic_recording(stored: &Value, path: &str, before: &[u8], after: &[u8], initial: bool) {
+fn assert_atomic_recording(stored: &Value, path: &str, before: &[u8], after: &[u8]) {
     assert_file_entry(stored, "priors", path, before);
     assert_file_entry(stored, "outputs", path, after);
-    if initial {
-        assert_file_entry(stored, "inputs", path, before);
-    } else {
-        eprintln!(
-            "atomic witness unavailable outside initial PID namespace; asserting legacy recording"
-        );
-        assert_no_input(stored, path);
-    }
-}
-
-#[test]
-fn namespace_predicate_drives_both_atomic_recording_expectations() {
-    let initial = namespace::is_initial_pid_namespace(Ok(PathBuf::from("pid:[4026531836]")));
-    let nested = namespace::is_initial_pid_namespace(Ok(PathBuf::from("pid:[4026531837]")));
-    assert!(initial);
-    assert!(!nested);
-    assert!(!namespace::is_initial_pid_namespace(Err(
-        std::io::Error::from(std::io::ErrorKind::PermissionDenied)
-    )));
-    let before = format!("f:{}", blake3::hash(b"one\n").to_hex());
-    let after = format!("f:{}", blake3::hash(b"done\n").to_hex());
-    let mut stored = serde_json::json!({
-        "inputs": [{"path": "f", "id": before}],
-        "priors": [{"path": "f", "id": before}],
-        "outputs": [{"path": "f", "id": after}]
-    });
-    assert_atomic_recording(&stored, "f", b"one\n", b"done\n", initial);
-    stored["inputs"] = serde_json::json!([]);
-    assert_atomic_recording(&stored, "f", b"one\n", b"done\n", nested);
+    assert_file_entry(stored, "inputs", path, before);
 }
 
 #[test]
 fn atomic_sed_records_the_preimage_then_runs_to_a_fixed_point() {
-    let initial = namespace::is_initial_pid_namespace(fs::read_link("/proc/self/ns/pid"));
     let case = Case::new("atomic-sed-fixed-point");
     case.file("f", b"one\n");
     age();
@@ -1398,7 +1366,7 @@ fn atomic_sed_records_the_preimage_then_runs_to_a_fixed_point() {
     let first = run(&case, "atomic-sed", script, &[]);
     assert_recorded(&first, &case, "atomic-sed");
     let stored = proof(&case, "atomic-sed");
-    assert_atomic_recording(&stored, "f", b"one\n", b"done\n", initial);
+    assert_atomic_recording(&stored, "f", b"one\n", b"done\n");
     let input = stored["inputs"]
         .as_array()
         .unwrap()
@@ -1409,12 +1377,7 @@ fn atomic_sed_records_the_preimage_then_runs_to_a_fixed_point() {
         .unwrap()
         .iter()
         .find(|v| v["path"] == "f");
-    if initial {
-        assert_eq!(input, prior);
-    } else {
-        assert!(input.is_none());
-        assert!(prior.is_some());
-    }
+    assert_eq!(input, prior);
     let temp = stored["removed"]
         .as_array()
         .unwrap()
@@ -1423,17 +1386,6 @@ fn atomic_sed_records_the_preimage_then_runs_to_a_fixed_point() {
         .find(|name| name.starts_with("sed"))
         .expect("the temporary source remains a removal");
     assert_entry_id(&stored, "priors", temp, "a");
-    if !initial {
-        let second = run(&case, "atomic-sed", script, &[]);
-        assert!(second.status.success(), "{}", stderr(&second));
-        assert!(
-            stderr(&second).contains("stoop: skip "),
-            "{}",
-            stderr(&second)
-        );
-        assert_eq!(fs::read(case.root().join("f")).unwrap(), b"done\n");
-        return;
-    }
 
     let second = run(&case, "atomic-sed", script, &[]);
     assert_recorded(&second, &case, "atomic-sed");
@@ -1458,26 +1410,10 @@ fn atomic_sed_records_the_preimage_then_runs_to_a_fixed_point() {
 
 #[test]
 fn atomic_sed_that_always_changes_its_input_never_skips() {
-    let initial = namespace::is_initial_pid_namespace(fs::read_link("/proc/self/ns/pid"));
     let case = Case::new("atomic-sed-changing");
     case.file("f", b"one\n");
     age();
     let script = "exec sed -i 's/^/x/' f";
-    if !initial {
-        let first = run(&case, "atomic-changing", script, &[]);
-        assert_recorded(&first, &case, "atomic-changing");
-        let stored = proof(&case, "atomic-changing");
-        assert_atomic_recording(&stored, "f", b"one\n", b"xone\n", false);
-        let second = run(&case, "atomic-changing", script, &[]);
-        assert!(second.status.success(), "{}", stderr(&second));
-        assert!(
-            stderr(&second).contains("stoop: skip "),
-            "{}",
-            stderr(&second)
-        );
-        assert_eq!(fs::read(case.root().join("f")).unwrap(), b"xone\n");
-        return;
-    }
     for (before, after) in [
         (b"one\n".as_slice(), b"xone\n".as_slice()),
         (b"xone\n".as_slice(), b"xxone\n".as_slice()),
@@ -1651,7 +1587,7 @@ os.close(fd)
     );
     assert_recorded(&out, &case, "lease");
     let stored = proof(&case, "lease");
-    assert_atomic_recording(&stored, "f", b"old contents\n", b"new contents\n", true);
+    assert_atomic_recording(&stored, "f", b"old contents\n", b"new contents\n");
 }
 
 /// Regenerate the single-tracee `exec sed -i` recording through the real recorder on Linux. The raw

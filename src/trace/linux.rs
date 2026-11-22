@@ -9,12 +9,6 @@
 //! except for priors: what a path held before the run first wrote it is read at the
 //! same stop, because the write is about to change it.
 
-mod namespace;
-
-use namespace::is_initial_pid_namespace;
-#[cfg(test)]
-use namespace::PROC_PID_INIT_INO;
-
 use super::identity::{self, Observation, ReadBudget, Seen};
 use super::{AtomicLanding, ExecEvent, Scope, Trace};
 use crate::ignore::Ignore;
@@ -24,7 +18,7 @@ use crate::pathutil::{absolutize, to_key, without_dots, Physical};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::{CString, OsString};
 use std::fs;
-use std::io::{self, Read};
+use std::io;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -45,10 +39,6 @@ const SECCOMP_RET_ERRNO: u32 = 0x0005_0000;
 const NT_PRSTATUS: usize = 1;
 const AT_FDCWD: i32 = -100;
 const PATH_MAX: usize = 4096;
-/// Leave room for a complete row in one seq_file page.
-const LOCK_TABLE_MARGIN: usize = 256;
-/// Reject implausible page sizes rather than allocating without a bound.
-const LOCK_TABLE_MAX_PAGE: usize = 1 << 20;
 
 /// Linux ABI flags, the same on every architecture.
 const AT_SYMLINK_NOFOLLOW: i32 = 0x100;
@@ -619,7 +609,6 @@ struct RenameCandidate {
     key: String,
     source: identity::FileStat,
     parent: (u64, u64),
-    hash: String,
 }
 
 struct RenameOperation<'a> {
@@ -648,7 +637,6 @@ struct Rec<'a> {
     root: PathBuf,
     hashed: u64,
     read_budget: ReadBudget,
-    rewrite_budget: ReadBudget,
     prior_binding: Option<PriorBinding>,
     oid_epoch: Option<Arc<crate::oid_attrs::Epoch>>,
     link_walks: BTreeMap<PathBuf, Vec<PathBuf>>,
@@ -665,10 +653,6 @@ struct Tracer<'a> {
     confirmed_reads: HashMap<PathBuf, Seen>,
     landing_inodes: HashMap<(u64, u64), String>,
     shared_context: bool,
-    /// The lock table is complete only in the initial PID namespace.
-    initial_pid_namespace: bool,
-    /// None when a complete one-page lock snapshot cannot be established.
-    lock_table: Option<LockTable>,
     live_tasks: HashSet<i32>,
     syscall: i64,
     allow_network: bool,
@@ -732,9 +716,6 @@ pub fn run<'a>(
         }
     }
 
-    let initial_pid_namespace =
-        scope.is_some() && is_initial_pid_namespace(fs::read_link("/proc/self/ns/pid"));
-    let lock_table = initial_pid_namespace.then(LockTable::open).flatten();
     let mut tr = Tracer {
         ops: tbl.into_iter().collect(),
         cwds: HashMap::new(),
@@ -745,8 +726,6 @@ pub fn run<'a>(
         pending_witness: HashMap::new(),
         confirmed_reads: HashMap::new(),
         landing_inodes: HashMap::new(),
-        initial_pid_namespace,
-        lock_table,
         shared_context: false,
         live_tasks: HashSet::from([pid]),
         syscall: 0,
@@ -759,7 +738,6 @@ pub fn run<'a>(
             oid_epoch: s.oid_epoch.clone(),
             hashed: 0,
             read_budget: ReadBudget::default(),
-            rewrite_budget: ReadBudget::default(),
             prior_binding: None,
             link_walks: BTreeMap::new(),
             redirected_reads: HashSet::new(),
@@ -2024,6 +2002,7 @@ fn successful_rename(result: i64) -> bool {
     result == 0
 }
 
+// Rename can change ctime; the full landing stat, including exit ctime, is checked later.
 fn same_renamed_file(before: &identity::FileStat, after: &identity::FileStat) -> bool {
     before.dev == after.dev
         && before.ino == after.ino
@@ -2113,77 +2092,7 @@ fn plain_route(real: &Path, lexical: &Path) -> bool {
 
 #[cfg(test)]
 thread_local! {
-    static LOCK_TABLE_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static READ_WITNESS_STOPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// A reusable buffer for a lock-table snapshot that must fit within a single seq_file fill.
-struct LockTable {
-    buffer: Vec<u8>,
-}
-
-impl LockTable {
-    fn allocate() -> Option<Self> {
-        let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).ok()?;
-        if page <= LOCK_TABLE_MARGIN || page > LOCK_TABLE_MAX_PAGE {
-            return None;
-        }
-        Some(Self {
-            buffer: vec![0; page - LOCK_TABLE_MARGIN + 1],
-        })
-    }
-
-    fn open() -> Option<Self> {
-        Self::open_from(fs::File::open("/proc/locks"))
-    }
-
-    fn open_from<R: Read>(source: io::Result<R>) -> Option<Self> {
-        let mut table = Self::allocate()?;
-        table.snapshot(source)?;
-        Some(table)
-    }
-
-    fn snapshot<R: Read>(&mut self, table: io::Result<R>) -> Option<&str> {
-        let mut table = table.ok()?;
-        // seq_file releases its lock between fills and resumes by position. A longer snapshot
-        // can skip a row if the table changes, so use one read and leave a margin within a page.
-        let len = table.read(&mut self.buffer).ok()?;
-        if len == self.buffer.len() {
-            return None;
-        }
-        std::str::from_utf8(&self.buffer[..len]).ok()
-    }
-
-    fn lists<R: Read>(&mut self, table: io::Result<R>, stat: &identity::FileStat) -> Option<bool> {
-        let text = self.snapshot(table)?;
-        Some(text.split_whitespace().any(|field| {
-            let mut parts = field.split(':');
-            match (parts.next(), parts.next(), parts.next(), parts.next()) {
-                (Some(major), Some(minor), Some(ino), None) => {
-                    u64::from_str_radix(major, 16).is_ok()
-                        && u64::from_str_radix(minor, 16).is_ok()
-                        && ino.parse::<u64>().ok() == Some(stat.ino)
-                }
-                _ => false,
-            }
-        }))
-    }
-}
-
-/// A failed or oversized snapshot disables the witness; a matching inode keeps the legacy path.
-fn lock_table_lists(table: &mut LockTable, stat: &identity::FileStat) -> Option<bool> {
-    #[cfg(test)]
-    LOCK_TABLE_SCANS.with(|scans| scans.set(scans.get() + 1));
-    // Some filesystems report a different device for a lock than for stat(). A matching inode on
-    // any device is enough to keep the legacy path.
-    table.lists(fs::File::open("/proc/locks"), stat)
-}
-
-#[cfg(test)]
-fn lock_table_lists_from<R: Read>(table: io::Result<R>, stat: &identity::FileStat) -> bool {
-    LockTable::allocate()
-        .and_then(|mut snapshot| snapshot.lists(table, stat))
-        .unwrap_or(true)
 }
 
 impl Tracer<'_> {
@@ -2277,12 +2186,10 @@ impl Tracer<'_> {
         path: &Path,
     ) -> Option<ReadCandidate> {
         if self.shared_context
-            || !self.initial_pid_namespace
-            || self.lock_table.is_none()
             || self.confirmed_reads.contains_key(path)
             || self.rec.as_ref().is_none_or(|rec| {
                 !path.starts_with(rec.phys.real())
-                    || rec.rewrite_budget.hashed >= identity::READ_HASH_BUDGET
+                    || rec.read_budget.hashed >= identity::READ_HASH_BUDGET
             })
             || !plain_argument(pid, args, dirfd, argument)
         {
@@ -2396,13 +2303,11 @@ impl Tracer<'_> {
                     return;
                 }
                 let inode = (stat.dev, stat.ino);
-                if let Some(previous) = self.t.atomic_landings.insert(
-                    candidate.key.clone(),
-                    AtomicLanding {
-                        stat,
-                        hash: candidate.hash,
-                    },
-                ) {
+                if let Some(previous) = self
+                    .t
+                    .atomic_landings
+                    .insert(candidate.key.clone(), AtomicLanding { stat })
+                {
                     self.landing_inodes
                         .remove(&(previous.stat.dev, previous.stat.ino));
                 }
@@ -2426,9 +2331,8 @@ impl Tracer<'_> {
             a_meta,
             b_meta,
         } = operation;
-        if self.shared_context
-            || !self.initial_pid_namespace
-            || self.lock_table.is_none()
+        if self.rec.is_none()
+            || self.shared_context
             || self.live_tasks.len() != 1
             || flags.is_some_and(|index| args[index] != 0)
             || !plain_argument(pid, args, from.0, from.1)
@@ -2483,25 +2387,6 @@ impl Tracer<'_> {
             return None;
         }
         let source_stat = identity::file_stat(source);
-        let rec = self.rec.as_mut()?;
-        let used = rec.rewrite_budget.hashed;
-        if used > identity::READ_HASH_BUDGET || source_stat.size > identity::READ_HASH_BUDGET - used
-        {
-            return None;
-        }
-        // A failed snapshot disables later read witnesses too.
-        let listed = lock_table_lists(self.lock_table.as_mut()?, &source_stat);
-        if listed.is_none() {
-            self.lock_table = None;
-        }
-        if listed != Some(false) {
-            return None;
-        }
-        let identity::ReadHash::Hashed(hash) =
-            identity::hash_bound(a, &source_stat, &mut rec.rewrite_budget)
-        else {
-            return None;
-        };
         Some((
             RenameCandidate {
                 from: a.to_path_buf(),
@@ -2509,7 +2394,6 @@ impl Tracer<'_> {
                 key,
                 source: source_stat,
                 parent: (parent.dev(), parent.ino()),
-                hash,
             },
             seen,
         ))
@@ -3835,7 +3719,6 @@ mod tests {
             root: root.clone(),
             hashed: 0,
             read_budget: ReadBudget::default(),
-            rewrite_budget: ReadBudget::default(),
             prior_binding: None,
             oid_epoch: Some(Arc::new(crate::oid_attrs::Epoch {
                 basis: HashMap::new(),
@@ -3902,8 +3785,6 @@ mod tests {
             confirmed_reads: HashMap::new(),
             landing_inodes: HashMap::new(),
             shared_context: false,
-            initial_pid_namespace: false,
-            lock_table: None,
             live_tasks: HashSet::new(),
             syscall: 0,
             allow_network: false,

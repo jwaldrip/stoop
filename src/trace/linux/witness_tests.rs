@@ -30,7 +30,6 @@ fn landing(ino: u64, mode: u32) -> AtomicLanding {
             ctime_ns: 1,
             mode,
         },
-        hash: "h".into(),
     }
 }
 
@@ -42,7 +41,6 @@ fn rec_for<'a>(root: &Path, ignore: &'a Ignore) -> Rec<'a> {
         root: root.to_path_buf(),
         hashed: 0,
         read_budget: ReadBudget::default(),
-        rewrite_budget: ReadBudget::default(),
         prior_binding: None,
         oid_epoch: None,
         link_walks: BTreeMap::new(),
@@ -61,8 +59,6 @@ fn tracer_for(rec: Rec<'_>) -> Tracer<'_> {
         confirmed_reads: HashMap::new(),
         landing_inodes: HashMap::new(),
         shared_context: false,
-        initial_pid_namespace: is_initial_pid_namespace(fs::read_link("/proc/self/ns/pid")),
-        lock_table: LockTable::allocate(),
         live_tasks: HashSet::new(),
         syscall: 0,
         allow_network: false,
@@ -302,7 +298,6 @@ fn a_rename_witness_names_only_ordinary_operands() {
     );
     let ignore = Ignore::new(&[], None, &[]);
     let mut tracer = tracer_for(rec_for(&root, &ignore));
-    tracer.initial_pid_namespace = true;
     let pid = std::process::id() as i32;
     tracer.live_tasks.insert(pid);
     tracer.t.keys.insert(temp.clone(), "t".into());
@@ -474,218 +469,6 @@ fn a_source_changed_after_entry_does_not_match_its_landing() {
     fs::remove_dir_all(root).unwrap();
 }
 
-#[test]
-fn an_oversized_lock_table_withholds_the_witness() {
-    let stat = landing(42, 0o100644).stat;
-    let table = vec![b' '; (1 << 20) + 1];
-    assert!(
-        lock_table_lists_from(Ok(io::Cursor::new(table)), &stat),
-        "an oversized lock table must fall back to the legacy recorder"
-    );
-}
-
-#[test]
-fn an_over_budget_source_is_not_scanned_or_opened() {
-    with_ordinary_rename("budget-limit", |tracer, pid, args, temp, target, metas| {
-        tracer.initial_pid_namespace = true;
-        let used = identity::READ_HASH_BUDGET - 3;
-        tracer.rec.as_mut().unwrap().rewrite_budget.hashed = used;
-        let scans_before = LOCK_TABLE_SCANS.with(|scans| scans.get());
-        assert!(!rename_offered(tracer, pid, args, temp, target, metas));
-        assert_eq!(
-            LOCK_TABLE_SCANS.with(|scans| scans.get()),
-            scans_before,
-            "an over-budget source must not scan the lock table"
-        );
-        assert_eq!(
-            tracer.rec.as_ref().unwrap().rewrite_budget.hashed,
-            used,
-            "an over-budget source must not be opened or hashed"
-        );
-    });
-}
-
-#[test]
-#[ignore = "requires a child PID namespace with its own procfs"]
-fn a_child_pid_namespace_withholds_the_rename_witness() {
-    let namespace = fs::read_link("/proc/self/ns/pid").expect("PID namespace");
-    assert_ne!(namespace, Path::new("pid:[4026531836]"));
-    with_ordinary_rename(
-        "child-pid-namespace",
-        |tracer, pid, args, temp, target, metas| {
-            assert!(
-                !rename_offered(tracer, pid, args, temp, target, metas),
-                "a child PID namespace cannot establish lock-table completeness"
-            );
-        },
-    );
-}
-
-#[test]
-fn initial_pid_namespace_requires_the_kernel_initial_inode() {
-    assert_eq!(PROC_PID_INIT_INO, 4_026_531_836);
-    assert!(is_initial_pid_namespace(Ok(PathBuf::from(
-        "pid:[4026531836]"
-    ))));
-    for name in [
-        "pid:[4026531837]",
-        "pid:[4026532194]",
-        "mnt:[4026531836]",
-        "pid:[4026531836]\n",
-        "pid:[0xeffffffc]",
-    ] {
-        assert!(!is_initial_pid_namespace(Ok(PathBuf::from(name))), "{name}");
-    }
-    assert!(!is_initial_pid_namespace(Err(io::Error::from(
-        io::ErrorKind::NotFound
-    ))));
-    assert!(!is_initial_pid_namespace(Err(io::Error::from(
-        io::ErrorKind::PermissionDenied
-    ))));
-}
-
-#[test]
-fn a_cached_child_namespace_never_scans_the_lock_table() {
-    with_ordinary_rename(
-        "namespace-guard",
-        |tracer, pid, args, temp, target, metas| {
-            tracer.initial_pid_namespace = false;
-            let scans = LOCK_TABLE_SCANS.with(|count| count.get());
-            let used = tracer.rec.as_ref().unwrap().rewrite_budget.hashed;
-            assert!(!rename_offered(tracer, pid, args, temp, target, metas));
-            assert_eq!(LOCK_TABLE_SCANS.with(|count| count.get()), scans);
-            assert_eq!(tracer.rec.as_ref().unwrap().rewrite_budget.hashed, used);
-
-            tracer.initial_pid_namespace = true;
-            assert!(rename_offered(tracer, pid, args, temp, target, metas));
-            assert_eq!(LOCK_TABLE_SCANS.with(|count| count.get()), scans + 1);
-        },
-    );
-}
-
-#[test]
-fn source_budget_boundary_admits_only_bytes_that_can_be_hashed() {
-    with_ordinary_rename(
-        "budget-boundary",
-        |tracer, pid, args, temp, target, metas| {
-            tracer.initial_pid_namespace = true;
-            let before = identity::READ_HASH_BUDGET - 4;
-            tracer.rec.as_mut().unwrap().rewrite_budget.hashed = before;
-            assert!(rename_offered(tracer, pid, args, temp, target, metas));
-            assert_eq!(
-                tracer.rec.as_ref().unwrap().rewrite_budget.hashed,
-                identity::READ_HASH_BUDGET
-            );
-            fs::write(temp, b"").unwrap();
-            let empty = fs::symlink_metadata(temp).unwrap();
-            assert!(rename_offered(
-                tracer,
-                pid,
-                args,
-                temp,
-                target,
-                (&empty, metas.1)
-            ));
-            tracer.rec.as_mut().unwrap().rewrite_budget.hashed = identity::READ_HASH_BUDGET + 1;
-            let scans = LOCK_TABLE_SCANS.with(|count| count.get());
-            assert!(!rename_offered(
-                tracer,
-                pid,
-                args,
-                temp,
-                target,
-                (&empty, metas.1)
-            ));
-            assert_eq!(LOCK_TABLE_SCANS.with(|count| count.get()), scans);
-        },
-    );
-}
-
-#[test]
-fn lock_table_accepts_exact_cap_and_fails_closed_on_read_errors() {
-    let stat = landing(42, 0o100644).stat;
-    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
-    let exact = vec![b' '; page - LOCK_TABLE_MARGIN];
-    assert!(!lock_table_lists_from(Ok(io::Cursor::new(exact)), &stat));
-    assert!(lock_table_lists_from::<io::Cursor<Vec<u8>>>(
-        Err(io::Error::from(io::ErrorKind::PermissionDenied)),
-        &stat
-    ));
-    assert!(lock_table_lists_from(
-        Ok(io::Cursor::new(vec![0xff])),
-        &stat
-    ));
-    struct Broken;
-    impl Read for Broken {
-        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            Err(io::Error::other("injected read error"))
-        }
-    }
-    assert!(lock_table_lists_from(Ok(Broken), &stat));
-}
-
-#[test]
-fn matching_inode_is_conservative_across_different_devices() {
-    let stat = landing(42, 0o100644).stat;
-    let different_device = b"1: LEASE ADVISORY WRITE 7 00:ff:42 0 EOF\n";
-    assert!(lock_table_lists_from(
-        Ok(io::Cursor::new(different_device)),
-        &stat
-    ));
-    let other_inode = b"1: LEASE ADVISORY WRITE 7 00:ff:43 0 EOF\n";
-    assert!(!lock_table_lists_from(
-        Ok(io::Cursor::new(other_inode)),
-        &stat
-    ));
-}
-
-#[test]
-fn a_lock_table_that_cannot_fit_in_one_page_is_withheld() {
-    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
-    let stat = landing(42, 0o100644).stat;
-    assert!(page > 256);
-    assert!(!lock_table_lists_from(
-        Ok(io::Cursor::new(vec![b' '; page - 256])),
-        &stat
-    ));
-    assert!(
-        lock_table_lists_from(Ok(io::Cursor::new(vec![b' '; page - 255])), &stat),
-        "a table beyond one page less the margin must keep the legacy recorder"
-    );
-    assert!(lock_table_lists_from(
-        Ok(io::Cursor::new(vec![b' '; page])),
-        &stat
-    ));
-}
-
-#[test]
-fn a_lock_table_snapshot_uses_only_one_read() {
-    struct Counted {
-        reads: std::rc::Rc<std::cell::Cell<usize>>,
-    }
-    impl Read for Counted {
-        fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-            let previous = self.reads.get();
-            self.reads.set(previous + 1);
-            if previous == 0 {
-                output[0] = b' ';
-                Ok(1)
-            } else {
-                Ok(0)
-            }
-        }
-    }
-    let count = std::rc::Rc::new(std::cell::Cell::new(0));
-    let stat = landing(42, 0o100644).stat;
-    assert!(!lock_table_lists_from(
-        Ok(Counted {
-            reads: count.clone()
-        }),
-        &stat
-    ));
-    assert_eq!(count.get(), 1, "a lock snapshot must use one bounded read");
-}
-
 fn recorded_input_bytes(tracer: &Tracer<'_>, root: &Path, ignore: &Ignore) -> Vec<u8> {
     let mut physical = Physical::new(root, root);
     let inputs = crate::run::build_inputs(
@@ -711,7 +494,7 @@ fn disabled_read_witness_requests_no_stop_and_preserves_legacy_inputs() {
 
     let mut disabled = tracer_for(rec_for(&root, &ignore));
     disabled.t.seen = Some(HashMap::new());
-    disabled.initial_pid_namespace = false;
+    disabled.mark_shared_context();
     let pid = std::process::id() as i32;
     let spelling = CString::new(path.as_os_str().as_bytes()).unwrap();
     let args = path_args(&spelling);
@@ -732,7 +515,7 @@ fn disabled_read_witness_requests_no_stop_and_preserves_legacy_inputs() {
 }
 
 #[test]
-fn exhausted_budget_and_unusable_table_request_no_read_stops() {
+fn exhausted_read_budget_requests_no_stops_and_preserves_legacy_inputs() {
     let root = scratch("disabled-read-conditions");
     let path = root.join("f");
     fs::write(&path, b"unchanged\n").unwrap();
@@ -746,43 +529,18 @@ fn exhausted_budget_and_unusable_table_request_no_read_stops() {
     let args = path_args(&spelling);
 
     let mut enabled = tracer_for(rec_for(&root, &ignore));
-    enabled.initial_pid_namespace = true;
     enabled.t.seen = Some(HashMap::new());
     let before = READ_WITNESS_STOPS.with(|count| count.get());
     enabled.open(pid, &args, None, 1, Some(2));
     assert_eq!(READ_WITNESS_STOPS.with(|count| count.get()), before + 1);
 
-    for unusable_table in [false, true] {
-        let mut disabled = tracer_for(rec_for(&root, &ignore));
-        disabled.initial_pid_namespace = true;
-        disabled.t.seen = Some(HashMap::new());
-        if unusable_table {
-            disabled.lock_table = None;
-        } else {
-            disabled.rec.as_mut().unwrap().rewrite_budget.hashed = identity::READ_HASH_BUDGET;
-        }
-        let before = READ_WITNESS_STOPS.with(|count| count.get());
-        disabled.open(pid, &args, None, 1, Some(2));
-        assert_eq!(READ_WITNESS_STOPS.with(|count| count.get()), before);
-        assert!(!disabled.pending_witness.contains_key(&pid));
-        assert_eq!(recorded_input_bytes(&disabled, &root, &ignore), expected);
-    }
+    let mut disabled = tracer_for(rec_for(&root, &ignore));
+    disabled.t.seen = Some(HashMap::new());
+    disabled.rec.as_mut().unwrap().read_budget.hashed = identity::READ_HASH_BUDGET;
+    let before = READ_WITNESS_STOPS.with(|count| count.get());
+    disabled.open(pid, &args, None, 1, Some(2));
+    assert_eq!(READ_WITNESS_STOPS.with(|count| count.get()), before);
+    assert!(!disabled.pending_witness.contains_key(&pid));
+    assert_eq!(recorded_input_bytes(&disabled, &root, &ignore), expected);
     fs::remove_dir_all(root).unwrap();
-}
-
-#[test]
-fn lock_table_preflight_rejects_unreadable_or_overlong_snapshots() {
-    assert!(LockTable::open_from(Ok(io::Cursor::new(b""))).is_some());
-    assert!(
-        LockTable::open_from::<io::Cursor<Vec<u8>>>(Err(io::Error::from(
-            io::ErrorKind::PermissionDenied
-        )))
-        .is_none()
-    );
-    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
-    assert!(LockTable::open_from(Ok(io::Cursor::new(vec![
-        b' ';
-        page - LOCK_TABLE_MARGIN + 1
-    ])))
-    .is_none());
 }
