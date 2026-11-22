@@ -1722,3 +1722,143 @@ mod pass_tests {
         ));
     }
 }
+
+/// M1 (ignored, a measurement). The cost of encoding, writing (with fsync and rename) and parsing a
+/// full-roster bundle at 1, 2, 4 and 8 MiB. Run it in release:
+/// `cargo test --release --bin stoop bundle_write_cost -- --ignored --nocapture`.
+#[cfg(all(test, unix))]
+mod cost_tests {
+    use super::*;
+    use std::time::Instant;
+
+    fn base(units: &[String], table: Vec<Input>) -> SuiteBundleV1 {
+        let pending = pending(PendingSpec {
+            argv: &["runner".into(), "{changed:**/*.t}".into()],
+            cwd: "",
+            scope: None,
+            label: None,
+            source: "filter",
+            filter: "**/*.t",
+            units: units.to_vec(),
+            config: None,
+            config_suite: None,
+        })
+        .unwrap();
+        let entries = table.len().max(2);
+        let units = pending
+            .roster
+            .units
+            .iter()
+            .enumerate()
+            .map(|(index, unit)| {
+                let mut pair = vec![
+                    ((2 * index) % entries) as u32,
+                    ((2 * index + 1) % entries) as u32,
+                ];
+                pair.sort_unstable();
+                pair.dedup();
+                let version = UnitVersion {
+                    created: 1,
+                    exact: true,
+                    source: ResultSource::Exit,
+                    guard: "guard".into(),
+                    inputs: delta(&pair),
+                    outputs: Vec::new(),
+                };
+                (unit.clone(), vec![version])
+            })
+            .collect();
+        SuiteBundleV1 {
+            v: VERSION,
+            generation: GENERATION,
+            suite: pending.suite,
+            provenance: Provenance::current(),
+            origin: pending.origin,
+            whole_key_digest: "key".into(),
+            whole: Some("p-1".into()),
+            policy: pending.policy,
+            guard: LaunchGuard {
+                env: BTreeMap::new(),
+                env_excluded: Vec::new(),
+                ignore: Vec::new(),
+            },
+            guard_digest: "guard".into(),
+            roster: pending.roster,
+            table,
+            units,
+            residue: Residue::default(),
+            state: SuiteState::Ready,
+        }
+    }
+
+    /// A bundle of about `target` bytes: the full roster, and a table of long paths that carries
+    /// the bulk. Each entry costs the same bytes, so the count is a division.
+    fn sized(target: usize) -> SuiteBundleV1 {
+        let roster: Vec<String> = (0..MAX_UNITS)
+            .map(|index| format!("tests/unit-{index:05}.t"))
+            .collect();
+        let entry = |index: usize| Input {
+            path: format!("src/generated/{index:08}/{}", "d".repeat(180)),
+            id: "f:00".into(),
+            oid: None,
+            oid_basis: None,
+        };
+        let one = base(&roster, vec![entry(0), entry(1)]);
+        let per = serde_json::to_vec(&entry(0)).unwrap().len() + 1;
+        let fixed = serde_json::to_vec(&one).unwrap().len() - 2 * per;
+        // The index digits grow with the table, so the estimate runs low: trim until it fits.
+        let mut count = target.saturating_sub(fixed) / per;
+        loop {
+            let bundle = base(&roster, (0..count.max(2)).map(entry).collect());
+            let size = serde_json::to_vec(&bundle).unwrap().len();
+            if size <= target || count <= 2 {
+                return bundle;
+            }
+            count -= (size - target) / per + 1;
+        }
+    }
+
+    /// The value at fraction `p` of `samples`, in milliseconds.
+    fn at(samples: &mut [f64], p: f64) -> f64 {
+        samples.sort_by(|a, b| a.total_cmp(b));
+        samples[((samples.len() - 1) as f64 * p).round() as usize]
+    }
+
+    #[test]
+    #[ignore = "a measurement: cargo test --release --bin stoop bundle_write_cost -- --ignored --nocapture"]
+    fn bundle_write_cost() {
+        let dir = std::env::temp_dir().join(format!("stoop-m1-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let area = Area::open(&dir, true).unwrap().unwrap();
+        for mib in [1usize, 2, 4, 8] {
+            let target = (mib * 1024 * 1024).min(MAX_BYTES as usize - 4096);
+            let bundle = sized(target);
+            let id = bundle.suite.clone();
+            let (mut encode_ms, mut write_ms, mut parse_ms) = (Vec::new(), Vec::new(), Vec::new());
+            let mut size = 0;
+            for _ in 0..20 {
+                let started = Instant::now();
+                let bytes = encode(&bundle).unwrap();
+                let encoded = Instant::now();
+                write_bytes(&area, &id, &bytes).unwrap();
+                let written = Instant::now();
+                assert!(matches!(read_bundle(&area, &id), ReadBundle::Current(_)));
+                let parsed = Instant::now();
+                size = bytes.len();
+                encode_ms.push((encoded - started).as_secs_f64() * 1e3);
+                write_ms.push((written - encoded).as_secs_f64() * 1e3);
+                parse_ms.push((parsed - written).as_secs_f64() * 1e3);
+            }
+            println!(
+                "M1 size={size} encode_p50={:.2}ms encode_p95={:.2}ms write_p50={:.2}ms write_p95={:.2}ms parse_p50={:.2}ms parse_p95={:.2}ms",
+                at(&mut encode_ms, 0.5),
+                at(&mut encode_ms, 0.95),
+                at(&mut write_ms, 0.5),
+                at(&mut write_ms, 0.95),
+                at(&mut parse_ms, 0.5),
+                at(&mut parse_ms, 0.95),
+            );
+        }
+        let _ = fs::remove_dir_all(&dir);
+    }
+}

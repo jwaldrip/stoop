@@ -639,3 +639,51 @@ fn a_shell_environment_hook_never_dispatches() {
     );
     full_form(&s.launches());
 }
+
+/// M2 (ignored, a measurement). The milliseconds one attribution launch costs in a Git root and in
+/// a plain directory, against the same runner run directly. `STOOP_BENCH_UNITS` sets the roster
+/// size, from 3 to 4096. Run it in release:
+/// `STOOP_BENCH_UNITS=1024 cargo test --release --test units_attribution attribution_pass_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "a measurement: STOOP_BENCH_UNITS=256 cargo test --release --test units_attribution attribution_pass_cost -- --ignored --nocapture"]
+fn attribution_pass_cost() {
+    let units: usize = std::env::var("STOOP_BENCH_UNITS")
+        .ok()
+        .and_then(|text| text.parse().ok())
+        .unwrap_or(256);
+    assert!(
+        (3..=4096).contains(&units),
+        "STOOP_BENCH_UNITS is 3 to 4096"
+    );
+    for git in [false, true] {
+        let s = Suite::new();
+        for index in 0..units - 3 {
+            s.write(&format!("tests/u{index:05}.t"), "src/shared.src\n");
+        }
+        if git {
+            s.write(".stoopignore", ".git\n");
+            s.git("work");
+        }
+        success(&s.hook(&[]));
+        edit(&s, 2);
+        let started = std::time::Instant::now();
+        let out = s.hook(&[]);
+        let pass = started.elapsed();
+        success(&out);
+        let launched = s.launches().len();
+        let mut names: Vec<String> = ROSTER.iter().map(|unit| unit.to_string()).collect();
+        for index in 0..units - 3 {
+            names.push(format!("tests/u{index:05}.t"));
+        }
+        let started = std::time::Instant::now();
+        for name in &names {
+            success(&s.direct(&s.root, &[name.as_str()], &[]));
+        }
+        let direct = started.elapsed();
+        println!(
+            "M2 git={git} units={units} launches={launched} pass_ms_per_launch={:.3} direct_ms_per_launch={:.3}",
+            pass.as_secs_f64() * 1e3 / units as f64,
+            direct.as_secs_f64() * 1e3 / units as f64,
+        );
+    }
+}
