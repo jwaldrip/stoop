@@ -454,6 +454,10 @@ fn probes() {
         "probe changed while the command ran",
     );
     pair.compare_file("probe.log");
+    assert_eq!(
+        fs::read_to_string(pair.roots[0].join("probe.log")).unwrap(),
+        "probe\nprobe\nprobe\nprobe\nprobe\nprobe\nfailed\ncheck\ncheck\ncheck\ncheck\nprobe\nprobe\n"
+    );
     pair.compare_file("probe.txt");
     pair.compare_store(".stoop");
 }
@@ -485,14 +489,22 @@ fn explain_many() {
 
 fn nonrecording() {
     let pair = Pair::new("nonrecording");
+    let args = [
+        "run",
+        "--root",
+        ".",
+        "--key",
+        "exit",
+        "--",
+        "sh",
+        "-c",
+        "cat in.txt >/dev/null; exit 3",
+    ];
+    let base = pair.command(0, "", &args, &[]).output().unwrap();
+    let subject = pair.command(1, "", &args, &[]).output().unwrap();
+    assert_eq!(base.status.code(), Some(3));
     contains(
-        &pair.run(
-            "D9 exit 3",
-            "exit",
-            &[],
-            "cat in.txt >/dev/null; exit 3",
-            &[],
-        ),
+        &pair.compare_output("D9 exit 3", &base, &subject),
         "stoop: run",
     );
     contains(
@@ -521,6 +533,11 @@ fn nonrecording() {
         ),
         "not recorded",
     );
+    for root in &pair.roots {
+        for key in ["exit", "norecord", "network", "gitread"] {
+            assert!(!root.join(format!(".stoop/proofs/{key}.json")).exists());
+        }
+    }
     pair.compare_store(".stoop");
 }
 
@@ -584,6 +601,9 @@ fn midrun() {
     }
     let text = pair.compare_output("D10 refusal", &outputs[0], &outputs[1]);
     contains(&text, "in.txt changed while the command ran");
+    for root in &pair.roots {
+        assert!(!root.join(".stoop/proofs/mid.json").exists());
+    }
     pair.compare_store(".stoop");
 }
 
