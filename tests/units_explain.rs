@@ -430,6 +430,7 @@ fn a_filter_that_selects_no_unit_is_explained() {
     let s = Suite::new();
     let words = ["./t", "{changed:*.none}"];
     success(&s.run(&s.root, &[], &words, &[]));
+    edit(&s, 2);
     let out = explain_is_read_only(&s, &words, &[], &[]);
     assert_eq!(code(&out), 1, "{}", err(&out));
     let (tracked_line, decision) = tail(&out);
