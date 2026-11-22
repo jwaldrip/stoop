@@ -248,11 +248,10 @@ fn i3_a_stat_of_another_units_file_is_not_a_read() {
     assert_eq!(proven(&s), ROSTER);
 }
 
-// I4: a disabled suite is not used. Its changed runs take the first-run form and print nothing a pass
-// would print. Explain names the state, and adding a unit keeps it disabled. `forget --units` clears it:
-// the first changed run after that is the full form, which records the suite again, and the next one
-// starts a pass, as A12 shows. Fails on a tree without a persisted state: the second change starts a
-// pass again.
+// I4: a disabled suite is not used. Its changed runs take the first-run form and print nothing a pass would
+// print. Explain names the state, and adding a unit keeps it disabled. `forget --units` clears it: the first
+// changed run after that is the full form, which records the suite again, and the next one starts a pass, as
+// A12 shows. Fails on a tree without a persisted state: the second change starts a pass again.
 #[test]
 fn i4_a_disabled_suite_takes_the_full_form_until_forget() {
     let s = Suite::new();
@@ -265,7 +264,18 @@ fn i4_a_disabled_suite_takes_the_full_form_until_forget() {
     let (reason, label) = disabled(&s);
     assert_eq!(reason, "read_unit");
 
+    // Explain runs before any full run records the changed tree, so it describes the disabled state.
     edit(&s, 3);
+    let explained = explain_with(&s, &knob);
+    assert_eq!(code(&explained), 1, "{}", text(&explained.stderr));
+    assert_eq!(
+        text(&explained.stderr).lines().last().unwrap(),
+        format!(
+            "stoop: no attribution pass: suite {id} disabled: {label}; run 'stoop forget --units {id}' after fixing it"
+        )
+    );
+
+    // The changed run is the full form, and it prints nothing that a pass or a disabled suite would print.
     s.clear_log();
     let out = s.hook(&knob);
     success(&out);
@@ -276,17 +286,7 @@ fn i4_a_disabled_suite_takes_the_full_form_until_forget() {
         "{err}"
     );
 
-    let explained = explain_with(&s, &knob);
-    assert_eq!(code(&explained), 1, "{}", text(&explained.stderr));
-    let explained_err = text(&explained.stderr);
-    let last = explained_err.lines().last().unwrap();
-    assert_eq!(
-        last,
-        format!(
-            "stoop: no attribution pass: suite {id} disabled: {label}; run 'stoop forget --units {id}' after fixing it"
-        )
-    );
-
+    // A new unit keeps the state.
     s.write("tests/d.t", "src/shared.src\n");
     edit(&s, 4);
     s.clear_log();
@@ -296,6 +296,8 @@ fn i4_a_disabled_suite_takes_the_full_form_until_forget() {
     assert_eq!(launches[0].ran().len(), 4, "{launches:?}");
     assert_eq!(disabled(&s), (reason.clone(), label.clone()));
 
+    // forget clears the state. The first changed run after it is the full form, which records the suite, and the
+    // next one starts a pass. The breach still holds, so that pass stops at its first unit.
     forget_units(&s, &id);
     edit(&s, 5);
     s.clear_log();
@@ -306,14 +308,61 @@ fn i4_a_disabled_suite_takes_the_full_form_until_forget() {
     edit(&s, 6);
     s.clear_log();
     let out = s.hook(&knob);
+    assert_eq!(code(&out), 125, "{}", text(&out.stderr));
     assert!(
         text(&out.stderr).contains("stoop: attribution pass: 4 units, one launch each"),
         "{}",
         text(&out.stderr)
     );
-    one_per_unit(
-        &s.launches(),
-        &["tests/a.t", "tests/b.t", "tests/c.t", "tests/d.t"],
+    one_per_unit(&s.launches(), &["tests/a.t"]);
+    assert_eq!(disabled(&s), (reason, label));
+}
+
+/// The shell hook the attribution tests used before W6-1. Its code never passes the unit to the runner, so each
+/// launch runs the runner's full form, which reads every unit.
+const UNIT_LESS_SHELL_SUITE: &str = "[[units.suite]]\nid = \"shell\"\nmatch = ['sh', '-c', './t; s=$?; : \"$STOOP_CHANGED\"; exit $s', 'sh']\nunits = ['tests/**/*.t']\n";
+const UNIT_LESS_SHELL_WORDS: [&str; 4] =
+    ["sh", "-c", "./t; s=$?; : \"$STOOP_CHANGED\"; exit $s", "sh"];
+
+// I9: a shell hook whose code never passes its unit to the runner runs the fixture's full form on every launch,
+// and that form reads every unit. The first launch is coupled: the suite is disabled at a with the read as its
+// label, the run exits 125 after one launch, and explain names the same state. Fails on a tree without check
+// (b): all three units launch and the status is 0.
+#[test]
+fn i9_a_shell_hook_that_does_not_pass_its_unit_reads_every_unit() {
+    let s = Suite::new();
+    s.config(UNIT_LESS_SHELL_SUITE);
+    success(&s.run(&s.root, &[], &UNIT_LESS_SHELL_WORDS, &[]));
+    edit(&s, 2);
+    s.clear_log();
+    let out = s.run(&s.root, &[], &UNIT_LESS_SHELL_WORDS, &[]);
+    let err = text(&out.stderr);
+    assert_eq!(code(&out), 125, "{err}");
+    let launches = s.launches();
+    assert_eq!(launches.len(), 1, "{launches:?}");
+    assert_eq!(launches[0].env("changed"), "tests/a.t", "{launches:?}");
+    assert_eq!(launches[0].ran(), ROSTER, "{launches:?}");
+    let (reason, label) = disabled(&s);
+    assert_eq!(reason, "read_unit");
+    assert_eq!(label, "tests/a.t read tests/b.t");
+    let id = suite_id(&s);
+    assert!(err.contains(&disabled_line(&id, &label)), "{err}");
+
+    // Explain, after a further change, names the same state as the run.
+    edit(&s, 3);
+    let mut command = s.stoop(&s.root);
+    command
+        .args(["explain", "--root"])
+        .arg(&s.root)
+        .arg("--")
+        .args(UNIT_LESS_SHELL_WORDS);
+    let explained = spawning(|| command.output()).unwrap();
+    assert_eq!(code(&explained), 1, "{}", text(&explained.stderr));
+    assert_eq!(
+        text(&explained.stderr).lines().last().unwrap(),
+        format!(
+            "stoop: no attribution pass: suite {id} disabled: {label}; run 'stoop forget --units {id}' after fixing it"
+        )
     );
 }
 
