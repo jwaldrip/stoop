@@ -1,7 +1,7 @@
 //! The decision: skip, or run and learn.
 
 #[path = "units/mod.rs"]
-mod units;
+pub(crate) mod units;
 pub(crate) use units::hook::safe;
 
 use crate::ignore::Ignore;
@@ -40,6 +40,8 @@ pub struct Opts {
     pub no_learn_volatile: bool,
     /// `stoop forget --volatile KEY`: forget what was learned instead of a proof.
     pub volatile_forget: bool,
+    /// `stoop forget --units ID`: forget a suite bundle instead of a whole proof.
+    pub units_forget: bool,
     /// Record runs that used the network (their results are invisible to a file trace).
     pub allow_network: bool,
     /// Extra text searched for runner variable names (a CI step's script body).
@@ -842,6 +844,60 @@ struct RunCx<'a> {
     remote: Option<Remote>,
 }
 
+/// These constraints also govern the later unit-execution path.
+fn eligible_for_units(cx: &RunCx<'_>, config_invalid: bool, independent_false: bool) -> bool {
+    let o = cx.o;
+    cx.hook.is_some()
+        && !cx.bypass
+        && !cx.explain
+        && cx.observe_runners
+        && !config_invalid
+        && !independent_false
+        && !o.no_record
+        && !o.allow_network
+        && o.probes.is_empty()
+        && o.ignore.is_empty()
+        && o.ignore_env.is_empty()
+}
+
+fn unit_bookkeeping(
+    cx: &RunCx<'_>,
+    config: &units::config::Config,
+    config_invalid: bool,
+    independent_false: bool,
+) -> Option<units::bundle::Pending> {
+    if !eligible_for_units(cx, config_invalid, independent_false) {
+        return None;
+    }
+    let hook = cx.hook.as_ref()?;
+    let suite = config.select(&hook.original, cx.rel_cwd).ok().flatten();
+    let configured = suite
+        .and_then(|suite| suite.units.as_ref())
+        .map(|patterns| units::filter::Filter::configured(patterns));
+    let inline = (!hook.shell_env_code)
+        .then(|| {
+            hook.placeholders
+                .iter()
+                .flatten()
+                .find_map(|placeholder| placeholder.filter.as_ref())
+        })
+        .flatten();
+    let filter = inline.or(configured.as_ref())?;
+    let ignore = units::universe::catalog_ignore(cx.root, &cx.o.ignore, &cx.o.transient).ok()?;
+    let catalog = units::universe::discover(cx.root, &ignore, filter, configured.as_ref()).ok()?;
+    units::bundle::pending(units::bundle::PendingSpec {
+        argv: &hook.original,
+        cwd: cx.rel_cwd,
+        scope: cx.scope.as_deref(),
+        label: cx.o.key.as_deref(),
+        source: if inline.is_some() { "filter" } else { "config" },
+        filter: filter.text(),
+        units: catalog.units.into_iter().map(|unit| unit.0).collect(),
+        config: config.key_source(),
+        config_suite: suite.map(|suite| suite.id.as_str()),
+    })
+}
+
 struct Lookup {
     proofs: Vec<Proof>,
     hit_idx: Option<usize>,
@@ -1228,7 +1284,25 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         remote,
     };
     let lookup = legacy_lookup(&cx, &key);
-    legacy_finish(cx, key, lookup)
+    // The roster is taken before the command launches. Only a run that launches takes it: a
+    // whole-command hit that is skipped never walks the tree. This is the skip legacy_finish applies.
+    let launches = cx.full_reason.is_some() || lookup.hit_idx.is_none();
+    let pending = if launches {
+        unit_bookkeeping(&cx, &config, config_invalid, independent_false)
+    } else {
+        None
+    };
+    let outcome = legacy_finish(cx, key, lookup);
+    if let (Some(pending), How::Recorded { proof: digest }) = (pending, &outcome.how) {
+        if let Some(proof) = store
+            .load(&outcome.key)
+            .into_iter()
+            .find(|proof| proof.digest() == *digest)
+        {
+            units::bundle::record(&volatile_store, pending, &outcome.key, digest, proof);
+        }
+    }
+    outcome
 }
 
 fn legacy_lookup(cx: &RunCx<'_>, key: &str) -> Lookup {
