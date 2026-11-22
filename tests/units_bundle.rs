@@ -946,8 +946,15 @@ fn a_hard_linked_suite_lock_is_never_taken() {
 fn a_warm_whole_command_hit_never_runs_the_suite_inventory() {
     let f = Fixture::new();
     // Inputs are committed, as in a real repository. An untracked input has no basis, so a run
-    // that reads one is never recorded and can never become a hit.
+    // that reads one is never recorded. The policy forces every hook run to launch when the
+    // default branch is unknown or HEAD is on it, so a default is configured and HEAD is elsewhere.
+    fs::write(
+        f.root.join(".stoop.toml"),
+        "[units]\ndefault_branch = \"main\"\n",
+    )
+    .unwrap();
     git(&f.root, &["init", "-q"]);
+    git(&f.root, &["symbolic-ref", "HEAD", "refs/heads/work"]);
     git(&f.root, &["add", "-A"]);
     git(
         &f.root,
