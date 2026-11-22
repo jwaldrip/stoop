@@ -1563,7 +1563,13 @@ fn build_outputs(
     let mut reasons = Vec::new();
     let mut verified = Vec::new();
     for (key, (id, post)) in keys.into_iter().zip(ids) {
-        if landing_verified(trace, key, id.as_ref().map(|(id, _)| id.as_str()), &post) {
+        let output_id = id.as_ref().map(|(id, _)| id.as_str());
+        let direct = trace.bound_priors.contains(key)
+            && output_id.is_some_and(|id| {
+                (id.starts_with("f:") || id.starts_with("x:"))
+                    && trace.priors.get(key).is_some_and(|prior| prior != id)
+            });
+        if direct || landing_verified(trace, key, output_id, &post) {
             verified.push(key.clone());
         }
         match id.map(|(id, _)| id) {

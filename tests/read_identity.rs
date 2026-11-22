@@ -534,14 +534,15 @@ fn a_file_read_then_written_by_the_command_still_records() {
     let case = Case::new("t8");
     case.file("f", b"start\n");
     age();
-    let out = run(&case, "t8", "cat f >/dev/null; echo x >> f", &[]);
+    let out = run(
+        &case,
+        "t8",
+        "exec bash -c 'cat f >/dev/null; echo x >> f'",
+        &[],
+    );
     assert_recorded(&out, &case, "t8");
     let stored = proof(&case, "t8");
-    assert!(stored["inputs"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|entry| entry["path"] != "f"));
+    assert_file_entry(&stored, "inputs", "f", b"start\n");
     assert_file_entry(&stored, "priors", "f", b"start\n");
     assert_file_entry(&stored, "outputs", "f", b"start\nx\n");
 }
