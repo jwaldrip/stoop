@@ -451,8 +451,10 @@ int main(void) {
         assert_eq!(f.log(), "pytest\n");
     }
 
-    // The shim delivers the child's stop before its parent's fork event on every run,
-    // whichever order the kernel reports them in. The lineage must survive that order.
+    // The shim gives the tracer the child's stop before the parent's fork event on every
+    // run, whichever order the kernel reports them in. When the tracer resumes the child
+    // before it knows the child's lineage, the shim returns the child's next event before
+    // the held fork event, so the lost lineage shows up in the observation below.
     #[test]
     fn child_stop_before_fork_event_keeps_lineage() {
         let f = Fixture::new();
@@ -467,6 +469,7 @@ int main(void) {
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ptrace.h>
@@ -474,11 +477,11 @@ int main(void) {
 #include <sys/wait.h>
 #include <unistd.h>
 
-// The kernel may report the child's initial stop before or after its parent's fork
-// event. This shim always returns the child's stop first: it holds the parent's fork
-// event, waits for the child's own stop, and returns the held event on the next wait.
-static pid_t held;
-static int held_status, phase;
+// Phase 0 waits for the first event. Phase 1 has returned the child's stop and holds the
+// parent's fork event. Phase 2 has finished the hold. Phase 3 is an early resume: the
+// child's next event goes first. Phase 4 has returned the held fork event.
+static pid_t held, child;
+static int held_status, phase, child_resumed;
 
 static void __attribute__((noreturn)) fail(const char *message) {
     (void)!write(2, message, strlen(message));
@@ -494,11 +497,43 @@ static void record(const char *order) {
     }
 }
 
+long ptrace(enum __ptrace_request request, ...) {
+    static long (*real_ptrace)(enum __ptrace_request, ...);
+    if (!real_ptrace) real_ptrace = dlsym(RTLD_NEXT, "ptrace");
+    va_list args;
+    va_start(args, request);
+    pid_t pid = va_arg(args, int);
+    void *addr = va_arg(args, void *);
+    void *data = va_arg(args, void *);
+    va_end(args);
+    if (phase == 1 && pid == child &&
+        (request == PTRACE_CONT || request == PTRACE_SYSCALL || request == PTRACE_DETACH))
+        child_resumed = 1;
+    return real_ptrace(request, pid, addr, data);
+}
+
 pid_t waitpid(pid_t pid, int *status, int options) {
     static pid_t (*real_waitpid)(pid_t, int *, int);
     if (!real_waitpid) real_waitpid = dlsym(RTLD_NEXT, "waitpid");
     if (pid == -1 && phase == 1) {
+        if (child_resumed) {
+            // The tracer resumed the child before it saw the parent's fork event, so the
+            // child's next event goes first. Bounded, so a stalled child fails loudly.
+            phase = 3;
+            for (int i = 0; i < 5000; i++) {
+                pid_t next = real_waitpid(child, status, __WALL | WNOHANG);
+                if (next == child) return next;
+                if (next < 0 && errno != EINTR) fail("order shim: waiting for the resumed child failed\n");
+                usleep(1000);
+            }
+            fail("order shim: the resumed child produced no event\n");
+        }
         phase = 2;
+        *status = held_status;
+        return held;
+    }
+    if (pid == -1 && phase == 3) {
+        phase = 4;
         *status = held_status;
         return held;
     }
@@ -517,7 +552,7 @@ pid_t waitpid(pid_t pid, int *status, int options) {
     held_status = *status;
     unsigned long message = 0;
     if (ptrace(PTRACE_GETEVENTMSG, held, (void *)0, &message) < 0) fail("order shim: no child pid\n");
-    pid_t child = (pid_t)message;
+    child = (pid_t)message;
     for (int i = 0; i < 5000; i++) {
         int child_status = 0;
         pid_t got = real_waitpid(child, &child_status, __WALL | WNOHANG);
