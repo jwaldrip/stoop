@@ -1163,10 +1163,11 @@ fn a_non_unit_file_renamed_in_a_listed_directory_is_a_change() {
     assert_eq!(launched(&s), [""]);
 }
 
-/// STOP 4: a top-level unit added since the full run is covered by its own proof. The whole proof records no root listing
-/// here, so once the subset has proved the unit, the next run skips. The root never excuses a listing change (spec 3.10).
+/// STOP 4: a top-level unit added since the full run is covered by its own proof, and the next run skips. The whole proof
+/// records no root listing, so no root excuse is needed: the subset proves the unit, and the skip then consults only the
+/// unit's proof (spec 3.10).
 #[test]
-fn a_top_level_unit_added_since_the_full_run_is_never_excused() {
+fn a_top_level_unit_added_since_the_full_run_is_covered_by_its_own_proof() {
     let s = Suite::new();
     success(&passed(&s, &[]));
     s.write("z.t", "src/c.src\n");
@@ -1275,12 +1276,14 @@ fn a_removed_file_a_unit_reads_makes_that_unit_affected() {
 }
 
 /// STOP 4, files a unit reads: a file that only a removed unit's version reads is not covered, because that unit is no
-/// longer on the roster. The full command runs.
+/// longer on the roster. The flag appears after the unit's first proof, so the unit's own run covers it. The full command
+/// runs once the unit is removed.
 #[test]
 fn a_file_read_only_by_a_removed_units_version_is_a_change() {
     let s = Suite::new();
     success(&passed(&s, &[]));
     s.write("tests/d.t", "src/c.src\n");
+    success(&split(&s, &[]));
     s.write("tests/d.flag", "ok\n");
     success(&split(&s, &[]));
     fs::remove_file(s.path("tests/d.t")).unwrap();
@@ -1508,7 +1511,8 @@ fn a_new_failing_runner_only_test_in_src_beside_every_unit_edited_is_a_full_run(
 }
 
 /// An ignored test (`tests/z.t` is in `.stoopignore`, so it is no unit) that the full form runs, and that fails once
-/// `T_IF` names it, beside an edit to a unit. The full form runs and fails; a subset of the unit would pass.
+/// `T_IF` names it, beside an edit to a unit. A subset of the unit would pass. The catalog reads `.stoopignore`, which no
+/// unit reads, so the residue refuses the subset before the listing is looked at; the test pins that the full form runs.
 #[test]
 fn an_ignored_test_beside_a_unit_edit_is_a_full_run() {
     let s = Suite::new();
@@ -1522,7 +1526,6 @@ fn an_ignored_test_beside_a_unit_edit_is_a_full_run() {
     let out = split(&s, &env);
     assert_eq!(code(&out), 1, "{}", stderr(&out));
     assert!(full(&out), "{}", stderr(&out));
-    assert!(stderr(&out).contains("tests changed"), "{}", stderr(&out));
     assert_eq!(launched(&s), [""]);
 }
 
