@@ -594,9 +594,9 @@ fn decide_cost() {
         );
         ms
     });
-    // An edit to a file in a directory that the full command lists leaves every listing as it was, and no unit
-    // reads the file, so the run skips.
-    s.write("docs/readme.md", "edited\n");
+    // Removing a unit's file changes its directory's listing, which the legacy proof refuses. The engine skips through the
+    // bundle's excuse for that name (E16), and the first skip drops the unit's versions under the lock.
+    s.remove("tests/u00000.t");
     let skip_ms = median_ms(|| {
         let started = Instant::now();
         let skip = split(&s, &[]);
@@ -1033,10 +1033,12 @@ fn the_skip_line_counts_the_roster_units_inputs_only() {
     success(&out);
     assert_eq!(decision(&out), "skip", "{}", stderr(&out));
     let (units, inputs) = skip_counts(&stderr(&out));
+    // Explain also prints the unit universe's line, which has no input count. The suite's line, with its inputs, is the one
+    // a skip is checked against.
     let tracked = stderr(&explain(&s, &[]))
         .lines()
-        .find(|line| line.starts_with("stoop: tracked "))
-        .expect("a tracked line")
+        .find(|line| line.starts_with("stoop: tracked ") && line.contains(" inputs; "))
+        .expect("a tracked line with its inputs")
         .to_owned();
     assert!(
         tracked.starts_with(&format!("stoop: tracked {units} units, {inputs} inputs;")),
@@ -1197,7 +1199,7 @@ fn a_disagreement_waits_for_a_suite_lock_that_is_released_soon() {
         .args(["run", "--root"])
         .arg(&s.root)
         .args(["--", "./t", HOOK]);
-    for (name, value) in with(&borrowed, &[("STOOP_FULL", "1")]) {
+    for (name, value) in with(&borrowed, &[SPLIT, ("STOOP_FULL", "1")]) {
         command.env(name, value);
     }
     let child = spawning(|| {
