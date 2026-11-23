@@ -3,6 +3,7 @@
 
 use serde_json::Value;
 use std::ffi::CString;
+use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
@@ -1156,6 +1157,96 @@ fn clean_pass_matches_the_base() {
         subject.keys().collect::<Vec<_>>(),
         "D18 store file list"
     );
+}
+
+/// The run and explain of the hook D19 and D20 use, and the tree they run on: a runner that reads each unit and
+/// `in.txt`, and two units that read `in.txt`.
+const RUN_HOOK: [&str; 6] = [
+    "run",
+    "--key",
+    "clean",
+    "--",
+    "./runner",
+    "{changed:**/*.t}",
+];
+const EXPLAIN_HOOK: [&str; 6] = [
+    "explain",
+    "--key",
+    "clean",
+    "--",
+    "./runner",
+    "{changed:**/*.t}",
+];
+
+fn hooked_tree(pair: &Pair) {
+    pair.write(
+        "runner",
+        "#!/bin/sh\nfor word in \"$@\"; do\n\tcat \"$word\" >/dev/null\ndone\ncat in.txt >/dev/null\nprintf 'unit\\n'\n",
+    );
+    pair.write("tests/a.t", "in.txt\n");
+    pair.write("tests/b.t", "in.txt\n");
+    for root in &pair.roots {
+        fs::set_permissions(root.join("runner"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+}
+
+/// D19: with `STOOP_SPLIT` unset, a cold run, a changed run that is a pass, an unchanged run after it and explain print,
+/// exit and store what the base does. The engine adds nothing to a hooked run that does not ask for it.
+#[test]
+#[ignore = "requires STOOP_BASE_BIN and a Linux tracer"]
+fn d19_switch_off_matches_the_base() {
+    let pair = Pair::new("switch-off");
+    hooked_tree(&pair);
+    contains(&pair.step("D19 cold", "", &RUN_HOOK, &[]), "recorded");
+    pair.write("in.txt", "two\n");
+    contains(
+        &pair.step("D19 pass", "", &RUN_HOOK, &[]),
+        "stoop: attribution pass: 2 units, one launch each",
+    );
+    pair.step("D19 unchanged after the pass", "", &RUN_HOOK, &[]);
+    pair.step("D19 explain", "", &EXPLAIN_HOOK, &[]);
+    pair.compare_store(".stoop");
+}
+
+/// The same steps as D19, run by the subject alone with `STOOP_SPLIT` set to `value`, or unset. Each step's status,
+/// stdout and normalized stderr is returned.
+fn subject_steps(pair: &Pair, value: Option<&OsStr>) -> Vec<(Option<i32>, Vec<u8>, String)> {
+    let run = |args: &[&str]| {
+        let mut command = pair.command(1, "", args, &[]);
+        if let Some(value) = value {
+            command.env("STOOP_SPLIT", value);
+        }
+        let out = command.output().unwrap();
+        let stderr = normalize(&String::from_utf8_lossy(&out.stderr), &pair.roots[1]);
+        (out.status.code(), out.stdout, stderr)
+    };
+    hooked_tree(pair);
+    let mut steps = vec![run(&RUN_HOOK)];
+    pair.write("in.txt", "two\n");
+    steps.push(run(&RUN_HOOK));
+    steps.push(run(&RUN_HOOK));
+    steps.push(run(&EXPLAIN_HOOK));
+    steps
+}
+
+/// D20: `STOOP_SPLIT` set to `0`, to an empty value or to a value that is not UTF-8 is the same as unset. Each step of
+/// D19 prints, exits and stores the same with it as without it.
+#[test]
+#[ignore = "requires STOOP_BASE_BIN and a Linux tracer"]
+fn d20_a_falsy_switch_is_the_same_as_unset() {
+    let plain = Pair::new("falsy-unset");
+    let plain_steps = subject_steps(&plain, None);
+    let plain_store = store_snapshot(&plain.roots[1].join(".stoop"));
+    for value in [OsStr::new("0"), OsStr::new(""), OsStr::from_bytes(b"\xff")] {
+        let pair = Pair::new("falsy-set");
+        let steps = subject_steps(&pair, Some(value));
+        assert_eq!(steps, plain_steps, "D20 {value:?}: the steps");
+        assert_eq!(
+            store_snapshot(&pair.roots[1].join(".stoop")),
+            plain_store,
+            "D20 {value:?}: the store"
+        );
+    }
 }
 
 #[test]
