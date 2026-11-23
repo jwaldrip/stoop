@@ -122,7 +122,7 @@ fn launch(frame: &Frame<'_, '_>, mut pass: Pass, plan: &Plan) -> Outcome {
             .map(|affected| (affected.unit.clone(), affected.changed.clone()))
             .collect()
     };
-    let ran = attribution::launch_each(
+    let mut ran = attribution::launch_each(
         cx,
         frame.hook,
         frame.ignore,
@@ -137,6 +137,7 @@ fn launch(frame: &Frame<'_, '_>, mut pass: Pass, plan: &Plan) -> Outcome {
     for name in run::HOOK_ENV {
         std::env::set_var(name, "");
     }
+    ran.unread = attribution::unread_excuses(&pass, &plan.excused, &ran.proven);
     let status = attribution::finish(&mut pass, frame.lookup, frame.pending, &ran, planned, quiet);
     Outcome {
         status,
@@ -259,6 +260,7 @@ mod tests {
             units: 30,
             inputs: 7,
             affected,
+            excused: Vec::new(),
         });
         assert!(
             line.starts_with(

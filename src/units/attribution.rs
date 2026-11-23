@@ -6,6 +6,7 @@
 
 use super::bundle::{self, LaunchGuard, Pass, Pending, Scratch, Start, Stored};
 use super::config::Config;
+use super::engine::Excused;
 use super::expand;
 use super::hook::{safe, Base, FileMode, Hook};
 use super::independence::{Named, Roster, Violation, Written};
@@ -17,7 +18,7 @@ use crate::input::Input;
 use crate::pathutil::to_key;
 use crate::proof::now;
 use crate::run::{self, How, Lookup, Outcome, RunCx};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
@@ -145,6 +146,23 @@ impl Breach {
     }
 }
 
+/// A name that an affected unit's stored proof named, which the listing check excused, and that no new proof of this run
+/// reads by content (spec 3.10, rv34). Nothing covers the name after the run, so the run has no verdict.
+pub(super) struct Unread {
+    path: String,
+    units: Vec<String>,
+}
+
+impl Unread {
+    fn line(&self) -> String {
+        format!(
+            "stoop: this run has no verdict (exit 125): {} appeared, and no unit's new proof reads it; earlier proofs of {} named it",
+            safe(&self.path),
+            safe(&self.units.join(", "))
+        )
+    }
+}
+
 /// What a loop of launches came to (spec 3.7, 3.11).
 pub(super) struct Ran {
     /// The first nonzero launch status, in launch order.
@@ -159,6 +177,10 @@ pub(super) struct Ran {
     pub(super) stopped: Option<(usize, Violation)>,
     /// The skipped units whose proofs the run's writes broke (spec 3.7): at most one per level.
     pub(super) breaches: Vec<Breach>,
+    /// The units whose new proof this run stored (spec 3.10, rv34).
+    pub(super) proven: BTreeSet<String>,
+    /// The excused names that no new proof of this run reads by content (spec 3.10, rv34).
+    pub(super) unread: Vec<Unread>,
 }
 
 /// The launches of a pass or a subset, one traced launch per unit in `units` order (spec 3.3, 3.7, 3.11). Each launch
@@ -188,6 +210,8 @@ pub(super) fn launch_each(
         over_budget: 0,
         stopped: None,
         breaches: Vec::new(),
+        proven: BTreeSet::new(),
+        unread: Vec::new(),
     };
     let mut listing_breach: Option<Breach> = None;
     for (index, unit) in units.iter().enumerate() {
@@ -263,7 +287,12 @@ pub(super) fn launch_each(
                     match launch::judge(&context, &trace, &observed) {
                         Verdict::Proven(kept) => {
                             let (old_inputs, old_outputs) = pass.held_of(unit);
-                            match pass.record(&launch.unit, &kept.inputs, &kept.outputs, now()) {
+                            let stored =
+                                pass.record(&launch.unit, &kept.inputs, &kept.outputs, now());
+                            if matches!(stored, Stored::Stored) {
+                                ran.proven.insert(unit.clone());
+                            }
+                            match stored {
                                 Stored::OverBudget => ran.over_budget += 1,
                                 Stored::Stored | Stored::WriteFailed => {
                                     named.forget(unit, &paths(&old_inputs), &paths(&old_outputs));
@@ -424,9 +453,42 @@ pub(super) fn finish(
         for breach in &ran.breaches {
             say(quiet, breach.line());
         }
+        for unread in &ran.unread {
+            say(quiet, unread.line());
+        }
     }
-    let no_verdict = ran.unlaunched || stopped_early || !ran.breaches.is_empty();
+    let no_verdict =
+        ran.unlaunched || stopped_early || !ran.breaches.is_empty() || !ran.unread.is_empty();
     exit_status(ran.status, no_verdict)
+}
+
+/// The excused names that no new proof of this run reads by content (spec 3.10, rv34). A unit counts only when this run
+/// stored its new proof, and the proof must hold the name as a regular file (`f:` or `x:`), as `covered_reads` takes it.
+pub(super) fn unread_excuses(
+    pass: &Pass,
+    excused: &[Excused],
+    proven: &BTreeSet<String>,
+) -> Vec<Unread> {
+    excused
+        .iter()
+        .filter(|excused| {
+            !excused
+                .units
+                .iter()
+                .filter(|unit| proven.contains(*unit))
+                .any(|unit| {
+                    let (inputs, _) = pass.held_of(unit);
+                    inputs.iter().any(|input| {
+                        input.path == excused.path
+                            && (input.id.starts_with("f:") || input.id.starts_with("x:"))
+                    })
+                })
+        })
+        .map(|excused| Unread {
+            path: excused.path.clone(),
+            units: excused.units.clone(),
+        })
+        .collect()
 }
 
 /// The paths of a list of inputs or outputs, in their order.
