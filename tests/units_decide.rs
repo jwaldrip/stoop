@@ -1336,11 +1336,12 @@ fn a_deleted_input_that_a_unit_reads_is_not_a_skip() {
     let ran = split(&s, &[]);
     assert_eq!(
         decision(&explained),
-        "full",
+        "subset",
         "explain: {}",
         stderr(&explained)
     );
-    assert_eq!(decision(&ran), "full", "run: {}", stderr(&ran));
+    assert_eq!(decision(&ran), "subset", "run: {}", stderr(&ran));
+    assert_eq!(s.launches().len(), 1, "the subset launches c alone");
     assert!(
         stderr(&explained).contains("stoop: affected tests/c.t: src/c.src changed"),
         "{}",
