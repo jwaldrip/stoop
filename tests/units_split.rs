@@ -1111,20 +1111,34 @@ fn run_model(seed: u64, steps: usize) {
     }
 }
 
-/// STOP 4 (spec 3.10, E16 as amended): a no-op after a subset that added a unit skips. The subset proved the new unit, so
-/// its own version covers it, and the whole proof's listing of `tests` gained only that name. This is M1 seed 1, step 15.
+/// STOP 4 (spec 3.10, E16 as amended): a no-op after a subset that added a unit skips. The subset launched only the new
+/// unit and proved it, so its own version covers it, and the whole proof's listing of `tests` gained only that name. The
+/// no-op is the engine's skip (`no tracked input changed`), not the legacy hit. This is M1 seed 1, step 15.
 #[test]
 fn m1_seed1_step15_a_no_op_after_a_subset_that_added_a_unit_skips() {
     let s = Suite::new();
     success(&passed(&s, &[]));
     s.write("tests/d.t", "src/c.src\n");
-    success(&split(&s, &[]));
+    s.clear_log();
+    let added = split(&s, &[]);
+    success(&added);
+    assert_eq!(launched(&s), ["tests/d.t"], "{}", stderr(&added));
     s.clear_log();
     let explained = explain(&s, &[]);
     let out = split(&s, &[]);
     success(&out);
     assert!(skipped(&explained), "{}", stderr(&explained));
     assert!(skipped(&out), "{}", stderr(&out));
+    assert!(
+        stderr(&explained).contains("no tracked input changed"),
+        "{}",
+        stderr(&explained)
+    );
+    assert!(
+        stderr(&out).contains("no tracked input changed"),
+        "{}",
+        stderr(&out)
+    );
     assert!(s.launches().is_empty(), "a skip launches nothing");
 }
 
