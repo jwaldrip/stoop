@@ -344,8 +344,12 @@ fn t10_a_new_unit_is_not_skipped() {
     s.clear_log();
     let out = split(&s, &[]);
     success(&out);
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
-    assert_eq!(s.launches().len(), 1, "the full form launches once");
+    assert_eq!(decision(&out), "subset", "{}", stderr(&out));
+    assert_eq!(
+        s.launches().len(),
+        1,
+        "the subset launches the new unit alone"
+    );
 }
 
 /// T11 (D11): a unit that Git ignores after its pass leaves the roster while its file stays. The next run takes the
