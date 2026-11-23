@@ -1606,8 +1606,9 @@ pub(crate) fn counts(store: &Path, id: &str, units: &[String], key: &str) -> (us
     (inputs.len(), proven)
 }
 
-/// The residue of the whole command's proof for `key`, when the suite's current proof has one that is known and not
-/// empty: its count and its first paths (spec 3.8). It reads the store and takes no lock, so `stoop explain` can call it.
+/// The residue of the whole command's proof for `key`, when the suite is not disabled and its current proof has one that
+/// is known and not empty: its count and its first paths (spec 3.8). A disabled suite names no residue, because its
+/// proofs count for nothing (spec 3.6). It reads the store and takes no lock, so `stoop explain` can call it.
 pub(crate) fn known_residue(store: &Path, id: &str, key: &str) -> Option<(usize, Vec<String>)> {
     let Ok(Some(area)) = Area::open(store, false) else {
         return None;
@@ -1615,7 +1616,9 @@ pub(crate) fn known_residue(store: &Path, id: &str, key: &str) -> Option<(usize,
     let ReadBundle::Current(bundle) = read_bundle(&area, id) else {
         return None;
     };
+    // A disabled suite names no residue: its proofs count for nothing (spec 3.6), as `counts` finds.
     if bundle.generation != GENERATION
+        || !matches!(bundle.state, SuiteState::Ready)
         || !recorded(&bundle, &digest_text("stoop whole key v1", key))
     {
         return None;
