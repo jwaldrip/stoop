@@ -563,7 +563,12 @@ fn an_expired_unit_proof_is_affected() {
     );
     s.clear_log();
     let out = split(&s, &[]);
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert_eq!(decision(&out), "pass", "{}", stderr(&out));
+    assert_eq!(
+        s.launches().len(),
+        3,
+        "the attribution pass launches each unit once"
+    );
 }
 
 /// The cost of an engine skip against a legacy hit at `STOOP_BENCH_UNITS` roster units (256, 1024 or 4096). It prints
