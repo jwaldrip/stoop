@@ -221,7 +221,13 @@ pub(super) fn launch_each(
         std::env::set_var("STOOP_CHANGED", &launch.value);
         std::env::set_var("STOOP_UNITS", &launch.value);
         std::env::set_var("STOOP_CHANGED_FILE", &lists.changed);
-        std::env::set_var("STOOP_CHANGED_INPUTS", &inputs);
+        // Above 64 KiB the variable is unset, and the list file carries the list (spec 3.11, rv31). The kernel refuses one
+        // environment string over 128 KiB, so a longer export would stop the launch from starting.
+        if inputs.len() <= CHANGED_INPUTS_ENV_MAX {
+            std::env::set_var("STOOP_CHANGED_INPUTS", &inputs);
+        } else {
+            std::env::remove_var("STOOP_CHANGED_INPUTS");
+        }
         std::env::set_var("STOOP_CHANGED_INPUTS_FILE", &lists.inputs);
         // The root listing before the launch, which the root guard compares with the one after it (spec 3.5).
         let root_before = launch::root_names(cx.root);
@@ -323,6 +329,10 @@ fn file_breach(skipped: &[SkippedUnit], written: &Written) -> Option<Breach> {
         })
     })
 }
+
+/// The largest changed-inputs list that `STOOP_CHANGED_INPUTS` exports whole, in bytes (spec 3.11, rv31). Above it the
+/// variable is unset and the list file carries the list.
+const CHANGED_INPUTS_ENV_MAX: usize = 64 * 1024;
 
 /// The changed inputs of one launch, as `STOOP_CHANGED_INPUTS` holds them (spec 3.11): the cwd-relative paths of the
 /// changed keys inside the root, sorted, one per line. A pass has none, so its text is empty.
