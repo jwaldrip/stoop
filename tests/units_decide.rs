@@ -676,13 +676,17 @@ fn t20_a_change_that_not_every_unit_reads_is_not_global() {
     s.clear_log();
     let out = split(&s, &[]);
     success(&out);
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert_eq!(decision(&out), "subset", "{}", stderr(&out));
     assert!(
         !stderr(&out).contains("every unit reads it"),
         "{}",
         stderr(&out)
     );
-    assert_eq!(s.launches().len(), 1, "the full form launches once");
+    assert_eq!(
+        s.launches().len(),
+        2,
+        "the subset launches a and b, each once"
+    );
 }
 
 /// T21: explain names the units a change affects and no others: the two that read the changed source, not the third.
