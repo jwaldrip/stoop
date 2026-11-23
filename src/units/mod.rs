@@ -1,6 +1,7 @@
 pub(crate) mod attribution;
 pub(crate) mod bundle;
 pub(crate) mod config;
+pub(crate) mod engine;
 pub(crate) mod expand;
 pub(crate) mod filter;
 pub(crate) mod hook;

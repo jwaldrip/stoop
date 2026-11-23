@@ -223,7 +223,7 @@ impl Journal {
             }
             // `stoop sh` never activates hooks, so a unit outcome cannot reach the journal. If one
             // did, it would be blocked like any unrecorded step.
-            How::Units => {
+            How::Units | How::UnitsSkipped => {
                 self.blocked = true;
                 self.save()?;
                 return Ok(());
