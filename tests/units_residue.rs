@@ -90,8 +90,9 @@ fn i9_explain_names_a_lint_the_full_command_runs() {
     );
 }
 
-/// I10: a unit file that the full command runs and no unit reads is residue, until a filter makes it a unit. Then the
-/// residue of the second suite is empty.
+/// I10: a unit file that the full command runs and no unit reads is residue, until a filter makes it a unit. The
+/// runner also probes that file's `.flag`, which only the full command probes, so the residue holds the probe too.
+/// Then the residue of the second suite, whose filter makes the file a unit, is empty.
 #[test]
 fn i10_a_file_the_full_command_runs_is_residue_until_a_filter_takes_it() {
     let s = Suite::new();
@@ -100,8 +101,8 @@ fn i10_a_file_the_full_command_runs_is_residue_until_a_filter_takes_it() {
     success(&s.hook(&[("T_U", "1")]));
     let r = residue(&s);
     assert_eq!(r["state"], "provisional", "{r}");
-    assert_eq!(r["count"], 1, "{r}");
-    assert_eq!(paths(&r), ["e2e/x.u"], "{r}");
+    assert_eq!(r["count"], 2, "{r}");
+    assert_eq!(paths(&r), ["e2e/x.flag", "e2e/x.u"], "{r}");
 
     let wide = "{changed:**/*.t|**/*.u|!slow/**}";
     let t = Suite::new();
