@@ -816,11 +816,19 @@ fn run_model(seed: u64, steps: usize) {
         s.clear_log();
         let oracle = s.direct(&s.root, &[], &[]);
         let report = || {
+            let mut listing: Vec<String> = std::fs::read_dir(s.path("tests"))
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect();
+            listing.sort();
             format!(
-                "seed {seed}, step {step}\noperations:\n  {}\nsubject exit {}, oracle exit {}\nsubject stderr:\n{}",
+                "seed {seed}, step {step}\noperations:\n  {}\nsubject exit {}, oracle exit {}\ntests/ now: {}\nsubject stderr:\n{}",
                 operations.join("\n  "),
                 code(&subject),
                 code(&oracle),
+                listing.join(" "),
                 stderr(&subject)
             )
         };
@@ -934,4 +942,109 @@ fn an_added_unit_whose_proof_expired_is_affected_not_excused() {
         stderr(&out)
     );
     assert_eq!(launched(&s), ["tests/d.t"]);
+}
+
+/// STOP 4, files a unit reads: a file that a unit reads and that appears after the full run is covered by that unit's
+/// own proof, so the next run skips. The whole proof never held the file.
+#[test]
+fn a_file_a_unit_reads_that_appears_after_the_full_run_is_covered_by_that_unit() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.write("tests/a.flag", "ok\n");
+    s.clear_log();
+    success(&split(&s, &[]));
+    assert_eq!(launched(&s), ["tests/a.t"]);
+    s.clear_log();
+    let explained = explain(&s, &[]);
+    let out = split(&s, &[]);
+    success(&out);
+    assert!(skipped(&explained), "{}", stderr(&explained));
+    assert!(skipped(&out), "{}", stderr(&out));
+    assert!(s.launches().is_empty(), "a skip launches nothing");
+}
+
+/// STOP 4, files a unit reads: a file that no unit reads and that appears after the full run is a change, so the full
+/// command runs.
+#[test]
+fn a_file_no_unit_reads_that_appears_after_the_full_run_is_a_change() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.write("tests/notes.txt", "read by no unit\n");
+    s.clear_log();
+    let explained = explain(&s, &[]);
+    let out = split(&s, &[]);
+    success(&out);
+    assert!(
+        stderr(&explained).contains("(tests changed)"),
+        "{}",
+        stderr(&explained)
+    );
+    assert!(stderr(&out).contains("(tests changed)"), "{}", stderr(&out));
+    assert_eq!(launched(&s), [""]);
+}
+
+/// STOP 4, files a unit reads: editing such a file makes that unit affected, so it launches and the run does not skip.
+#[test]
+fn an_edited_file_a_unit_reads_makes_that_unit_affected() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.write("tests/a.flag", "ok\n");
+    success(&split(&s, &[]));
+    s.write("tests/a.flag", "fail\n");
+    s.clear_log();
+    let out = split(&s, &[]);
+    assert!(!skipped(&out), "{}", stderr(&out));
+    assert_eq!(launched(&s), ["tests/a.t"]);
+}
+
+/// STOP 4, files a unit reads: removing such a file makes that unit affected, so it launches and the run does not skip.
+#[test]
+fn a_removed_file_a_unit_reads_makes_that_unit_affected() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.write("tests/a.flag", "ok\n");
+    success(&split(&s, &[]));
+    fs::remove_file(s.path("tests/a.flag")).unwrap();
+    s.clear_log();
+    let out = split(&s, &[]);
+    success(&out);
+    assert!(!skipped(&out), "{}", stderr(&out));
+    assert_eq!(launched(&s), ["tests/a.t"]);
+}
+
+/// STOP 4, files a unit reads: a file that only a removed unit's version reads is not covered, because that unit is no
+/// longer on the roster. The full command runs.
+#[test]
+fn a_file_read_only_by_a_removed_units_version_is_a_change() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.write("tests/d.t", "src/c.src\n");
+    s.write("tests/d.flag", "ok\n");
+    success(&split(&s, &[]));
+    fs::remove_file(s.path("tests/d.t")).unwrap();
+    s.clear_log();
+    let out = split(&s, &[]);
+    success(&out);
+    assert!(stderr(&out).contains("(tests changed)"), "{}", stderr(&out));
+    assert_eq!(launched(&s), [""]);
+}
+
+/// STOP 4: a unit added after the full run and removed again is not a change. Its listing entry is gone, and the file
+/// that a unit covers is the only difference the whole proof has not seen, so the next run skips.
+#[test]
+fn an_added_unit_removed_again_is_not_a_change() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.write("tests/a.flag", "ok\n");
+    success(&split(&s, &[]));
+    s.write("tests/d.t", "src/c.src\n");
+    success(&split(&s, &[]));
+    fs::remove_file(s.path("tests/d.t")).unwrap();
+    s.clear_log();
+    let explained = explain(&s, &[]);
+    let out = split(&s, &[]);
+    success(&out);
+    assert!(skipped(&explained), "{}", stderr(&explained));
+    assert!(skipped(&out), "{}", stderr(&out));
+    assert!(s.launches().is_empty(), "a skip launches nothing");
 }

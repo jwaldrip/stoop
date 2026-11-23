@@ -294,7 +294,7 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
     }
     if affected.is_empty() {
         // E16 also needs every listing that the whole proof holds to be as it was (see `listings_change`).
-        if let Some(reason) = listings_change(cx, view, proof) {
+        if let Some(reason) = listings_change(cx, view, &current, proof) {
             return verdict(Decision::Full(Some(reason)), shown, clean);
         }
         return verdict(Decision::Skip(skipped(cx, view)), shown, clean);
@@ -351,7 +351,12 @@ fn pairs(affected: &[Affected]) -> Vec<(String, String)> {
 /// residue leaves out the listings of the catalog walk, so a name that a walked directory gained or lost is seen by no
 /// unit's proof, unless a unit lists that directory itself. The whole proof's own `dl:` entries see it. The first changed
 /// directory in path order is named, as the legacy lookup names a changed input.
-fn listings_change(cx: &Judged<'_>, view: &View, proof: &Proof) -> Option<String> {
+fn listings_change(
+    cx: &Judged<'_>,
+    view: &View,
+    current: &Current,
+    proof: &Proof,
+) -> Option<String> {
     let mut entries: Vec<&Input> = proof
         .inputs
         .iter()
@@ -359,8 +364,20 @@ fn listings_change(cx: &Judged<'_>, view: &View, proof: &Proof) -> Option<String
         .filter(|input| input.id.starts_with("dl:"))
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
+    // A skip usually finds every listing as it was, and then no excuse is read.
+    let same = par_map(&entries, |input| listing_matches(cx.root, input));
+    if same.iter().all(|&same| same) {
+        return None;
+    }
+    let recorded: BTreeSet<&str> = proof
+        .inputs
+        .iter()
+        .chain(&proof.outputs)
+        .map(|input| input.path.as_str())
+        .collect();
+    let covered = covered_reads(cx, view, current, &recorded);
     let moved = par_map(&entries, |input| {
-        !listing_holds(cx.root, view, cx.roster, input, proof)
+        !listing_holds(cx.root, view, cx.roster, input, proof, &covered)
     });
     entries
         .iter()
@@ -368,24 +385,66 @@ fn listings_change(cx: &Judged<'_>, view: &View, proof: &Proof) -> Option<String
         .find_map(|(input, moved)| moved.then(|| format!("{} changed", safe(&input.path))))
 }
 
-/// Whether a listing that the whole proof records still holds (spec 3.10, E16, as amended for STOP 4). The current names
-/// must give the recorded digest. If they do not, the difference must be explained exactly, by two kinds of name:
+/// Whether the names that a listing holds now give the digest that the whole proof records for it (spec 3.10, E16).
+fn listing_matches(root: &Path, recorded: &Input) -> bool {
+    match (
+        recorded.id.strip_prefix("dl:"),
+        listed(&from_key(root, &recorded.path)),
+    ) {
+        (Some(digest), Some(mut names)) => list_hash_of_names(&mut names) == digest,
+        _ => false,
+    }
+}
+
+/// The paths that a valid version of a roster unit reads by content, and that the whole proof does not hold at all
+/// (spec 3.10, E16). A file such as a unit's flag can appear after the whole proof. The unit's version verified its
+/// identity, so the unit's own proof covers the file. A version that does not hold covers nothing, and neither does a
+/// unit that has left the roster.
+fn covered_reads(
+    cx: &Judged<'_>,
+    view: &View,
+    current: &Current,
+    recorded: &BTreeSet<&str>,
+) -> BTreeSet<String> {
+    let mut reads = BTreeSet::new();
+    for unit in cx.roster {
+        for version in view.units.get(unit).into_iter().flatten() {
+            if !version_reasons(cx, view, current, version).0.is_empty() {
+                continue;
+            }
+            for &index in &version.inputs {
+                let input = &view.table[index as usize];
+                let content = input.id.starts_with("f:") || input.id.starts_with("x:");
+                if content && !recorded.contains(input.path.as_str()) {
+                    reads.insert(input.path.clone());
+                }
+            }
+        }
+    }
+    reads
+}
+
+/// Whether a listing that the whole proof records still holds (spec 3.10, E16, as amended for STOP 4 and for files a
+/// unit reads). The current names must give the recorded digest. If they do not, the difference must be explained
+/// exactly, by three kinds of name:
 ///
 /// - Lost names: the entries under this directory that are absent now, from two sources: the bundle's units with
-///   versions (the former members of the roster), and the whole proof's own regular-file entries (`f:` and `x:`).
+///   versions that the whole proof read (the former members of the roster), and the whole proof's own regular-file
+///   entries (`f:` and `x:`).
 /// - Added units: roster units under this directory that the whole proof never read, so they did not exist when it was
-///   recorded. Each holds a valid version, which `judge` has established, because a listing is checked only when no unit
-///   is affected. The root listing (`.`) never excuses an added unit.
+///   recorded. Each holds a valid version, because `judge` checks a listing only when every unit holds one.
+/// - Added files: files under this directory that a valid version of a roster unit reads and the whole proof does not
+///   hold (`covered_reads`).
 ///
-/// The candidate is the current names without the added units, plus the lost names. It must give the recorded digest
-/// exactly. So an added name that is not a valid unit, a non-unit name added or renamed, a lost name the proof never
-/// recorded, or a removed directory is a change. A unit that the proof read but that is absent now is a lost name only.
+/// The root never excuses an added name. The candidate is the current names without the added names, plus the lost
+/// names. It must give the recorded digest exactly, so any other added or removed name is a change.
 fn listing_holds(
     root: &Path,
     view: &View,
     roster: &[String],
     recorded: &Input,
     proof: &Proof,
+    covered: &BTreeSet<String>,
 ) -> bool {
     let (Some(digest), Some(mut names)) = (
         recorded.id.strip_prefix("dl:"),
@@ -406,7 +465,7 @@ fn listing_holds(
         .filter(|read| read.id.starts_with("f:") || read.id.starts_with("x:"))
         .map(|read| read.path.as_str())
         .collect();
-    // The root never excuses an added unit. Elsewhere, a roster unit that the proof never read did not exist when the
+    // The root never excuses an added name. Elsewhere, a roster unit that the proof never read did not exist when the
     // proof was recorded, and it holds a version, because `judge` checks a listing only when every unit holds one.
     let excused = !matches!(recorded.path.as_str(), "" | ".");
     let added: BTreeSet<Vec<u8>> = roster
@@ -417,8 +476,11 @@ fn listing_holds(
                 .get(unit.as_str())
                 .is_some_and(|versions| !versions.is_empty())
         })
-        .filter_map(|unit| {
-            Path::new(unit.as_str())
+        .map(String::as_str)
+        .chain(covered.iter().map(String::as_str))
+        .filter(|path| excused && under(path))
+        .filter_map(|path| {
+            Path::new(path)
                 .file_name()
                 .map(|name| name.as_encoded_bytes().to_vec())
         })
@@ -426,7 +488,9 @@ fn listing_holds(
     let lost: BTreeSet<Vec<u8>> = view
         .units
         .iter()
-        .filter(|(unit, versions)| !versions.is_empty() && under(unit.as_str()))
+        .filter(|(unit, versions)| {
+            !versions.is_empty() && under(unit.as_str()) && read_entries.contains(unit.as_str())
+        })
         .map(|(unit, _)| unit.as_str())
         .chain(
             proof
@@ -896,5 +960,88 @@ mod tests {
             skip_line("key", &skip),
             "stoop: skip key: no tracked input changed (3 units, 7 inputs)"
         );
+    }
+
+    fn input(path: &str, id: &str) -> Input {
+        Input {
+            path: path.to_owned(),
+            id: id.to_owned(),
+            oid: None,
+            oid_basis: None,
+        }
+    }
+
+    /// A view whose table is `table` and whose units are `units`, with every table entry as it is now on disk.
+    fn view_of(units: Vec<(&str, Vec<Version>)>, table: Vec<Input>) -> (View, Current) {
+        let current = Current(
+            table
+                .iter()
+                .map(|entry| (entry.path.clone(), [Some(entry.id.clone()), None]))
+                .collect(),
+        );
+        let view = View {
+            whole: "whole".to_owned(),
+            disabled: None,
+            table,
+            units: units
+                .into_iter()
+                .map(|(unit, versions)| (unit.to_owned(), versions))
+                .collect(),
+            residue: None,
+        };
+        (view, current)
+    }
+
+    fn version(created: u64, inputs: Vec<u32>) -> Version {
+        Version {
+            created,
+            guard: "g".to_owned(),
+            inputs,
+            outputs: Vec::new(),
+        }
+    }
+
+    fn judged<'a>(roster: &'a [String], max_age: u64) -> Judged<'a> {
+        Judged {
+            root: Path::new("."),
+            suite: "suite",
+            roster,
+            proofs: &[],
+            guard: "g".to_owned(),
+            max_age,
+            now: 1_000,
+        }
+    }
+
+    #[test]
+    fn a_file_a_valid_roster_version_reads_is_covered() {
+        let table = vec![input("tests/a.t", "f:1"), input("tests/a.flag", "f:2")];
+        let (view, current) = view_of(vec![("tests/a.t", vec![version(1_000, vec![0, 1])])], table);
+        let roster = vec!["tests/a.t".to_owned()];
+        let covered = covered_reads(&judged(&roster, 0), &view, &current, &BTreeSet::new());
+        assert!(covered.contains("tests/a.flag"), "{covered:?}");
+    }
+
+    #[test]
+    fn a_file_read_only_by_an_expired_version_is_not_covered() {
+        let table = vec![input("tests/a.t", "f:1"), input("tests/a.flag", "f:2")];
+        let versions = vec![version(1_000, vec![0]), version(1, vec![0, 1])];
+        let (view, current) = view_of(vec![("tests/a.t", versions)], table);
+        let roster = vec!["tests/a.t".to_owned()];
+        let covered = covered_reads(&judged(&roster, 100), &view, &current, &BTreeSet::new());
+        assert!(!covered.contains("tests/a.flag"), "{covered:?}");
+    }
+
+    #[test]
+    fn a_file_read_only_by_a_version_of_a_unit_that_left_the_roster_is_not_covered() {
+        let table = vec![input("tests/b.t", "f:1"), input("tests/a.flag", "f:2")];
+        let units = vec![
+            ("tests/a.t", vec![version(1_000, vec![1])]),
+            ("tests/b.t", vec![version(1_000, vec![0])]),
+        ];
+        let (view, current) = view_of(units, table);
+        let roster = vec!["tests/b.t".to_owned()];
+        let covered = covered_reads(&judged(&roster, 0), &view, &current, &BTreeSet::new());
+        assert!(!covered.contains("tests/a.flag"), "{covered:?}");
     }
 }
