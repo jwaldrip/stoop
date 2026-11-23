@@ -196,6 +196,20 @@ fn without_created(value: &mut Value) {
     }
 }
 
+/// The clocks of a stored bundle: a version's `created` and a disabled suite's `at`. Two runs of the same commands
+/// store different clocks and the same units, so only the rest is compared.
+fn without_clocks(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.remove("created");
+            map.remove("at");
+            map.values_mut().for_each(without_clocks);
+        }
+        Value::Array(values) => values.iter_mut().for_each(without_clocks),
+        _ => {}
+    }
+}
+
 fn store_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Value>> {
     fn visit(
         base: &Path,
@@ -218,6 +232,14 @@ fn store_snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Option<Val
                     let mut value: Value =
                         serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
                     without_created(&mut value);
+                    Some(value)
+                } else if relative.starts_with("units")
+                    && relative.extension().is_some_and(|x| x == "json")
+                {
+                    // A suite's bundle is compared by content, without its clocks: the same runs store the same units.
+                    let mut value: Value =
+                        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                    without_clocks(&mut value);
                     Some(value)
                 } else {
                     None

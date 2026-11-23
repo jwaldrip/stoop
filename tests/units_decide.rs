@@ -18,8 +18,8 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, Output};
-use std::time::Instant;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 use units_common::*;
 
 /// The switch that turns the engine on (spec 3.1).
@@ -594,8 +594,9 @@ fn decide_cost() {
         );
         ms
     });
-    // A new file in a directory that the full command lists changes the whole proof, and no unit reads it.
-    s.write("docs/extra.md", "x\n");
+    // An edit to a file in a directory that the full command lists leaves every listing as it was, and no unit
+    // reads the file, so the run skips.
+    s.write("docs/readme.md", "edited\n");
     let skip_ms = median_ms(|| {
         let started = Instant::now();
         let skip = split(&s, &[]);
@@ -758,14 +759,14 @@ fn t_e15_listed_output_is_affected_not_global() {
 }
 
 /// Every launch lists the root (`T_LS_ROOT`), so the root listing is an input of each unit. Its identity is its own:
-/// a change that only the whole proof sees, in a directory the root lists, skips on the units' unchanged listing.
+/// an edit inside a directory the root lists leaves the root's listing as it was, so the run still skips.
 #[test]
 fn t_listed_identity_is_its_own() {
     let env = [("T_LS_ROOT", "1")];
     let s = Suite::new();
     s.write("docs/readme.md", "x\n");
     success(&passed(&s, &env, &[SPLIT]));
-    s.write("docs/extra.md", "x\n");
+    s.write("docs/readme.md", "edited\n");
     let out = s.hook(&with(&env, &[SPLIT]));
     success(&out);
     assert!(
@@ -782,7 +783,7 @@ fn t_skip_line_counts_distinct_inputs() {
     let s = Suite::new();
     s.write("tests/d.t", "src/c.src\n");
     success(&passed(&s, &[], &[SPLIT]));
-    s.write("docs/extra.md", "x\n");
+    s.write("docs/readme.md", "edited\n");
     let out = split(&s, &[]);
     success(&out);
     let (units, inputs) = skip_counts(&stderr(&out));
@@ -818,7 +819,7 @@ fn t_view_refuses_another_command_bundle() {
     let mut bundle = s.bundle().expect("a suite bundle");
     bundle["whole_key_digest"] = Value::from("recorded for another command");
     fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
-    s.write("docs/extra.md", "x\n");
+    s.write("docs/readme.md", "edited\n");
     let out = split(&s, &[]);
     assert!(
         !stderr(&out).contains("no tracked input changed"),
@@ -836,7 +837,7 @@ fn t_later_generation_is_another_version() {
     let mut bundle = s.bundle().expect("a suite bundle");
     bundle["generation"] = Value::from(3);
     fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
-    s.write("docs/extra.md", "x\n");
+    s.write("docs/readme.md", "edited\n");
     let out = split(&s, &[]);
     assert!(
         !stderr(&out).contains("no tracked input changed"),
@@ -887,4 +888,329 @@ fn t_e15_a_changed_output_is_named_changed() {
         "{}",
         stderr(&out)
     );
+}
+
+/// Explains the pinned hook under `env`, with `STOOP_SPLIT` on or off.
+fn explain_switch(s: &Suite, env: &[(&str, &str)], on: bool) -> Output {
+    let mut command = s.stoop(&s.root);
+    command
+        .args(["explain", "--root"])
+        .arg(&s.root)
+        .args(["--", "./t", HOOK]);
+    if on {
+        command.env(SPLIT.0, SPLIT.1);
+    }
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    spawning(|| command.output()).unwrap()
+}
+
+/// The stderr with proof ages replaced, so two explains taken a moment apart compare equal.
+fn aged(out: &Output) -> String {
+    let text = stderr(out);
+    let mut result = String::new();
+    let mut rest = text.as_str();
+    while !rest.is_empty() {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        let after = &rest[digits..];
+        let is_age = ["s ago", "m ago", "h ago", "d ago"]
+            .iter()
+            .any(|suffix| after.starts_with(*suffix));
+        if digits > 0 && is_age {
+            result.push_str("<age>");
+            rest = &after[5..];
+        } else {
+            let step = if digits > 0 {
+                digits
+            } else {
+                rest.chars().next().map_or(0, char::len_utf8)
+            };
+            result.push_str(&rest[..step]);
+            rest = &rest[step..];
+        }
+    }
+    result
+}
+
+/// Explains and runs the pinned hook under `env`: both make a full decision, and the run fails as the full command
+/// does. The full form launches once.
+fn full_and_failing(s: &Suite, env: &[(&str, &str)]) {
+    let explained = explain(s, env);
+    s.clear_log();
+    let ran = split(s, env);
+    assert_eq!(
+        decision(&explained),
+        "full",
+        "explain: {}",
+        stderr(&explained)
+    );
+    assert_eq!(decision(&ran), "full", "run: {}", stderr(&ran));
+    assert_eq!(code(&ran), 1, "{}", stderr(&ran));
+    assert_eq!(s.launches().len(), 1, "the full form launches once");
+}
+
+/// E8 (spec 3.12): explain of a disabled suite prints what the switch-off path prints, not the engine's lines.
+#[test]
+fn explain_of_a_disabled_suite_prints_what_the_switch_off_prints() {
+    let s = Suite::new();
+    let env = [("T_READ_OTHER", "tests/b.t")];
+    // The pass finds that a unit reads another unit's file, which disables the suite (spec 3.3, check b).
+    passed(&s, &env, &[SPLIT]);
+    assert_eq!(state(&s)["status"], "disabled", "{}", state(&s));
+    let off = explain_switch(&s, &env, false);
+    let on = explain_switch(&s, &env, true);
+    assert_eq!(
+        aged(&on),
+        aged(&off),
+        "E8 prints what the switch off prints"
+    );
+    assert_eq!(code(&on), code(&off));
+}
+
+/// E9 (spec 3.12): explain before any unit proof, and while a pass is due, prints what the switch-off path prints.
+#[test]
+fn explain_before_any_unit_proof_prints_what_the_switch_off_prints() {
+    let s = Suite::new();
+    assert_eq!(
+        aged(&explain_switch(&s, &[], true)),
+        aged(&explain_switch(&s, &[], false)),
+        "cold"
+    );
+    success(&s.hook(&[]));
+    edit(&s, 2);
+    let off = explain_switch(&s, &[], false);
+    let on = explain_switch(&s, &[], true);
+    assert_eq!(
+        aged(&on),
+        aged(&off),
+        "E9 prints what the switch off prints"
+    );
+}
+
+/// STOOP_MAX_AGE=0 means no expiry, as for legacy proofs: a version created long ago still holds.
+#[test]
+fn a_maximum_age_of_zero_never_expires_a_version() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    let path = s.bundle_path().expect("a suite bundle");
+    let mut bundle = s.bundle().expect("a suite bundle");
+    for versions in bundle["units"].as_object_mut().unwrap().values_mut() {
+        for version in versions.as_array_mut().unwrap() {
+            version["created"] = Value::from(1);
+        }
+    }
+    fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+    agree(&s, &[("STOOP_MAX_AGE", "0")], "skip");
+}
+
+/// A skip with nothing to drop takes no lock and writes no bundle: its bytes and its inode are the same afterwards.
+#[test]
+fn a_skip_with_nothing_to_drop_writes_nothing() {
+    use std::os::unix::fs::MetadataExt;
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    let path = s.bundle_path().expect("a suite bundle");
+    let inode = |path: &PathBuf| fs::metadata(path).unwrap().ino();
+    let before = (s.bundle_bytes(), inode(&path));
+    let out = split(&s, &[]);
+    success(&out);
+    assert_eq!(decision(&out), "skip", "{}", stderr(&out));
+    assert_eq!(
+        (s.bundle_bytes(), inode(&path)),
+        before,
+        "a skip with nothing to drop writes no bundle"
+    );
+}
+
+/// The skip line and explain's tracked line count the same inputs once a unit has left the roster (spec 3.12).
+#[test]
+fn the_skip_line_counts_the_roster_units_inputs_only() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    s.remove("tests/c.t");
+    let out = split(&s, &[]);
+    success(&out);
+    assert_eq!(decision(&out), "skip", "{}", stderr(&out));
+    let (units, inputs) = skip_counts(&stderr(&out));
+    let tracked = stderr(&explain(&s, &[]))
+        .lines()
+        .find(|line| line.starts_with("stoop: tracked "))
+        .expect("a tracked line")
+        .to_owned();
+    assert!(
+        tracked.starts_with(&format!("stoop: tracked {units} units, {inputs} inputs;")),
+        "the skip counts {units} units and {inputs} inputs; the tracked line is {tracked}"
+    );
+}
+
+/// E10 (spec 3.10): when the whole proof is gone, another stored proof does not stand in for it.
+#[test]
+fn a_whole_proof_that_is_gone_is_not_replaced_by_another() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    // A forced full run stores a second whole proof, which becomes the bundle's and the newest in the store.
+    std::thread::sleep(Duration::from_millis(1100));
+    success(&split(&s, &[("STOOP_FULL", "1")]));
+    let file = fs::read_dir(s.root.join(".stoop/proofs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "json"))
+        .expect("a proof file");
+    let mut stored: Value = serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+    let proofs = stored["proofs"].as_array_mut().unwrap();
+    assert!(proofs.len() >= 2, "two proofs: {}", proofs.len());
+    proofs.remove(0);
+    fs::write(&file, serde_json::to_vec(&stored).unwrap()).unwrap();
+    s.clear_log();
+    let out = split(&s, &[]);
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("the last full run's proof is gone"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// A new file that the full command runs and no unit names is not a skip. The runner's full form also runs `*.u`
+/// files, which the filter does not name. `tests/z.u` is new and fails, so the full command fails. Only the listing of
+/// `tests` shows the change, since the residue leaves the listings of the catalog walk out (spec 3.8).
+#[test]
+fn a_new_file_the_full_command_runs_in_a_listed_directory_is_not_a_skip() {
+    let s = Suite::new();
+    // No `*.u` file exists when the whole proof is recorded, so the residue is empty.
+    s.remove("e2e/x.u");
+    let env = [("T_U", "1")];
+    success(&passed(&s, &env, &[SPLIT]));
+    s.write("tests/z.u", "src/c.src\n");
+    s.write("tests/z.flag", "fail\n");
+    assert_eq!(
+        code(&s.direct(&s.root, &[], &env)),
+        1,
+        "the full command fails on the new file"
+    );
+    full_and_failing(&s, &env);
+}
+
+/// As above, with a file that Git ignores, so the catalog never names it, and with the root's dot files out of stoop's
+/// view, so the residue is empty as in the pinned fixture. The stock runner's full form runs the file.
+#[test]
+fn a_new_git_ignored_file_the_full_command_runs_is_not_a_skip() {
+    let s = Suite::new();
+    s.write(".gitignore", "tests/z.t\ntests/z.flag\n");
+    s.write(".stoopignore", ".git\n.stoopignore\n.gitignore\n");
+    s.git("feature");
+    let branch = [("STOOP_DEFAULT_BRANCH", "main")];
+    success(&passed(&s, &branch, &[SPLIT]));
+    s.write("tests/z.t", "src/c.src\n");
+    s.write("tests/z.flag", "fail\n");
+    assert_eq!(
+        code(&s.direct(&s.root, &[], &branch)),
+        1,
+        "the full command fails on the new file"
+    );
+    full_and_failing(&s, &branch);
+}
+
+/// A new file in a directory the full command never lists is not a change to any listing the proof holds. The runner
+/// prunes `slow/`, so the run skips.
+#[test]
+fn a_new_file_in_a_directory_the_full_command_never_lists_is_a_skip() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    s.write("slow/extra.t", "src/c.src\n");
+    agree(&s, &[], "skip");
+}
+
+/// A deleted file that no unit names, in a directory the full command lists, changes that listing. The run takes the
+/// full form, and the reason names the directory.
+#[test]
+fn a_deleted_non_unit_file_in_a_listed_directory_runs_the_full_form() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    s.remove("docs/readme.md");
+    let explained = explain(&s, &[]);
+    s.clear_log();
+    let ran = split(&s, &[]);
+    assert_eq!(
+        decision(&explained),
+        "full",
+        "explain: {}",
+        stderr(&explained)
+    );
+    assert_eq!(decision(&ran), "full", "run: {}", stderr(&ran));
+    assert!(stderr(&ran).contains("(docs changed)"), "{}", stderr(&ran));
+    assert_eq!(s.launches().len(), 1, "the full form launches once");
+}
+
+/// A removed unit's file leaves its directory's listing, which the whole proof read. The run still skips, and so does
+/// the next run, since a skip does not record the proof again (spec 3.10, E16).
+#[test]
+fn a_removed_unit_file_is_still_a_skip_on_each_later_run() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    s.remove("tests/c.t");
+    agree(&s, &[], "skip");
+    agree(&s, &[], "skip");
+}
+
+/// A disagreement that cannot take the suite lock says so and stores nothing. The lock stays held for the whole forced
+/// run, so the bounded wait gives up (spec 3.10, E1).
+#[test]
+fn a_disagreement_that_cannot_take_the_suite_lock_says_so() {
+    let s = Suite::new();
+    let flag = s.outside.join("fail-full");
+    let env = armed_full_failure(&s, flag.to_str().unwrap());
+    let borrowed: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    fs::write(&flag, b"").unwrap();
+    let id = s
+        .bundle_path()
+        .expect("a suite bundle")
+        .file_stem()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let held = hold_lock(&s);
+    let out = split(&s, &with(&borrowed, &[("STOOP_FULL", "1")]));
+    drop(held);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    let line = format!(
+        "stoop: could not record that the full command failed while every unit held (the suite is busy); run 'stoop forget --units {id}' to be safe"
+    );
+    assert!(stderr(&out).contains(&line), "{}", stderr(&out));
+    assert_eq!(state(&s)["status"], "ready", "{}", state(&s));
+}
+
+/// The bounded wait takes the suite lock when another run releases it shortly after, and then the disagreement is
+/// stored (spec 3.10, E1).
+#[test]
+fn a_disagreement_waits_for_a_suite_lock_that_is_released_soon() {
+    let s = Suite::new();
+    let flag = s.outside.join("fail-full");
+    let env = armed_full_failure(&s, flag.to_str().unwrap());
+    let borrowed: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    fs::write(&flag, b"").unwrap();
+    let held = hold_lock(&s);
+    let mut command = s.stoop(&s.root);
+    command
+        .args(["run", "--root"])
+        .arg(&s.root)
+        .args(["--", "./t", HOOK]);
+    for (name, value) in with(&borrowed, &[("STOOP_FULL", "1")]) {
+        command.env(name, value);
+    }
+    let child = spawning(|| {
+        command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    })
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    drop(held);
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert_eq!(state(&s)["status"], "disabled", "{}", state(&s));
+    assert_eq!(state(&s)["code"], "disagreement", "{}", state(&s));
 }
