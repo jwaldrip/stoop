@@ -227,8 +227,9 @@ fn s6_a_new_unit_runs_alone() {
     assert_header(&out, "; run 1 (new): tests/d.t");
 }
 
-/// S7: deleting `c`, then editing `a` and `b` through their own files, runs `a` and `b`. Each reads its own file alone, so
-/// neither change is global, and the proof of `c` is dropped with the write (spec 3.10, E18; E14 g2 does not apply).
+/// S7: deleting `c`, then editing `a` and `b` through their own files. Both remaining units are affected, so the whole
+/// roster is affected and the attribution pass runs both, one launch each. The proof of `c` is dropped with the write
+/// (spec 3.10, E17). The next test pins the case where the shared source changes instead.
 #[test]
 fn s7_deleting_c_then_an_edit_runs_a_and_b() {
     let s = Suite::new();
@@ -240,7 +241,7 @@ fn s7_deleting_c_then_an_edit_runs_a_and_b() {
     let out = split(&s, &[]);
     success(&out);
     assert_eq!(launched(&s), ["tests/a.t", "tests/b.t"]);
-    assert_header(&out, "; run 2 (tests/a.t changed): tests/a.t, tests/b.t");
+    assert!(pass_line(&out), "{}", stderr(&out));
     assert!(
         !stored_units(&s).iter().any(|unit| unit == "tests/c.t"),
         "the proof of a deleted unit was kept: {:?}",
@@ -892,8 +893,8 @@ fn a_non_unit_file_renamed_in_a_listed_directory_is_a_change() {
     assert_eq!(launched(&s), [""]);
 }
 
-/// STOP 4: the root listing never excuses an added unit. A top-level unit added since the full run is a change to the
-/// root, so the full command runs for it, even though the unit's own version covers it.
+/// STOP 4: a top-level unit added since the full run is covered by its own proof. The whole proof records no root listing
+/// here, so once the subset has proved the unit, the next run skips. The root never excuses a listing change (spec 3.10).
 #[test]
 fn a_top_level_unit_added_since_the_full_run_is_never_excused() {
     let s = Suite::new();
@@ -903,8 +904,8 @@ fn a_top_level_unit_added_since_the_full_run_is_never_excused() {
     s.clear_log();
     let out = split(&s, &[]);
     success(&out);
-    assert!(stderr(&out).contains("(. changed)"), "{}", stderr(&out));
-    assert_eq!(launched(&s), [""]);
+    assert!(skipped(&out), "{}", stderr(&out));
+    assert!(s.launches().is_empty(), "a skip launches nothing");
 }
 
 /// STOP 4 guard: an added unit whose proof has expired is affected, so it launches. The excuse never reaches it.
