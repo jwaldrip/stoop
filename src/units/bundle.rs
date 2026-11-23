@@ -2791,6 +2791,28 @@ mod pass_tests {
         assert_eq!(stored_residue.whole, Some(digest));
     }
 
+    /// A pass whose only write came first still stores its residue at its end: a single unit is written at once, so
+    /// the residue is persisted only if settling marks the pass dirty.
+    #[test]
+    fn a_pass_whose_only_write_came_first_still_stores_its_residue() {
+        let roster = ["tests/a.t"];
+        let proof = whole_proof(&["src/shared", "lint"]);
+        let digest = proof.digest();
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.whole = Some(digest.clone());
+        let dir = seed("pass-one-write", &bundle);
+        let pending = pending_for(&roster);
+        let id = pending.suite().to_owned();
+        let mut pass = pass_of(start(&dir, &pending, "key", guard()));
+        let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
+        pass.settle_residue(&[proof], &[]);
+        drop(pass);
+        let stored_residue = stored(&dir, &id).residue;
+        assert!(matches!(stored_residue.state, ResidueState::Provisional));
+        assert_eq!(stored_residue.paths, ["lint"]);
+        assert_eq!(stored_residue.whole, Some(digest));
+    }
+
     /// A residue measured before a pass is cleared when the pass starts, and the clearing is written even when the
     /// pass stores no unit proof.
     #[test]
