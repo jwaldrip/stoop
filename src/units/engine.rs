@@ -10,13 +10,14 @@ use super::config::Config;
 use super::hook::safe;
 use super::residue;
 use crate::ignore::Ignore;
-use crate::input::{identify, par_map, Input};
+use crate::input::{identify, list_hash_of_names, par_map, Input};
 use crate::pathutil::from_key;
 use crate::proof::{now, Proof};
 use crate::run::{Lookup, RunCx};
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::Path;
+use std::{fs, io};
 
 /// How many affected units explain names before it counts the rest (spec 3.12).
 const NAMED: usize = 20;
@@ -254,6 +255,10 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
         return verdict(Decision::Full(Some(reason)), shown, clean);
     }
     if affected.is_empty() {
+        // E16 also needs every listing that the whole proof holds to be as it was (see `listings_change`).
+        if let Some(reason) = listings_change(cx, view, proof) {
+            return verdict(Decision::Full(Some(reason)), shown, clean);
+        }
         return verdict(Decision::Skip(skipped(cx, view)), shown, clean);
     }
     // E17 and E18: W7-1 has no subset, so the full command runs for the legacy reason.
@@ -266,6 +271,96 @@ fn verdict(decision: Decision, affected: Option<Vec<(String, String)>>, clean: b
         affected,
         clean,
     }
+}
+
+/// Step E16 for listings (spec 3.10). A skip also needs the listings that the whole proof holds to be as they were. The
+/// residue leaves out the listings of the catalog walk, so a name that a walked directory gained or lost is seen by no
+/// unit's proof, unless a unit lists that directory itself. The whole proof's own `dl:` entries see it. The first changed
+/// directory in path order is named, as the legacy lookup names a changed input.
+fn listings_change(cx: &Judged<'_>, view: &View, proof: &Proof) -> Option<String> {
+    let mut entries: Vec<&Input> = proof
+        .inputs
+        .iter()
+        .chain(&proof.outputs)
+        .filter(|input| input.id.starts_with("dl:"))
+        .collect();
+    entries.sort_by(|a, b| a.path.cmp(&b.path));
+    let moved = par_map(&entries, |input| {
+        !listing_holds(cx.root, view, input, proof)
+    });
+    entries
+        .iter()
+        .zip(moved)
+        .find_map(|(input, moved)| moved.then(|| format!("{} changed", safe(&input.path))))
+}
+
+/// Whether a listing that the whole proof records still holds (spec 3.10, E16). The current names must give the recorded
+/// digest. If they do not, the difference may only be names that were lost. The candidate is the current names plus the
+/// lost names, and it must give the recorded digest exactly, so an added name, a rename, or a lost name that the proof
+/// never recorded is a change.
+///
+/// The lost names are the entries under this directory that are absent now, from two sources: the bundle's units with
+/// versions (the former members of the roster), and the whole proof's own regular-file entries (`f:` and `x:`). A
+/// non-unit name that the full command only listed was never opened or stat'ed, so the whole proof holds no entry for
+/// it, and the bundle holds no version for it. A non-unit file that the full command did read is in the residue, which
+/// E12 refuses before this check runs. So no non-unit name can be a lost name.
+fn listing_holds(root: &Path, view: &View, recorded: &Input, proof: &Proof) -> bool {
+    let (Some(digest), Some(mut names)) = (
+        recorded.id.strip_prefix("dl:"),
+        listed(&from_key(root, &recorded.path)),
+    ) else {
+        return false;
+    };
+    if list_hash_of_names(&mut names) == digest {
+        return true;
+    }
+    let dir = Path::new(&recorded.path);
+    let under = |key: &str| Path::new(key).parent() == Some(dir);
+    let lost: BTreeSet<Vec<u8>> = view
+        .units
+        .iter()
+        .filter(|(unit, versions)| !versions.is_empty() && under(unit.as_str()))
+        .map(|(unit, _)| unit.as_str())
+        .chain(
+            proof
+                .inputs
+                .iter()
+                .filter(|read| read.id.starts_with("f:") || read.id.starts_with("x:"))
+                .filter(|read| under(read.path.as_str()))
+                .map(|read| read.path.as_str()),
+        )
+        .filter(|key| is_absent(&from_key(root, key)))
+        .filter_map(|key| {
+            Path::new(key)
+                .file_name()
+                .map(|name| name.as_encoded_bytes().to_vec())
+        })
+        .collect();
+    names.extend(lost);
+    list_hash_of_names(&mut names) == digest
+}
+
+/// The entry names of a listed directory as `identify` reads them. An absent path lists as no names. `None` when the
+/// path cannot be listed, or is not a directory now.
+fn listed(dir: &Path) -> Option<Vec<Vec<u8>>> {
+    match fs::symlink_metadata(dir) {
+        Ok(meta) if meta.is_dir() => fs::read_dir(dir)
+            .ok()?
+            .map(|entry| Some(entry.ok()?.file_name().as_encoded_bytes().to_vec()))
+            .collect(),
+        Err(_) if is_absent(dir) => Some(Vec::new()),
+        _ => None,
+    }
+}
+
+/// Whether a path does not exist, which `identify` records as `a` inside the root.
+fn is_absent(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_err_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+        )
+    })
 }
 
 /// The inputs and outputs that a decision checks: those of each roster unit's versions. The whole proof's entries are
