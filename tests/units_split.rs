@@ -1048,3 +1048,65 @@ fn an_added_unit_removed_again_is_not_a_change() {
     assert!(skipped(&out), "{}", stderr(&out));
     assert!(s.launches().is_empty(), "a skip launches nothing");
 }
+
+/// STOP 4, reviewer r25: a new top-level unit that fails has no proof, so it is affected and runs alone. A skip would hide it.
+#[test]
+fn a_new_top_level_unit_that_fails_is_not_a_skip() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.write("z.t", "src/c.src\n");
+    s.write("z.flag", "fail\n");
+    s.clear_log();
+    let out = split(&s, &[]);
+    assert!(!skipped(&out), "{}", stderr(&out));
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert_eq!(launched(&s), ["z.t"]);
+}
+
+/// STOP 4, reviewer r25b: a failing unit in a new top-level directory is affected and runs alone.
+#[test]
+fn a_new_unit_in_a_new_top_level_directory_that_fails_is_not_a_skip() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.write("extra/z.t", "src/c.src\n");
+    s.write("extra/z.flag", "fail\n");
+    s.clear_log();
+    let out = split(&s, &[]);
+    assert!(!skipped(&out), "{}", stderr(&out));
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert_eq!(launched(&s), ["extra/z.t"]);
+}
+
+/// STOP 4, reviewer r27: a unit file replaced by a directory that holds a failing unit. The new unit runs alone.
+#[test]
+fn a_unit_file_replaced_by_a_directory_holding_a_failing_unit_is_not_a_skip() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.remove("tests/c.t");
+    s.write("tests/c.t/x.t", "src/c.src\n");
+    s.write("tests/c.t/x.flag", "fail\n");
+    s.clear_log();
+    let out = split(&s, &[]);
+    assert!(!skipped(&out), "{}", stderr(&out));
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert_eq!(launched(&s), ["tests/c.t/x.t"]);
+}
+
+/// E11, reviewer r37 (issue #81, item 2): a dangling link still exists, so the unit has not been removed. Its
+/// symlink_metadata is what says so, and `metadata` would say it is gone. The full command takes the full form.
+#[test]
+fn a_unit_file_replaced_by_a_dangling_link_takes_the_full_form() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.remove("tests/c.t");
+    std::os::unix::fs::symlink("gone.t", s.path("tests/c.t")).unwrap();
+    s.clear_log();
+    let out = split(&s, &[]);
+    assert!(full(&out), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("tests/c.t is no longer one of the units but still exists"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(launched(&s), [""]);
+}
