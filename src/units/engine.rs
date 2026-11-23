@@ -494,17 +494,13 @@ fn summary(reasons: &[String]) -> String {
     }
 }
 
-/// Step E11 (spec 3.10): a unit with a version that left the roster while its file stays. The first in key order is
-/// named.
+/// Step E11 (spec 3.10): a unit with a version that left the roster while its path still exists, whatever its type (a
+/// file, a directory or a link). A path that is gone is a removed unit (E16). The first in key order is named.
 fn leftover(cx: &Judged<'_>, view: &View) -> Option<String> {
     view.units.iter().find_map(|(unit, versions)| {
         let stays = !versions.is_empty()
             && cx.roster.binary_search(unit).is_err()
-            && cx
-                .root
-                .join(unit)
-                .symlink_metadata()
-                .is_ok_and(|meta| meta.is_file());
+            && cx.root.join(unit).symlink_metadata().is_ok();
         stays.then(|| {
             format!(
                 "{} is no longer one of the units but still exists",
