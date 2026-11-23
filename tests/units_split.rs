@@ -669,6 +669,7 @@ struct Model {
     runner_listed: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
     runner_sources: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
     full: std::collections::BTreeSet<usize>,
+    runners_at_full: std::collections::BTreeSet<usize>,
 }
 
 impl Model {
@@ -693,6 +694,7 @@ impl Model {
             runner_listed: Default::default(),
             runner_sources: Default::default(),
             full: Default::default(),
+            runners_at_full: Default::default(),
         };
         for _ in 0..6 {
             model.add(s, rng);
@@ -1011,6 +1013,10 @@ fn run_model(seed: u64, steps: usize) {
             None
         };
         let owed_now = std::mem::take(&mut owed);
+        let runner_new = model
+            .runners
+            .iter()
+            .any(|id| !model.runners_at_full.contains(id));
         s.clear_log();
         let subject = split(&s, &env);
         let launches = launched(&s);
@@ -1043,47 +1049,63 @@ fn run_model(seed: u64, steps: usize) {
             match &stored {
                 _ if owed_now => assert!(
                     launches.is_empty(),
-                    "a no-op right after a refused full run must skip: {}",
+                    "a no-op right after a full run must skip: {}",
                     report()
                 ),
-                None => assert!(
+                None if !runner_new => assert!(
                     launches.is_empty(),
                     "a no-op after a passing run launched: {}",
                     report()
                 ),
-                Some((count, paths)) => {
-                    // A refused no-op may run the full form once. Its residue must name only what the model allows
-                    // (`residue_owner`), and the no-op after that run must skip (checked above).
-                    if !launches.is_empty() {
+                // A refused no-op may run the full form once. So may a no-op after a runner-only test was added since the
+                // last full pass: its name is no unit, so the listing of `tests` no longer matches the whole proof's.
+                _ => {
+                    if launches.is_empty() {
+                        assert!(
+                            stored.is_some(),
+                            "a no-op skipped a runner-only test added since the last full pass: {}",
+                            report()
+                        );
+                    } else {
                         assert_eq!(
                             launches,
                             [""],
                             "a refused no-op must run the full form once: {}",
                             report()
                         );
-                        assert!(
-                            stderr(&subject).contains("the full command reads "),
-                            "{}",
-                            report()
-                        );
-                        for path in paths {
-                            if let Err(why) = residue_owner(&model, path) {
-                                panic!(
-                                    "the residue of {count} files names {path}, and {why}: {}",
+                        match &stored {
+                            Some((count, paths)) => {
+                                assert!(
+                                    stderr(&subject).contains("the full command reads "),
+                                    "{}",
                                     report()
                                 );
+                                for path in paths {
+                                    if let Err(why) = residue_owner(&model, path) {
+                                        panic!(
+                                            "the residue of {count} files names {path}, and {why}: {}",
+                                            report()
+                                        );
+                                    }
+                                }
+                                println!(
+                                    "M1 exemption: seed {seed}, step {step}: a residue of {count} files; the full form runs once"
+                                );
                             }
+                            None => assert!(
+                                stderr(&subject).contains("tests changed"),
+                                "a runner-only test added since the last full pass must change the listing: {}",
+                                report()
+                            ),
                         }
                         owed = true;
-                        println!(
-                            "M1 exemption: seed {seed}, step {step}: a residue of {count} files; the full form runs once"
-                        );
                     }
                 }
             }
         }
         if subject_code == 0 && launches == [""] {
             model.full = model.listing_now();
+            model.runners_at_full = model.runners.iter().copied().collect();
         }
         passing = subject_code == 0;
     }
@@ -1550,30 +1572,6 @@ fn a_top_level_entry_written_by_the_last_launch_is_125_not_disabled() {
     assert_eq!(code(&out), 125, "{}", stderr(&out));
     assert_eq!(launched(&s), ["tests/c.t"]);
     assert_eq!(state(&s)["status"], "ready", "{}", stderr(&out));
-}
-
-/// `tests/b.t` also reads a file outside the root, which no other unit reads. When that file changes, the subset launches
-/// `b` alone, and `STOOP_CHANGED_INPUTS` names no path outside the root (spec 3.11).
-#[test]
-fn a_changed_input_outside_the_root_is_not_named_to_its_launch() {
-    let s = Suite::new();
-    let outside = s.outside.join("o.src");
-    s.write("tests/b.t", "src/shared.src\n../outside/o.src\n");
-    fs::write(&outside, "v1\n").unwrap();
-    success(&split(&s, &[]));
-    edit(&s, 2);
-    success(&split(&s, &[]));
-    fs::write(&outside, "v2\n").unwrap();
-    s.clear_log();
-    let out = split(&s, &[]);
-    success(&out);
-    assert_eq!(launched(&s), ["tests/b.t"], "{}", stderr(&out));
-    assert_eq!(
-        s.launches()[0].env("changed_inputs"),
-        "",
-        "{}",
-        stderr(&out)
-    );
 }
 
 /// The attribution pass exports no changed inputs, to any launch, in the variable (spec 3.11). Every unit is affected

@@ -292,11 +292,11 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
     if let Some(reason) = output_missing(cx, view, proof) {
         return verdict(Decision::Full(Some(reason)), shown, clean);
     }
+    // E16 to E18 each need every listing that the whole proof holds to be as it was (see `listings_change`).
+    if let Some(reason) = listings_change(cx, view, &current, proof, &affected) {
+        return verdict(Decision::Full(Some(reason)), shown, clean);
+    }
     if affected.is_empty() {
-        // E16 also needs every listing that the whole proof holds to be as it was (see `listings_change`).
-        if let Some(reason) = listings_change(cx, view, &current, proof) {
-            return verdict(Decision::Full(Some(reason)), shown, clean);
-        }
         return verdict(Decision::Skip(skipped(cx, view)), shown, clean);
     }
     // E17 and E18: the affected units launch one at a time. Units that are all affected make the attribution pass.
@@ -347,15 +347,17 @@ fn pairs(affected: &[Affected]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Step E16 for listings (spec 3.10). A skip also needs the listings that the whole proof holds to be as they were. The
-/// residue leaves out the listings of the catalog walk, so a name that a walked directory gained or lost is seen by no
-/// unit's proof, unless a unit lists that directory itself. The whole proof's own `dl:` entries see it. The first changed
-/// directory in path order is named, as the legacy lookup names a changed input.
+/// The listing check of spec 3.10, which runs before the skip (E16) and before a subset or an attribution pass (E17 and
+/// E18). Every listing that the whole proof holds must be as it was, or its difference must be excused as `listing_holds`
+/// allows. The residue leaves out the listings of the catalog walk, so a name that a walked directory gained or lost is
+/// seen by no unit's proof, unless a unit lists that directory itself. The whole proof's own `dl:` entries see it. The
+/// first directory that is not excused is named in path order, as the legacy lookup names a changed input.
 fn listings_change(
     cx: &Judged<'_>,
     view: &View,
     current: &Current,
     proof: &Proof,
+    affected: &[Affected],
 ) -> Option<String> {
     let mut entries: Vec<&Input> = proof
         .inputs
@@ -364,7 +366,7 @@ fn listings_change(
         .filter(|input| input.id.starts_with("dl:"))
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
-    // A skip usually finds every listing as it was, and then no excuse is read.
+    // A run usually finds every listing as it was, and then no excuse is read.
     let same = par_map(&entries, |input| listing_matches(cx.root, input));
     if same.iter().all(|&same| same) {
         return None;
@@ -376,7 +378,8 @@ fn listings_change(
         .filter(|input| input.id != "a")
         .map(|input| input.path.as_str())
         .collect();
-    let covered = covered_reads(cx, view, current, &recorded);
+    let mut covered = covered_reads(cx, view, current, &recorded);
+    covered.extend(rerun_reads(view, affected, &recorded));
     let moved = par_map(&entries, |input| {
         !listing_holds(cx.root, view, cx.roster, input, proof, &covered)
     });
@@ -425,6 +428,26 @@ fn covered_reads(
     reads
 }
 
+/// The paths that the stored versions of an affected roster unit name, and that the whole proof did not hold as present
+/// (spec 3.10, E17 and E18). The unit launches in this run, and its new version names what that launch reads, so the
+/// launch covers each of these paths as a valid version covers the files it reads (`covered_reads`). Every version of an
+/// affected unit is stale, and none is required to hold. A path is named whatever its kind, so a flag file that the unit
+/// stats as absent is covered when it appears (spec 3.10, flag files and S9).
+fn rerun_reads(view: &View, affected: &[Affected], recorded: &BTreeSet<&str>) -> BTreeSet<String> {
+    let mut reads = BTreeSet::new();
+    for changed in affected {
+        for version in view.units.get(&changed.unit).into_iter().flatten() {
+            for &index in &version.inputs {
+                let input = &view.table[index as usize];
+                if !recorded.contains(input.path.as_str()) {
+                    reads.insert(input.path.clone());
+                }
+            }
+        }
+    }
+    reads
+}
+
 /// Whether a listing that the whole proof records still holds (spec 3.10, E16, as amended for STOP 4 and for files a
 /// unit reads). The current names must give the recorded digest. If they do not, the difference must be explained
 /// exactly, by three kinds of name:
@@ -433,9 +456,9 @@ fn covered_reads(
 ///   versions (the former members of the roster), and the whole proof's own regular-file
 ///   entries (`f:` and `x:`).
 /// - Added units: roster units under this directory that the whole proof never read, so they did not exist when it was
-///   recorded. Each holds a valid version, because `judge` checks a listing only when every unit holds one.
-/// - Added files: files under this directory that a valid version of a roster unit reads and the whole proof does not
-///   hold (`covered_reads`).
+///   recorded. Each is valid or affected, and an affected unit launches in this run, so each is covered either way.
+/// - Added files: files under this directory that a valid unit proof reads, or that an affected unit names as an input,
+///   and that the whole proof does not hold (`covered_reads` and `rerun_reads`).
 ///
 /// The root never excuses an added name. The candidate is the current names without the added names, plus the lost
 /// names. It must give the recorded digest exactly, so any other added or removed name is a change.
@@ -466,17 +489,13 @@ fn listing_holds(
         .filter(|read| read.id.starts_with("f:") || read.id.starts_with("x:"))
         .map(|read| read.path.as_str())
         .collect();
-    // The root never excuses an added name. Elsewhere, a roster unit that the proof never read did not exist when the
-    // proof was recorded, and it holds a version, because `judge` checks a listing only when every unit holds one.
+    // The root never excuses an added name. Elsewhere, a roster unit that the whole proof never read did not exist when
+    // the proof was recorded. Each roster unit is either valid or affected, and an affected unit launches in this run, so
+    // each such unit is excused here. `judge` runs this check before both the skip and the subset.
     let excused = !matches!(recorded.path.as_str(), "" | ".");
     let added: BTreeSet<Vec<u8>> = roster
         .iter()
         .filter(|unit| excused && under(unit.as_str()) && !read_entries.contains(unit.as_str()))
-        .filter(|unit| {
-            view.units
-                .get(unit.as_str())
-                .is_some_and(|versions| !versions.is_empty())
-        })
         .map(String::as_str)
         .chain(covered.iter().map(String::as_str))
         .filter(|path| excused && under(path))

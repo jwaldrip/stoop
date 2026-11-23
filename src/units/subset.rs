@@ -113,11 +113,15 @@ fn launch(frame: &Frame<'_, '_>, mut pass: Pass, plan: &Plan) -> Outcome {
         named.store(&unit, &paths(&inputs), &paths(&outputs));
     }
     let skipped = skipped_units(&pass, units, &launched);
-    let changed: HashMap<String, Vec<String>> = plan
-        .affected
-        .iter()
-        .map(|affected| (affected.unit.clone(), affected.changed.clone()))
-        .collect();
+    // An attribution pass names no changed input: each of its launches sees an empty STOOP_CHANGED_INPUTS (spec 3.11).
+    let changed: HashMap<String, Vec<String>> = if planned == units.len() {
+        HashMap::new()
+    } else {
+        plan.affected
+            .iter()
+            .map(|affected| (affected.unit.clone(), affected.changed.clone()))
+            .collect()
+    };
     let ran = attribution::launch_each(
         cx,
         frame.hook,
