@@ -360,7 +360,7 @@ fn listings_change(cx: &Judged<'_>, view: &View, proof: &Proof) -> Option<String
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
     let moved = par_map(&entries, |input| {
-        !listing_holds(cx.root, view, input, proof)
+        !listing_holds(cx.root, view, cx.roster, input, proof)
     });
     entries
         .iter()
@@ -368,17 +368,25 @@ fn listings_change(cx: &Judged<'_>, view: &View, proof: &Proof) -> Option<String
         .find_map(|(input, moved)| moved.then(|| format!("{} changed", safe(&input.path))))
 }
 
-/// Whether a listing that the whole proof records still holds (spec 3.10, E16). The current names must give the recorded
-/// digest. If they do not, the difference may only be names that were lost. The candidate is the current names plus the
-/// lost names, and it must give the recorded digest exactly, so an added name, a rename, or a lost name that the proof
-/// never recorded is a change.
+/// Whether a listing that the whole proof records still holds (spec 3.10, E16, as amended for STOP 4). The current names
+/// must give the recorded digest. If they do not, the difference must be explained exactly, by two kinds of name:
 ///
-/// The lost names are the entries under this directory that are absent now, from two sources: the bundle's units with
-/// versions (the former members of the roster), and the whole proof's own regular-file entries (`f:` and `x:`). A
-/// non-unit name that the full command only listed was never opened or stat'ed, so the whole proof holds no entry for
-/// it, and the bundle holds no version for it. A non-unit file that the full command did read is in the residue, which
-/// E12 refuses before this check runs. So no non-unit name can be a lost name.
-fn listing_holds(root: &Path, view: &View, recorded: &Input, proof: &Proof) -> bool {
+/// - Lost names: the entries under this directory that are absent now, from two sources: the bundle's units with
+///   versions (the former members of the roster), and the whole proof's own regular-file entries (`f:` and `x:`).
+/// - Added units: roster units under this directory that the whole proof never read, so they did not exist when it was
+///   recorded. Each holds a valid version, which `judge` has established, because a listing is checked only when no unit
+///   is affected. The root listing (`.`) never excuses an added unit.
+///
+/// The candidate is the current names without the added units, plus the lost names. It must give the recorded digest
+/// exactly. So an added name that is not a valid unit, a non-unit name added or renamed, a lost name the proof never
+/// recorded, or a removed directory is a change. A unit that the proof read but that is absent now is a lost name only.
+fn listing_holds(
+    root: &Path,
+    view: &View,
+    roster: &[String],
+    recorded: &Input,
+    proof: &Proof,
+) -> bool {
     let (Some(digest), Some(mut names)) = (
         recorded.id.strip_prefix("dl:"),
         listed(&from_key(root, &recorded.path)),
@@ -390,6 +398,31 @@ fn listing_holds(root: &Path, view: &View, recorded: &Input, proof: &Proof) -> b
     }
     let dir = Path::new(&recorded.path);
     let under = |key: &str| Path::new(key).parent() == Some(dir);
+    // Every entry that the whole proof read by content or by stat. A unit that existed when the proof was recorded read
+    // its own file, so its path is among these.
+    let read_entries: BTreeSet<&str> = proof
+        .inputs
+        .iter()
+        .filter(|read| read.id.starts_with("f:") || read.id.starts_with("x:"))
+        .map(|read| read.path.as_str())
+        .collect();
+    // The root never excuses an added unit. Elsewhere, a roster unit that the proof never read did not exist when the
+    // proof was recorded, and it holds a version, because `judge` checks a listing only when every unit holds one.
+    let excused = !matches!(recorded.path.as_str(), "" | ".");
+    let added: BTreeSet<Vec<u8>> = roster
+        .iter()
+        .filter(|unit| excused && under(unit.as_str()) && !read_entries.contains(unit.as_str()))
+        .filter(|unit| {
+            view.units
+                .get(unit.as_str())
+                .is_some_and(|versions| !versions.is_empty())
+        })
+        .filter_map(|unit| {
+            Path::new(unit.as_str())
+                .file_name()
+                .map(|name| name.as_encoded_bytes().to_vec())
+        })
+        .collect();
     let lost: BTreeSet<Vec<u8>> = view
         .units
         .iter()
@@ -410,8 +443,12 @@ fn listing_holds(root: &Path, view: &View, recorded: &Input, proof: &Proof) -> b
                 .map(|name| name.as_encoded_bytes().to_vec())
         })
         .collect();
-    names.extend(lost);
-    list_hash_of_names(&mut names) == digest
+    let mut candidate: Vec<Vec<u8>> = names
+        .into_iter()
+        .filter(|name| !added.contains(name))
+        .collect();
+    candidate.extend(lost);
+    list_hash_of_names(&mut candidate) == digest
 }
 
 /// The entry names of a listed directory as `identify` reads them. An absent path lists as no names. `None` when the
