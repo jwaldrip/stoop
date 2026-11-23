@@ -1375,6 +1375,60 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         Some(verdict) => (Some(verdict.decision), verdict.clean, verdict.affected),
         None => (None, false, None),
     };
+    // Explain prints the decision of a subset or an attribution pass, and launches nothing (spec 3.12). Its decision line
+    // prints whatever the quiet setting, and its suite lines follow when the run is not quiet.
+    if explain {
+        if let Some(units::engine::Decision::Pass(plan) | units::engine::Decision::Subset(plan)) =
+            &decision
+        {
+            let whole = matches!(&decision, Some(units::engine::Decision::Pass(_)));
+            eprintln!("{}", units::subset::decision_line(&cx, &key, plan, whole));
+            if let (false, Some(suite)) = (o.quiet, named.as_ref()) {
+                let affected: Vec<(String, String)> = plan
+                    .affected
+                    .iter()
+                    .map(|unit| (unit.unit.clone(), unit.why.clone()))
+                    .collect();
+                for line in units::engine::explain_after(
+                    &volatile_store,
+                    &suite.id,
+                    &suite.units,
+                    &key,
+                    Some(&affected),
+                ) {
+                    eprintln!("{line}");
+                }
+            }
+            return Outcome {
+                status: 1,
+                key,
+                how: How::Untraced,
+            };
+        }
+    }
+    // A subset or an attribution pass launches under the suite lock, which decides again before it launches (spec 3.10).
+    // The verdict the lock reads is the run's decision when it no longer keeps the launches.
+    let (decision, clean, affected) = match decision {
+        Some(units::engine::Decision::Pass(_) | units::engine::Decision::Subset(_)) => {
+            match pending.as_ref() {
+                Some(pending) => match units::subset::execute(
+                    &cx,
+                    &lookup,
+                    pending,
+                    &volatile_store,
+                    &key,
+                    max_age,
+                ) {
+                    units::subset::Attempt::Ran(outcome) => return outcome,
+                    units::subset::Attempt::Decided(verdict) => {
+                        (Some(verdict.decision), verdict.clean, verdict.affected)
+                    }
+                },
+                None => (Some(units::engine::Decision::Full(None)), false, None),
+            }
+        }
+        other => (other, clean, affected),
+    };
     // A skip that drops versions of units that left the roster settles them under the suite lock, and may change its
     // decision there (spec 3.10, E16). Explain writes nothing, so it never settles.
     let decision = match decision {

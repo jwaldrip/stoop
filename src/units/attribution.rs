@@ -1,15 +1,15 @@
 //! The attribution pass (spec 3.1 to 3.7). A changed run of a hooked suite launches each unit of its roster
-//! once, in roster order, under one traced launch each. Each launch is judged by the independence checks in
-//! `launch` (spec 3.3): one that breaks a check stops the pass and disables the suite. Nothing is skipped on
-//! the strength of a unit proof yet, so every run that does not dispatch is the legacy path, unchanged.
-//! `stoop explain` asks the same checks, through `screen` and `probe`, so it predicts the decision made here.
+//! once, in roster order, under one traced launch each. The launches are `launch_each`, which a subset run
+//! shares (spec 3.10, E17 and E18). Each launch is judged by the independence checks in `launch` (spec 3.3): one
+//! that breaks a check stops the pass and disables the suite. `stoop explain` asks the same checks, through `screen`
+//! and `explain_lines`, so it predicts the decision made here.
 
 use super::bundle::{self, LaunchGuard, Pass, Pending, Scratch, Start, Stored};
 use super::config::Config;
 use super::expand;
 use super::hook::{safe, Base, FileMode, Hook};
 use super::independence::{Named, Roster, Violation, Written};
-use super::launch::{self, Observed, Verdict};
+use super::launch::{self, Observed, SkippedUnit, Verdict};
 use super::policy;
 use super::residue;
 use crate::ignore::Ignore;
@@ -17,7 +17,8 @@ use crate::input::Input;
 use crate::pathutil::to_key;
 use crate::proof::now;
 use crate::run::{self, How, Lookup, Outcome, RunCx};
-use std::ffi::OsString;
+use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
 use std::path::Path;
@@ -40,19 +41,8 @@ pub(crate) fn pass(
     let pending = screen(cx, hook, config, lookup, Ok(pending)).ok()?;
     // 8 and 9: the bundle is checked without the lock, then again under it. The store's unit folder is
     // excluded by its literal name, wherever the store sits, so no trace of it becomes an input (spec 4.7).
-    let mut ignore = Ignore::new(
-        &cx.o.ignore,
-        Some(&cx.root.join(".stoopignore")),
-        &cx.o.transient,
-    );
-    for folder in store_folders(cx.root, store) {
-        ignore.exclude_folder(&folder);
-    }
-    let guard = LaunchGuard {
-        env: cx.env_now.clone(),
-        env_excluded: cx.env_excluded.clone(),
-        ignore: ignore.patterns(),
-    };
+    let ignore = ignore_for(cx, store);
+    let guard = guard_of(cx, &ignore);
     let quiet = cx.o.quiet;
     let mut bundle_pass: Pass = match bundle::start(store, pending, key, guard) {
         Start::Pass(bundle_pass) => bundle_pass,
@@ -77,33 +67,146 @@ pub(crate) fn pass(
         ),
     );
     let real_root = std::fs::canonicalize(cx.root).unwrap_or_else(|_| cx.root.clone());
-    let forms = expand::list_forms(hook);
     let roster = Roster::new(units);
-    // What this run's launches have written, and what the proofs stored so far name (spec 3.3).
+    let ran = launch_each(
+        cx,
+        hook,
+        &ignore,
+        &mut bundle_pass,
+        units,
+        &roster,
+        &mut Named::default(),
+        &[],
+        &HashMap::new(),
+        &real_root,
+    );
+    for name in run::HOOK_ENV {
+        std::env::set_var(name, "");
+    }
+    let status = finish(&mut bundle_pass, lookup, pending, &ran, units.len(), quiet);
+    Some(Outcome {
+        status,
+        key: key.to_owned(),
+        how: How::Units,
+    })
+}
+
+/// The ignore set a run's launches are judged with: the command's own rules, with the store's unit folder excluded
+/// (spec 4.7). A version's guard is taken from the same set, through `guard_of`.
+pub(super) fn ignore_for(cx: &RunCx<'_>, store: &Path) -> Ignore {
+    let mut ignore = Ignore::new(
+        &cx.o.ignore,
+        Some(&cx.root.join(".stoopignore")),
+        &cx.o.transient,
+    );
+    for folder in store_folders(cx.root, store) {
+        ignore.exclude_folder(&folder);
+    }
+    ignore
+}
+
+/// The guard that a version and a whole proof are judged against, for the ignore set of `ignore_for` (spec 3.6).
+pub(super) fn guard_of(cx: &RunCx<'_>, ignore: &Ignore) -> LaunchGuard {
+    LaunchGuard {
+        env: cx.env_now.clone(),
+        env_excluded: cx.env_excluded.clone(),
+        ignore: ignore.patterns(),
+    }
+}
+
+/// A skipped unit whose proof a run's own writes broke (spec 3.7). `dir` is set for the listing level, which names the
+/// directory whose entries the launch changed. The file level names the path that the launch wrote.
+pub(super) struct Breach {
+    writer: String,
+    key: String,
+    dir: Option<String>,
+    skipped: String,
+}
+
+impl Breach {
+    fn line(&self) -> String {
+        match &self.dir {
+            None => format!(
+                "stoop: this run has no verdict (exit 125): {} changed {}, which skipped unit {} reads",
+                safe(&self.writer),
+                safe(&self.key),
+                safe(&self.skipped)
+            ),
+            Some(dir) => {
+                let shown = if dir.is_empty() { "." } else { dir };
+                format!(
+                    "stoop: this run has no verdict (exit 125): {} changed the entries of {}, which skipped unit {} lists",
+                    safe(&self.writer),
+                    safe(shown),
+                    safe(&self.skipped)
+                )
+            }
+        }
+    }
+}
+
+/// What a loop of launches came to (spec 3.7, 3.11).
+pub(super) struct Ran {
+    /// The first nonzero launch status, in launch order.
+    pub(super) status: i32,
+    /// The launches that ran.
+    pub(super) ran: usize,
+    /// Whether a planned unit was not launched at all, so the run has no verdict from it.
+    pub(super) unlaunched: bool,
+    /// The launches whose proofs the bundle's budget refused.
+    pub(super) over_budget: usize,
+    /// The first launch that broke an independence check, by its index in the launch list, and what it broke.
+    pub(super) stopped: Option<(usize, Violation)>,
+    /// The skipped units whose proofs the run's writes broke (spec 3.7): at most one per level.
+    pub(super) breaches: Vec<Breach>,
+}
+
+/// The launches of a pass or a subset, one traced launch per unit in `units` order (spec 3.3, 3.7, 3.11). Each launch
+/// is judged, and its proof replaces the unit's version when it holds. `named` holds the names the bundle's versions give,
+/// and `skipped` the units that are not launched, so a launch that breaks one of them is seen. `changed` gives each
+/// launched unit its changed inputs, which the launch exports as `STOOP_CHANGED_INPUTS` (spec 3.11).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn launch_each(
+    cx: &RunCx<'_>,
+    hook: &Hook,
+    ignore: &Ignore,
+    pass: &mut Pass,
+    units: &[String],
+    roster: &Roster,
+    named: &mut Named,
+    skipped: &[SkippedUnit],
+    changed: &HashMap<String, Vec<String>>,
+    real_root: &Path,
+) -> Ran {
+    let quiet = cx.o.quiet;
+    let forms = expand::list_forms(hook);
     let mut written = Written::default();
-    let mut named = Named::default();
-    let mut status = 0;
-    let mut unlaunched = false;
-    let mut ran = 0;
-    let mut over_budget = 0;
-    // The first launch that breaks an independence check, by its roster index, and what it breaks.
-    let mut stopped: Option<(usize, Violation)> = None;
+    let mut ran = Ran {
+        status: 0,
+        ran: 0,
+        unlaunched: false,
+        over_budget: 0,
+        stopped: None,
+        breaches: Vec::new(),
+    };
+    let mut listing_breach: Option<Breach> = None;
     for (index, unit) in units.iter().enumerate() {
         let unit_name = safe(unit);
         // The launch's list files live in its own folder, which is removed when this iteration ends.
-        let mut folder = match bundle_pass.scratch() {
+        let mut folder = match pass.scratch() {
             Ok(folder) => folder,
             Err(error) => {
                 not_launched(quiet, &unit_name, &error);
-                unlaunched = true;
+                ran.unlaunched = true;
                 continue;
             }
         };
-        let lists = match Lists::write(&mut folder, cx.root, cx.cwd, unit, &forms) {
+        let inputs = changed_inputs(cx, changed.get(unit));
+        let lists = match Lists::write(&mut folder, cx.root, cx.cwd, unit, &forms, &inputs) {
             Ok(lists) => lists,
             Err(error) => {
                 not_launched(quiet, &unit_name, &error);
-                unlaunched = true;
+                ran.unlaunched = true;
                 continue;
             }
         };
@@ -112,18 +215,18 @@ pub(crate) fn pass(
         }) else {
             let why = "its arguments cannot be expanded";
             not_launched(quiet, &unit_name, &why);
-            unlaunched = true;
+            ran.unlaunched = true;
             continue;
         };
         std::env::set_var("STOOP_CHANGED", &launch.value);
         std::env::set_var("STOOP_UNITS", &launch.value);
         std::env::set_var("STOOP_CHANGED_FILE", &lists.changed);
-        std::env::set_var("STOOP_CHANGED_INPUTS", "");
+        std::env::set_var("STOOP_CHANGED_INPUTS", &inputs);
         std::env::set_var("STOOP_CHANGED_INPUTS_FILE", &lists.inputs);
         // The root listing before the launch, which the root guard compares with the one after it (spec 3.5).
         let root_before = launch::root_names(cx.root);
         let unit_status =
-            match run::launch_traced(cx, &launch.argv, &ignore, &real_root, false, false, false) {
+            match run::launch_traced(cx, &launch.argv, ignore, real_root, false, false, false) {
                 // A trace that fails before the command starts has run nothing. The unit runs once
                 // untraced and keeps no proof. It is never retried traced, because that could run it
                 // a second time.
@@ -135,34 +238,30 @@ pub(crate) fn pass(
                             safe(&error.to_string())
                         ),
                     );
-                    ran += 1;
+                    ran.ran += 1;
                     run::plain(&launch.argv, &[])
                 }
                 Ok(trace) => {
-                    ran += 1;
-                    let observed = Observed::of(&trace, cx.root, &real_root, &ignore);
+                    ran.ran += 1;
+                    let observed = Observed::of(&trace, cx.root, real_root, ignore);
                     let context = launch::Context {
                         root: cx.root,
-                        real_root: &real_root,
-                        ignore: &ignore,
-                        roster: &roster,
+                        real_root,
+                        ignore,
+                        roster,
                         members: std::slice::from_ref(unit),
                         written: &written,
-                        named: &named,
+                        named,
                         root_before: &root_before,
                     };
                     match launch::judge(&context, &trace, &observed) {
                         Verdict::Proven(kept) => {
-                            let stored = bundle_pass.record(
-                                &launch.unit,
-                                &kept.inputs,
-                                &kept.outputs,
-                                now(),
-                            );
-                            match stored {
-                                Stored::OverBudget => over_budget += 1,
+                            let (old_inputs, old_outputs) = pass.held_of(unit);
+                            match pass.record(&launch.unit, &kept.inputs, &kept.outputs, now()) {
+                                Stored::OverBudget => ran.over_budget += 1,
                                 Stored::Stored | Stored::WriteFailed => {
-                                    named.store(unit, &paths(&kept.inputs), &paths(&kept.outputs))
+                                    named.forget(unit, &paths(&old_inputs), &paths(&old_outputs));
+                                    named.store(unit, &paths(&kept.inputs), &paths(&kept.outputs));
                                 }
                             }
                         }
@@ -180,38 +279,105 @@ pub(crate) fn pass(
                                     ),
                                 );
                             }
-                            stopped = Some((index, violation));
+                            ran.stopped = Some((index, violation));
                         }
+                    }
+                    // The listing level of the 125 rule, judged while the trace is still here (spec 3.7).
+                    if listing_breach.is_none() {
+                        listing_breach = launch::listing(skipped, cx.root, real_root, &trace).map(
+                            |(skip, key, dir)| Breach {
+                                writer: unit.clone(),
+                                key,
+                                dir: Some(dir),
+                                skipped: skip,
+                            },
+                        );
                     }
                     written.add(&observed.writes, unit);
                     trace.status
                 }
             };
         // The first nonzero status in roster order. A failing unit never stops the pass (spec 3.9).
-        status = keep(status, unit_status);
-        if stopped.is_some() {
+        ran.status = keep(ran.status, unit_status);
+        if ran.stopped.is_some() {
             break;
         }
     }
-    for name in run::HOOK_ENV {
-        std::env::set_var(name, "");
+    // The file level of the 125 rule: a launch wrote a path that a skipped unit names (spec 3.7).
+    ran.breaches.extend(file_breach(skipped, &written));
+    ran.breaches.extend(listing_breach);
+    ran
+}
+
+/// The first skipped unit whose input, output or own file this run wrote, in roster order (spec 3.7). The writer is the
+/// first launch that wrote the path.
+fn file_breach(skipped: &[SkippedUnit], written: &Written) -> Option<Breach> {
+    skipped.iter().find_map(|skip| {
+        skip.paths.iter().find_map(|path| {
+            written.writer(path).map(|writer| Breach {
+                writer: writer.to_owned(),
+                key: path.clone(),
+                dir: None,
+                skipped: skip.unit.clone(),
+            })
+        })
+    })
+}
+
+/// The changed inputs of one launch, as `STOOP_CHANGED_INPUTS` holds them (spec 3.11): the cwd-relative paths of the
+/// changed keys inside the root, sorted, one per line. A pass has none, so its text is empty.
+fn changed_inputs(cx: &RunCx<'_>, keys: Option<&Vec<String>>) -> OsString {
+    let mut paths: Vec<OsString> = keys
+        .into_iter()
+        .flatten()
+        .filter(|key| !key.starts_with('/'))
+        .map(|key| {
+            let path = expand::render(cx.root, cx.cwd, key, Base::Cwd);
+            if path.is_empty() {
+                OsString::from(".")
+            } else {
+                path
+            }
+        })
+        .collect();
+    paths.sort();
+    paths.dedup();
+    let mut text = OsString::new();
+    for (index, path) in paths.iter().enumerate() {
+        if index > 0 {
+            text.push("\n");
+        }
+        text.push(path);
     }
-    // The residue of the whole command, measured now that the pass has launched every unit it could (spec 3.8).
-    bundle_pass.settle_residue(&lookup.proofs, pending.listings());
+    text
+}
+
+/// Settles a run's launches once they end (spec 3.6 to 3.8, 3.11, 3.12): the residue of the whole command, the state
+/// a stopped run stores, and the exit status. `planned` is the number of launches the run planned.
+pub(super) fn finish(
+    pass: &mut Pass,
+    lookup: &Lookup,
+    pending: &Pending,
+    ran: &Ran,
+    planned: usize,
+    quiet: bool,
+) -> i32 {
+    // The residue of the whole command, measured now that the run has launched every unit it could (spec 3.8).
+    pass.settle_residue(&lookup.proofs, pending.listings());
     let id = pending.suite();
-    // The state a stopped pass stores is decided by `disabling` (spec 3.6). It is stored under the lock this pass holds.
+    // The state a stopped run stores is decided by `disabling` (spec 3.6). It is stored under the lock this run holds.
     if let Some(Disabling {
         code,
         label,
         keep_units,
     }) = disabling(
-        stopped.as_ref().map(|(_, violation)| violation),
-        over_budget > 0,
+        ran.stopped.as_ref().map(|(_, violation)| violation),
+        ran.over_budget > 0,
     ) {
         let stored = if keep_units {
-            bundle_pass.disable(code, &label)
+            pass.disable(code, &label)
         } else {
-            bundle_pass.disable_without_versions(code, &label)
+            pass.disable_without_versions(code, &label)
         };
         if stored.is_ok() {
             say(
@@ -222,7 +388,7 @@ pub(crate) fn pass(
             );
         } else {
             // The state could not be stored, so no proof may stay usable under an enabled suite.
-            bundle_pass.remove_bundle();
+            pass.remove_bundle();
             say(
                 quiet,
                 format!(
@@ -231,24 +397,26 @@ pub(crate) fn pass(
             );
         }
     }
-    // A run with no failing launch has no verdict when a unit was not launched or it stopped before its last launch
-    // (spec 3.7). A stop says how far it got (spec 3.12).
-    let planned = units.len();
-    let stopped_early = matches!(&stopped, Some((index, _)) if index + 1 < planned);
-    if status == 0 && stopped_early {
-        say(
-            quiet,
-            format!(
-                "stoop: this run has no verdict (exit 125): only {ran} of {planned} launches ran"
-            ),
-        );
+    // A run with no failing launch has no verdict when a unit was not launched, when it stopped before its last
+    // launch, or when a skipped unit's proof no longer holds because of the run's writes (spec 3.7). A stop says how
+    // far it got (spec 3.12).
+    let stopped_early = matches!(&ran.stopped, Some((index, _)) if index + 1 < planned);
+    if ran.status == 0 {
+        if stopped_early {
+            say(
+                quiet,
+                format!(
+                    "stoop: this run has no verdict (exit 125): only {} of {planned} launches ran",
+                    ran.ran
+                ),
+            );
+        }
+        for breach in &ran.breaches {
+            say(quiet, breach.line());
+        }
     }
-    status = exit_status(status, unlaunched || stopped_early);
-    Some(Outcome {
-        status,
-        key: key.to_owned(),
-        how: How::Units,
-    })
+    let no_verdict = ran.unlaunched || stopped_early || !ran.breaches.is_empty();
+    exit_status(ran.status, no_verdict)
 }
 
 /// The paths of a list of inputs or outputs, in their order.
@@ -527,8 +695,8 @@ fn store_folders(root: &Path, store: &Path) -> Vec<String> {
 }
 
 /// The files one launch names (spec 3.7, 4.12). `changed` is the newline list of the unit's cwd-relative
-/// path, which `STOOP_CHANGED_FILE` names and `{changed:file}` reads. `inputs` is empty, for
-/// `STOOP_CHANGED_INPUTS_FILE`. `others` holds the other list forms the hook names, once each.
+/// path, which `STOOP_CHANGED_FILE` names and `{changed:file}` reads. `inputs` holds the launch's changed
+/// inputs, which `STOOP_CHANGED_INPUTS_FILE` names. `others` holds the other list forms the hook names, once each.
 struct Lists {
     changed: OsString,
     inputs: OsString,
@@ -543,6 +711,7 @@ impl Lists {
         cwd: &Path,
         unit: &str,
         forms: &[(FileMode, Base)],
+        inputs: &OsStr,
     ) -> io::Result<Lists> {
         let changed = write_form(folder, root, cwd, unit, FileMode::File, Base::Cwd)?;
         let mut others: Vec<(FileMode, Base, OsString)> = Vec::new();
@@ -554,7 +723,9 @@ impl Lists {
             let path = write_form(folder, root, cwd, unit, mode, base)?;
             others.push((mode, base, path));
         }
-        let inputs = folder.write("inputs", &[])?.into_os_string();
+        let inputs = folder
+            .write("inputs", inputs.as_encoded_bytes())?
+            .into_os_string();
         Ok(Lists {
             changed,
             inputs,

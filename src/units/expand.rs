@@ -104,7 +104,7 @@ fn relative(from: &Path, to: &Path) -> PathBuf {
 
 /// A unit's path as a placeholder with `base` shows it. The root is absolute, so `cwd` and the
 /// root's join stay comparable.
-fn render(root: &Path, cwd: &Path, unit: &str, base: Base) -> OsString {
+pub(crate) fn render(root: &Path, cwd: &Path, unit: &str, base: Base) -> OsString {
     match base {
         Base::Cwd => relative(cwd, &root.join(unit)).into_os_string(),
         Base::Root => OsString::from(unit),

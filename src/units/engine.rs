@@ -1,8 +1,10 @@
 //! The decision engine (spec 3.9 and 3.10). With `STOOP_SPLIT` on, a changed run of a hooked suite decides from the unit
-//! proofs in its bundle whether it may skip. W7-1 acts on one decision, a skip when no unit is affected. Every other
-//! decision takes the full command, which is the switch-off path, with the reason the spec gives. Explain takes the same
-//! decision without the suite lock and prints the same lines (spec 3.12). Nothing here writes, except `settle` and
-//! `disagree`, which run under the suite lock.
+//! proofs in its bundle which units are affected. A run with none skips (E16). A run whose affected units are the whole
+//! roster is an attribution pass that keeps versions (E17), and any other affected set is a subset, one launch per unit
+//! (E18). Both run under the suite lock, which decides again before it launches (`subset`). Every other decision takes
+//! the full command, which is the switch-off path, with the reason the spec gives. Explain takes the same decision
+//! without the suite lock and prints the same lines (spec 3.12). Nothing here writes, except `settle` and `disagree`,
+//! which run under the suite lock.
 
 use super::attribution;
 use super::bundle::{self, LaunchGuard, Pending, Settled, Version, View};
@@ -21,7 +23,7 @@ use std::time::{Duration, Instant};
 use std::{fs, io};
 
 /// How many affected units explain names before it counts the rest (spec 3.12).
-const NAMED: usize = 20;
+pub(super) const NAMED: usize = 20;
 
 /// The reason of a unit that has no proof (spec 3.9).
 const NEW: &str = "new";
@@ -54,10 +56,14 @@ pub(crate) enum Decision {
     Legacy,
     /// Step E8 for a disabled suite: the full command runs, for this reason.
     Disabled(String),
-    /// Steps E10 to E15, and E17 and E18 in W7-1: the full command runs. `None` keeps the legacy reason.
+    /// Steps E10 to E15: the full command runs. `None` keeps the legacy reason.
     Full(Option<String>),
     /// Step E16: no unit is affected, so the run skips.
     Skip(Skipped),
+    /// Step E17: every unit of the roster is affected, so the attribution pass runs and keeps versions.
+    Pass(Plan),
+    /// Step E18: some units are affected, so one launch runs for each of them, and the rest keep their proofs.
+    Subset(Plan),
 }
 
 /// A skip, with the counts its line names (spec 3.12).
@@ -68,6 +74,24 @@ pub(crate) struct Skipped {
     pub(crate) inputs: usize,
     /// Whether the bundle holds versions of units that left the roster. A skip drops them under the suite lock.
     pub(crate) drop: bool,
+}
+
+/// The affected set of a decision that launches units (spec 3.9, E17 and E18), in roster order.
+pub(crate) struct Plan {
+    /// The roster's units.
+    pub(crate) units: usize,
+    /// The distinct inputs that the roster's proofs name, which the subset header counts.
+    pub(crate) inputs: usize,
+    /// The affected units, in roster order.
+    pub(crate) affected: Vec<Affected>,
+}
+
+/// One affected unit (spec 3.9): its reason, which the header and explain name, and the inputs that changed for its
+/// proof, which `STOOP_CHANGED_INPUTS` names for its launch (spec 3.11). A unit that has no proof changed no input.
+pub(crate) struct Affected {
+    pub(crate) unit: String,
+    pub(crate) why: String,
+    pub(crate) changed: Vec<String>,
 }
 
 /// A decision with what explain prints for it.
@@ -125,8 +149,17 @@ fn plain() -> Verdict {
     }
 }
 
+/// The verdict of a locked run that keeps the full command for no engine reason: the legacy path decides (spec 3.10).
+pub(super) fn unrun() -> Verdict {
+    Verdict {
+        decision: Decision::Full(None),
+        affected: None,
+        clean: false,
+    }
+}
+
 /// What a decision reads besides the bundle: the roster, the candidate whole proofs, the environment now and the clock.
-struct Judged<'a> {
+pub(super) struct Judged<'a> {
     root: &'a Path,
     suite: &'a str,
     roster: &'a [String],
@@ -137,7 +170,7 @@ struct Judged<'a> {
 }
 
 impl<'a> Judged<'a> {
-    fn new(
+    pub(super) fn new(
         cx: &'a RunCx<'_>,
         pending: &'a Pending,
         proofs: &'a [Proof],
@@ -236,7 +269,7 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
         }
     }
     // E13 onward: the affected units are known, and explain shows them.
-    let shown = Some(affected.clone());
+    let shown = Some(pairs(&affected));
     if whole_guard(proof) != cx.guard {
         return verdict(
             Decision::Full(Some(
@@ -266,8 +299,36 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
         }
         return verdict(Decision::Skip(skipped(cx, view)), shown, clean);
     }
-    // E17 and E18: W7-1 has no subset, so the full command runs for the legacy reason.
-    verdict(Decision::Full(None), shown, clean)
+    // E17 and E18: the affected units launch one at a time. Units that are all affected make the attribution pass.
+    let whole = affected.len() == cx.roster.len();
+    let plan = Plan {
+        units: cx.roster.len(),
+        inputs: skipped(cx, view).inputs,
+        affected,
+    };
+    verdict(
+        if whole {
+            Decision::Pass(plan)
+        } else {
+            Decision::Subset(plan)
+        },
+        shown,
+        clean,
+    )
+}
+
+/// The decision of a locked run that launches units (spec 3.10). `Ok` carries the plan for E17 and E18. `Err` carries
+/// the verdict of every other decision, which the run takes as it stands.
+pub(super) fn judge_units(cx: &Judged<'_>, view: &View) -> Result<Plan, Verdict> {
+    let verdict = judge(cx, view);
+    match verdict.decision {
+        Decision::Pass(plan) | Decision::Subset(plan) => Ok(plan),
+        decision => Err(Verdict {
+            decision,
+            affected: verdict.affected,
+            clean: verdict.clean,
+        }),
+    }
 }
 
 fn verdict(decision: Decision, affected: Option<Vec<(String, String)>>, clean: bool) -> Verdict {
@@ -276,6 +337,14 @@ fn verdict(decision: Decision, affected: Option<Vec<(String, String)>>, clean: b
         affected,
         clean,
     }
+}
+
+/// The reason and unit of each affected unit, as explain names them.
+fn pairs(affected: &[Affected]) -> Vec<(String, String)> {
+    affected
+        .iter()
+        .map(|affected| (affected.unit.clone(), affected.why.clone()))
+        .collect()
 }
 
 /// Step E16 for listings (spec 3.10). A skip also needs the listings that the whole proof holds to be as they were. The
@@ -432,33 +501,49 @@ impl Current {
 
 /// Step E13 (spec 3.9): the roster units whose proof no longer holds, each with its reason, in roster order. A unit
 /// holds when one of its versions holds, and each version is judged against its own stamp, guard and entries.
-fn analyse(cx: &Judged<'_>, view: &View, current: &Current) -> Vec<(String, String)> {
+fn analyse(cx: &Judged<'_>, view: &View, current: &Current) -> Vec<Affected> {
     let mut affected = Vec::new();
     for unit in cx.roster {
-        let versions: Vec<Vec<String>> = view
+        let judged: Vec<(Vec<String>, Vec<String>)> = view
             .units
             .get(unit)
             .into_iter()
             .flatten()
             .map(|version| version_reasons(cx, view, current, version))
             .collect();
-        if versions.is_empty() {
-            affected.push((unit.clone(), NEW.to_owned()));
-        } else if versions.iter().all(|reasons| !reasons.is_empty()) {
-            affected.push((unit.clone(), summary(&versions[0])));
+        if judged.is_empty() {
+            affected.push(Affected {
+                unit: unit.clone(),
+                why: NEW.to_owned(),
+                changed: Vec::new(),
+            });
+        } else if judged.iter().all(|(reasons, _)| !reasons.is_empty()) {
+            let mut changed: Vec<String> = judged
+                .iter()
+                .flat_map(|(_, changed)| changed.iter().cloned())
+                .collect();
+            changed.sort();
+            changed.dedup();
+            affected.push(Affected {
+                unit: unit.clone(),
+                why: summary(&judged[0].0),
+                changed,
+            });
         }
     }
     affected
 }
 
 /// Why one version no longer holds, in the order spec 3.9 gives: its age, its environment, its inputs and its outputs.
+/// It also returns the inputs that changed, as root-relative keys (spec 3.11).
 fn version_reasons(
     cx: &Judged<'_>,
     view: &View,
     current: &Current,
     version: &Version,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let mut reasons = Vec::new();
+    let mut changed = Vec::new();
     if cx.max_age > 0 && cx.now.saturating_sub(version.created) > cx.max_age {
         reasons.push("proof expired".to_owned());
     }
@@ -469,6 +554,7 @@ fn version_reasons(
         let input = &view.table[index as usize];
         if !current.holds(input) {
             reasons.push(format!("{} changed", safe(&input.path)));
+            changed.push(input.path.clone());
         }
     }
     for &index in &version.outputs {
@@ -482,7 +568,7 @@ fn version_reasons(
             reasons.push(format!("output {} {verb}", safe(&output.path)));
         }
     }
-    reasons
+    (reasons, changed)
 }
 
 /// The reason a unit prints: its first reason, and how many more it has (spec 3.9).

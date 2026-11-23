@@ -88,7 +88,7 @@ fn sorted(items: &[String]) -> Vec<&str> {
     out
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct UnitVersion {
     created: u64,
     exact: bool,
@@ -98,7 +98,7 @@ struct UnitVersion {
     outputs: Vec<u32>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ResultSource {
     Exit,
@@ -1290,6 +1290,13 @@ impl Drop for Scratch {
     }
 }
 
+/// The state a kept pass holds before a record, which a refused record restores (spec 3.11).
+type Snapshot = (
+    BTreeMap<String, Vec<UnitVersion>>,
+    Vec<Input>,
+    BTreeMap<String, u32>,
+);
+
 /// One attribution pass. It holds the suite lock until it is dropped, so no other stoop changes
 /// the suite meanwhile, and it rewrites the bundle after each stored proof.
 pub(crate) struct Pass {
@@ -1302,6 +1309,11 @@ pub(crate) struct Pass {
     /// When the bundle was last written, and whether a proof is held that no write has stored yet.
     last_write: Option<Instant>,
     dirty: bool,
+    /// The state a stopped run stores: `attribution` for a pass, `subset` for a run that keeps versions (spec 3.6).
+    phase: &'static str,
+    /// Whether the pass keeps the bundle's versions, as `keep` does. A kept pass compacts the table whenever it replaces
+    /// a proof (spec 3.11). A clear pass starts with no versions, so it never replaces one.
+    keep: bool,
     #[cfg(test)]
     writes: usize,
 }
@@ -1312,9 +1324,9 @@ impl Pass {
         Scratch::create(&self.area, &self.bundle.suite)
     }
 
-    /// Keeps one unit's proof as its only version. The bundle is written when a write is due (see
-    /// `FLUSH_INTERVAL`). A version that would exceed the budget is dropped with the table entries
-    /// it added.
+    /// Keeps one unit's proof as its only version, in place of the version the unit held (spec 3.11). The bundle is
+    /// written when a write is due (see `FLUSH_INTERVAL`). A proof that the budget or the bundle's bounds refuse is not
+    /// kept: the unit keeps the version it held, and the table keeps no entry of the refused proof.
     pub(crate) fn record(
         &mut self,
         unit: &str,
@@ -1323,6 +1335,15 @@ impl Pass {
         created: u64,
     ) -> Stored {
         let mark = self.bundle.table.len();
+        // A kept pass compacts the table, which renumbers every version. A refused proof restores the state the record
+        // began with, so the state is taken before anything changes (spec 3.11).
+        let snapshot = self.keep.then(|| {
+            (
+                self.bundle.units.clone(),
+                self.bundle.table.clone(),
+                self.interned.clone(),
+            )
+        });
         let inputs = self.indices(inputs);
         let outputs = self.indices(outputs);
         let version = UnitVersion {
@@ -1333,17 +1354,20 @@ impl Pass {
             inputs: delta(&inputs),
             outputs: delta(&outputs),
         };
-        self.bundle.units.insert(unit.to_owned(), vec![version]);
+        let previous = self.bundle.units.insert(unit.to_owned(), vec![version]);
+        if self.keep {
+            self.compact_table();
+        }
         let Ok(bytes) = serde_json::to_vec(&self.bundle) else {
-            self.discard(unit, mark);
+            self.refuse(unit, previous, mark, snapshot);
             return Stored::WriteFailed;
         };
         if bytes.len() as u64 > self.budget {
-            self.discard(unit, mark);
+            self.refuse(unit, previous, mark, snapshot);
             return Stored::OverBudget;
         }
         if !valid_bundle(&self.bundle, &self.bundle.suite) {
-            self.discard(unit, mark);
+            self.refuse(unit, previous, mark, snapshot);
             return Stored::WriteFailed;
         }
         self.dirty = true;
@@ -1396,20 +1420,113 @@ impl Pass {
         index
     }
 
-    /// Drops what `record` added for `unit`, so memory matches what is stored.
-    fn discard(&mut self, unit: &str, mark: usize) {
-        self.bundle.units.remove(unit);
+    /// Undoes a refused record (spec 3.11). A kept pass restores the state the record began with. A clear pass puts back
+    /// the version the unit held, or none, and drops the table entries the proof added, as it always did.
+    fn refuse(
+        &mut self,
+        unit: &str,
+        previous: Option<Vec<UnitVersion>>,
+        mark: usize,
+        snapshot: Option<Snapshot>,
+    ) {
+        if let Some((units, table, interned)) = snapshot {
+            self.bundle.units = units;
+            self.bundle.table = table;
+            self.interned = interned;
+            return;
+        }
+        match previous {
+            Some(versions) => {
+                self.bundle.units.insert(unit.to_owned(), versions);
+            }
+            None => {
+                self.bundle.units.remove(unit);
+            }
+        }
         self.bundle.table.truncate(mark);
         self.interned.retain(|_, index| (*index as usize) < mark);
     }
 
+    /// Rebuilds the table from the entries that the versions still index, and renumbers the interned indices to match
+    /// (spec 3.11).
+    fn compact_table(&mut self) {
+        let renumber = compact(&mut self.bundle);
+        self.interned = std::mem::take(&mut self.interned)
+            .into_iter()
+            .filter_map(|(key, index)| {
+                renumber
+                    .get(index as usize)
+                    .copied()
+                    .flatten()
+                    .map(|new| (key, new))
+            })
+            .collect();
+    }
+
+    /// Drops the versions of units that left the roster, and compacts the table (spec 3.11). A pass starts with no
+    /// versions, so only a kept run has any to drop. Returns whether anything changed.
+    fn prune(&mut self) -> bool {
+        let units = self.bundle.units.len();
+        let table = self.bundle.table.len();
+        let roster = &self.bundle.roster.units;
+        self.bundle
+            .units
+            .retain(|unit, _| roster.binary_search(unit).is_ok());
+        self.compact_table();
+        let changed = self.bundle.units.len() != units || self.bundle.table.len() != table;
+        self.dirty |= changed;
+        changed
+    }
+
+    /// The entries that a unit's stored versions name, as inputs and as outputs, in table order (spec 3.9).
+    fn entries(&self, versions: &[UnitVersion]) -> (Vec<Input>, Vec<Input>) {
+        let len = self.bundle.table.len();
+        let mut inputs = Vec::new();
+        let mut outputs = Vec::new();
+        for version in versions {
+            for index in undelta(&version.inputs, len).unwrap_or_default() {
+                inputs.push(self.bundle.table[index as usize].clone());
+            }
+            for index in undelta(&version.outputs, len).unwrap_or_default() {
+                outputs.push(self.bundle.table[index as usize].clone());
+            }
+        }
+        (inputs, outputs)
+    }
+
+    /// The entries that `unit`'s stored versions name. Empty for a unit with no version.
+    pub(crate) fn held_of(&self, unit: &str) -> (Vec<Input>, Vec<Input>) {
+        self.bundle.units.get(unit).map_or_else(
+            || (Vec::new(), Vec::new()),
+            |versions| self.entries(versions),
+        )
+    }
+
+    /// Every unit that holds a version, with the entries its versions name.
+    pub(crate) fn held(&self) -> Vec<(String, Vec<Input>, Vec<Input>)> {
+        self.bundle
+            .units
+            .iter()
+            .map(|(unit, versions)| {
+                let (inputs, outputs) = self.entries(versions);
+                (unit.clone(), inputs, outputs)
+            })
+            .collect()
+    }
+
+    /// Names the state a stopped run stores: `attribution` for a run that launches every unit, `subset` for one that
+    /// launches some (spec 3.6).
+    pub(crate) fn set_phase(&mut self, phase: &'static str) {
+        self.phase = phase;
+    }
+
     /// Stores the suite as disabled for `code` and `label`, under the lock this pass holds, at once: a run killed
     /// after this point keeps the state. The unit proofs held so far stay on disk, unread, until `forget --units`
-    /// (spec 3.6).
+    /// (spec 3.6). The state names the handle's phase.
     pub(crate) fn disable(&mut self, code: &str, label: &str) -> io::Result<()> {
         self.bundle.state = SuiteState::Disabled {
             code: code.to_owned(),
-            phase: "attribution".to_owned(),
+            phase: self.phase.to_owned(),
             label: label.to_owned(),
             at: now(),
         };
@@ -1517,9 +1634,97 @@ fn start_with(
         budget: MAX_BYTES,
         last_write: None,
         dirty: stored,
+        phase: "attribution",
+        keep: false,
         #[cfg(test)]
         writes: 0,
     })
+}
+
+/// What `keep` does under the suite lock (spec 3.10, E17 and E18).
+#[allow(clippy::large_enum_variant)] // The handle stays inline, as `Start` keeps it, so a run makes no allocation for it.
+pub(crate) enum Kept<T, D> {
+    /// Another stoop holds the suite lock, so nothing is decided here.
+    Busy,
+    /// The bundle cannot be read, written or kept for this command.
+    Unavailable,
+    /// `decide` did not keep the decision. Nothing is written.
+    Declined(D),
+    /// The decision holds under the lock. The pass keeps the bundle's versions, and a run replaces only what it launches.
+    Locked(Pass, T),
+}
+
+/// Under the suite lock, judges the bundle with `decide`. When it keeps the decision, returns a pass that keeps the
+/// bundle's versions (spec 3.11). The checks are those of `start`, without the one that refuses a suite with a proof for
+/// a unit, which a subset needs. `phase` names the state a stopped run stores (spec 3.6).
+pub(crate) fn keep<T, D>(
+    store: &Path,
+    pending: &Pending,
+    key: &str,
+    guard: LaunchGuard,
+    decide: impl FnOnce(&View) -> Result<T, D>,
+) -> Kept<T, D> {
+    let Ok(Some(area)) = Area::open(store, false) else {
+        return Kept::Unavailable;
+    };
+    let held = match lock(&area, &pending.suite) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Kept::Busy,
+        Err(_) => return Kept::Unavailable,
+    };
+    clear_temps(&area, &pending.suite);
+    let Some(view) = view_in(&area, pending, key) else {
+        return Kept::Unavailable;
+    };
+    let value = match decide(&view) {
+        Ok(value) => value,
+        Err(declined) => return Kept::Declined(declined),
+    };
+    if !area.writable(&pending.suite) {
+        return Kept::Unavailable;
+    }
+    let Some(mut bundle) = bundle_for(&area, pending, key) else {
+        return Kept::Unavailable;
+    };
+    if matches!(bundle.state, SuiteState::Disabled { .. }) {
+        return Kept::Unavailable;
+    }
+    bundle.guard_digest = guard.digest();
+    bundle.guard = guard;
+    bundle.policy.clone_from(&pending.policy);
+    bundle.roster = Roster {
+        source: pending.roster.source.clone(),
+        units: pending.roster.units.clone(),
+    };
+    let mut pass = Pass {
+        area,
+        _lock: held,
+        interned: interned_of(&bundle.table),
+        bundle,
+        budget: MAX_BYTES,
+        last_write: None,
+        dirty: false,
+        phase: "subset",
+        keep: true,
+        #[cfg(test)]
+        writes: 0,
+    };
+    pass.prune();
+    Kept::Locked(pass, value)
+}
+
+/// The table index of each entry, by its serialized form (see `Pass::intern`).
+fn interned_of(table: &[Input]) -> BTreeMap<String, u32> {
+    table
+        .iter()
+        .enumerate()
+        .map(|(index, input)| {
+            (
+                serde_json::to_string(input).expect("an input always serializes"),
+                u32::try_from(index).expect("the table is bounded"),
+            )
+        })
+        .collect()
 }
 
 /// Whether a bundle was recorded for this command and provenance. A pass, `stoop explain` and the counts judge a
@@ -1776,17 +1981,18 @@ pub(crate) fn drop_stale(
 }
 
 /// Rebuilds the table from the entries that the versions still index, in table order, and renumbers the versions to it.
-fn compact(bundle: &mut SuiteBundleV1) {
+/// It returns where each old entry went: `None` for an entry that no version indexes (spec 3.11).
+fn compact(bundle: &mut SuiteBundleV1) -> Vec<Option<u32>> {
     let len = bundle.table.len();
     let mut used: BTreeSet<u32> = BTreeSet::new();
     for version in bundle.units.values().flatten() {
         used.extend(undelta(&version.inputs, len).unwrap_or_default());
         used.extend(undelta(&version.outputs, len).unwrap_or_default());
     }
-    let mut renumber = vec![0u32; len];
+    let mut renumber: Vec<Option<u32>> = vec![None; len];
     let mut table = Vec::with_capacity(used.len());
     for (new, &old) in used.iter().enumerate() {
-        renumber[old as usize] = u32::try_from(new).expect("the table is bounded");
+        renumber[old as usize] = Some(u32::try_from(new).expect("the table is bounded"));
         table.push(bundle.table[old as usize].clone());
     }
     for version in bundle.units.values_mut().flatten() {
@@ -1794,12 +2000,13 @@ fn compact(bundle: &mut SuiteBundleV1) {
             let renamed: Vec<u32> = undelta(indices.as_slice(), len)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|index| renumber[index as usize])
+                .filter_map(|index| renumber[index as usize])
                 .collect();
             *indices = delta(&renamed);
         }
     }
     bundle.table = table;
+    renumber
 }
 
 /// Stores the suite as disabled for a disagreement (spec 3.4 and 3.6): a full command failed while every unit's proof
@@ -3559,6 +3766,192 @@ mod settle_tests {
             matches!(settle_at(&dir, &pending), Some(Decision::Disabled(_))),
             "the locked decision replaces the skip"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod keep_tests {
+    use super::*;
+
+    fn input(path: &str) -> Input {
+        Input {
+            path: path.into(),
+            id: "f:00".into(),
+            oid: None,
+            oid_basis: None,
+        }
+    }
+
+    fn guard() -> LaunchGuard {
+        LaunchGuard {
+            env: BTreeMap::new(),
+            env_excluded: Vec::new(),
+            ignore: Vec::new(),
+        }
+    }
+
+    fn pending_for(units: &[&str]) -> Pending {
+        pending(PendingSpec {
+            argv: &["runner".into(), "{changed:*.t}".into()],
+            cwd: "",
+            scope: None,
+            label: None,
+            source: "filter",
+            filter: "*.t",
+            units: units.iter().map(|unit| unit.to_string()).collect(),
+            config: None,
+            config_suite: None,
+            listings: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn version(inputs: Vec<u32>) -> UnitVersion {
+        UnitVersion {
+            created: 1,
+            exact: true,
+            source: ResultSource::Exit,
+            guard: "guard".into(),
+            inputs,
+            outputs: Vec::new(),
+        }
+    }
+
+    /// A bundle that `keep` accepts for `pending` under `key`, holding `units` over `table`.
+    fn bundle_for(
+        pending: Pending,
+        key: &str,
+        table: Vec<Input>,
+        units: BTreeMap<String, Vec<UnitVersion>>,
+    ) -> SuiteBundleV1 {
+        SuiteBundleV1 {
+            v: VERSION,
+            generation: GENERATION,
+            suite: pending.suite,
+            provenance: Provenance::current(),
+            origin: pending.origin,
+            whole_key_digest: digest_text("stoop whole key v1", key),
+            whole: Some("p-1".into()),
+            policy: pending.policy,
+            guard: guard(),
+            guard_digest: "guard".into(),
+            roster: pending.roster,
+            table,
+            units,
+            residue: Residue::default(),
+            state: SuiteState::Ready,
+        }
+    }
+
+    /// Writes `bundle` into a new store and returns the store's directory.
+    fn seed(name: &str, bundle: &SuiteBundleV1) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("stoop-keep-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let area = Area::open(&dir, true).unwrap().unwrap();
+        write_bundle(&area, bundle).unwrap();
+        dir
+    }
+
+    /// The pass that `keep` gives for `pending`, which keeps its bundle's versions.
+    fn kept(dir: &Path, pending: &Pending) -> Pass {
+        match keep(dir, pending, "key", guard(), |_| Ok::<(), ()>(())) {
+            Kept::Locked(pass, ()) => pass,
+            Kept::Busy => panic!("the suite lock was busy"),
+            Kept::Unavailable => panic!("the bundle is not kept"),
+            Kept::Declined(()) => panic!("the decision was declined"),
+        }
+    }
+
+    fn paths(entries: &[Input]) -> Vec<String> {
+        entries.iter().map(|entry| entry.path.clone()).collect()
+    }
+
+    #[test]
+    fn a_kept_pass_replaces_only_the_unit_it_proves_and_compacts_the_table() {
+        let units = ["tests/a.t", "tests/b.t"];
+        let mut held = BTreeMap::new();
+        held.insert("tests/a.t".to_owned(), vec![version(vec![0])]);
+        held.insert("tests/b.t".to_owned(), vec![version(vec![1])]);
+        let table = vec![input("src/a.src"), input("src/b.src")];
+        let dir = seed(
+            "replace",
+            &bundle_for(pending_for(&units), "key", table, held),
+        );
+        let mut pass = kept(&dir, &pending_for(&units));
+        assert!(matches!(
+            pass.record("tests/a.t", &[input("src/c.src")], &[], 2),
+            Stored::Stored
+        ));
+        assert_eq!(paths(&pass.held_of("tests/a.t").0), ["src/c.src"]);
+        assert_eq!(paths(&pass.held_of("tests/b.t").0), ["src/b.src"]);
+        assert_eq!(
+            pass.bundle.table.len(),
+            2,
+            "the replaced proof's entry is compacted away"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_record_keeps_the_version_the_unit_held() {
+        let units = ["tests/a.t"];
+        let mut held = BTreeMap::new();
+        held.insert("tests/a.t".to_owned(), vec![version(vec![0])]);
+        let table = vec![input("src/a.src")];
+        let dir = seed(
+            "refused",
+            &bundle_for(pending_for(&units), "key", table, held),
+        );
+        let mut pass = kept(&dir, &pending_for(&units));
+        pass.budget = 1;
+        assert!(matches!(
+            pass.record("tests/a.t", &[input("src/c.src")], &[], 2),
+            Stored::OverBudget
+        ));
+        assert_eq!(paths(&pass.held_of("tests/a.t").0), ["src/a.src"]);
+        assert_eq!(
+            pass.bundle.table.len(),
+            1,
+            "the refused proof's entry is gone"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_kept_pass_drops_the_versions_of_units_that_left_the_roster() {
+        let all = ["tests/a.t", "tests/gone.t"];
+        let mut held = BTreeMap::new();
+        held.insert("tests/a.t".to_owned(), vec![version(vec![0])]);
+        held.insert("tests/gone.t".to_owned(), vec![version(vec![1])]);
+        let table = vec![input("src/a.src"), input("src/gone.src")];
+        let dir = seed("prune", &bundle_for(pending_for(&all), "key", table, held));
+        let pass = kept(&dir, &pending_for(&["tests/a.t"]));
+        assert!(!pass.bundle.units.contains_key("tests/gone.t"));
+        assert_eq!(
+            pass.bundle.table.len(),
+            1,
+            "the departed unit's entry is compacted away"
+        );
+        assert!(
+            pass.dirty,
+            "the pruned bundle is written when the pass ends"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_kept_pass_stores_the_subset_phase_when_it_is_disabled() {
+        let units = ["tests/a.t"];
+        let bundle = bundle_for(pending_for(&units), "key", Vec::new(), BTreeMap::new());
+        let dir = seed("phase", &bundle);
+        let mut pass = kept(&dir, &pending_for(&units));
+        pass.disable("wrote_input", "tests/a.t wrote src/c.src")
+            .unwrap();
+        match &pass.bundle.state {
+            SuiteState::Disabled { phase, .. } => assert_eq!(phase, "subset"),
+            SuiteState::Ready => panic!("the suite is not disabled"),
+        }
         let _ = fs::remove_dir_all(&dir);
     }
 }
