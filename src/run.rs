@@ -898,6 +898,12 @@ fn unit_suite(
     let filter = inline.or(configured.as_ref())?;
     let ignore = units::universe::catalog_ignore(cx.root, &cx.o.ignore, &cx.o.transient).ok()?;
     let catalog = units::universe::discover(cx.root, &ignore, filter, configured.as_ref()).ok()?;
+    // The listing paths of this walk. The residue leaves them out, because the walk itself covers them (spec 3.8).
+    let listings: Vec<String> = catalog
+        .inputs
+        .iter()
+        .map(|input| input.path.clone())
+        .collect();
     let roster: Vec<String> = catalog.units.into_iter().map(|unit| unit.0).collect();
     let id = units::bundle::suite_id(
         &hook.original,
@@ -917,6 +923,7 @@ fn unit_suite(
             units: roster.clone(),
             config: config.key_source(),
             config_suite: suite.map(|suite| suite.id.as_str()),
+            listings,
         }),
     };
     Some(units::attribution::Suite {

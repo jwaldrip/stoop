@@ -9,6 +9,7 @@ pub(crate) mod independence;
 pub(crate) mod launch;
 pub(crate) mod policy;
 mod registry;
+pub(crate) mod residue;
 pub(crate) mod universe;
 
 pub(super) use registry::diagnostic;
