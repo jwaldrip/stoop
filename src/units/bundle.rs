@@ -947,10 +947,19 @@ fn read_bundle(area: &Area, id: &str) -> ReadBundle {
         return ReadBundle::OtherVersion;
     }
     match serde_json::from_slice::<SuiteBundleV1>(&bytes) {
-        Ok(bundle) if valid_bundle(&bundle, id) && valid_versions(&bundle) => {
-            ReadBundle::Current(bundle)
+        Ok(mut bundle) => {
+            // A residue that does not match its own count is unknown, not corrupt. An older binary keeps the residue
+            // and writes the bundle back without its count, while the units and the state stay true (spec 3.8).
+            if !valid_residue(&bundle.residue) {
+                bundle.residue = Residue::default();
+            }
+            if valid_bundle(&bundle, id) && valid_versions(&bundle) {
+                ReadBundle::Current(bundle)
+            } else {
+                ReadBundle::Corrupt
+            }
         }
-        _ => ReadBundle::Corrupt,
+        Err(_) => ReadBundle::Corrupt,
     }
 }
 
