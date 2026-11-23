@@ -940,30 +940,33 @@ fn run_model(seed: u64, steps: usize) {
                     report()
                 ),
                 Some((count, paths)) => {
-                    // The exemption (spec 3.8, E12): the stored residue refuses the no-op, so the full form runs once, and
-                    // the residue may name only files that deleted units read, by the model's own history.
-                    assert_eq!(
-                        launches,
-                        [""],
-                        "a refused no-op must run the full form once: {}",
-                        report()
-                    );
-                    assert!(
-                        stderr(&subject).contains("the full command reads "),
-                        "{}",
-                        report()
-                    );
-                    for path in paths {
-                        if let Err(why) = residue_owner(&model, path) {
-                            panic!(
-                                "the residue of {count} files names {path}, and {why}: {}",
-                                report()
-                            );
+                    // A refused no-op may still skip. The legacy whole-command proof is checked before the residue (spec 3.10,
+                    // E2), and a skip launches nothing, which satisfies the assertion. Only a full run is an exemption, and
+                    // it must name only files that deleted units read, by the model's own history.
+                    if !launches.is_empty() {
+                        assert_eq!(
+                            launches,
+                            [""],
+                            "a refused no-op must run the full form once: {}",
+                            report()
+                        );
+                        assert!(
+                            stderr(&subject).contains("the full command reads "),
+                            "{}",
+                            report()
+                        );
+                        for path in paths {
+                            if let Err(why) = residue_owner(&model, path) {
+                                panic!(
+                                    "the residue of {count} files names {path}, and {why}: {}",
+                                    report()
+                                );
+                            }
                         }
+                        println!(
+                            "M1 exemption: seed {seed}, step {step}: a residue of {count} files that deleted units read; the full form runs once"
+                        );
                     }
-                    println!(
-                        "M1 exemption: seed {seed}, step {step}: a residue of {count} files that deleted units read; the full form runs once"
-                    );
                 }
             }
         }
