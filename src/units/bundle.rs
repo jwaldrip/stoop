@@ -2463,7 +2463,11 @@ mod pass_tests {
     fn start_and_record_store_the_digest_of_the_same_guard() {
         let roster = ["tests/a.t"];
         let id = pending_for(&roster).suite;
-        let dir = seed("digest-agree", &bundle_for(pending_for(&roster), "key"));
+        // The seeded whole digest differs from the one recorded below, so the wait for record() ends only when
+        // record() has stored its bundle.
+        let mut seeded = bundle_for(pending_for(&roster), "key");
+        seeded.whole = Some("p-0".into());
+        let dir = seed("digest-agree", &seeded);
         let excluded = ["B", "A", "A"];
         let ignore = ["y", "x"];
         let started = pass_of(start(
@@ -2474,7 +2478,7 @@ mod pass_tests {
         ));
         let at_start = started.bundle.guard_digest.clone();
         drop(started);
-        let proof = Proof {
+        let proof = || Proof {
             created: 1,
             argv: Vec::new(),
             cwd: None,
@@ -2490,10 +2494,23 @@ mod pass_tests {
             probes: BTreeMap::new(),
             env_excluded: excluded.iter().map(|name| (*name).to_owned()).collect(),
         };
-        record(&dir, pending_for(&roster), "key", "p-1", proof);
-        let area = Area::open(&dir, false).unwrap().unwrap();
-        let ReadBundle::Current(stored) = read_bundle(&area, &id) else {
-            panic!("the recorded bundle is not current");
+        // record() is best effort. A busy suite lock makes it return without writing, which happens while another
+        // test thread's child still holds a copy of this suite's lock descriptor (see start_after_release). So it is
+        // called again until the bundle carries the digest it records, within 2 s. Only then are the digests asserted.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let stored = loop {
+            record(&dir, pending_for(&roster), "key", "p-1", proof());
+            let area = Area::open(&dir, false).unwrap().unwrap();
+            if let ReadBundle::Current(bundle) = read_bundle(&area, &id) {
+                if bundle.whole.as_deref() == Some("p-1") {
+                    break bundle;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "record() stored no bundle within 2 s, so the suite lock stayed busy"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
         };
         assert_eq!(stored.guard_digest, at_start, "start and record agree");
         assert_eq!(
