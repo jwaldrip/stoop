@@ -227,9 +227,31 @@ fn s6_a_new_unit_runs_alone() {
     assert_header(&out, "; run 1 (new): tests/d.t");
 }
 
-/// S7: deleting `c`, then editing the shared source, runs `a` and `b`. The proof of `c` is dropped with the write.
+/// S7: deleting `c`, then editing `a` and `b` through their own files, runs `a` and `b`. Each reads its own file alone, so
+/// neither change is global, and the proof of `c` is dropped with the write (spec 3.10, E18; E14 g2 does not apply).
 #[test]
 fn s7_deleting_c_then_an_edit_runs_a_and_b() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.remove("tests/c.t");
+    s.write("tests/a.t", "src/shared.src\n\n");
+    s.write("tests/b.t", "src/shared.src\n\n");
+    s.clear_log();
+    let out = split(&s, &[]);
+    success(&out);
+    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t"]);
+    assert_header(&out, "; run 2 (tests/a.t changed): tests/a.t, tests/b.t");
+    assert!(
+        !stored_units(&s).iter().any(|unit| unit == "tests/c.t"),
+        "the proof of a deleted unit was kept: {:?}",
+        stored_units(&s)
+    );
+}
+
+/// S7, the plan's literal scenario: deleting `c`, then editing the shared source. `a` and `b` both read that source, so
+/// the change is global and the full command runs for it (spec 3.10, E14 g2). The full command's record drops `c`.
+#[test]
+fn s7_literal_deleting_c_then_an_edit_to_shared_is_global() {
     let s = Suite::new();
     success(&passed(&s, &[]));
     s.remove("tests/c.t");
@@ -237,11 +259,12 @@ fn s7_deleting_c_then_an_edit_runs_a_and_b() {
     s.clear_log();
     let out = split(&s, &[]);
     success(&out);
-    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t"]);
-    assert_header(
-        &out,
-        "; run 2 (src/shared.src changed): tests/a.t, tests/b.t",
+    assert!(
+        stderr(&out).contains("(src/shared.src changed and every unit reads it)"),
+        "{}",
+        stderr(&out)
     );
+    assert_eq!(launched(&s), [""]);
     assert!(
         !stored_units(&s).iter().any(|unit| unit == "tests/c.t"),
         "the proof of a deleted unit was kept: {:?}",
@@ -276,9 +299,10 @@ fn s9_a_listed_file_that_appears_reruns_only_the_unit_that_lists_it() {
     assert_header(&out, "; run 1 (src/missing.src changed): tests/c.t");
 }
 
-/// S9b: with `T_LS_ROOT`, every unit lists the root, so a new top-level entry reruns every unit that listed it.
+/// S9b: with `T_LS_ROOT`, every unit lists the root, so a new top-level entry changes a listing that every unit's proof
+/// names. That is a change every unit reads, so the full command runs for it (spec 3.10, E14 g2).
 #[test]
-fn s9b_with_t_ls_root_a_new_top_level_entry_reruns_the_units_that_list_the_root() {
+fn s9b_with_t_ls_root_a_new_top_level_entry_is_global() {
     let s = Suite::new();
     let env = [("T_LS_ROOT", "1")];
     success(&passed(&s, &env));
@@ -286,8 +310,12 @@ fn s9b_with_t_ls_root_a_new_top_level_entry_reruns_the_units_that_list_the_root(
     s.clear_log();
     let out = split(&s, &env);
     success(&out);
-    assert!(pass_line(&out), "{}", stderr(&out));
-    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t", "tests/c.t"]);
+    assert!(
+        stderr(&out).contains("(. changed and every unit reads it)"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(launched(&s), [""]);
 }
 
 /// S10b: a launch's unit variables name only the unit, and `STOOP_CHANGED_INPUTS` names the changed input it has.
