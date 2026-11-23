@@ -1218,7 +1218,8 @@ fn a_disagreement_waits_for_a_suite_lock_that_is_released_soon() {
 }
 
 /// A runner whose full form reads every `*.t` outside `slow/` but `tests/skip.t`, so the whole proof lists that file
-/// without reading it. A unit run cats the words it is given, so a unit proof still reads its own file.
+/// without reading it. A unit run reads the programs the full form reads, as the pinned runner does (the purity rule),
+/// and cats the words it is given, so a unit proof reads its own file and the residue stays empty.
 const SKIPS_ONE: &str = r#"#!/bin/sh
 if [ $# -eq 0 ]; then
 	for f in $(find . \( -name '.?*' -o -path ./slow \) -prune -o -type f -name '*.t' -print | sed 's|^\./||' | LC_ALL=C sort); do
@@ -1226,19 +1227,26 @@ if [ $# -eq 0 ]; then
 	done
 	exit 0
 fi
+find /dev/null -prune >/dev/null
+sed -n q </dev/null
+LC_ALL=C sort </dev/null >/dev/null
 for f in "$@"; do
 	cat "$f" > /dev/null
 done
 "#;
 
 /// The bundle excuses a unit's file that the whole proof listed and never read. Deleting it is not a change to its
-/// directory, so the run skips, and so does the next one (E16).
+/// directory, so the run skips (E16). That skip drops the unit's version, and the whole proof holds no entry for the
+/// name, so the next run takes the full form for the directory's listing.
 #[test]
 fn a_unit_the_whole_proof_never_read_is_excused_by_its_bundle() {
     let s = Suite::new();
     s.executable("t", SKIPS_ONE);
     s.write("tests/skip.t", "src/c.src\n");
-    success(&passed(&s, &[], &[SPLIT]));
+    success(&s.hook(&[]));
+    // The runner's units never read src/shared.src, so the change that starts the pass is a unit's own file.
+    s.write("tests/a.t", "src/shared.src\nedited\n");
+    success(&s.hook(&[SPLIT]));
     let units = s.bundle().expect("a suite bundle")["units"].clone();
     assert!(
         units.get("tests/skip.t").is_some(),
@@ -1246,7 +1254,9 @@ fn a_unit_the_whole_proof_never_read_is_excused_by_its_bundle() {
     );
     s.remove("tests/skip.t");
     agree(&s, &[], "skip");
-    agree(&s, &[], "skip");
+    let out = split(&s, &[]);
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert!(stderr(&out).contains("(tests changed)"), "{}", stderr(&out));
 }
 
 /// A removed directory of units is a change: its parent's listing loses a name that is not a file, and no proof
