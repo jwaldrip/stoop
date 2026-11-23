@@ -1,13 +1,14 @@
 //! Bounded, local suite rosters. A bundle does not itself confer a proof hit.
 
 use super::attribution::Refusal;
+use super::residue;
 use crate::input::Input;
 use crate::proof::{now, Proof};
 #[cfg(not(unix))]
 use crate::sys::Private;
 use crate::trace::Provenance;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 #[cfg(not(unix))]
 use std::fs::OpenOptions;
@@ -116,7 +117,11 @@ enum ResidueState {
 #[derive(Serialize, Deserialize)]
 struct Residue {
     state: ResidueState,
+    /// The first `residue::STORED` paths, in sorted order. `count` is how many paths the residue holds in all.
     paths: Vec<String>,
+    /// How many paths the residue holds (spec 3.8). A bundle written before this field holds no residue to count.
+    #[serde(default)]
+    count: usize,
     whole: Option<String>,
 }
 
@@ -125,6 +130,7 @@ impl Default for Residue {
         Self {
             state: ResidueState::None,
             paths: Vec::new(),
+            count: 0,
             whole: None,
         }
     }
@@ -201,6 +207,8 @@ pub(crate) struct Pending {
     origin: Origin,
     roster: Roster,
     policy: String,
+    /// The catalog's listing paths for this run's walk, sorted. The residue leaves them out (spec 3.8).
+    listings: Vec<String>,
 }
 
 impl Pending {
@@ -210,6 +218,10 @@ impl Pending {
 
     pub(crate) fn units(&self) -> &[String] {
         &self.roster.units
+    }
+
+    pub(crate) fn listings(&self) -> &[String] {
+        &self.listings
     }
 }
 
@@ -275,6 +287,8 @@ pub(crate) struct PendingSpec<'a> {
     pub units: Vec<String>,
     pub config: Option<&'a [u8]>,
     pub config_suite: Option<&'a str>,
+    /// The listing paths of this run's catalog walk, which the residue leaves out (spec 3.8).
+    pub listings: Vec<String>,
 }
 
 /// The caller supplies the catalog rebuilt for this invocation, never its listing inputs.
@@ -289,6 +303,7 @@ pub(crate) fn pending(spec: PendingSpec<'_>) -> Result<Pending, Refusal> {
         units,
         config,
         config_suite,
+        listings,
     } = spec;
     if units.is_empty() {
         return Err(Refusal::NoUnits);
@@ -317,6 +332,7 @@ pub(crate) fn pending(spec: PendingSpec<'_>) -> Result<Pending, Refusal> {
             units,
         },
         policy: hash.finalize().to_hex().to_string(),
+        listings,
     })
 }
 
@@ -350,6 +366,13 @@ fn valid_bundle(bundle: &SuiteBundleV1, id: &str) -> bool {
             .units
             .iter()
             .all(|(unit, versions)| valid_unit(unit) && versions.len() <= MAX_VERSIONS)
+        && valid_residue(&bundle.residue)
+}
+
+/// A residue names the first `residue::STORED` of its paths, in sorted order, and its count holds every path.
+fn valid_residue(residue: &Residue) -> bool {
+    residue.paths.len() == residue.count.min(residue::STORED)
+        && residue.paths.windows(2).all(|pair| pair[0] < pair[1])
 }
 
 fn bundle_name(id: &str) -> String {
@@ -1029,7 +1052,7 @@ pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, pr
     let guard_digest = guard.digest();
     // A full run keeps the suite's state whatever its roster: only `forget --units` or a generation bump clears a
     // disabled suite (spec 3.6).
-    let (table, units, residue, state) = match previous {
+    let (table, mut units, residue, state) = match previous {
         Some(old) if old.generation == GENERATION && old.provenance == provenance => {
             (old.table, old.units, old.residue, old.state)
         }
@@ -1043,24 +1066,83 @@ pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, pr
             SuiteState::Ready,
         ),
     };
-    let bundle = SuiteBundleV1 {
+    // Only the roster's units keep a version (C19). A unit that left the roster is no longer a claim about this suite.
+    units.retain(|unit, _| pending.roster.units.binary_search(unit).is_ok());
+    let Pending {
+        suite,
+        origin,
+        roster,
+        policy,
+        listings,
+    } = pending;
+    let mut bundle = SuiteBundleV1 {
         v: VERSION,
         generation: GENERATION,
-        suite: pending.suite,
+        suite,
         provenance,
-        origin: pending.origin,
+        origin,
         whole_key_digest: digest_text("stoop whole key v1", key),
         whole: Some(digest.into()),
-        policy: pending.policy,
+        policy,
         guard,
         guard_digest,
-        roster: pending.roster,
+        roster,
         table,
         units,
         residue,
         state,
     };
+    store_residue(&mut bundle, &proof.inputs, digest, &listings);
     let _ = write_bundle(&area, &bundle);
+}
+
+/// Stores the residue of a whole proof's inputs (spec 3.8, points i and ii). It is measured only when every roster unit
+/// holds a version, and it is kept while it is already known for `digest`. It is stored provisional: W6 compares paths
+/// and cannot confirm them (C4, C5). A residue that would take the bundle past its bound is not kept.
+fn store_residue(bundle: &mut SuiteBundleV1, whole: &[Input], digest: &str, listings: &[String]) {
+    if residue_known(&bundle.residue, digest) {
+        return;
+    }
+    let complete = bundle.roster.units.iter().all(|unit| {
+        bundle
+            .units
+            .get(unit)
+            .is_some_and(|versions| !versions.is_empty())
+    });
+    let next = if complete {
+        let covered = covered_paths(bundle);
+        let (count, paths) = residue::uncovered(whole, listings, &covered);
+        Residue {
+            state: ResidueState::Provisional,
+            paths,
+            count,
+            whole: Some(digest.to_owned()),
+        }
+    } else {
+        Residue::default()
+    };
+    bundle.residue = next;
+    if encode(bundle).is_err() {
+        bundle.residue = Residue::default();
+    }
+}
+
+/// Whether `residue` is known for `digest`: it has a state, and it was measured for that proof.
+fn residue_known(residue: &Residue, digest: &str) -> bool {
+    !matches!(residue.state, ResidueState::None) && residue.whole.as_deref() == Some(digest)
+}
+
+/// The paths of the inputs of every unit version the bundle holds: what the units' own runs read (spec 3.8).
+fn covered_paths(bundle: &SuiteBundleV1) -> BTreeSet<&str> {
+    let len = bundle.table.len();
+    bundle
+        .units
+        .values()
+        .flatten()
+        .filter_map(|version| undelta(&version.inputs, len))
+        .flatten()
+        .map(|index| bundle.table[index as usize].path.as_str())
+        .collect()
 }
 
 /// What `start` decides for one invocation.
@@ -1336,6 +1418,21 @@ impl Pass {
         let _ = self.area.unlink(&bundle_name(&self.bundle.suite));
         self.dirty = false;
     }
+
+    /// Stores the residue of the suite's whole proof when a pass ends (spec 3.8, point i). The proof is the one of
+    /// `proofs` whose digest is the bundle's `whole`. Without it, the residue stays unknown.
+    pub(crate) fn settle_residue(&mut self, proofs: &[Proof], listings: &[String]) {
+        let Some(digest) = self.bundle.whole.clone() else {
+            return;
+        };
+        let Some(proof) = proofs.iter().find(|proof| proof.digest() == digest) else {
+            return;
+        };
+        store_residue(&mut self.bundle, &proof.inputs, &digest, listings);
+        if !matches!(self.bundle.residue.state, ResidueState::None) {
+            self.dirty = true;
+        }
+    }
 }
 
 impl Drop for Pass {
@@ -1396,6 +1493,9 @@ fn start_with(
     };
     bundle.units.clear();
     bundle.table.clear();
+    // The units the residue was measured against are cleared, so the pass measures the residue again at its end.
+    let stored = !matches!(bundle.residue.state, ResidueState::None);
+    bundle.residue = Residue::default();
     Start::Pass(Pass {
         area,
         _lock: held,
@@ -1403,7 +1503,7 @@ fn start_with(
         interned: BTreeMap::new(),
         budget: MAX_BYTES,
         last_write: None,
-        dirty: false,
+        dirty: stored,
         #[cfg(test)]
         writes: 0,
     })
@@ -1504,6 +1604,25 @@ pub(crate) fn counts(store: &Path, id: &str, units: &[String], key: &str) -> (us
     inputs.sort_unstable();
     inputs.dedup();
     (inputs.len(), proven)
+}
+
+/// The residue of the whole command's proof for `key`, when the suite's current proof has one that is known and not
+/// empty: its count and its first paths (spec 3.8). It reads the store and takes no lock, so `stoop explain` can call it.
+pub(crate) fn known_residue(store: &Path, id: &str, key: &str) -> Option<(usize, Vec<String>)> {
+    let Ok(Some(area)) = Area::open(store, false) else {
+        return None;
+    };
+    let ReadBundle::Current(bundle) = read_bundle(&area, id) else {
+        return None;
+    };
+    if bundle.generation != GENERATION
+        || !recorded(&bundle, &digest_text("stoop whole key v1", key))
+    {
+        return None;
+    }
+    let whole = bundle.whole.as_deref()?;
+    (residue_known(&bundle.residue, whole) && bundle.residue.count > 0)
+        .then(|| (bundle.residue.count, bundle.residue.paths.clone()))
 }
 
 /// Checked on read only: each version's indices must lie below the table and strictly increase.
@@ -1713,6 +1832,7 @@ mod tests {
             units: vec!["tests/a.t".into()],
             config: None,
             config_suite: None,
+            listings: Vec::new(),
         })
         .unwrap();
         let bundle = SuiteBundleV1 {
@@ -1911,6 +2031,7 @@ mod pass_tests {
             units: units.iter().map(|unit| unit.to_string()).collect(),
             config: None,
             config_suite: None,
+            listings: Vec::new(),
         })
         .unwrap()
     }
@@ -2216,6 +2337,7 @@ mod pass_tests {
             units: units.to_vec(),
             config: None,
             config_suite: None,
+            listings: Vec::new(),
         })
         .unwrap()
     }
@@ -2519,6 +2641,220 @@ mod pass_tests {
             "start stores the guard's digest"
         );
     }
+
+    /// A whole-command proof that reads `inputs`, with the fields `record` takes from it.
+    fn whole_proof(inputs: &[&str]) -> Proof {
+        Proof {
+            created: 1,
+            argv: Vec::new(),
+            cwd: Some(String::new()),
+            scope: None,
+            provenance: Some(Provenance::current()),
+            env: BTreeMap::new(),
+            inputs: inputs.iter().map(|path| input(path)).collect(),
+            outputs: Vec::new(),
+            removed: Vec::new(),
+            ignore: Some(Vec::new()),
+            priors: None,
+            unplannable: Vec::new(),
+            probes: BTreeMap::new(),
+            env_excluded: Vec::new(),
+        }
+    }
+
+    /// The suite bundle stored in `dir` under `id`, which must be current.
+    fn stored(dir: &Path, id: &str) -> SuiteBundleV1 {
+        let area = Area::open(dir, false).unwrap().unwrap();
+        match read_bundle(&area, id) {
+            ReadBundle::Current(bundle) => bundle,
+            _ => panic!("the suite bundle is not current"),
+        }
+    }
+
+    /// C19: a record keeps the versions of the roster's units only. A unit that left the roster is no longer a claim.
+    #[test]
+    fn a_record_keeps_the_versions_of_its_roster_only() {
+        let roster = ["tests/a.t"];
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.table = vec![input("src/a")];
+        bundle
+            .units
+            .insert("tests/a.t".into(), vec![version(vec![0])]);
+        bundle
+            .units
+            .insert("tests/gone.t".into(), vec![version(vec![0])]);
+        let dir = seed("prune", &bundle);
+        let pending = pending_for(&roster);
+        let id = pending.suite().to_owned();
+        record(&dir, pending, "key", "p-whole", whole_proof(&["src/a"]));
+        let units = stored(&dir, &id).units;
+        assert_eq!(units.keys().collect::<Vec<_>>(), [&"tests/a.t".to_owned()]);
+    }
+
+    /// Spec 3.8, point ii: a record stores the residue of its own proof once every roster unit holds a version. The
+    /// residue is the proof's inputs that neither a listing nor a unit version covers. It is provisional.
+    #[test]
+    fn a_record_stores_the_residue_of_its_proof_when_every_unit_holds_a_version() {
+        let roster = ["tests/a.t", "tests/b.t"];
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.table = vec![input("src/shared"), input("src/own")];
+        bundle
+            .units
+            .insert("tests/a.t".into(), vec![version(delta(&[0]))]);
+        bundle
+            .units
+            .insert("tests/b.t".into(), vec![version(delta(&[0, 1]))]);
+        let dir = seed("record-residue", &bundle);
+        let mut pending = pending_for(&roster);
+        pending.listings = vec![".".into(), "tests".into()];
+        let id = pending.suite().to_owned();
+        let proof = whole_proof(&[".", "tests", "src/shared", "lint", "/usr/bin/od"]);
+        record(&dir, pending, "key", "p-whole", proof);
+        let stored_residue = stored(&dir, &id).residue;
+        assert!(matches!(stored_residue.state, ResidueState::Provisional));
+        assert_eq!(stored_residue.count, 2);
+        assert_eq!(stored_residue.paths, ["/usr/bin/od", "lint"]);
+        assert_eq!(stored_residue.whole.as_deref(), Some("p-whole"));
+    }
+
+    /// A roster unit without a version leaves the residue unknown, whatever the proof reads.
+    #[test]
+    fn a_record_leaves_the_residue_unknown_while_a_roster_unit_has_no_version() {
+        let roster = ["tests/a.t", "tests/b.t"];
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.table = vec![input("src/shared")];
+        bundle
+            .units
+            .insert("tests/a.t".into(), vec![version(delta(&[0]))]);
+        let dir = seed("record-partial", &bundle);
+        let pending = pending_for(&roster);
+        let id = pending.suite().to_owned();
+        record(&dir, pending, "key", "p-whole", whole_proof(&["lint"]));
+        let stored_residue = stored(&dir, &id).residue;
+        assert!(matches!(stored_residue.state, ResidueState::None));
+        assert_eq!(stored_residue.count, 0);
+        assert!(stored_residue.paths.is_empty());
+        assert_eq!(stored_residue.whole, None);
+    }
+
+    /// A residue known for the proof a record stores is kept, not measured again (spec 3.8).
+    #[test]
+    fn a_record_keeps_a_residue_already_known_for_its_proof() {
+        let roster = ["tests/a.t"];
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.whole = Some("p-whole".into());
+        bundle.table = vec![input("src/shared")];
+        bundle
+            .units
+            .insert("tests/a.t".into(), vec![version(delta(&[0]))]);
+        bundle.residue = Residue {
+            state: ResidueState::Provisional,
+            paths: vec!["kept".into()],
+            count: 1,
+            whole: Some("p-whole".into()),
+        };
+        let dir = seed("record-kept", &bundle);
+        let pending = pending_for(&roster);
+        let id = pending.suite().to_owned();
+        record(
+            &dir,
+            pending,
+            "key",
+            "p-whole",
+            whole_proof(&["src/shared", "lint"]),
+        );
+        let stored_residue = stored(&dir, &id).residue;
+        assert_eq!(stored_residue.paths, ["kept"]);
+        assert_eq!(stored_residue.count, 1);
+    }
+
+    /// Spec 3.8, point i: a pass that stores every unit proof settles the residue of the proof its bundle names.
+    #[test]
+    fn a_pass_settles_the_residue_of_the_proof_its_bundle_names() {
+        let roster = ["tests/a.t", "tests/b.t"];
+        let proof = whole_proof(&["src/shared", "lint"]);
+        let digest = proof.digest();
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.whole = Some(digest.clone());
+        let dir = seed("pass-residue", &bundle);
+        let pending = pending_for(&roster);
+        let id = pending.suite().to_owned();
+        let mut pass = pass_of(start(&dir, &pending, "key", guard()));
+        let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
+        let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
+        pass.settle_residue(&[proof], &[]);
+        drop(pass);
+        let stored_residue = stored(&dir, &id).residue;
+        assert!(matches!(stored_residue.state, ResidueState::Provisional));
+        assert_eq!(stored_residue.paths, ["lint"]);
+        assert_eq!(stored_residue.count, 1);
+        assert_eq!(stored_residue.whole, Some(digest));
+    }
+
+    /// A residue measured before a pass is cleared when the pass starts, and the clearing is written even when the
+    /// pass stores no unit proof.
+    #[test]
+    fn a_pass_clears_the_residue_it_started_with() {
+        let roster = ["tests/a.t"];
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.residue = Residue {
+            state: ResidueState::Provisional,
+            paths: vec!["stale".into()],
+            count: 1,
+            whole: Some("p-1".into()),
+        };
+        let dir = seed("pass-clears", &bundle);
+        let pending = pending_for(&roster);
+        let id = pending.suite().to_owned();
+        drop(pass_of(start(&dir, &pending, "key", guard())));
+        let stored_residue = stored(&dir, &id).residue;
+        assert!(matches!(stored_residue.state, ResidueState::None));
+        assert!(stored_residue.paths.is_empty());
+    }
+
+    /// `stoop explain` names a residue only when it is known for the suite's current proof and is not empty.
+    #[test]
+    fn known_residue_names_only_a_known_non_empty_residue_of_the_current_proof() {
+        let roster = ["tests/a.t"];
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.residue = Residue {
+            state: ResidueState::Provisional,
+            paths: vec!["lint".into()],
+            count: 1,
+            whole: Some("p-1".into()),
+        };
+        let dir = seed("known-residue", &bundle);
+        let id = pending_for(&roster).suite().to_owned();
+        assert_eq!(
+            known_residue(&dir, &id, "key"),
+            Some((1, vec!["lint".to_owned()]))
+        );
+        assert_eq!(known_residue(&dir, &id, "other"), None, "another command");
+        bundle.residue.whole = Some("p-2".into());
+        write_bundle(&Area::open(&dir, false).unwrap().unwrap(), &bundle).unwrap();
+        assert_eq!(known_residue(&dir, &id, "key"), None, "another proof");
+        bundle.residue = Residue::default();
+        write_bundle(&Area::open(&dir, false).unwrap().unwrap(), &bundle).unwrap();
+        assert_eq!(known_residue(&dir, &id, "key"), None, "no residue");
+    }
+
+    /// A bundle whose residue count does not match its paths is corrupt, so no decision reads it.
+    #[test]
+    fn a_residue_whose_count_does_not_match_its_paths_makes_the_bundle_corrupt() {
+        let roster = ["tests/a.t"];
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        let dir = seed("residue-corrupt", &bundle);
+        let id = pending_for(&roster).suite().to_owned();
+        bundle.residue = Residue {
+            state: ResidueState::Provisional,
+            paths: vec!["a".into()],
+            count: 2,
+            whole: Some("p-1".into()),
+        };
+        fs::write(bundle_file(&dir, &id), serde_json::to_vec(&bundle).unwrap()).unwrap();
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        assert!(matches!(read_bundle(&area, &id), ReadBundle::Corrupt));
+    }
 }
 
 /// M1 (ignored, a measurement). The cost of encoding, writing (with fsync and rename) and parsing a
@@ -2541,6 +2877,7 @@ mod cost_tests {
             units: units.to_vec(),
             config: None,
             config_suite: None,
+            listings: Vec::new(),
         })
         .unwrap();
         let entries = table.len().max(2);

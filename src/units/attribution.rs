@@ -11,6 +11,7 @@ use super::hook::{safe, Base, FileMode, Hook};
 use super::independence::{Named, Roster, Violation, Written};
 use super::launch::{self, Observed, Verdict};
 use super::policy;
+use super::residue;
 use crate::ignore::Ignore;
 use crate::input::Input;
 use crate::pathutil::to_key;
@@ -195,6 +196,8 @@ pub(crate) fn pass(
     for name in run::HOOK_ENV {
         std::env::set_var(name, "");
     }
+    // The residue of the whole command, measured now that the pass has launched every unit it could (spec 3.8).
+    bundle_pass.settle_residue(&lookup.proofs, pending.listings());
     let id = pending.suite();
     // The state a stopped pass stores is decided by `disabling` (spec 3.6). It is stored under the lock this pass holds.
     if let Some(Disabling {
@@ -407,6 +410,8 @@ pub(crate) fn explain_lines(
         suite.pending.as_ref().map_err(|refusal| *refusal),
     )
     .and_then(|pending| bundle::probe(store, pending, key).map(|()| pending.units().len()));
+    let residue_text = bundle::known_residue(store, &suite.id, key)
+        .map(|(count, paths)| residue::line(count, &paths));
     let (inputs, proven) = bundle::counts(store, &suite.id, &suite.units, key);
     let total = suite.units.len();
     let tracked = format!(
@@ -425,7 +430,12 @@ pub(crate) fn explain_lines(
         },
         Err(refusal) => format!("stoop: no attribution pass: {refusal}"),
     };
-    Some(vec![tracked, decision])
+    Some(
+        residue_text
+            .into_iter()
+            .chain([tracked, decision])
+            .collect(),
+    )
 }
 
 /// One line for the operator, unless `--quiet` asks for none.
