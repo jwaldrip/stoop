@@ -1,0 +1,32 @@
+name: W7-1 probe mutants
+
+# A probe that runs one single-site mutant of the engine at a time against the decision tests. It is never merged.
+on:
+  push:
+    branches: ['probe/**']
+
+concurrency:
+  group: probe-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  mutants:
+    name: single-site mutants of the engine (Linux x86-64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the shells the hook tests run under
+        run: sudo apt-get update && sudo apt-get install -y zsh fish dash
+      - name: Run each mutant against the decision tests
+        env:
+          CARGO_INCREMENTAL: "0"
+        run: python3 probe-mutants.py 2>&1 | tee "$RUNNER_TEMP/mutants.log"
+        continue-on-error: true
+      - name: Summary
+        if: always()
+        run: grep '^MUTANT' "$RUNNER_TEMP/mutants.log" || echo "no mutant lines"
