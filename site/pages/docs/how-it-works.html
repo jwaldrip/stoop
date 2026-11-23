@@ -58,6 +58,10 @@
 </ul>
 <p><code>--ignore-env NAME</code> leaves out one more. <code>--env NAME</code> puts one back in, for example a <code>GITHUB_</code> variable the step depends on without naming it.</p>
 
+<h2 id="residue">The residue of a unit suite</h2>
+<p>The proof of each unit covers only what that unit's own run reads. The whole command can read more: a lint script that runs once, a program that only the full run starts, or a file that no unit opens. That remainder is the residue. stoop measures it by path: the input paths of the whole command's proof, less the directories this run's catalog walk listed, less every input path that a unit's proof names. A path outside the repository keeps its absolute form.</p>
+<p>stoop measures the residue when an attribution pass ends, and when a full run passes, once every unit in the roster holds a proof. It stores the residue as provisional. A path comparison cannot confirm that a unit read the same state the whole command read, so stoop does not treat the residue as confirmed. A runner that finds its tests with an external program shows that program as residue, because no unit runs it.</p>
+
 <h2 id="fails-wide">When it runs anyway</h2>
 <p>stoop fails wide. Each of these means the command runs, and the ones marked "not recorded" also mean no proof is written:</p>
 <table>
