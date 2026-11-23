@@ -77,8 +77,11 @@ fn decision(out: &Output) -> &'static str {
         "skip"
     } else if log.contains("stoop: attribution pass: ")
         || log.contains("would run an attribution pass: ")
+        || log.contains("(attribution pass): ")
     {
         "pass"
+    } else if log.contains("inputs; run ") || log.contains(" units affected, one launch each)") {
+        "subset"
     } else if log.contains("run full ") {
         "full"
     } else {
