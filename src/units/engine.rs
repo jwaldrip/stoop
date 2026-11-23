@@ -195,7 +195,7 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
         return verdict(Decision::Legacy, None, false);
     }
     let proof = cx.proofs.iter().find(|proof| proof.digest() == view.whole);
-    let current = Current::of(cx.root, &checked(cx, view, proof));
+    let current = Current::of(cx.root, &checked(cx, view));
     let affected = analyse(cx, view, &current);
     let covered = matches!(view.residue, Some((0, _)));
     let clean = affected.is_empty() && covered;
@@ -250,7 +250,7 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
             clean,
         );
     }
-    if let Some(reason) = output_missing(cx, view, proof, &current) {
+    if let Some(reason) = output_missing(cx, view, proof) {
         return verdict(Decision::Full(Some(reason)), shown, clean);
     }
     if affected.is_empty() {
@@ -268,8 +268,9 @@ fn verdict(decision: Decision, affected: Option<Vec<(String, String)>>, clean: b
     }
 }
 
-/// The inputs and outputs that a decision checks: those of each roster unit's versions, and those of the whole proof.
-fn checked<'a>(cx: &Judged<'_>, view: &'a View, proof: Option<&'a Proof>) -> Vec<&'a Input> {
+/// The inputs and outputs that a decision checks: those of each roster unit's versions. The whole proof's entries are
+/// not among them. E14 and E15 identify the whole proof's entries that they name, and only those.
+fn checked<'a>(cx: &Judged<'_>, view: &'a View) -> Vec<&'a Input> {
     let mut entries = Vec::new();
     for unit in cx.roster {
         for version in view.units.get(unit).into_iter().flatten() {
@@ -286,9 +287,6 @@ fn checked<'a>(cx: &Judged<'_>, view: &'a View, proof: Option<&'a Proof>) -> Vec
                     .map(|&index| &view.table[index as usize]),
             );
         }
-    }
-    if let Some(proof) = proof {
-        entries.extend(proof.inputs.iter().chain(&proof.outputs));
     }
     entries
 }
@@ -450,21 +448,18 @@ fn global_change(cx: &Judged<'_>, view: &View, proof: &Proof, current: &Current)
         if !changed {
             return None;
         }
+        // The whole proof's entry is identified here, and only for a path that changed (spec 3.10, E14).
         let differs = match proof.inputs.iter().find(|input| input.path == path) {
             None => true,
-            Some(input) => current.id(input) != Some(input.id.as_str()),
+            Some(input) => Current::of(cx.root, &[input]).id(input) != Some(input.id.as_str()),
         };
         differs.then(|| path.to_owned())
     })
 }
 
-/// Step E15 (spec 3.10): an output of the whole proof that no roster unit's version lists must still hold.
-fn output_missing(
-    cx: &Judged<'_>,
-    view: &View,
-    proof: &Proof,
-    current: &Current,
-) -> Option<String> {
+/// Step E15 (spec 3.10): an output of the whole proof that no roster unit's version lists must still hold. Only such an
+/// output is identified.
+fn output_missing(cx: &Judged<'_>, view: &View, proof: &Proof) -> Option<String> {
     let listed: BTreeSet<&str> = cx
         .roster
         .iter()
@@ -474,7 +469,11 @@ fn output_missing(
         .map(|&index| view.table[index as usize].path.as_str())
         .collect();
     proof.outputs.iter().find_map(|output| {
-        if listed.contains(output.path.as_str()) || current.holds(output) {
+        if listed.contains(output.path.as_str()) {
+            return None;
+        }
+        let current = Current::of(cx.root, &[output]);
+        if current.holds(output) {
             return None;
         }
         let verb = if current.absent(output) {
