@@ -839,3 +839,98 @@ fn run_model(seed: u64, steps: usize) {
         passing = subject_code == 0;
     }
 }
+
+/// STOP 4 (spec 3.10, E16 as amended): a no-op after a subset that added a unit skips. The subset proved the new unit, so
+/// its own version covers it, and the whole proof's listing of `tests` gained only that name. This is M1 seed 1, step 15.
+#[test]
+fn m1_seed1_step15_a_no_op_after_a_subset_that_added_a_unit_skips() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.write("tests/d.t", "src/c.src\n");
+    success(&split(&s, &[]));
+    s.clear_log();
+    let explained = explain(&s, &[]);
+    let out = split(&s, &[]);
+    success(&out);
+    assert!(skipped(&explained), "{}", stderr(&explained));
+    assert!(skipped(&out), "{}", stderr(&out));
+    assert!(s.launches().is_empty(), "a skip launches nothing");
+}
+
+/// STOP 4: an added unit is excused, but a non-unit file added to the same listing is not, so the full command runs.
+#[test]
+fn an_added_unit_next_to_an_added_non_unit_is_a_change() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.write("tests/d.t", "src/c.src\n");
+    success(&split(&s, &[]));
+    s.write("tests/notes.txt", "not a unit\n");
+    s.clear_log();
+    let explained = explain(&s, &[]);
+    let out = split(&s, &[]);
+    success(&out);
+    assert!(
+        stderr(&explained).contains("(tests changed)"),
+        "{}",
+        stderr(&explained)
+    );
+    assert!(stderr(&out).contains("(tests changed)"), "{}", stderr(&out));
+    assert_eq!(launched(&s), [""]);
+}
+
+/// STOP 4: a non-unit file renamed inside a listed directory is a change, because its new name is not a unit.
+#[test]
+fn a_non_unit_file_renamed_in_a_listed_directory_is_a_change() {
+    let s = Suite::new();
+    s.write("tests/notes.txt", "not a unit\n");
+    success(&passed(&s, &[]));
+    fs::rename(s.path("tests/notes.txt"), s.path("tests/notes2.txt")).unwrap();
+    s.clear_log();
+    let out = split(&s, &[]);
+    success(&out);
+    assert!(stderr(&out).contains("(tests changed)"), "{}", stderr(&out));
+    assert_eq!(launched(&s), [""]);
+}
+
+/// STOP 4: the root listing never excuses an added unit. A top-level unit added since the full run is a change to the
+/// root, so the full command runs for it, even though the unit's own version covers it.
+#[test]
+fn a_top_level_unit_added_since_the_full_run_is_never_excused() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.write("z.t", "src/c.src\n");
+    success(&split(&s, &[]));
+    s.clear_log();
+    let out = split(&s, &[]);
+    success(&out);
+    assert!(stderr(&out).contains("(. changed)"), "{}", stderr(&out));
+    assert_eq!(launched(&s), [""]);
+}
+
+/// STOP 4 guard: an added unit whose proof has expired is affected, so it launches. The excuse never reaches it.
+#[test]
+fn an_added_unit_whose_proof_expired_is_affected_not_excused() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    s.write("tests/d.t", "src/c.src\n");
+    success(&split(&s, &[]));
+    let path = s.bundle_path().expect("a suite bundle");
+    let mut bundle = s.bundle().expect("a suite bundle");
+    for (unit, versions) in bundle["units"].as_object_mut().unwrap().iter_mut() {
+        if unit == "tests/d.t" {
+            for version in versions.as_array_mut().unwrap() {
+                version["created"] = Value::from(1);
+            }
+        }
+    }
+    fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+    s.clear_log();
+    let out = split(&s, &[]);
+    success(&out);
+    assert!(
+        stderr(&out).contains("run 1 (proof expired): tests/d.t"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(launched(&s), ["tests/d.t"]);
+}
