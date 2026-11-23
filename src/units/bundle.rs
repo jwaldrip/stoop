@@ -933,21 +933,13 @@ fn read_bundle(area: &Area, id: &str) -> ReadBundle {
     if bytes.len() as u64 > MAX_BYTES {
         return ReadBundle::Corrupt;
     }
-    let header: Header = match serde_json::from_slice(&bytes) {
-        Ok(header) => header,
-        Err(_) => return ReadBundle::Corrupt,
-    };
-    if header.v != u64::from(VERSION)
-        || header
-            .generation
-            .as_ref()
-            .and_then(serde_json::Value::as_u64)
-            .is_some_and(|generation| generation > u64::from(GENERATION))
-    {
-        return ReadBundle::OtherVersion;
-    }
+    // The bundle is parsed once. A bundle this build cannot read in full is still another version when its header says
+    // so, and only that path reads the header.
     match serde_json::from_slice::<SuiteBundleV1>(&bytes) {
         Ok(mut bundle) => {
+            if bundle.v != VERSION || bundle.generation > GENERATION {
+                return ReadBundle::OtherVersion;
+            }
             // A residue that does not match its own count is unknown, not corrupt. An older binary keeps the residue
             // and writes the bundle back without its count, while the units and the state stay true (spec 3.8).
             if !valid_residue(&bundle.residue) {
@@ -959,7 +951,19 @@ fn read_bundle(area: &Area, id: &str) -> ReadBundle {
                 ReadBundle::Corrupt
             }
         }
-        Err(_) => ReadBundle::Corrupt,
+        Err(_) => match serde_json::from_slice::<Header>(&bytes) {
+            Ok(header)
+                if header.v != u64::from(VERSION)
+                    || header
+                        .generation
+                        .as_ref()
+                        .and_then(serde_json::Value::as_u64)
+                        .is_some_and(|generation| generation > u64::from(GENERATION)) =>
+            {
+                ReadBundle::OtherVersion
+            }
+            _ => ReadBundle::Corrupt,
+        },
     }
 }
 
