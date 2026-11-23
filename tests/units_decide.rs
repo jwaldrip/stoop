@@ -566,3 +566,80 @@ fn decide_cost() {
         skip_ms / hit_ms
     );
 }
+
+/// T18: a unit proof made under another environment is affected, even when the whole proof's environment matches. The
+/// run takes the full form, and explain names the environment for each unit.
+#[test]
+fn t18_a_unit_proof_made_under_another_environment_is_affected() {
+    let s = Suite::new();
+    success(&s.hook(&[]));
+    edit(&s, 2);
+    // The pass runs under FOO=1, so every unit's proof is made under that environment.
+    success(&split(&s, &[("FOO", "1")]));
+    s.clear_log();
+    // Back to no FOO: the whole proof was made without it, so only the units' proofs can see the change.
+    let explained = explain(&s, &[]);
+    assert!(
+        stderr(&explained).contains("stoop: affected tests/a.t: the environment changed"),
+        "{}",
+        stderr(&explained)
+    );
+    let out = split(&s, &[]);
+    success(&out);
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert_eq!(s.launches().len(), 1, "the full form launches once");
+}
+
+/// T19: a unit that left the roster and no longer exists keeps no proof after a skip. The skip drops its versions, and
+/// the bundle names only the roster's units.
+#[test]
+fn t19_a_skip_drops_the_proof_of_a_unit_that_was_removed() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    s.remove("tests/c.t");
+    s.clear_log();
+    let out = split(&s, &[]);
+    success(&out);
+    assert_eq!(decision(&out), "skip", "{}", stderr(&out));
+    assert!(s.launches().is_empty(), "a skip launches nothing");
+    let units = s.bundle().expect("a suite bundle")["units"].clone();
+    assert!(units.get("tests/c.t").is_none(), "{units}");
+    assert!(units.get("tests/a.t").is_some(), "{units}");
+}
+
+/// T20: a change that not every unit reads is not a change to the whole suite. Its reason is the legacy one.
+#[test]
+fn t20_a_change_that_not_every_unit_reads_is_not_global() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    // Units a and b read the shared source, and c does not.
+    edit(&s, 3);
+    s.clear_log();
+    let out = split(&s, &[]);
+    success(&out);
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("every unit reads it"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(s.launches().len(), 1, "the full form launches once");
+}
+
+/// T21: explain names the units a change affects and no others: the two that read the changed source, not the third.
+#[test]
+fn t21_explain_names_only_the_affected_units() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    edit(&s, 3);
+    let log = stderr(&explain(&s, &[]));
+    assert!(
+        log.contains("stoop: affected tests/a.t: src/shared.src changed"),
+        "{log}"
+    );
+    assert!(
+        log.contains("stoop: affected tests/b.t: src/shared.src changed"),
+        "{log}"
+    );
+    assert!(!log.contains("stoop: affected tests/c.t"), "{log}");
+}
