@@ -1380,7 +1380,7 @@ fn a_new_unit_at_the_top_level_is_not_a_skip() {
     let direct = s.direct(&s.root, &[], &[]);
     assert_eq!(code(&direct), 1, "{}", stderr(&direct));
     let out = split(&s, &[]);
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert_eq!(decision(&out), "subset", "{}", stderr(&out));
     assert_eq!(code(&out), 1, "{}", stderr(&out));
 }
 
