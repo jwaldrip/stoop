@@ -648,11 +648,16 @@ enum Op {
     Noop,
 }
 
-/// The model's state: which units exist, and how many edits have been made.
+/// The model's state: which units exist, how many edits have been made, and what the model itself knows of each unit's
+/// history. `deleted` holds the units that were removed. `listed` holds every source index that a unit ever listed, and
+/// `sources` holds the indices its file lists now. The residue check reads only this history.
 struct Model {
     units: Vec<usize>,
     next: usize,
     revision: usize,
+    deleted: std::collections::BTreeSet<usize>,
+    listed: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
+    sources: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
 }
 
 impl Model {
@@ -668,6 +673,9 @@ impl Model {
             units: Vec::new(),
             next: 0,
             revision: 0,
+            deleted: Default::default(),
+            listed: Default::default(),
+            sources: Default::default(),
         };
         for _ in 0..6 {
             model.add(s, rng);
@@ -681,7 +689,17 @@ impl Model {
         let id = self.next;
         self.next += 1;
         self.units.push(id);
-        write_unit(s, rng, id);
+        self.rewrite(s, rng, id);
+    }
+
+    /// Writes unit `id`'s file, and records the sources that it lists.
+    fn rewrite(&mut self, s: &Suite, rng: &mut Rng, id: usize) {
+        let listed = write_unit(s, rng, id);
+        self.listed
+            .entry(id)
+            .or_default()
+            .extend(listed.iter().copied());
+        self.sources.insert(id, listed.into_iter().collect());
     }
 
     fn roster(&self) -> Vec<String> {
@@ -726,10 +744,15 @@ impl Model {
                     &format!("revision {}\n", self.revision),
                 );
             }
-            Op::Rewrite(k) => write_unit(s, rng, self.units[k]),
+            Op::Rewrite(k) => {
+                let id = self.units[k];
+                self.rewrite(s, rng, id);
+            }
             Op::Add => self.add(s, rng),
             Op::Delete(k) => {
                 let id = self.units.remove(k);
+                self.deleted.insert(id);
+                self.sources.remove(&id);
                 s.remove(&unit_path(id));
                 if s.path(&flag_path(id)).exists() {
                     s.remove(&flag_path(id));
@@ -756,8 +779,8 @@ fn flag_path(id: usize) -> String {
     format!("tests/m{id}.flag")
 }
 
-/// Writes unit `id`'s file with one to three distinct sources, each on its own line.
-fn write_unit(s: &Suite, rng: &mut Rng, id: usize) {
+/// Writes unit `id`'s file with one to three distinct sources, each on its own line, and returns those sources.
+fn write_unit(s: &Suite, rng: &mut Rng, id: usize) -> Vec<usize> {
     let count = 1 + rng.below(3);
     let mut sources: Vec<usize> = Vec::new();
     while sources.len() < count {
@@ -771,6 +794,7 @@ fn write_unit(s: &Suite, rng: &mut Rng, id: usize) {
         .map(|source| format!("src/s{source}\n"))
         .collect();
     s.write(&unit_path(id), &body);
+    sources
 }
 
 fn count_from_env(name: &str, default: usize) -> usize {
@@ -781,8 +805,10 @@ fn count_from_env(name: &str, default: usize) -> usize {
 }
 
 /// M1: over seeded sequences of edits, the subject's verdict (with `STOOP_SPLIT=1`) equals the verdict of the runner
-/// run directly. Its status is never 125 or 2, every launched argument is a roster unit, and a no-op after a passing
-/// run launches nothing. Seeds come from `STOOP_MODEL_SEEDS` (4 by default) and steps from `STOOP_MODEL_STEPS` (30).
+/// run directly. Its status is never 125 or 2, and every launched argument is a roster unit. A no-op after a passing run
+/// launches nothing, except when the stored residue refuses it: the full form then runs once, its residue names only
+/// files that deleted units read (checked from the model's own history), and each such exemption is printed.
+/// Seeds come from `STOOP_MODEL_SEEDS` (4 by default) and steps from `STOOP_MODEL_STEPS` (30).
 #[test]
 fn model_split_runs_give_the_full_runs_verdict() {
     let seeds = count_from_env("STOOP_MODEL_SEEDS", 4);
@@ -790,6 +816,68 @@ fn model_split_runs_give_the_full_runs_verdict() {
     for seed in 1..=seeds {
         run_model(seed as u64, steps);
     }
+}
+
+/// The residue the engine stored, when it is known for the proof it belongs to and counts paths above zero. That residue
+/// refuses a no-op with the residue reason (spec 3.8, E12). The paths are the first ones the bundle stores.
+fn stored_residue(s: &Suite) -> Option<(usize, Vec<String>)> {
+    let bundle = s.bundle()?;
+    let residue = &bundle["residue"];
+    let known = residue["state"] != "none"
+        && !bundle["whole"].is_null()
+        && residue["whole"] == bundle["whole"];
+    let count = residue["count"].as_u64()? as usize;
+    if !known || count == 0 {
+        return None;
+    }
+    let paths: Vec<String> = residue["paths"]
+        .as_array()?
+        .iter()
+        .filter_map(|path| path.as_str().map(str::to_owned))
+        .collect();
+    Some((count, paths))
+}
+
+/// Whether the model's own history allows the stored residue to name `path` (spec 3.8). Only a file that a deleted unit
+/// read may be named: a deleted unit's own file or flag, or a source that it listed and that no live unit lists now. A
+/// file of a live unit, a source that a live unit lists, or a path that no deleted unit read is a defect.
+fn residue_owner(model: &Model, path: &str) -> Result<(), String> {
+    let live_file = model
+        .units
+        .iter()
+        .any(|id| path == unit_path(*id) || path == flag_path(*id));
+    if live_file {
+        return Err("it is a file of a live unit".to_owned());
+    }
+    let deleted_file = model
+        .deleted
+        .iter()
+        .any(|id| path == unit_path(*id) || path == flag_path(*id));
+    if deleted_file {
+        return Ok(());
+    }
+    let Some(source) = path
+        .strip_prefix("src/s")
+        .and_then(|n| n.parse::<usize>().ok())
+    else {
+        return Err("no deleted unit read it".to_owned());
+    };
+    if model
+        .sources
+        .values()
+        .any(|listed| listed.contains(&source))
+    {
+        return Err("a live unit lists that source now".to_owned());
+    }
+    if model.deleted.iter().any(|id| {
+        model
+            .listed
+            .get(id)
+            .is_some_and(|listed| listed.contains(&source))
+    }) {
+        return Ok(());
+    }
+    Err("no deleted unit listed that source".to_owned())
 }
 
 fn run_model(seed: u64, steps: usize) {
@@ -810,6 +898,12 @@ fn run_model(seed: u64, steps: usize) {
         model.apply(&s, &mut rng, op);
         operations.push(format!("step {step}: {op:?}"));
         let roster = model.roster();
+        // The residue the engine stored before this step's run: the decision that the run makes reads it.
+        let stored = if matches!(op, Op::Noop) && passing {
+            stored_residue(&s)
+        } else {
+            None
+        };
         s.clear_log();
         let subject = split(&s, &[]);
         let launches = launched(&s);
@@ -839,11 +933,39 @@ fn run_model(seed: u64, steps: usize) {
             assert!(roster.contains(launch), "a non-unit argument: {}", report());
         }
         if matches!(op, Op::Noop) && passing {
-            assert!(
-                launches.is_empty(),
-                "a no-op after a passing run launched: {}",
-                report()
-            );
+            match &stored {
+                None => assert!(
+                    launches.is_empty(),
+                    "a no-op after a passing run launched: {}",
+                    report()
+                ),
+                Some((count, paths)) => {
+                    // The exemption (spec 3.8, E12): the stored residue refuses the no-op, so the full form runs once, and
+                    // the residue may name only files that deleted units read, by the model's own history.
+                    assert_eq!(
+                        launches,
+                        [""],
+                        "a refused no-op must run the full form once: {}",
+                        report()
+                    );
+                    assert!(
+                        stderr(&subject).contains("the full command reads "),
+                        "{}",
+                        report()
+                    );
+                    for path in paths {
+                        if let Err(why) = residue_owner(&model, path) {
+                            panic!(
+                                "the residue of {count} files names {path}, and {why}: {}",
+                                report()
+                            );
+                        }
+                    }
+                    println!(
+                        "M1 exemption: seed {seed}, step {step}: a residue of {count} files that deleted units read; the full form runs once"
+                    );
+                }
+            }
         }
         passing = subject_code == 0;
     }
@@ -1083,7 +1205,8 @@ fn a_new_unit_in_a_new_top_level_directory_that_fails_is_not_a_skip() {
     assert_eq!(launched(&s), ["extra/z.t"]);
 }
 
-/// STOP 4, reviewer r27: a unit file replaced by a directory that holds a failing unit. The new unit runs alone.
+/// STOP 4, reviewer r27: a unit file replaced by a directory that holds a failing unit. The path still exists, so E11 takes
+/// the full form, which runs the new unit and fails. A skip would hide it.
 #[test]
 fn a_unit_file_replaced_by_a_directory_holding_a_failing_unit_is_not_a_skip() {
     let s = Suite::new();
@@ -1094,8 +1217,62 @@ fn a_unit_file_replaced_by_a_directory_holding_a_failing_unit_is_not_a_skip() {
     s.clear_log();
     let out = split(&s, &[]);
     assert!(!skipped(&out), "{}", stderr(&out));
+    assert!(full(&out), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("tests/c.t is no longer one of the units but still exists"),
+        "{}",
+        stderr(&out)
+    );
     assert_eq!(code(&out), 1, "{}", stderr(&out));
-    assert_eq!(launched(&s), ["tests/c.t/x.t"]);
+    assert_eq!(launched(&s), [""]);
+}
+
+/// A unit deleted before it has a proof leaves reads in the whole proof that no unit can attribute (spec 3.8). The pass
+/// after the deletion measures the residue, so the next no-op is refused on it and runs the full form once, with the
+/// residue reason. That full run records the whole proof again, so the no-op after it skips.
+#[test]
+fn a_unit_deleted_before_it_had_a_proof_takes_one_full_run_then_skips() {
+    let s = Suite::new();
+    success(&split(&s, &[]));
+    fs::remove_file(s.path("tests/c.t")).unwrap();
+    s.clear_log();
+    let pass = split(&s, &[]);
+    success(&pass);
+    assert!(pass_line(&pass), "{}", stderr(&pass));
+    s.clear_log();
+    let refused = split(&s, &[]);
+    success(&refused);
+    assert!(full(&refused), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("the full command reads ")
+            && stderr(&refused).contains("tests/c.t"),
+        "{}",
+        stderr(&refused)
+    );
+    assert_eq!(launched(&s), [""]);
+    s.clear_log();
+    let explained = explain(&s, &[]);
+    let out = split(&s, &[]);
+    success(&out);
+    assert!(skipped(&explained), "{}", stderr(&explained));
+    assert!(skipped(&out), "{}", stderr(&out));
+    assert!(s.launches().is_empty(), "a skip launches nothing");
+}
+
+/// A unit deleted after it had a proof leaves its reads attributed: the residue was measured while the unit existed, and
+/// it is not measured again while the whole proof is current. So the run skips.
+#[test]
+fn a_unit_deleted_after_it_had_a_proof_stays_attributed_and_skips() {
+    let s = Suite::new();
+    success(&passed(&s, &[]));
+    fs::remove_file(s.path("tests/c.t")).unwrap();
+    s.clear_log();
+    let explained = explain(&s, &[]);
+    let out = split(&s, &[]);
+    success(&out);
+    assert!(skipped(&explained), "{}", stderr(&explained));
+    assert!(skipped(&out), "{}", stderr(&out));
+    assert!(s.launches().is_empty(), "a skip launches nothing");
 }
 
 /// E11, reviewer r37 (issue #81, item 2): a dangling link still exists, so the unit has not been removed. Its
