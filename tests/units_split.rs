@@ -384,9 +384,9 @@ fn s13_t_lint_makes_every_change_a_full_run() {
     assert_eq!(launched(&s), [""]);
 }
 
-/// S15: a `{unit}` run whose unit `b` fails keeps `b` affected. Its previous proof stays until `b` passes.
+/// S15: a `{unit}` run whose unit `b` fails keeps `b` affected, so the next run launches it again.
 #[test]
-fn a_failing_unit_keeps_its_previous_proof_until_it_passes() {
+fn a_failing_unit_stays_affected_until_it_passes() {
     let s = Suite::new();
     let run = |s: &Suite| s.run(&s.root, &[], &["./t", UNIT], &[SPLIT]);
     success(&run(&s));
@@ -643,14 +643,19 @@ enum Op {
     Rewrite(usize),
     Add,
     Delete(usize),
+    Rename(usize),
+    Readd(usize),
+    Runner,
+    RunnerDelete(usize),
     Setup,
     Docs,
     Noop,
 }
 
-/// The model's state: which units exist, how many edits have been made, and what the model itself knows of each unit's
-/// history. `deleted` holds the units that were removed. `listed` holds every source index that a unit ever listed, and
-/// `sources` holds the indices its file lists now. The residue check reads only this history.
+/// The model's state: which units and runner-only tests exist, how many edits have been made, and what the model knows of
+/// each file's history. A removed name is in `deleted` or `deleted_runners`. `listed` and `runner_listed` hold every source
+/// index that a file ever listed, and `sources` and `runner_sources` hold the indices that a file lists now. `full` holds
+/// the sources that the units and runners listed when the last full run passed, which is what the whole proof records.
 struct Model {
     units: Vec<usize>,
     next: usize,
@@ -658,12 +663,18 @@ struct Model {
     deleted: std::collections::BTreeSet<usize>,
     listed: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
     sources: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
+    runners: Vec<usize>,
+    deleted_runners: std::collections::BTreeSet<usize>,
+    next_runner: usize,
+    runner_listed: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
+    runner_sources: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
+    full: std::collections::BTreeSet<usize>,
 }
 
 impl Model {
     /// The first state: six units, each listing one to three of four sources. The default tree's units are removed.
     fn start(s: &Suite, rng: &mut Rng) -> Model {
-        for unit in ["tests/a.t", "tests/b.t", "tests/c.t"] {
+        for unit in ["tests/a.t", "tests/b.t", "tests/c.t", "e2e/x.u"] {
             s.remove(unit);
         }
         for source in 0..4 {
@@ -676,6 +687,12 @@ impl Model {
             deleted: Default::default(),
             listed: Default::default(),
             sources: Default::default(),
+            runners: Vec::new(),
+            deleted_runners: Default::default(),
+            next_runner: 0,
+            runner_listed: Default::default(),
+            runner_sources: Default::default(),
+            full: Default::default(),
         };
         for _ in 0..6 {
             model.add(s, rng);
@@ -706,10 +723,21 @@ impl Model {
         self.units.iter().map(|id| unit_path(*id)).collect()
     }
 
-    /// The next operation. A unit is added only up to nine, and deleted only while two remain.
+    /// The sources that the units and the runner-only tests list now.
+    fn listing_now(&self) -> std::collections::BTreeSet<usize> {
+        self.sources
+            .values()
+            .chain(self.runner_sources.values())
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    /// The next operation. A unit is added only up to nine, and deleted only while two remain. Names are renamed or
+    /// re-added, and runner-only tests come and go, so that a step can carry several operations at once.
     fn pick(&self, rng: &mut Rng) -> Op {
         let units = self.units.len();
-        match rng.below(12) {
+        match rng.below(18) {
             0 => Op::Flag(rng.below(units), Flag::Fail),
             1 => Op::Flag(rng.below(units), Flag::Ok),
             2 => Op::Flag(rng.below(units), Flag::Removed),
@@ -719,6 +747,13 @@ impl Model {
             8 if units > 2 => Op::Delete(rng.below(units)),
             9 => Op::Setup,
             10 => Op::Docs,
+            11 => Op::Rename(rng.below(units)),
+            12 if !self.deleted.is_empty() => {
+                let index = rng.below(self.deleted.len());
+                Op::Readd(*self.deleted.iter().nth(index).expect("a deleted unit"))
+            }
+            13 | 14 => Op::Runner,
+            15 if !self.runners.is_empty() => Op::RunnerDelete(rng.below(self.runners.len())),
             _ => Op::Noop,
         }
     }
@@ -766,6 +801,44 @@ impl Model {
                 self.revision += 1;
                 s.write("docs/readme.md", &format!("docs {}\n", self.revision));
             }
+            Op::Rename(k) => {
+                let old = self.units[k];
+                let new = self.next;
+                self.next += 1;
+                self.units[k] = new;
+                self.deleted.insert(old);
+                fs::rename(s.path(&unit_path(old)), s.path(&unit_path(new))).unwrap();
+                if s.path(&flag_path(old)).exists() {
+                    fs::rename(s.path(&flag_path(old)), s.path(&flag_path(new))).unwrap();
+                }
+                let listed = self.listed.get(&old).cloned().unwrap_or_default();
+                self.listed.insert(new, listed);
+                if let Some(sources) = self.sources.remove(&old) {
+                    self.sources.insert(new, sources);
+                }
+            }
+            Op::Readd(id) => {
+                self.deleted.remove(&id);
+                self.units.push(id);
+                self.rewrite(s, rng, id);
+            }
+            Op::Runner => {
+                let id = self.next_runner;
+                self.next_runner += 1;
+                self.runners.push(id);
+                let listed = write_listing(s, rng, &runner_path(id));
+                self.runner_listed
+                    .entry(id)
+                    .or_default()
+                    .extend(listed.iter().copied());
+                self.runner_sources.insert(id, listed.into_iter().collect());
+            }
+            Op::RunnerDelete(k) => {
+                let id = self.runners.remove(k);
+                self.deleted_runners.insert(id);
+                self.runner_sources.remove(&id);
+                s.remove(&runner_path(id));
+            }
             Op::Noop => {}
         }
     }
@@ -779,8 +852,18 @@ fn flag_path(id: usize) -> String {
     format!("tests/m{id}.flag")
 }
 
-/// Writes unit `id`'s file with one to three distinct sources, each on its own line, and returns those sources.
+/// Writes unit `id`'s file, with one to three distinct sources, and returns those sources.
 fn write_unit(s: &Suite, rng: &mut Rng, id: usize) -> Vec<usize> {
+    write_listing(s, rng, &unit_path(id))
+}
+
+/// A runner-only test's file: a `*.u` file that the full form runs under `T_U`, and that no unit covers.
+fn runner_path(id: usize) -> String {
+    format!("tests/r{id}.u")
+}
+
+/// Writes the file at `rel` with one to three distinct sources, each on its own line, and returns those sources.
+fn write_listing(s: &Suite, rng: &mut Rng, rel: &str) -> Vec<usize> {
     let count = 1 + rng.below(3);
     let mut sources: Vec<usize> = Vec::new();
     while sources.len() < count {
@@ -793,7 +876,7 @@ fn write_unit(s: &Suite, rng: &mut Rng, id: usize) -> Vec<usize> {
         .iter()
         .map(|source| format!("src/s{source}\n"))
         .collect();
-    s.write(&unit_path(id), &body);
+    s.write(rel, &body);
     sources
 }
 
@@ -804,16 +887,18 @@ fn count_from_env(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
-/// M1: over seeded sequences of edits, the subject's verdict (with `STOOP_SPLIT=1`) equals the verdict of the runner
-/// run directly. Its status is never 125 or 2, and every launched argument is a roster unit. A no-op after a passing run
-/// launches nothing, except when the stored residue refuses it: the full form then runs once, its residue names only
-/// files that deleted units read (checked from the model's own history), and each such exemption is printed.
-/// Seeds come from `STOOP_MODEL_SEEDS` (4 by default) and steps from `STOOP_MODEL_STEPS` (30).
+/// M1: over seeded sequences of edits, the subject's verdict (with `STOOP_SPLIT=1`) equals the verdict of the runner run
+/// directly, with `T_U=1`, so the full form also runs the runner-only tests. Its status is never 125 or 2, and every
+/// launched argument is a roster unit. A no-op after a passing run launches nothing, unless the stored residue refuses it.
+/// Then the full form runs once, its residue names only what `residue_owner` allows, and the next no-op must skip.
+/// Seeds come from `STOOP_MODEL_FIRST` (1 by default) for `STOOP_MODEL_SEEDS` (4 by default), and steps from
+/// `STOOP_MODEL_STEPS` (30). A step applies one operation, or two in about three steps in ten, before its run.
 #[test]
 fn model_split_runs_give_the_full_runs_verdict() {
+    let first = count_from_env("STOOP_MODEL_FIRST", 1);
     let seeds = count_from_env("STOOP_MODEL_SEEDS", 4);
     let steps = count_from_env("STOOP_MODEL_STEPS", 30);
-    for seed in 1..=seeds {
+    for seed in first..first + seeds {
         run_model(seed as u64, steps);
     }
 }
@@ -838,29 +923,35 @@ fn stored_residue(s: &Suite) -> Option<(usize, Vec<String>)> {
     Some((count, paths))
 }
 
-/// Whether the model's own history allows the stored residue to name `path` (spec 3.8). Only a file that a deleted unit
-/// read may be named: a deleted unit's own file or flag, or a source that it listed and that no live unit lists now. A
-/// file of a live unit, a source that a live unit lists, or a path that no deleted unit read is a defect.
+/// Whether the model's own history allows the stored residue to name `path` (spec 3.8). A file of a live unit, or a
+/// source that a live unit lists now, is a defect. A file of a deleted unit or runner-only test is allowed, and so is a
+/// file of a live runner-only test, which the full command reads and no unit does. A source is allowed when a deleted
+/// unit or a runner-only test ever listed it, or when the last full pass listed it and no unit lists it now.
 fn residue_owner(model: &Model, path: &str) -> Result<(), String> {
-    let live_file = model
+    let live_unit_file = model
         .units
         .iter()
         .any(|id| path == unit_path(*id) || path == flag_path(*id));
-    if live_file {
+    if live_unit_file {
         return Err("it is a file of a live unit".to_owned());
     }
-    let deleted_file = model
+    let deleted_unit_file = model
         .deleted
         .iter()
         .any(|id| path == unit_path(*id) || path == flag_path(*id));
-    if deleted_file {
+    let runner_file = model.runners.iter().any(|id| path == runner_path(*id))
+        || model
+            .deleted_runners
+            .iter()
+            .any(|id| path == runner_path(*id));
+    if deleted_unit_file || runner_file {
         return Ok(());
     }
     let Some(source) = path
         .strip_prefix("src/s")
         .and_then(|n| n.parse::<usize>().ok())
     else {
-        return Err("no deleted unit read it".to_owned());
+        return Err("no deleted unit or runner-only test read it".to_owned());
     };
     if model
         .sources
@@ -869,46 +960,62 @@ fn residue_owner(model: &Model, path: &str) -> Result<(), String> {
     {
         return Err("a live unit lists that source now".to_owned());
     }
-    if model.deleted.iter().any(|id| {
+    let deleted_listed = model.deleted.iter().any(|id| {
         model
             .listed
             .get(id)
             .is_some_and(|listed| listed.contains(&source))
-    }) {
+    });
+    let runner_listed = model
+        .runner_listed
+        .values()
+        .any(|listed| listed.contains(&source));
+    if deleted_listed || runner_listed || model.full.contains(&source) {
         return Ok(());
     }
-    Err("no deleted unit listed that source".to_owned())
+    Err("no deleted unit listed it, and the last full pass did not list it".to_owned())
 }
 
 fn run_model(seed: u64, steps: usize) {
     let s = Suite::new();
     let mut rng = Rng::new(seed);
     let mut model = Model::start(&s, &mut rng);
-    let cold = split(&s, &[]);
+    let env = [("T_U", "1")];
+    let cold = split(&s, &env);
     assert_eq!(
         code(&cold),
         0,
         "seed {seed}: the cold run failed: {}",
         stderr(&cold)
     );
+    model.full = model.listing_now();
     let mut passing = true;
+    // Set by a refused no-op whose full form ran: the next step, when it is a no-op, must skip.
+    let mut owed = false;
     let mut operations: Vec<String> = Vec::new();
     for step in 1..=steps {
-        let op = model.pick(&mut rng);
-        model.apply(&s, &mut rng, op);
-        operations.push(format!("step {step}: {op:?}"));
+        let count = if rng.below(10) < 3 { 2 } else { 1 };
+        let mut ops = Vec::new();
+        for _ in 0..count {
+            let op = model.pick(&mut rng);
+            model.apply(&s, &mut rng, op);
+            ops.push(op);
+        }
+        let noop = ops.iter().all(|op| matches!(op, Op::Noop));
+        operations.push(format!("step {step}: {ops:?}"));
         let roster = model.roster();
         // The residue the engine stored before this step's run: the decision that the run makes reads it.
-        let stored = if matches!(op, Op::Noop) && passing {
+        let stored = if noop && passing {
             stored_residue(&s)
         } else {
             None
         };
+        let owed_now = std::mem::take(&mut owed);
         s.clear_log();
-        let subject = split(&s, &[]);
+        let subject = split(&s, &env);
         let launches = launched(&s);
         s.clear_log();
-        let oracle = s.direct(&s.root, &[], &[]);
+        let oracle = s.direct(&s.root, &[], &env);
         let report = || {
             let mut listing: Vec<String> = std::fs::read_dir(s.path("tests"))
                 .into_iter()
@@ -932,17 +1039,21 @@ fn run_model(seed: u64, steps: usize) {
         for launch in launches.iter().filter(|launch| !launch.is_empty()) {
             assert!(roster.contains(launch), "a non-unit argument: {}", report());
         }
-        if matches!(op, Op::Noop) && passing {
+        if noop && passing {
             match &stored {
+                _ if owed_now => assert!(
+                    launches.is_empty(),
+                    "a no-op right after a refused full run must skip: {}",
+                    report()
+                ),
                 None => assert!(
                     launches.is_empty(),
                     "a no-op after a passing run launched: {}",
                     report()
                 ),
                 Some((count, paths)) => {
-                    // A refused no-op may still skip. The legacy whole-command proof is checked before the residue (spec 3.10,
-                    // E2), and a skip launches nothing, which satisfies the assertion. Only a full run is an exemption, and
-                    // it must name only files that deleted units read, by the model's own history.
+                    // A refused no-op may run the full form once. Its residue must name only what the model allows
+                    // (`residue_owner`), and the no-op after that run must skip (checked above).
                     if !launches.is_empty() {
                         assert_eq!(
                             launches,
@@ -963,12 +1074,16 @@ fn run_model(seed: u64, steps: usize) {
                                 );
                             }
                         }
+                        owed = true;
                         println!(
-                            "M1 exemption: seed {seed}, step {step}: a residue of {count} files that deleted units read; the full form runs once"
+                            "M1 exemption: seed {seed}, step {step}: a residue of {count} files; the full form runs once"
                         );
                     }
                 }
             }
+        }
+        if subject_code == 0 && launches == [""] {
+            model.full = model.listing_now();
         }
         passing = subject_code == 0;
     }
@@ -1295,4 +1410,188 @@ fn a_unit_file_replaced_by_a_dangling_link_takes_the_full_form() {
         stderr(&out)
     );
     assert_eq!(launched(&s), [""]);
+}
+
+/// A new runner-only test (a `*.u` file that the full form runs under `T_U`) that fails, beside an edit to a unit. The
+/// new name is no unit, so no excuse covers it: the full form runs and reports the failure a subset would not run.
+fn fail_runner_only(s: &Suite, rel: &str) {
+    s.write(rel, "src/c.src\n");
+    s.write(&format!("{}.flag", rel.trim_end_matches(".u")), "fail\n");
+}
+
+#[test]
+fn a_new_failing_runner_only_test_beside_a_unit_edit_is_a_full_run() {
+    let s = Suite::new();
+    s.remove("e2e/x.u");
+    let env = [("T_U", "1")];
+    success(&passed(&s, &env));
+    fail_runner_only(&s, "tests/z.u");
+    s.write("tests/c.t", "src/c.src\n\n");
+    s.clear_log();
+    let out = split(&s, &env);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(full(&out), "{}", stderr(&out));
+    assert!(stderr(&out).contains("tests changed"), "{}", stderr(&out));
+    assert_eq!(launched(&s), [""]);
+}
+
+#[test]
+fn a_new_failing_runner_only_test_in_src_beside_a_unit_edit_is_a_full_run() {
+    let s = Suite::new();
+    s.remove("e2e/x.u");
+    let env = [("T_U", "1")];
+    success(&passed(&s, &env));
+    fail_runner_only(&s, "src/z.u");
+    s.write("tests/c.t", "src/c.src\n\n");
+    s.clear_log();
+    let out = split(&s, &env);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(full(&out), "{}", stderr(&out));
+    assert!(stderr(&out).contains("src changed"), "{}", stderr(&out));
+    assert_eq!(launched(&s), [""]);
+}
+
+#[test]
+fn a_new_failing_runner_only_test_beside_every_unit_edited_is_a_full_run() {
+    let s = Suite::new();
+    s.remove("e2e/x.u");
+    let env = [("T_U", "1")];
+    success(&passed(&s, &env));
+    fail_runner_only(&s, "tests/z.u");
+    s.write("tests/c.t", "src/c.src\n\n");
+    edit(&s, 3);
+    s.clear_log();
+    let out = split(&s, &env);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(full(&out), "{}", stderr(&out));
+    assert!(!pass_line(&out), "{}", stderr(&out));
+    assert_eq!(launched(&s), [""]);
+}
+
+#[test]
+fn a_new_failing_runner_only_test_in_src_beside_every_unit_edited_is_a_full_run() {
+    let s = Suite::new();
+    s.remove("e2e/x.u");
+    let env = [("T_U", "1")];
+    success(&passed(&s, &env));
+    fail_runner_only(&s, "src/z.u");
+    s.write("tests/c.t", "src/c.src\n\n");
+    edit(&s, 3);
+    s.clear_log();
+    let out = split(&s, &env);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(full(&out), "{}", stderr(&out));
+    assert!(!pass_line(&out), "{}", stderr(&out));
+    assert_eq!(launched(&s), [""]);
+}
+
+/// An ignored test (`tests/z.t` is in `.stoopignore`, so it is no unit) that the full form runs, and that fails once
+/// `T_IF` names it, beside an edit to a unit. The full form runs and fails; a subset of the unit would pass.
+#[test]
+fn an_ignored_test_beside_a_unit_edit_is_a_full_run() {
+    let s = Suite::new();
+    s.write(".stoopignore", "tests/z.t\n");
+    let z = s.path("tests/z.t").display().to_string();
+    let env = [("T_FAIL_FULL", "1"), ("T_IF", z.as_str())];
+    success(&passed(&s, &env));
+    s.write("tests/z.t", "src/c.src\n");
+    s.write("tests/c.t", "src/c.src\n\n");
+    s.clear_log();
+    let out = split(&s, &env);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert!(full(&out), "{}", stderr(&out));
+    assert!(stderr(&out).contains("tests changed"), "{}", stderr(&out));
+    assert_eq!(launched(&s), [""]);
+}
+
+/// A failing unit keeps the proof it held until it passes. `b` fails in a run that replaces `a`'s proof, and its old
+/// proof still holds when the shared source is back as it was: `b` is not launched, while `a` is. A dropped or a stored
+/// failing proof would launch `b` as well.
+#[test]
+fn a_failing_unit_keeps_its_previous_proof_until_it_passes() {
+    let s = Suite::new();
+    let run = |s: &Suite| s.run(&s.root, &[], &["./t", UNIT], &[SPLIT]);
+    s.write("tests/b.flag", "ok\n");
+    success(&run(&s));
+    edit(&s, 2);
+    success(&run(&s));
+    s.write("tests/b.flag", "fail\n");
+    edit(&s, 3);
+    s.clear_log();
+    let out = run(&s);
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t"]);
+    s.write("tests/b.flag", "ok\n");
+    edit(&s, 2);
+    s.clear_log();
+    let out = run(&s);
+    success(&out);
+    assert_eq!(launched(&s), ["tests/a.t"], "{}", stderr(&out));
+}
+
+/// A launch that writes a top-level entry, which the proof of a skipped unit lists through the root, is a 125 when it is
+/// the last launch. S18b covers the first launch; the listing level must not skip the last one.
+#[test]
+fn a_top_level_entry_written_by_the_last_launch_is_125_not_disabled() {
+    let s = Suite::new();
+    let go = s.outside.join("go").display().to_string();
+    let top = s.root.join("new.top").display().to_string();
+    let env = [
+        ("T_LS_ROOT", "1"),
+        ("T_WRITE", top.as_str()),
+        ("T_WRITE_AT", "tests/c.t"),
+        ("T_IF", go.as_str()),
+    ];
+    success(&passed(&s, &env));
+    fs::write(&go, "").unwrap();
+    s.write("src/c.src", "c changed\n");
+    s.clear_log();
+    let out = split(&s, &env);
+    assert_eq!(code(&out), 125, "{}", stderr(&out));
+    assert_eq!(launched(&s), ["tests/c.t"]);
+    assert_eq!(state(&s)["status"], "ready", "{}", stderr(&out));
+}
+
+/// `tests/b.t` also reads a file outside the root, which no other unit reads. When that file changes, the subset launches
+/// `b` alone, and `STOOP_CHANGED_INPUTS` names no path outside the root (spec 3.11).
+#[test]
+fn a_changed_input_outside_the_root_is_not_named_to_its_launch() {
+    let s = Suite::new();
+    let outside = s.outside.join("o.src");
+    s.write("tests/b.t", "src/shared.src\n../outside/o.src\n");
+    fs::write(&outside, "v1\n").unwrap();
+    success(&split(&s, &[]));
+    edit(&s, 2);
+    success(&split(&s, &[]));
+    fs::write(&outside, "v2\n").unwrap();
+    s.clear_log();
+    let out = split(&s, &[]);
+    success(&out);
+    assert_eq!(launched(&s), ["tests/b.t"], "{}", stderr(&out));
+    assert_eq!(
+        s.launches()[0].env("changed_inputs"),
+        "",
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// The attribution pass exports no changed inputs, to any launch, in the variable (spec 3.11). Every unit is affected
+/// here and each holds a stored version, so this is an attribution pass that keeps its versions.
+#[test]
+fn the_attribution_pass_exports_no_changed_inputs() {
+    let s = Suite::new();
+    success(&split(&s, &[]));
+    edit(&s, 2);
+    success(&split(&s, &[]));
+    s.write("src/c.src", "c changed\n");
+    edit(&s, 3);
+    s.clear_log();
+    let out = split(&s, &[]);
+    success(&out);
+    assert!(pass_line(&out), "{}", stderr(&out));
+    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t", "tests/c.t"]);
+    for launch in s.launches() {
+        assert_eq!(launch.env("changed_inputs"), "", "{}", stderr(&out));
+    }
 }
