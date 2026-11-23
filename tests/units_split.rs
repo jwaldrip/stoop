@@ -1029,10 +1029,11 @@ fn a_file_read_only_by_a_removed_units_version_is_a_change() {
     assert_eq!(launched(&s), [""]);
 }
 
-/// STOP 4: a unit added after the full run and removed again is not a change. Its listing entry is gone, and the file
-/// that a unit covers is the only difference the whole proof has not seen, so the next run skips.
+/// STOP 4: a unit added after the full run and removed again leaves its version in the bundle, and the listing check reads
+/// that version as a name the listing lost. The whole proof never held the name, so the run takes the full form once, which
+/// records the listing as it is now. The next run skips.
 #[test]
-fn an_added_unit_removed_again_is_not_a_change() {
+fn an_added_unit_removed_again_takes_one_full_run_then_skips() {
     let s = Suite::new();
     success(&passed(&s, &[]));
     s.write("tests/a.flag", "ok\n");
@@ -1041,11 +1042,16 @@ fn an_added_unit_removed_again_is_not_a_change() {
     success(&split(&s, &[]));
     fs::remove_file(s.path("tests/d.t")).unwrap();
     s.clear_log();
-    let explained = explain(&s, &[]);
     let out = split(&s, &[]);
     success(&out);
+    assert!(full(&out), "{}", stderr(&out));
+    assert!(stderr(&out).contains("(tests changed)"), "{}", stderr(&out));
+    s.clear_log();
+    let explained = explain(&s, &[]);
+    let next = split(&s, &[]);
+    success(&next);
     assert!(skipped(&explained), "{}", stderr(&explained));
-    assert!(skipped(&out), "{}", stderr(&out));
+    assert!(skipped(&next), "{}", stderr(&next));
     assert!(s.launches().is_empty(), "a skip launches nothing");
 }
 

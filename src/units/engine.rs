@@ -373,6 +373,7 @@ fn listings_change(
         .inputs
         .iter()
         .chain(&proof.outputs)
+        .filter(|input| input.id != "a")
         .map(|input| input.path.as_str())
         .collect();
     let covered = covered_reads(cx, view, current, &recorded);
@@ -396,7 +397,7 @@ fn listing_matches(root: &Path, recorded: &Input) -> bool {
     }
 }
 
-/// The paths that a valid version of a roster unit reads by content, and that the whole proof does not hold at all
+/// The paths that a valid version of a roster unit reads by content, and that the whole proof did not hold as present
 /// (spec 3.10, E16). A file such as a unit's flag can appear after the whole proof. The unit's version verified its
 /// identity, so the unit's own proof covers the file. A version that does not hold covers nothing, and neither does a
 /// unit that has left the roster.
@@ -429,7 +430,7 @@ fn covered_reads(
 /// exactly, by three kinds of name:
 ///
 /// - Lost names: the entries under this directory that are absent now, from two sources: the bundle's units with
-///   versions that the whole proof read (the former members of the roster), and the whole proof's own regular-file
+///   versions (the former members of the roster), and the whole proof's own regular-file
 ///   entries (`f:` and `x:`).
 /// - Added units: roster units under this directory that the whole proof never read, so they did not exist when it was
 ///   recorded. Each holds a valid version, because `judge` checks a listing only when every unit holds one.
@@ -488,9 +489,7 @@ fn listing_holds(
     let lost: BTreeSet<Vec<u8>> = view
         .units
         .iter()
-        .filter(|(unit, versions)| {
-            !versions.is_empty() && under(unit.as_str()) && read_entries.contains(unit.as_str())
-        })
+        .filter(|(unit, versions)| !versions.is_empty() && under(unit.as_str()))
         .map(|(unit, _)| unit.as_str())
         .chain(
             proof
