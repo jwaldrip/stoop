@@ -1344,3 +1344,103 @@ fn a_deleted_input_that_a_unit_reads_is_not_a_skip() {
         stderr(&explained)
     );
 }
+
+/// m07 (spec 3.9, `new`): a new unit in a new top-level directory. A whole proof drops the root listing and never listed
+/// the new directory, so only the new-unit reason keeps the run from a skip. The full command runs the unit, and it fails.
+#[test]
+fn a_new_unit_in_a_new_top_level_directory_is_not_a_skip() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    s.write("extra/z.t", "src/c.src\n");
+    s.write("extra/z.flag", "fail\n");
+    let direct = s.direct(&s.root, &[], &[]);
+    assert_eq!(code(&direct), 1, "{}", stderr(&direct));
+    let explained = explain(&s, &[]);
+    assert!(
+        stderr(&explained).contains("stoop: affected extra/z.t: new"),
+        "{}",
+        stderr(&explained)
+    );
+    let out = split(&s, &[]);
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+}
+
+/// m07, the root variant: a new unit at the top level. The whole proof has no root listing that shows the new name, so
+/// only the new-unit reason keeps the run from a skip.
+#[test]
+fn a_new_unit_at_the_top_level_is_not_a_skip() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    s.write("z.t", "src/c.src\n");
+    s.write("z.flag", "fail\n");
+    let direct = s.direct(&s.root, &[], &[]);
+    assert_eq!(code(&direct), 1, "{}", stderr(&direct));
+    let out = split(&s, &[]);
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+}
+
+/// m07 (r27): a unit's file replaced by a directory that holds a new, failing unit. The parent's listing keeps the same
+/// names, and the whole proof never listed the new directory, so the new-unit reason sees the change.
+#[test]
+fn a_unit_replaced_by_a_directory_holding_a_failing_unit_is_not_a_skip() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    s.remove("tests/c.t");
+    s.write("tests/c.t/x.t", "src/c.src\n");
+    s.write("tests/c.t/x.flag", "fail\n");
+    let direct = s.direct(&s.root, &[], &[]);
+    assert_eq!(code(&direct), 1, "{}", stderr(&direct));
+    let out = split(&s, &[]);
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+}
+
+/// z02 (spec 3.10, the generation check): a bundle of an earlier generation is not a view. `read_bundle` keeps earlier
+/// generations, so only the view's check on the generation stops a skip on this bundle.
+#[test]
+fn an_earlier_generation_bundle_is_not_a_view() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    let path = s.bundle_path().expect("a suite bundle");
+    let mut bundle = s.bundle().expect("a suite bundle");
+    bundle["generation"] = Value::from(1);
+    fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+    s.write("docs/readme.md", "edited\n");
+    let explained = explain(&s, &[]);
+    assert_ne!(decision(&explained), "skip", "{}", stderr(&explained));
+    let out = split(&s, &[]);
+    assert_ne!(decision(&out), "skip", "{}", stderr(&out));
+    assert!(
+        !stderr(&out).contains("no tracked input changed"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// E11 (spec 3.10), for a unit file that became a directory. The name still exists, so the unit has left the roster while
+/// its path stays, and the run takes the full form. T_U runs every *.u, so the full command runs the failing x.u inside the
+/// directory and exits 1.
+#[test]
+fn a_unit_file_replaced_by_a_directory_takes_the_full_form() {
+    let s = Suite::new();
+    s.remove("e2e/x.u");
+    let env = [("T_U", "1")];
+    success(&passed(&s, &env, &[SPLIT]));
+    s.remove("tests/c.t");
+    s.write("tests/c.t/x.u", "src/c.src\n");
+    s.write("tests/c.t/x.flag", "fail\n");
+    let direct = s.direct(&s.root, &[], &env);
+    assert_eq!(code(&direct), 1, "{}", stderr(&direct));
+    let explained = explain(&s, &env);
+    assert_eq!(decision(&explained), "full", "{}", stderr(&explained));
+    let out = split(&s, &env);
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("tests/c.t is no longer one of the units but still exists"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+}
