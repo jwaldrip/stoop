@@ -698,3 +698,181 @@ fn t21_explain_names_only_the_affected_units() {
     );
     assert!(!log.contains("stoop: affected tests/c.t"), "{log}");
 }
+
+/// The units and inputs a skip line names, `(N units, M inputs)`.
+fn skip_counts(text: &str) -> (usize, usize) {
+    let line = text
+        .lines()
+        .find(|line| line.contains("no tracked input changed"))
+        .expect("a skip line");
+    let inside = line.rsplit('(').next().unwrap().trim_end_matches(')');
+    let mut parts = inside.split(", ");
+    let count = |part: Option<&str>| -> usize {
+        part.and_then(|part| part.split(' ').next())
+            .and_then(|number| number.parse().ok())
+            .expect("a count")
+    };
+    (count(parts.next()), count(parts.next()))
+}
+
+/// E14 (g2) for a path the whole proof does not list. The cold run's proof lacks `src/x.src`. Once a pass has recorded
+/// every unit under its content, a change to it is a change every unit reads, so the full command runs for that reason.
+#[test]
+fn t_e14_lacking_path_is_global() {
+    let s = Suite::new();
+    success(&s.hook(&[]));
+    s.write("src/x.src", "one\n");
+    for unit in ["tests/a.t", "tests/b.t", "tests/c.t"] {
+        s.write(unit, "src/x.src\n");
+    }
+    success(&split(&s, &[]));
+    s.write("src/x.src", "two\n");
+    let out = split(&s, &[]);
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("src/x.src changed and every unit reads it"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// E15 for an output that a unit lists. The full run writes `tests/a.out` and the units list it, so it is a unit's output
+/// and not one only the full form writes. A changed `tests/a.out` affects `a`, and E15 does not name it.
+#[test]
+fn t_e15_listed_output_is_affected_not_global() {
+    let env = [("T_WRITE_EACH", "1")];
+    let s = Suite::new();
+    success(&s.hook(&env));
+    edit(&s, 2);
+    success(&s.hook(&with(&env, &[SPLIT])));
+    s.write("tests/a.out", "changed\n");
+    let out = s.hook(&with(&env, &[SPLIT]));
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("output tests/a.out changed"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(!stderr(&out).contains("is changed"), "{}", stderr(&out));
+}
+
+/// Every launch lists the root (`T_LS_ROOT`), so the root listing is an input of each unit. Its identity is its own:
+/// a change that only the whole proof sees, in a directory the root lists, skips on the units' unchanged listing.
+#[test]
+fn t_listed_identity_is_its_own() {
+    let env = [("T_LS_ROOT", "1")];
+    let s = Suite::new();
+    s.write("docs/readme.md", "x\n");
+    success(&passed(&s, &env, &[SPLIT]));
+    s.write("docs/extra.md", "x\n");
+    let out = s.hook(&with(&env, &[SPLIT]));
+    success(&out);
+    assert!(
+        stderr(&out).contains("no tracked input changed"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// The skip line counts each input once. A unit that reads only inputs that other units read adds its own file, and
+/// nothing more.
+#[test]
+fn t_skip_line_counts_distinct_inputs() {
+    let skip_with = |extra: bool| {
+        let s = Suite::new();
+        if extra {
+            s.write("tests/d.t", "src/c.src\n");
+        }
+        success(&passed(&s, &[], &[SPLIT]));
+        s.write("docs/extra.md", "x\n");
+        let out = split(&s, &[]);
+        success(&out);
+        skip_counts(&stderr(&out))
+    };
+    let (units, inputs) = skip_with(false);
+    let (more_units, more_inputs) = skip_with(true);
+    assert_eq!((units, more_units), (3, 4));
+    assert_eq!(
+        more_inputs,
+        inputs + 1,
+        "3 units name {inputs} inputs; 4 units name {more_inputs}"
+    );
+}
+
+/// A change that every unit reads is global only while a unit holds the old content. Once a pass has recorded every unit
+/// under the new content, an unchanged run skips.
+#[test]
+fn t_g2_a_recorded_change_is_not_global() {
+    let s = Suite::new();
+    s.write("tests/c.t", "src/shared.src\n");
+    success(&passed(&s, &[], &[SPLIT]));
+    let out = split(&s, &[]);
+    success(&out);
+    assert!(
+        stderr(&out).contains("no tracked input changed"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// A proof recorded for another command is not a view, so the run does not skip on it.
+#[test]
+fn t_view_refuses_another_command_bundle() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    let path = s.bundle_path().expect("a suite bundle");
+    let mut bundle = s.bundle().expect("a suite bundle");
+    bundle["whole_key_digest"] = Value::from("recorded for another command");
+    fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+    s.write("docs/extra.md", "x\n");
+    let out = split(&s, &[]);
+    assert!(
+        !stderr(&out).contains("no tracked input changed"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// A bundle of a later generation is not a view either, so the run does not skip on it.
+#[test]
+fn t_later_generation_is_another_version() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    let path = s.bundle_path().expect("a suite bundle");
+    let mut bundle = s.bundle().expect("a suite bundle");
+    bundle["generation"] = Value::from(3);
+    fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+    s.write("docs/extra.md", "x\n");
+    let out = split(&s, &[]);
+    assert!(
+        !stderr(&out).contains("no tracked input changed"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// A busy suite lock keeps a skip whose settle would drop a removed unit's versions: the skip stands and nothing is
+/// written. The next run that gets the lock drops them.
+#[test]
+fn t_busy_lock_keeps_the_skip() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    fs::remove_file(s.root.join("tests/c.t")).unwrap();
+    let lock = fs::read_dir(s.root.join(".stoop/units/v1"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "lock"))
+        .expect("a suite lock");
+    let held = File::open(&lock).unwrap();
+    // SAFETY: `held` is an open descriptor until the end of this test.
+    let locked = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    assert_eq!(locked, 0, "the test takes the suite lock");
+    let out = split(&s, &[]);
+    drop(held);
+    success(&out);
+    assert!(
+        stderr(&out).contains("no tracked input changed"),
+        "{}",
+        stderr(&out)
+    );
+}

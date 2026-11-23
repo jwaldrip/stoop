@@ -412,6 +412,21 @@ fn a_newer_bundle_version_is_never_overwritten_and_ls_identifies_it() {
 }
 
 #[test]
+fn a_later_generation_bundle_is_never_overwritten_and_ls_identifies_it() {
+    let f = Fixture::new();
+    success(&f.run(&[], Some("{changed:*.t}"), &[]));
+    let (path, mut bundle) = f.one_bundle();
+    bundle["generation"] = 3.into();
+    let later = serde_json::to_vec(&bundle).unwrap();
+    fs::write(&path, &later).unwrap();
+    success(&f.run(&[], Some("{changed:*.t}"), &[]));
+    assert_eq!(fs::read(&path).unwrap(), later);
+    let listing = f.cli("ls", &[]);
+    success(&listing);
+    assert!(String::from_utf8_lossy(&listing.stdout).contains("newer format"));
+}
+
+#[test]
 fn corrupt_bundle_is_reported_once_by_ls_and_replaced_silently_by_a_run() {
     let f = Fixture::new();
     success(&f.run(&[], Some("{changed:*.t}"), &[]));
