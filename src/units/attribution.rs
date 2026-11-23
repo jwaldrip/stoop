@@ -345,7 +345,7 @@ pub(crate) struct Suite {
 
 /// Spec 3.1, checks 1 to 7: the decisions taken before the store is read or the lock is taken. The
 /// run and `stoop explain` both call it, so they cannot disagree on these checks.
-fn screen<'p>(
+pub(crate) fn screen<'p>(
     cx: &RunCx<'_>,
     hook: &Hook,
     config: &Config,
@@ -412,13 +412,7 @@ pub(crate) fn explain_lines(
     .and_then(|pending| bundle::probe(store, pending, key).map(|()| pending.units().len()));
     let residue_text = bundle::known_residue(store, &suite.id, key)
         .map(|(count, paths)| residue::line(count, &paths));
-    let (inputs, proven) = bundle::counts(store, &suite.id, &suite.units, key);
-    let total = suite.units.len();
-    let tracked = format!(
-        "stoop: tracked {total} units, {inputs} inputs; {proven} proven, {} without a proof (suite {})",
-        total - proven,
-        suite.id
-    );
+    let tracked = tracked(store, &suite.id, &suite.units, key);
     let decision = match decision {
         Ok(launches) => format!("stoop: would run an attribution pass: {launches} launches"),
         Err(Refusal::SuiteDisabled) => match bundle::disabled(store, &suite.id) {
@@ -435,6 +429,17 @@ pub(crate) fn explain_lines(
             .into_iter()
             .chain([tracked, decision])
             .collect(),
+    )
+}
+
+/// The tracked line `stoop explain` prints for a suite: its roster's units, the inputs their proofs name, and how many of
+/// them hold a proof (spec 4.16). It reads the store and takes no lock.
+pub(crate) fn tracked(store: &Path, id: &str, units: &[String], key: &str) -> String {
+    let (inputs, proven) = bundle::counts(store, id, units, key);
+    let total = units.len();
+    format!(
+        "stoop: tracked {total} units, {inputs} inputs; {proven} proven, {} without a proof (suite {id})",
+        total - proven
     )
 }
 

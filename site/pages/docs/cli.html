@@ -126,6 +126,12 @@ options = [{ names = ["--files", "-f"], values = "many" }]</code></pre>
 </table>
 <p class="note">These are switches. A variable that is empty, or set to <code>0</code>, <code>false</code>, <code>no</code> or <code>off</code>, is off; anything else is on. That makes the common CI idiom <code>STOOP_SYNC_WRITE: ${{ github.ref == 'refs/heads/main' &amp;&amp; '1' || '' }}</code> safe: the empty string on a pull request does not turn publishing on. An empty <code>STOOP_SYNC</code> or <code>STOOP_STORE</code> counts as unset.</p>
 
+<h2 id="split">Unit skips (experimental)</h2>
+<p>With <code>STOOP_SPLIT=1</code>, a changed run of a hooked command reads each unit's own proof, and it skips when no unit is affected. A skip launches nothing and exits 0. It prints <code>stoop: skip KEY: no tracked input changed (N units, M inputs)</code>, with the same key as the legacy skip line.</p>
+<p>Every other changed run takes the full command, as it does without the switch, and its run line gives the reason. This release acts only on skips. A unit affected by a change is not run on its own, so its proof stays stale until <code>stoop forget --units KEY</code> clears the suite's unit proofs.</p>
+<p>A full command that fails while every unit's proof held disables the suite: <code>stoop: suite ID disabled: the full command failed while every unit's proof held; run 'stoop forget --units ID' after fixing it</code>. A disabled suite runs the full command until it is forgotten.</p>
+<p><code>stoop explain</code> makes the same decision and prints it first. It then prints the residue when there is one, the tracked counts, and up to 20 affected units with their reasons. The switch is off by default. An unset variable, or one that is empty, <code>0</code>, <code>false</code>, <code>no</code>, <code>off</code>, or not UTF-8, leaves every output as it was.</p>
+
 <h2 id="exit-codes">Exit codes</h2>
 <table>
   <thead><tr><th>Command</th><th>Exit code</th></tr></thead>
@@ -142,6 +148,8 @@ options = [{ names = ["--files", "-f"], values = "many" }]</code></pre>
 <dl>
   <dt>stoop: skip KEY: N inputs unchanged since T ago (Xms)</dt>
   <dd>A proof matched. The command did not run.</dd>
+  <dt>stoop: skip KEY: no tracked input changed (N units, M inputs)</dt>
+  <dd>With <code>STOOP_SPLIT=1</code>, no unit is affected, so the command did not run. See <a href="#split">unit skips</a>.</dd>
   <dt>stoop: run KEY: REASON</dt>
   <dd>No proof matched. REASON is what differed from the newest one: <code>no proof yet</code>, <code>src/main.rs changed</code>, <code>env changed</code>, <code>proof expired</code>, <code>STOOP_FULL is set</code>.</dd>
   <dt>stoop: recorded N inputs for KEY</dt>

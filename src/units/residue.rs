@@ -35,14 +35,20 @@ pub(crate) fn uncovered(
     (rest.len(), paths)
 }
 
-/// The line `stoop explain` prints for a known, non-empty residue: its count, then the first paths it names.
-pub(crate) fn line(count: usize, paths: &[String]) -> String {
+/// The residue as a reason: its count, then the first paths it names. A run that takes the full form for it prints
+/// this text, and `stoop explain` prints it behind its prefix (`line`).
+pub(crate) fn reason(count: usize, paths: &[String]) -> String {
     let noun = if count == 1 { "file" } else { "files" };
     let named: Vec<String> = paths.iter().take(NAMED).map(|path| safe(path)).collect();
     format!(
-        "stoop: the full command reads {count} {noun} no unit's own run reads, such as {}; widen the filter or narrow the command",
+        "the full command reads {count} {noun} no unit's own run reads, such as {}; widen the filter or narrow the command",
         named.join(", ")
     )
+}
+
+/// The line `stoop explain` prints for a known, non-empty residue: its count, then the first paths it names.
+pub(crate) fn line(count: usize, paths: &[String]) -> String {
+    format!("stoop: {}", reason(count, paths))
 }
 
 #[cfg(test)]

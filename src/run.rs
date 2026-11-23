@@ -599,6 +599,9 @@ pub enum How {
     /// A unit launch of an attribution pass (spec 3.3). Each unit's proof is kept apart from the
     /// whole-command proof, so this outcome is never a step proof.
     Units,
+    /// A hooked run that skipped because no unit is affected (spec 3.10, step E16). It names no proof, and the
+    /// journal blocks it like a unit launch.
+    UnitsSkipped,
 }
 
 pub struct Outcome {
@@ -948,7 +951,7 @@ fn unit_bookkeeping(
 pub(crate) struct Lookup {
     pub(crate) proofs: Vec<Proof>,
     pub(crate) hit_idx: Option<usize>,
-    why: String,
+    pub(crate) why: String,
     t0: Instant,
 }
 
@@ -1330,7 +1333,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         salt: &salt,
         remote,
     };
-    let lookup = legacy_lookup(&cx, &key);
+    let mut lookup = legacy_lookup(&cx, &key);
     // The roster is taken before the command launches. Only a run that launches takes it: a
     // whole-command hit that is skipped never walks the tree. This is the skip legacy_finish applies.
     let launches = cx.full_reason.is_some() || lookup.hit_idx.is_none();
@@ -1339,32 +1342,140 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     } else {
         None
     };
-    // The one call that dispatches an attribution pass (spec 3.1). Removing this statement
-    // returns every hooked run to the legacy path.
-    if let Some(outcome) = pending.as_ref().and_then(|pending| {
-        units::attribution::pass(&cx, &config, &lookup, pending, &volatile_store, &key)
-    }) {
-        return outcome;
-    }
-    // Explain adds two lines to a suite's decision (spec 4.16). They are computed while the context
-    // is whole, and printed after the lines the legacy path prints.
-    let suite_lines = (explain && !o.quiet)
+    // With `STOOP_SPLIT` on, the decision engine judges the run before any attribution pass (spec 3.10). Explain judges
+    // the suite it names, because it takes no roster. A run judges the roster it took.
+    let split = units::engine::switch() == Some(true);
+    let named = (explain && split)
         .then(|| {
             let refusal = units_refusal(&cx, config_invalid, independent_false);
-            let suite = unit_suite(&cx, &config, refusal);
-            units::attribution::explain_lines(
-                &cx,
-                &config,
-                &lookup,
-                suite.as_ref(),
-                &volatile_store,
-                &key,
-            )
+            unit_suite(&cx, &config, refusal)
         })
         .flatten();
+    let roster = if explain {
+        named.as_ref().and_then(|suite| suite.pending.as_ref().ok())
+    } else {
+        pending.as_ref()
+    };
+    let verdict = split
+        .then(|| {
+            roster.map(|pending| {
+                units::engine::decide(
+                    &cx,
+                    &config,
+                    &lookup,
+                    pending,
+                    &volatile_store,
+                    &key,
+                    max_age,
+                )
+            })
+        })
+        .flatten();
+    let (decision, clean, affected) = match verdict {
+        Some(verdict) => (Some(verdict.decision), verdict.clean, verdict.affected),
+        None => (None, false, None),
+    };
+    // A skip that drops versions of units that left the roster settles them under the suite lock, and may change its
+    // decision there (spec 3.10, E16). Explain writes nothing, so it never settles.
+    let decision = match decision {
+        Some(units::engine::Decision::Skip(skip)) if skip.drop && !explain => match &pending {
+            Some(pending) => Some(
+                units::engine::settle(&cx, pending, &lookup, &volatile_store, &key, max_age)
+                    .unwrap_or(units::engine::Decision::Skip(skip)),
+            ),
+            None => Some(units::engine::Decision::Skip(skip)),
+        },
+        other => other,
+    };
+    // Explain prints a disabled suite's switch-off refusal (spec 3.12), so only a run takes the engine's reason.
+    let decision = match decision {
+        Some(units::engine::Decision::Disabled(_)) if explain => {
+            Some(units::engine::Decision::Legacy)
+        }
+        other => other,
+    };
+    let forced = cx.full_reason.is_some();
+    let engine_full = matches!(
+        &decision,
+        Some(units::engine::Decision::Full(_) | units::engine::Decision::Disabled(_))
+    );
+    if let Some(units::engine::Decision::Skip(skip)) = decision {
+        if !o.quiet {
+            eprintln!("{}", units::engine::skip_line(&key, &skip));
+            if let Some(suite) = named.as_ref().filter(|_| explain) {
+                eprintln!(
+                    "{}",
+                    units::attribution::tracked(&volatile_store, &suite.id, &suite.units, &key)
+                );
+            }
+        }
+        return Outcome {
+            status: 0,
+            key,
+            how: How::UnitsSkipped,
+        };
+    }
+    // The disagreement check is armed when every unit held and the residue was covered, and a full command follows
+    // (spec 3.10, E1). A forced run arms it, and so does a full decision of the engine.
+    let armed = clean && (forced || engine_full);
+    let after_full = match (&decision, named.as_ref()) {
+        (
+            Some(units::engine::Decision::Full(_) | units::engine::Decision::Disabled(_)),
+            Some(suite),
+        ) if explain && !o.quiet => Some(units::engine::explain_after(
+            &volatile_store,
+            &suite.id,
+            &suite.units,
+            &key,
+            affected.as_deref(),
+        )),
+        _ => None,
+    };
+    // A full decision of the engine keeps the legacy form, with the reason the engine gives (spec 3.10).
+    if let Some(
+        units::engine::Decision::Disabled(reason) | units::engine::Decision::Full(Some(reason)),
+    ) = decision
+    {
+        lookup.why = reason;
+    }
+    // The one call that dispatches an attribution pass (spec 3.1). Removing this statement returns every hooked run
+    // to the legacy path. A full decision of the engine skips it.
+    if !engine_full {
+        if let Some(outcome) = pending.as_ref().and_then(|pending| {
+            units::attribution::pass(&cx, &config, &lookup, pending, &volatile_store, &key)
+        }) {
+            return outcome;
+        }
+    }
+    // Explain adds lines to a suite's decision (spec 4.16). A full decision of the engine prints its own lines after the
+    // legacy full form's decision line (spec 3.12). Every other decision prints the switch-off lines, which are computed
+    // while the context is whole.
+    let suite_lines = match after_full {
+        Some(lines) => Some(lines),
+        None => (explain && !o.quiet)
+            .then(|| {
+                let refusal = units_refusal(&cx, config_invalid, independent_false);
+                let suite = unit_suite(&cx, &config, refusal);
+                units::attribution::explain_lines(
+                    &cx,
+                    &config,
+                    &lookup,
+                    suite.as_ref(),
+                    &volatile_store,
+                    &key,
+                )
+            })
+            .flatten(),
+    };
     let outcome = legacy_finish(cx, key, lookup);
     for line in suite_lines.into_iter().flatten() {
         eprintln!("{line}");
+    }
+    // The disagreement check (spec 3.10, E1): the full command failed while every unit's proof held.
+    if armed && matches!(outcome.how, How::Failed) {
+        if let Some(pending) = pending.as_ref() {
+            units::engine::disagree(&volatile_store, pending, &outcome.key, o.quiet);
+        }
     }
     if let (Some(pending), How::Recorded { proof: digest }) = (pending, &outcome.how) {
         if let Some(proof) = store

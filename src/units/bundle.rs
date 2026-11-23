@@ -1637,6 +1637,198 @@ pub(crate) fn known_residue(store: &Path, id: &str, key: &str) -> Option<(usize,
         .then(|| (bundle.residue.count, bundle.residue.paths.clone()))
 }
 
+/// A unit version as a decision reads it (spec 3.9): its stamp, its guard digest, and the table indices of its inputs
+/// and outputs, in table order.
+pub(crate) struct Version {
+    pub(crate) created: u64,
+    pub(crate) guard: String,
+    pub(crate) inputs: Vec<u32>,
+    pub(crate) outputs: Vec<u32>,
+}
+
+/// A suite's bundle as one decision reads it (spec 3.9 and 3.10). A decision reads it without the suite lock, and
+/// judges it again under the lock before it writes anything.
+pub(crate) struct View {
+    /// The digest of the whole proof the bundle records.
+    pub(crate) whole: String,
+    /// The label of the disabled state, when the suite is disabled.
+    pub(crate) disabled: Option<String>,
+    /// The table that the versions index.
+    pub(crate) table: Vec<Input>,
+    /// Each unit's versions, in unit order.
+    pub(crate) units: BTreeMap<String, Vec<Version>>,
+    /// The residue, when it is known for `whole`: its count and its first paths.
+    pub(crate) residue: Option<(usize, Vec<String>)>,
+}
+
+impl View {
+    /// The view of a bundle that `read_bundle` accepted. `None` only when an index lies outside the table.
+    fn of(bundle: &SuiteBundleV1) -> Option<View> {
+        let whole = bundle.whole.clone()?;
+        let len = bundle.table.len();
+        let mut units = BTreeMap::new();
+        for (unit, versions) in &bundle.units {
+            let views = versions
+                .iter()
+                .map(|version| {
+                    Some(Version {
+                        created: version.created,
+                        guard: version.guard.clone(),
+                        inputs: undelta(&version.inputs, len)?,
+                        outputs: undelta(&version.outputs, len)?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            units.insert(unit.clone(), views);
+        }
+        let disabled = match &bundle.state {
+            SuiteState::Ready => None,
+            SuiteState::Disabled { label, .. } => Some(label.clone()),
+        };
+        let residue = residue_known(&bundle.residue, &whole)
+            .then(|| (bundle.residue.count, bundle.residue.paths.clone()));
+        Some(View {
+            whole,
+            disabled,
+            table: bundle.table.clone(),
+            units,
+            residue,
+        })
+    }
+}
+
+/// The suite's bundle for a decision, read without the lock (spec 3.9). `None` when the bundle is absent, unreadable,
+/// of another generation, or not recorded for this command, and the switch-off path decides then. A disabled suite has
+/// a view, so that its decision can name the label.
+pub(crate) fn view(store: &Path, pending: &Pending, key: &str) -> Option<View> {
+    let Ok(Some(area)) = Area::open(store, false) else {
+        return None;
+    };
+    let ReadBundle::Current(bundle) = read_bundle(&area, &pending.suite) else {
+        return None;
+    };
+    let digest = digest_text("stoop whole key v1", key);
+    if bundle.generation != GENERATION || !recorded(&bundle, &digest) {
+        return None;
+    }
+    View::of(&bundle)
+}
+
+/// What a write under the suite lock did (spec 3.10, E16).
+pub(crate) enum Settled {
+    /// The suite lock is busy, so nothing was written.
+    Busy,
+    /// `judge` did not confirm the skip under the lock, so nothing was written.
+    Declined,
+    /// The bundle was written.
+    Written,
+    /// The bundle could not be read or written, so nothing was written.
+    Failed,
+}
+
+/// Under the suite lock, reads the bundle again and asks `judge` whether the suite still skips. When it does, the
+/// versions of units that left the roster are dropped and the table is compacted (spec 3.11). A busy lock writes nothing.
+pub(crate) fn drop_stale(
+    store: &Path,
+    pending: &Pending,
+    key: &str,
+    judge: impl FnOnce(&View) -> bool,
+) -> Settled {
+    let Ok(Some(area)) = Area::open(store, false) else {
+        return Settled::Failed;
+    };
+    let _lock = match lock(&area, &pending.suite) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Settled::Busy,
+        Err(_) => return Settled::Failed,
+    };
+    let ReadBundle::Current(mut bundle) = read_bundle(&area, &pending.suite) else {
+        return Settled::Failed;
+    };
+    let digest = digest_text("stoop whole key v1", key);
+    if bundle.generation != GENERATION || !recorded(&bundle, &digest) {
+        return Settled::Failed;
+    }
+    let Some(view) = View::of(&bundle) else {
+        return Settled::Failed;
+    };
+    if !judge(&view) {
+        return Settled::Declined;
+    }
+    bundle
+        .units
+        .retain(|unit, _| pending.roster.units.binary_search(unit).is_ok());
+    compact(&mut bundle);
+    match write_bundle(&area, &bundle) {
+        Ok(()) => Settled::Written,
+        Err(_) => Settled::Failed,
+    }
+}
+
+/// Rebuilds the table from the entries that the versions still index, in table order, and renumbers the versions to it.
+fn compact(bundle: &mut SuiteBundleV1) {
+    let len = bundle.table.len();
+    let mut used: BTreeSet<u32> = BTreeSet::new();
+    for version in bundle.units.values().flatten() {
+        used.extend(undelta(&version.inputs, len).unwrap_or_default());
+        used.extend(undelta(&version.outputs, len).unwrap_or_default());
+    }
+    let mut renumber = vec![0u32; len];
+    let mut table = Vec::with_capacity(used.len());
+    for (new, &old) in used.iter().enumerate() {
+        renumber[old as usize] = u32::try_from(new).expect("the table is bounded");
+        table.push(bundle.table[old as usize].clone());
+    }
+    for version in bundle.units.values_mut().flatten() {
+        for indices in [&mut version.inputs, &mut version.outputs] {
+            let renamed: Vec<u32> = undelta(indices.as_slice(), len)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|index| renumber[index as usize])
+                .collect();
+            *indices = delta(&renamed);
+        }
+    }
+    bundle.table = table;
+}
+
+/// Stores the suite as disabled for a disagreement (spec 3.4 and 3.6): a full command failed while every unit's proof
+/// held. It is written under the suite lock, and only for a current bundle that is not disabled already. `Ok(false)`
+/// means that nothing was written.
+pub(crate) fn disable_full(
+    store: &Path,
+    pending: &Pending,
+    key: &str,
+    label: &str,
+) -> io::Result<bool> {
+    let Some(area) = Area::open(store, false)? else {
+        return Ok(false);
+    };
+    let _lock = match lock(&area, &pending.suite) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let ReadBundle::Current(mut bundle) = read_bundle(&area, &pending.suite) else {
+        return Ok(false);
+    };
+    let digest = digest_text("stoop whole key v1", key);
+    if bundle.generation != GENERATION
+        || !recorded(&bundle, &digest)
+        || matches!(bundle.state, SuiteState::Disabled { .. })
+    {
+        return Ok(false);
+    }
+    bundle.state = SuiteState::Disabled {
+        code: "disagreement".to_owned(),
+        phase: "full".to_owned(),
+        label: label.to_owned(),
+        at: now(),
+    };
+    write_bundle(&area, &bundle)?;
+    Ok(true)
+}
+
 /// Checked on read only: each version's indices must lie below the table and strictly increase.
 /// A check on every write would make a pass quadratic in its indices.
 fn valid_versions(bundle: &SuiteBundleV1) -> bool {

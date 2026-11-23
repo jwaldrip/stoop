@@ -623,6 +623,7 @@ fn report_run(o: Opts, fd: i32) -> i32 {
         run::How::Failed => ("ran", "failed", true),
         run::How::Untraced => ("ran", "untraced", false),
         run::How::Units => ("ran", "units", true),
+        run::How::UnitsSkipped => ("skipped", "units", true),
     };
     emit_decision(
         fd,
