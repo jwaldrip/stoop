@@ -1234,11 +1234,13 @@ fn subject_steps(pair: &Pair, value: Option<&OsStr>) -> Vec<(Option<i32>, Vec<u8
 #[test]
 #[ignore = "requires STOOP_BASE_BIN and a Linux tracer"]
 fn d20_a_falsy_switch_is_the_same_as_unset() {
-    let plain = Pair::new("falsy-unset");
+    // One name for both sides, so their HOME paths, and every environment hash that a proof stores, agree.
+    let plain = Pair::new("falsy");
     let plain_steps = subject_steps(&plain, None);
     let plain_store = store_snapshot(&plain.roots[1].join(".stoop"));
+    drop(plain);
     for value in [OsStr::new("0"), OsStr::new(""), OsStr::from_bytes(b"\xff")] {
-        let pair = Pair::new("falsy-set");
+        let pair = Pair::new("falsy");
         let steps = subject_steps(&pair, Some(value));
         assert_eq!(steps, plain_steps, "D20 {value:?}: the steps");
         assert_eq!(
@@ -1246,6 +1248,7 @@ fn d20_a_falsy_switch_is_the_same_as_unset() {
             plain_store,
             "D20 {value:?}: the store"
         );
+        drop(pair);
     }
 }
 

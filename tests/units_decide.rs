@@ -75,7 +75,9 @@ fn decision(out: &Output) -> &'static str {
     let log = stderr(out);
     if log.contains("stoop: skip ") {
         "skip"
-    } else if log.contains("attribution pass:") {
+    } else if log.contains("stoop: attribution pass: ")
+        || log.contains("would run an attribution pass: ")
+    {
         "pass"
     } else if log.contains("run full ") {
         "full"
@@ -343,6 +345,9 @@ fn t10_a_new_unit_is_not_skipped() {
 fn t11_a_unit_that_leaves_the_roster_while_its_file_stays_is_named() {
     let s = Suite::new();
     s.git("feature");
+    // A repository's own `.git` is read by every run, and a run that reads it records nothing (the message says
+    // to ignore it when that read cannot change the result).
+    s.write(".stoopignore", ".git\n");
     success(&passed(&s, &[], &[SPLIT]));
     git(&s, &["rm", "--cached", "-q", "tests/c.t"]);
     s.write(".gitignore", "tests/c.t\n");
