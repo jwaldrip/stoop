@@ -17,6 +17,7 @@ use crate::run::{Lookup, RunCx};
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::Path;
+use std::time::{Duration, Instant};
 use std::{fs, io};
 
 /// How many affected units explain names before it counts the rest (spec 3.12).
@@ -27,6 +28,10 @@ const NEW: &str = "new";
 
 /// The label of a suite that a full command disables when it fails while every unit's proof held (spec 3.4).
 pub(crate) const DISAGREEMENT: &str = "the full command failed while every unit's proof held";
+
+/// How long a disagreement waits for a suite lock that another run holds (spec 3.10, E1), and the pause between tries.
+const DISAGREE_WAIT: Duration = Duration::from_secs(2);
+const DISAGREE_STEP: Duration = Duration::from_millis(20);
 
 /// Whether the engine is on (spec 3.1). `None` when `STOOP_SPLIT` is unset. Otherwise it is on for a value that is not
 /// empty, `0`, `false`, `no` or `off` once trimmed and lowercased, and off for a value that is not UTF-8.
@@ -669,9 +674,23 @@ pub(crate) fn explain_after(
 }
 
 /// The disagreement check (spec 3.10, E1): a full command that fails while every unit's proof held disables the suite.
+/// The suite lock may be held by another run, so the write waits for it for up to `DISAGREE_WAIT`. A disagreement that
+/// still cannot be stored is reported. When the state could not be written, the suite's proofs are removed, so that no
+/// later run skips on them.
 pub(crate) fn disagree(store: &Path, pending: &Pending, key: &str, quiet: bool) {
     let id = pending.suite();
-    match bundle::disable_full(store, pending, key, DISAGREEMENT) {
+    let deadline = Instant::now() + DISAGREE_WAIT;
+    let outcome = loop {
+        match bundle::disable_full(store, pending, key, DISAGREEMENT) {
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                std::thread::sleep(DISAGREE_STEP);
+            }
+            outcome => break outcome,
+        }
+    };
+    match outcome {
         Ok(true) => {
             if !quiet {
                 eprintln!(
@@ -680,16 +699,20 @@ pub(crate) fn disagree(store: &Path, pending: &Pending, key: &str, quiet: bool) 
             }
         }
         Ok(false) => {}
-        Err(_) => {
-            // The state could not be stored, so the suite's proofs go, as an attribution pass removes them.
-            let removed = bundle::forget(store, id).is_ok();
+        Err(error) => {
+            let busy = error.kind() == io::ErrorKind::WouldBlock;
+            if !busy {
+                let _ = bundle::forget(store, id);
+            }
             if !quiet {
-                let rest = if removed {
-                    "its unit proofs are removed"
+                let why = if busy {
+                    "the suite is busy"
                 } else {
-                    "its unit proofs could not be removed either"
+                    "its state could not be written"
                 };
-                eprintln!("stoop: suite {id} could not store that it is disabled; {rest}");
+                eprintln!(
+                    "stoop: could not record that the full command failed while every unit held ({why}); run 'stoop forget --units {id}' to be safe"
+                );
             }
         }
     }

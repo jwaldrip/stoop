@@ -1804,7 +1804,8 @@ fn compact(bundle: &mut SuiteBundleV1) {
 
 /// Stores the suite as disabled for a disagreement (spec 3.4 and 3.6): a full command failed while every unit's proof
 /// held. It is written under the suite lock, and only for a current bundle that is not disabled already. `Ok(false)`
-/// means that nothing was written.
+/// means that nothing was written. A suite lock that another run holds is `WouldBlock`, so the caller can wait and try
+/// again.
 pub(crate) fn disable_full(
     store: &Path,
     pending: &Pending,
@@ -1814,11 +1815,7 @@ pub(crate) fn disable_full(
     let Some(area) = Area::open(store, false)? else {
         return Ok(false);
     };
-    let _lock = match lock(&area, &pending.suite) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
-        Err(error) => return Err(error),
-    };
+    let _lock = lock(&area, &pending.suite)?;
     let ReadBundle::Current(mut bundle) = read_bundle(&area, &pending.suite) else {
         return Ok(false);
     };
