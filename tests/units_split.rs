@@ -453,6 +453,33 @@ fn s18b_a_new_top_level_entry_from_a_launch_is_125_not_disabled() {
     );
 }
 
+/// S18c: the write of S18 made by the last launch. Nothing stops early, so the run has no verdict because the write
+/// broke a skipped unit's proof (spec 3.7, file level), and the suite is disabled.
+#[test]
+fn s18c_a_write_into_a_skipped_units_input_by_the_last_launch_is_125() {
+    let s = Suite::new();
+    let go = s.outside.join("go").display().to_string();
+    let env = [
+        ("T_WRITE", "src/c.src"),
+        ("T_WRITE_AT", "tests/b.t"),
+        ("T_IF", go.as_str()),
+    ];
+    success(&passed(&s, &env));
+    fs::write(&go, "").unwrap();
+    edit(&s, 3);
+    s.clear_log();
+    let out = split(&s, &env);
+    assert_eq!(code(&out), 125, "{}", stderr(&out));
+    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t"]);
+    assert_eq!(state(&s)["status"], "disabled", "{}", stderr(&out));
+    assert_eq!(state(&s)["code"], "wrote_input", "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("tests/b.t changed src/c.src, which skipped unit tests/c.t reads"),
+        "{}",
+        stderr(&out)
+    );
+}
+
 /// S19: a run that cannot take the suite lock runs the full command and says so (spec 3.10).
 #[test]
 fn s19_a_busy_suite_runs_the_full_command_and_says_so() {
