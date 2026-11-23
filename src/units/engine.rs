@@ -293,26 +293,30 @@ fn checked<'a>(cx: &Judged<'_>, view: &'a View) -> Vec<&'a Input> {
 
 /// The current identity of each checked entry, keyed by path and by whether its recorded identity lists a directory.
 /// `input::verify` uses the same key and the same identity, so a check here agrees with a check there.
-struct Current(HashMap<(String, bool), Option<String>>);
+struct Current(HashMap<String, [Option<String>; 2]>);
 
 impl Current {
     fn of(root: &Path, entries: &[&Input]) -> Current {
-        let keys: Vec<(String, bool)> = entries
+        let keys: Vec<(&str, bool)> = entries
             .iter()
-            .map(|input| key(input))
+            .map(|input| (input.path.as_str(), input.id.starts_with("dl:")))
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
-        let ids = par_map(&keys, |key| {
-            let (path, listed) = key;
-            identify(&from_key(root, path), !path.starts_with('/'), *listed)
+        let ids = par_map(&keys, |&(path, listed)| {
+            identify(&from_key(root, path), !path.starts_with('/'), listed)
         });
-        Current(keys.into_iter().zip(ids).collect())
+        let mut map: HashMap<String, [Option<String>; 2]> = HashMap::new();
+        for ((path, listed), id) in keys.into_iter().zip(ids) {
+            map.entry(path.to_owned()).or_default()[usize::from(listed)] = id;
+        }
+        Current(map)
     }
 
     /// The current identity of `input`, or `None` when its path cannot be read.
     fn id(&self, input: &Input) -> Option<&str> {
-        self.0.get(&key(input)).and_then(|id| id.as_deref())
+        let listed = usize::from(input.id.starts_with("dl:"));
+        self.0.get(input.path.as_str())?[listed].as_deref()
     }
 
     /// Whether `input` is as it was recorded.
@@ -324,10 +328,6 @@ impl Current {
     fn absent(&self, input: &Input) -> bool {
         self.id(input) == Some("a")
     }
-}
-
-fn key(input: &Input) -> (String, bool) {
-    (input.path.clone(), input.id.starts_with("dl:"))
 }
 
 /// Step E13 (spec 3.9): the roster units whose proof no longer holds, each with its reason, in roster order. A unit
@@ -426,28 +426,32 @@ fn global_change(cx: &Judged<'_>, view: &View, proof: &Proof, current: &Current)
     if proven.is_empty() {
         return None;
     }
-    let reads: Vec<BTreeSet<&str>> = proven
-        .iter()
-        .map(|versions| {
-            versions
-                .iter()
-                .flat_map(|version| version.inputs.iter())
-                .map(|&index| view.table[index as usize].path.as_str())
-                .collect()
-        })
-        .collect();
-    let mut shared: BTreeSet<&str> = reads.iter().flatten().copied().collect();
-    shared.retain(|path| reads.iter().all(|read| read.contains(path)));
-    shared.into_iter().find_map(|path| {
-        let changed = proven
+    // One pass finds the paths that every proven unit reads, and the paths whose recorded identity no longer holds for
+    // some proven unit. The first shared path that changed, in path order, is named if its whole-proof entry differs.
+    let mut readers: HashMap<&str, usize> = HashMap::new();
+    let mut changed: BTreeSet<&str> = BTreeSet::new();
+    for versions in &proven {
+        let mut reads: BTreeSet<&str> = BTreeSet::new();
+        for input in versions
             .iter()
-            .flat_map(|versions| versions.iter())
             .flat_map(|version| version.inputs.iter())
             .map(|&index| &view.table[index as usize])
-            .any(|input| input.path == path && !current.holds(input));
-        if !changed {
-            return None;
+        {
+            reads.insert(input.path.as_str());
+            if !current.holds(input) {
+                changed.insert(input.path.as_str());
+            }
         }
+        for path in reads {
+            *readers.entry(path).or_insert(0) += 1;
+        }
+    }
+    let shared: BTreeSet<&str> = readers
+        .into_iter()
+        .filter(|&(path, count)| count == proven.len() && changed.contains(path))
+        .map(|(path, _)| path)
+        .collect();
+    shared.into_iter().find_map(|path| {
         // The whole proof's entry is identified here, and only for a path that changed (spec 3.10, E14).
         let differs = match proof.inputs.iter().find(|input| input.path == path) {
             None => true,
@@ -487,10 +491,18 @@ fn output_missing(cx: &Judged<'_>, view: &View, proof: &Proof) -> Option<String>
 
 /// The counts a skip names, and whether it drops versions of units that left the roster (spec 3.10, E16).
 fn skipped(cx: &Judged<'_>, view: &View) -> Skipped {
-    let mut inputs: BTreeSet<u32> = BTreeSet::new();
+    // Each table entry counts once, however many versions list it.
+    let mut counted = vec![false; view.table.len()];
+    let mut inputs = 0;
     for unit in cx.roster {
         for version in view.units.get(unit).into_iter().flatten() {
-            inputs.extend(version.inputs.iter().copied());
+            for &index in &version.inputs {
+                let seen = &mut counted[index as usize];
+                if !*seen {
+                    *seen = true;
+                    inputs += 1;
+                }
+            }
         }
     }
     let drop = view
@@ -499,7 +511,7 @@ fn skipped(cx: &Judged<'_>, view: &View) -> Skipped {
         .any(|(unit, versions)| !versions.is_empty() && cx.roster.binary_search(unit).is_err());
     Skipped {
         units: cx.roster.len(),
-        inputs: inputs.len(),
+        inputs,
         drop,
     }
 }
