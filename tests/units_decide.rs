@@ -354,11 +354,14 @@ fn t11_a_unit_that_leaves_the_roster_while_its_file_stays_is_named() {
     // A repository's own `.git` is read by every run, and a run that reads it records nothing (the message says
     // to ignore it when that read cannot change the result).
     s.write(".stoopignore", ".git\n");
-    success(&passed(&s, &[], &[SPLIT]));
+    // The repository is on `feature`, which is not the default branch. With no default named, the context is unknown
+    // and every run is forced to the full form (spec 3.10, E1), so the default is named here.
+    let branch = [("STOOP_DEFAULT_BRANCH", "main")];
+    success(&passed(&s, &branch, &[SPLIT]));
     git(&s, &["rm", "--cached", "-q", "tests/c.t"]);
     s.write(".gitignore", "tests/c.t\n");
     s.clear_log();
-    let out = split(&s, &[]);
+    let out = split(&s, &branch);
     success(&out);
     assert_eq!(decision(&out), "full", "{}", stderr(&out));
     assert!(
@@ -581,8 +584,8 @@ fn decide_cost() {
     let hit_ms = started.elapsed().as_secs_f64() * 1e3;
     success(&hit);
     assert!(stderr(&hit).contains("stoop: skip "), "{}", stderr(&hit));
-    // A new top-level entry changes the whole proof's root listing, and no unit reads it.
-    s.write("extra.txt", "x\n");
+    // A new file in a directory that the full command lists changes the whole proof, and no unit reads it.
+    s.write("docs/extra.md", "x\n");
     let started = Instant::now();
     let skip = split(&s, &[]);
     let skip_ms = started.elapsed().as_secs_f64() * 1e3;
