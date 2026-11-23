@@ -1214,3 +1214,121 @@ fn a_disagreement_waits_for_a_suite_lock_that_is_released_soon() {
     assert_eq!(state(&s)["status"], "disabled", "{}", state(&s));
     assert_eq!(state(&s)["code"], "disagreement", "{}", state(&s));
 }
+
+/// A runner whose full form reads every `*.t` outside `slow/` but `tests/skip.t`, so the whole proof lists that file
+/// without reading it. A unit run cats the words it is given, so a unit proof still reads its own file.
+const SKIPS_ONE: &str = r#"#!/bin/sh
+if [ $# -eq 0 ]; then
+	for f in $(find . \( -name '.?*' -o -path ./slow \) -prune -o -type f -name '*.t' -print | sed 's|^\./||' | LC_ALL=C sort); do
+		if [ "$f" != tests/skip.t ]; then cat "$f" > /dev/null; fi
+	done
+	exit 0
+fi
+for f in "$@"; do
+	cat "$f" > /dev/null
+done
+"#;
+
+/// The bundle excuses a unit's file that the whole proof listed and never read. Deleting it is not a change to its
+/// directory, so the run skips, and so does the next one (E16).
+#[test]
+fn a_unit_the_whole_proof_never_read_is_excused_by_its_bundle() {
+    let s = Suite::new();
+    s.executable("t", SKIPS_ONE);
+    s.write("tests/skip.t", "src/c.src\n");
+    success(&passed(&s, &[], &[SPLIT]));
+    let units = s.bundle().expect("a suite bundle")["units"].clone();
+    assert!(
+        units.get("tests/skip.t").is_some(),
+        "the pass proves skip.t: {units}"
+    );
+    s.remove("tests/skip.t");
+    agree(&s, &[], "skip");
+    agree(&s, &[], "skip");
+}
+
+/// A removed directory of units is a change: its parent's listing loses a name that is not a file, and no proof
+/// excuses that name (E16).
+#[test]
+fn a_removed_directory_is_a_change() {
+    let s = Suite::new();
+    s.write("tests/sub/d.t", "src/c.src\n");
+    success(&passed(&s, &[], &[SPLIT]));
+    fs::remove_dir_all(s.path("tests/sub")).unwrap();
+    let explained = explain(&s, &[]);
+    s.clear_log();
+    let ran = split(&s, &[]);
+    assert_eq!(
+        decision(&explained),
+        "full",
+        "explain: {}",
+        stderr(&explained)
+    );
+    assert_eq!(decision(&ran), "full", "run: {}", stderr(&ran));
+    assert!(stderr(&ran).contains("(tests changed)"), "{}", stderr(&ran));
+    assert_eq!(s.launches().len(), 1, "the full form launches once");
+}
+
+/// A unit renamed to a name that no unit has is a change: the old name is lost, and the new name appeared, which is
+/// never excused.
+#[test]
+fn a_rename_of_a_unit_to_a_non_unit_name_is_a_change() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    fs::rename(s.path("tests/c.t"), s.path("tests/c.txt")).unwrap();
+    let explained = explain(&s, &[]);
+    s.clear_log();
+    let ran = split(&s, &[]);
+    assert_eq!(
+        decision(&explained),
+        "full",
+        "explain: {}",
+        stderr(&explained)
+    );
+    assert_eq!(decision(&ran), "full", "run: {}", stderr(&ran));
+    assert!(stderr(&ran).contains("(tests changed)"), "{}", stderr(&ran));
+    assert_eq!(s.launches().len(), 1, "the full form launches once");
+}
+
+/// An added name is never excused as a lost one, even when a unit leaves the same directory in the same change.
+#[test]
+fn an_added_name_is_never_excused_as_lost() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    s.write("tests/new.txt", "x\n");
+    s.remove("tests/c.t");
+    let explained = explain(&s, &[]);
+    s.clear_log();
+    let ran = split(&s, &[]);
+    assert_eq!(
+        decision(&explained),
+        "full",
+        "explain: {}",
+        stderr(&explained)
+    );
+    assert_eq!(decision(&ran), "full", "run: {}", stderr(&ran));
+    assert!(stderr(&ran).contains("(tests changed)"), "{}", stderr(&ran));
+}
+
+/// A deleted input that a unit reads affects that unit, so the run takes the full form and names the input.
+#[test]
+fn a_deleted_input_that_a_unit_reads_is_not_a_skip() {
+    let s = Suite::new();
+    success(&passed(&s, &[], &[SPLIT]));
+    s.remove("src/c.src");
+    let explained = explain(&s, &[]);
+    s.clear_log();
+    let ran = split(&s, &[]);
+    assert_eq!(
+        decision(&explained),
+        "full",
+        "explain: {}",
+        stderr(&explained)
+    );
+    assert_eq!(decision(&ran), "full", "run: {}", stderr(&ran));
+    assert!(
+        stderr(&explained).contains("stoop: affected tests/c.t: src/c.src changed"),
+        "{}",
+        stderr(&explained)
+    );
+}
