@@ -102,4 +102,13 @@ mod tests {
         let text = line(1, &["a\nb".to_owned()]);
         assert!(text.contains("such as a\\u{a}b;"), "{text}");
     }
+
+    #[test]
+    fn the_line_counts_every_path_it_is_given_a_count_for() {
+        let paths: Vec<String> = (0..STORED).map(|n| format!("f/{n:02}")).collect();
+        assert_eq!(
+            line(40, &paths),
+            "stoop: the full command reads 40 files no unit's own run reads, such as f/00, f/01, f/02, f/03, f/04; widen the filter or narrow the command"
+        );
+    }
 }

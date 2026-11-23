@@ -9,7 +9,8 @@
 
 mod units_common;
 
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::fs;
 use std::process::Output;
 use units_common::*;
 
@@ -230,4 +231,88 @@ fn i22_a_unit_that_leaves_the_roster_stops_covering_its_reads() {
     assert!(units.get("tests/c.t").is_none(), "{units}");
     let r = residue(&s);
     assert!(paths(&r).contains(&"src/c.src".to_owned()), "{r}");
+}
+
+/// I23: explain prints the residue line directly before the tracked line, so the residue reads with the counts it
+/// qualifies (spec 3.12).
+#[test]
+fn i23_the_residue_line_comes_directly_before_the_tracked_line() {
+    let s = Suite::new();
+    success(&s.hook(&[("T_LINT", "1")]));
+    edit(&s, 2);
+    success(&s.hook(&[("T_LINT", "1")]));
+    let explained = explain_with(&s, HOOK, &[("T_LINT", "1")]);
+    let text = stderr(&explained);
+    let lines: Vec<&str> = text.lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.starts_with("stoop: the full command reads "))
+        .unwrap_or_else(|| panic!("no residue line in:\n{text}"));
+    assert!(
+        lines
+            .get(at + 1)
+            .is_some_and(|next| next.starts_with("stoop: tracked ")),
+        "{text}"
+    );
+}
+
+/// I24: explain counts every path of the residue, not only the first 32 that a bundle stores (spec 3.8).
+#[test]
+fn i24_explain_counts_every_residue_path_not_only_the_stored_ones() {
+    let s = Suite::new();
+    let misc: Vec<String> = (1..=39).map(|n| format!("misc/{n:02}.txt")).collect();
+    for file in &misc {
+        s.write(file, "x\n");
+    }
+    let reads: String = misc.iter().map(|file| format!(" {file}")).collect();
+    s.executable("lint", &format!("#!/bin/sh\ncat{reads} >/dev/null\n"));
+    success(&s.hook(&[("T_LINT", "1")]));
+    edit(&s, 2);
+    success(&s.hook(&[("T_LINT", "1")]));
+    let r = residue(&s);
+    assert_eq!(r["count"], 40, "{r}");
+    assert_eq!(paths(&r).len(), 32, "{r}");
+    let explained = explain_with(&s, HOOK, &[("T_LINT", "1")]);
+    assert!(
+        stderr(&explained).contains(&residue_line(
+            40,
+            "lint, misc/01.txt, misc/02.txt, misc/03.txt, misc/04.txt"
+        )),
+        "{}",
+        stderr(&explained)
+    );
+}
+
+/// I25: a disabled suite names no residue and counts no proofs (spec 3.6, 3.12). Its roster units keep their
+/// versions, and a forced run records a residue for its whole proof while the suite stays disabled.
+#[test]
+fn i25_a_disabled_suite_names_no_residue_in_explain() {
+    let s = Suite::new();
+    success(&s.hook(&[("T_LINT", "1")]));
+    edit(&s, 2);
+    success(&s.hook(&[("T_LINT", "1")]));
+    // The state a breach stores, written by hand: the unit proofs and the residue are kept.
+    let path = s.bundle_path().unwrap();
+    let mut bundle: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    bundle["state"] = json!({
+        "status": "disabled",
+        "code": "wrote_unit",
+        "phase": "attribution",
+        "label": "tests/a.t wrote tests/b.t",
+        "at": 1
+    });
+    fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+    success(&s.hook(&[("T_LINT", "1"), ("STOOP_FULL", "1")]));
+    edit(&s, 3);
+    let explained = explain_with(&s, HOOK, &[("T_LINT", "1")]);
+    let text = stderr(&explained);
+    assert!(!text.contains("the full command reads"), "{text}");
+    assert!(
+        text.contains("stoop: tracked 3 units, 0 inputs; 0 proven, 3 without a proof"),
+        "{text}"
+    );
+    assert!(
+        text.contains(" disabled: tests/a.t wrote tests/b.t; run 'stoop forget --units "),
+        "{text}"
+    );
 }

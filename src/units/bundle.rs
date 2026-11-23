@@ -2896,12 +2896,13 @@ mod pass_tests {
         assert_eq!(known_residue(&dir, &id, "key"), None, "no residue");
     }
 
-    /// A bundle whose residue count does not match its paths is corrupt, so no decision reads it.
+    /// A residue that does not match its own count reads as unknown. The rest of the bundle is kept, so a bundle an
+    /// older binary rewrote does not turn corrupt (spec 3.8).
     #[test]
-    fn a_residue_whose_count_does_not_match_its_paths_makes_the_bundle_corrupt() {
+    fn a_residue_whose_count_does_not_match_its_paths_reads_as_unknown() {
         let roster = ["tests/a.t"];
         let mut bundle = bundle_for(pending_for(&roster), "key");
-        let dir = seed("residue-corrupt", &bundle);
+        let dir = seed("residue-mismatch", &bundle);
         let id = pending_for(&roster).suite().to_owned();
         bundle.residue = Residue {
             state: ResidueState::Provisional,
@@ -2911,7 +2912,145 @@ mod pass_tests {
         };
         fs::write(bundle_file(&dir, &id), serde_json::to_vec(&bundle).unwrap()).unwrap();
         let area = Area::open(&dir, false).unwrap().unwrap();
-        assert!(matches!(read_bundle(&area, &id), ReadBundle::Corrupt));
+        let ReadBundle::Current(read) = read_bundle(&area, &id) else {
+            panic!("a residue that does not match its count makes the bundle corrupt");
+        };
+        assert!(matches!(read.residue.state, ResidueState::None));
+        assert!(read.residue.paths.is_empty());
+        assert_eq!(read.residue.count, 0);
+    }
+
+    /// Spec 3.8, resilience: an older binary keeps a residue but writes it back without its count. The residue then
+    /// reads as unknown, and the units and a disabled state are kept.
+    #[test]
+    fn a_residue_without_a_count_keeps_the_units_and_the_disabled_state() {
+        let roster = ["tests/a.t"];
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.table = vec![input("src/shared")];
+        bundle
+            .units
+            .insert("tests/a.t".into(), vec![version(delta(&[0]))]);
+        bundle.state = SuiteState::Disabled {
+            code: "wrote_unit".into(),
+            phase: "attribution".into(),
+            label: "tests/a.t wrote tests/b.t".into(),
+            at: 1,
+        };
+        let dir = seed("residue-no-count", &bundle);
+        let id = pending_for(&roster).suite().to_owned();
+        let mut json = serde_json::to_value(&bundle).unwrap();
+        json["residue"] =
+            serde_json::json!({"state": "provisional", "paths": ["lint"], "whole": "p-1"});
+        fs::write(bundle_file(&dir, &id), serde_json::to_vec(&json).unwrap()).unwrap();
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        let ReadBundle::Current(read) = read_bundle(&area, &id) else {
+            panic!("a residue without a count makes the bundle corrupt");
+        };
+        assert!(matches!(read.residue.state, ResidueState::None));
+        assert_eq!(read.units.len(), 1);
+        assert!(matches!(read.state, SuiteState::Disabled { .. }));
+    }
+
+    /// A residue that does not match its own count is never encoded, so every bundle this code writes is consistent.
+    #[test]
+    fn a_residue_that_does_not_match_its_count_is_not_encoded() {
+        let roster = ["tests/a.t"];
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.residue = Residue {
+            state: ResidueState::Provisional,
+            paths: vec!["a".into()],
+            count: 2,
+            whole: Some("p-1".into()),
+        };
+        assert!(encode(&bundle).is_err());
+    }
+
+    /// Spec 3.8: explain counts every path of a residue, and a bundle stores only the first `residue::STORED` of them.
+    #[test]
+    fn known_residue_reports_the_count_not_the_stored_paths() {
+        let roster = ["tests/a.t"];
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        let kept: Vec<String> = (0..residue::STORED)
+            .map(|n| format!("misc/{n:02}"))
+            .collect();
+        bundle.residue = Residue {
+            state: ResidueState::Provisional,
+            paths: kept.clone(),
+            count: 40,
+            whole: Some("p-1".into()),
+        };
+        let dir = seed("known-count", &bundle);
+        let id = pending_for(&roster).suite().to_owned();
+        assert_eq!(known_residue(&dir, &id, "key"), Some((40, kept)));
+    }
+
+    /// Spec 3.6: a disabled suite names no residue, because its proofs count for nothing.
+    #[test]
+    fn known_residue_names_nothing_for_a_disabled_suite() {
+        let roster = ["tests/a.t"];
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.state = SuiteState::Disabled {
+            code: "wrote_unit".into(),
+            phase: "attribution".into(),
+            label: "tests/a.t wrote tests/b.t".into(),
+            at: 1,
+        };
+        bundle.residue = Residue {
+            state: ResidueState::Provisional,
+            paths: vec!["lint".into()],
+            count: 1,
+            whole: Some("p-1".into()),
+        };
+        let dir = seed("known-disabled", &bundle);
+        let id = pending_for(&roster).suite().to_owned();
+        assert_eq!(known_residue(&dir, &id, "key"), None);
+    }
+
+    /// Spec 3.8: a pass settles the residue of its bundle's whole proof. When the proofs given hold no such proof, the
+    /// residue stays unknown, so no covered residue carries a digest that nothing measured.
+    #[test]
+    fn a_pass_settles_nothing_without_its_whole_proof() {
+        let roster = ["tests/a.t", "tests/b.t"];
+        let measured = whole_proof(&["src/shared", "lint"]);
+        let other = whole_proof(&["src/shared", "setup.src"]);
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.whole = Some(measured.digest());
+        let dir = seed("pass-no-whole", &bundle);
+        let pending = pending_for(&roster);
+        let id = pending.suite().to_owned();
+        let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
+        let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
+        let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
+        pass.settle_residue(&[other], &[]);
+        drop(pass);
+        let stored_residue = stored(&dir, &id).residue;
+        assert!(matches!(stored_residue.state, ResidueState::None));
+        assert_eq!(stored_residue.count, 0);
+        assert!(stored_residue.paths.is_empty());
+        assert_eq!(stored_residue.whole, None);
+    }
+
+    /// Spec 3.8: the residue is the bundle's whole proof's, wherever that proof stands among the proofs given.
+    #[test]
+    fn a_pass_settles_its_whole_proof_among_others() {
+        let roster = ["tests/a.t", "tests/b.t"];
+        let measured = whole_proof(&["src/shared", "lint"]);
+        let other = whole_proof(&["src/shared", "setup.src"]);
+        let digest = measured.digest();
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.whole = Some(digest.clone());
+        let dir = seed("pass-among", &bundle);
+        let pending = pending_for(&roster);
+        let id = pending.suite().to_owned();
+        let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
+        let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
+        let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
+        pass.settle_residue(&[other, measured], &[]);
+        drop(pass);
+        let stored_residue = stored(&dir, &id).residue;
+        assert_eq!(stored_residue.paths, ["lint"]);
+        assert_eq!(stored_residue.count, 1);
+        assert_eq!(stored_residue.whole, Some(digest));
     }
 }
 
