@@ -1662,35 +1662,36 @@ pub(crate) struct View {
 }
 
 impl View {
-    /// The view of a bundle that `read_bundle` accepted. `None` only when an index lies outside the table.
-    fn of(bundle: &SuiteBundleV1) -> Option<View> {
-        let whole = bundle.whole.clone()?;
+    /// The view of a bundle that `read_bundle` accepted. The view takes the bundle's table and versions, so nothing is
+    /// copied. `None` only when an index lies outside the table.
+    fn of(bundle: SuiteBundleV1) -> Option<View> {
+        let whole = bundle.whole?;
         let len = bundle.table.len();
+        let residue = residue_known(&bundle.residue, &whole)
+            .then_some((bundle.residue.count, bundle.residue.paths));
         let mut units = BTreeMap::new();
-        for (unit, versions) in &bundle.units {
+        for (unit, versions) in bundle.units {
             let views = versions
-                .iter()
+                .into_iter()
                 .map(|version| {
                     Some(Version {
                         created: version.created,
-                        guard: version.guard.clone(),
                         inputs: undelta(&version.inputs, len)?,
                         outputs: undelta(&version.outputs, len)?,
+                        guard: version.guard,
                     })
                 })
                 .collect::<Option<Vec<_>>>()?;
-            units.insert(unit.clone(), views);
+            units.insert(unit, views);
         }
-        let disabled = match &bundle.state {
+        let disabled = match bundle.state {
             SuiteState::Ready => None,
-            SuiteState::Disabled { label, .. } => Some(label.clone()),
+            SuiteState::Disabled { label, .. } => Some(label),
         };
-        let residue = residue_known(&bundle.residue, &whole)
-            .then(|| (bundle.residue.count, bundle.residue.paths.clone()));
         Some(View {
             whole,
             disabled,
-            table: bundle.table.clone(),
+            table: bundle.table,
             units,
             residue,
         })
@@ -1704,14 +1705,19 @@ pub(crate) fn view(store: &Path, pending: &Pending, key: &str) -> Option<View> {
     let Ok(Some(area)) = Area::open(store, false) else {
         return None;
     };
-    let ReadBundle::Current(bundle) = read_bundle(&area, &pending.suite) else {
+    view_in(&area, pending, key)
+}
+
+/// This command's view of the bundle in `area`. It takes no lock, so a caller that writes holds the suite lock itself.
+fn view_in(area: &Area, pending: &Pending, key: &str) -> Option<View> {
+    let ReadBundle::Current(bundle) = read_bundle(area, &pending.suite) else {
         return None;
     };
     let digest = digest_text("stoop whole key v1", key);
     if bundle.generation != GENERATION || !recorded(&bundle, &digest) {
         return None;
     }
-    View::of(&bundle)
+    View::of(bundle)
 }
 
 /// What a write under the suite lock did (spec 3.10, E16).
@@ -1742,19 +1748,16 @@ pub(crate) fn drop_stale(
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Settled::Busy,
         Err(_) => return Settled::Failed,
     };
-    let ReadBundle::Current(mut bundle) = read_bundle(&area, &pending.suite) else {
-        return Settled::Failed;
-    };
-    let digest = digest_text("stoop whole key v1", key);
-    if bundle.generation != GENERATION || !recorded(&bundle, &digest) {
-        return Settled::Failed;
-    }
-    let Some(view) = View::of(&bundle) else {
+    let Some(view) = view_in(&area, pending, key) else {
         return Settled::Failed;
     };
     if !judge(&view) {
         return Settled::Declined;
     }
+    // The view takes the bundle it reads, so the write reads the bundle again under the same lock.
+    let ReadBundle::Current(mut bundle) = read_bundle(&area, &pending.suite) else {
+        return Settled::Failed;
+    };
     bundle
         .units
         .retain(|unit, _| pending.roster.units.binary_search(unit).is_ok());
