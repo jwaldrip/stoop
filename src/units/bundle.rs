@@ -2671,6 +2671,37 @@ mod pass_tests {
         }
     }
 
+    /// Records `proof` for `roster` with `listings`, and calls record again while a busy suite lock keeps it from
+    /// writing (see `start_after_release`). It returns once the bundle carries `digest` as its whole proof, and it
+    /// fails when that takes more than 2 s.
+    fn record_until_stored(
+        dir: &Path,
+        roster: &[&str],
+        listings: &[&str],
+        key: &str,
+        digest: &str,
+        proof: &Proof,
+    ) {
+        let id = pending_for(roster).suite().to_owned();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            let mut pending = pending_for(roster);
+            pending.listings = listings.iter().map(|path| (*path).to_owned()).collect();
+            record(dir, pending, key, digest, proof.clone());
+            let area = Area::open(dir, false).unwrap().unwrap();
+            if let ReadBundle::Current(bundle) = read_bundle(&area, &id) {
+                if bundle.whole.as_deref() == Some(digest) {
+                    return;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "record() stored no bundle within 2 s, so the suite lock stayed busy"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// C19: a record keeps the versions of the roster's units only. A unit that left the roster is no longer a claim.
     #[test]
     fn a_record_keeps_the_versions_of_its_roster_only() {
@@ -2684,9 +2715,15 @@ mod pass_tests {
             .units
             .insert("tests/gone.t".into(), vec![version(vec![0])]);
         let dir = seed("prune", &bundle);
-        let pending = pending_for(&roster);
-        let id = pending.suite().to_owned();
-        record(&dir, pending, "key", "p-whole", whole_proof(&["src/a"]));
+        let id = pending_for(&roster).suite().to_owned();
+        record_until_stored(
+            &dir,
+            &roster,
+            &[],
+            "key",
+            "p-whole",
+            &whole_proof(&["src/a"]),
+        );
         let units = stored(&dir, &id).units;
         assert_eq!(units.keys().collect::<Vec<_>>(), [&"tests/a.t".to_owned()]);
     }
@@ -2705,11 +2742,9 @@ mod pass_tests {
             .units
             .insert("tests/b.t".into(), vec![version(delta(&[0, 1]))]);
         let dir = seed("record-residue", &bundle);
-        let mut pending = pending_for(&roster);
-        pending.listings = vec![".".into(), "tests".into()];
-        let id = pending.suite().to_owned();
+        let id = pending_for(&roster).suite().to_owned();
         let proof = whole_proof(&[".", "tests", "src/shared", "lint", "/usr/bin/od"]);
-        record(&dir, pending, "key", "p-whole", proof);
+        record_until_stored(&dir, &roster, &[".", "tests"], "key", "p-whole", &proof);
         let stored_residue = stored(&dir, &id).residue;
         assert!(matches!(stored_residue.state, ResidueState::Provisional));
         assert_eq!(stored_residue.count, 2);
@@ -2727,9 +2762,15 @@ mod pass_tests {
             .units
             .insert("tests/a.t".into(), vec![version(delta(&[0]))]);
         let dir = seed("record-partial", &bundle);
-        let pending = pending_for(&roster);
-        let id = pending.suite().to_owned();
-        record(&dir, pending, "key", "p-whole", whole_proof(&["lint"]));
+        let id = pending_for(&roster).suite().to_owned();
+        record_until_stored(
+            &dir,
+            &roster,
+            &[],
+            "key",
+            "p-whole",
+            &whole_proof(&["lint"]),
+        );
         let stored_residue = stored(&dir, &id).residue;
         assert!(matches!(stored_residue.state, ResidueState::None));
         assert_eq!(stored_residue.count, 0);
@@ -2737,12 +2778,13 @@ mod pass_tests {
         assert_eq!(stored_residue.whole, None);
     }
 
-    /// A residue known for the proof a record stores is kept, not measured again (spec 3.8).
+    /// A residue known for the proof a record stores is kept, not measured again (spec 3.8). The seeded bundle names
+    /// another whole proof, so the wait in `record_until_stored` ends only once the record has written.
     #[test]
     fn a_record_keeps_a_residue_already_known_for_its_proof() {
         let roster = ["tests/a.t"];
         let mut bundle = bundle_for(pending_for(&roster), "key");
-        bundle.whole = Some("p-whole".into());
+        bundle.whole = Some("p-old".into());
         bundle.table = vec![input("src/shared")];
         bundle
             .units
@@ -2754,15 +2796,9 @@ mod pass_tests {
             whole: Some("p-whole".into()),
         };
         let dir = seed("record-kept", &bundle);
-        let pending = pending_for(&roster);
-        let id = pending.suite().to_owned();
-        record(
-            &dir,
-            pending,
-            "key",
-            "p-whole",
-            whole_proof(&["src/shared", "lint"]),
-        );
+        let id = pending_for(&roster).suite().to_owned();
+        let proof = whole_proof(&["src/shared", "lint"]);
+        record_until_stored(&dir, &roster, &[], "key", "p-whole", &proof);
         let stored_residue = stored(&dir, &id).residue;
         assert_eq!(stored_residue.paths, ["kept"]);
         assert_eq!(stored_residue.count, 1);
@@ -2779,7 +2815,7 @@ mod pass_tests {
         let dir = seed("pass-residue", &bundle);
         let pending = pending_for(&roster);
         let id = pending.suite().to_owned();
-        let mut pass = pass_of(start(&dir, &pending, "key", guard()));
+        let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
         let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
         let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
         pass.settle_residue(&[proof], &[]);
@@ -2803,7 +2839,7 @@ mod pass_tests {
         let dir = seed("pass-one-write", &bundle);
         let pending = pending_for(&roster);
         let id = pending.suite().to_owned();
-        let mut pass = pass_of(start(&dir, &pending, "key", guard()));
+        let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
         let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
         pass.settle_residue(&[proof], &[]);
         drop(pass);
@@ -2828,7 +2864,7 @@ mod pass_tests {
         let dir = seed("pass-clears", &bundle);
         let pending = pending_for(&roster);
         let id = pending.suite().to_owned();
-        drop(pass_of(start(&dir, &pending, "key", guard())));
+        drop(pass_of(start_after_release(&dir, &pending, "key")));
         let stored_residue = stored(&dir, &id).residue;
         assert!(matches!(stored_residue.state, ResidueState::None));
         assert!(stored_residue.paths.is_empty());
