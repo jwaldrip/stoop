@@ -204,12 +204,26 @@ pub(crate) fn listing(
             .parent()
             .map_or_else(String::new, |parent| parent.to_string_lossy().into_owned());
         for skip in skipped {
-            if let Some(dir) = skip.listed.iter().find(|listed| **listed == parent) {
+            if let Some(dir) = skip
+                .listed
+                .iter()
+                .find(|listed| dir_name(listed) == dir_name(&parent))
+            {
                 return Some((skip.unit.clone(), key.clone(), dir.clone()));
             }
         }
     }
     None
+}
+
+/// The directory a listing names, with the root spelled one way. A proof spells the root `.`, and a key's parent is
+/// empty for an entry at the root (spec 3.7).
+fn dir_name(text: &str) -> &str {
+    if text.is_empty() {
+        "."
+    } else {
+        text
+    }
 }
 
 /// Whether the run changed the entry at `key`: it was absent and now exists, or it existed and is gone. A key with no
