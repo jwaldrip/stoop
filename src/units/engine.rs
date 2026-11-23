@@ -525,6 +525,8 @@ fn listing_holds(
                 .map(|name| name.as_encoded_bytes().to_vec())
         })
         .collect();
+    // An added name is excused only while it is a regular file now (rv32): a directory, a link or another type is a change.
+    let regular = regular_names(&from_key(root, &recorded.path));
     let mut candidate: Vec<Vec<u8>> = names
         .into_iter()
         .filter(|name| !added.contains(name))
@@ -544,6 +546,20 @@ fn listed(dir: &Path) -> Option<Vec<Vec<u8>>> {
         Err(_) if is_absent(dir) => Some(Vec::new()),
         _ => None,
     }
+}
+
+/// The names of the regular files in a directory now, by each entry's own type, so a link is not one (spec 3.10, rv32).
+fn regular_names(dir: &Path) -> BTreeSet<Vec<u8>> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return BTreeSet::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let regular = entry.file_type().ok()?.is_file();
+            regular.then(|| entry.file_name().as_encoded_bytes().to_vec())
+        })
+        .collect()
 }
 
 /// Whether a path does not exist, which `identify` records as `a` inside the root.
