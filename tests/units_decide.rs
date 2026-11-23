@@ -1365,7 +1365,7 @@ fn a_new_unit_in_a_new_top_level_directory_is_not_a_skip() {
         stderr(&explained)
     );
     let out = split(&s, &[]);
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert_eq!(decision(&out), "subset", "{}", stderr(&out));
     assert_eq!(code(&out), 1, "{}", stderr(&out));
 }
 
