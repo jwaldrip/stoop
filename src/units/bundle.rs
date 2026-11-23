@@ -1708,16 +1708,19 @@ pub(crate) fn view(store: &Path, pending: &Pending, key: &str) -> Option<View> {
     view_in(&area, pending, key)
 }
 
-/// This command's view of the bundle in `area`. It takes no lock, so a caller that writes holds the suite lock itself.
-fn view_in(area: &Area, pending: &Pending, key: &str) -> Option<View> {
+/// This command's bundle in `area`, when it is current and was recorded for this command. It takes no lock, so a caller
+/// that writes holds the suite lock itself.
+fn bundle_for(area: &Area, pending: &Pending, key: &str) -> Option<SuiteBundleV1> {
     let ReadBundle::Current(bundle) = read_bundle(area, &pending.suite) else {
         return None;
     };
     let digest = digest_text("stoop whole key v1", key);
-    if bundle.generation != GENERATION || !recorded(&bundle, &digest) {
-        return None;
-    }
-    View::of(bundle)
+    (bundle.generation == GENERATION && recorded(&bundle, &digest)).then_some(bundle)
+}
+
+/// This command's view of the bundle in `area`, as `bundle_for` reads it.
+fn view_in(area: &Area, pending: &Pending, key: &str) -> Option<View> {
+    View::of(bundle_for(area, pending, key)?)
 }
 
 /// What a write under the suite lock did (spec 3.10, E16).
@@ -1754,8 +1757,8 @@ pub(crate) fn drop_stale(
     if !judge(&view) {
         return Settled::Declined;
     }
-    // The view takes the bundle it reads, so the write reads the bundle again under the same lock.
-    let ReadBundle::Current(mut bundle) = read_bundle(&area, &pending.suite) else {
+    // The view takes the bundle it reads, so the write reads it again under the same lock and checks it the same way.
+    let Some(mut bundle) = bundle_for(&area, pending, key) else {
         return Settled::Failed;
     };
     bundle
