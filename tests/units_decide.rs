@@ -168,6 +168,12 @@ fn t1_an_unchanged_run_after_a_pass_skips() {
     let out = split(&s, &[]);
     success(&out);
     assert_eq!(decision(&out), "skip", "{}", stderr(&out));
+    // The skip line keeps the whole command's key, which the MCP explain parser reads (spec 3.12).
+    assert!(
+        stderr(&out).contains("stoop: skip hook-t-"),
+        "{}",
+        stderr(&out)
+    );
     assert!(
         stderr(&out).contains("no tracked input changed (3 units,"),
         "{}",
@@ -447,6 +453,26 @@ fn t15_a_failing_full_run_against_held_proofs_disables_the_suite() {
     assert_eq!(state["status"], "disabled", "{state}");
     assert_eq!(state["code"], "disagreement", "{state}");
     assert_eq!(state["phase"], "full", "{state}");
+}
+
+/// T22 (D15, the covered condition): a failing forced run is not a disagreement while the residue holds files that no
+/// unit reads. The disagreement check arms only for a covered residue (spec 3.10, E1).
+#[test]
+fn t22_a_failing_forced_run_with_a_residue_does_not_disable() {
+    let s = Suite::new();
+    let flag = s.outside.join("fail-full");
+    let flag_text = flag.to_str().unwrap().to_owned();
+    // T_LINT adds a file that only the full command reads, so the residue is not empty after the pass.
+    let env = [
+        ("T_FAIL_FULL", "1"),
+        ("T_IF", flag_text.as_str()),
+        ("T_LINT", "1"),
+    ];
+    success(&passed(&s, &env, &[SPLIT]));
+    fs::write(&flag, b"").unwrap();
+    let out = split(&s, &with(&env, &[("STOOP_FULL", "1")]));
+    assert_eq!(code(&out), 1, "{}", stderr(&out));
+    assert_eq!(state(&s)["status"], "ready", "{}", state(&s));
 }
 
 /// T16 (D16): the same failure with a unit affected by a change is not a disagreement. The suite stays enabled.
