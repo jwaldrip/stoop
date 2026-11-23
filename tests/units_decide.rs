@@ -752,7 +752,7 @@ fn t_e15_listed_output_is_affected_not_global() {
     success(&s.hook(&with(&env, &[SPLIT, ("STOOP_FULL", "1")])));
     s.write("tests/a.out", "changed\n");
     let out = s.hook(&with(&env, &[SPLIT]));
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert_eq!(decision(&out), "subset", "{}", stderr(&out));
     assert!(
         stderr(&out).contains("output tests/a.out changed"),
         "{}",
