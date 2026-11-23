@@ -722,9 +722,9 @@ fn t_e14_lacking_path_is_global() {
     let s = Suite::new();
     success(&s.hook(&[]));
     s.write("src/x.src", "one\n");
-    for unit in ["tests/a.t", "tests/b.t", "tests/c.t"] {
-        s.write(unit, "src/x.src\n");
-    }
+    s.write("tests/a.t", "src/shared.src\nsrc/x.src\n");
+    s.write("tests/b.t", "src/shared.src\nsrc/x.src\n");
+    s.write("tests/c.t", "src/c.src\nsrc/x.src\n");
     success(&split(&s, &[]));
     s.write("src/x.src", "two\n");
     let out = split(&s, &[]);
@@ -745,6 +745,7 @@ fn t_e15_listed_output_is_affected_not_global() {
     success(&s.hook(&env));
     edit(&s, 2);
     success(&s.hook(&with(&env, &[SPLIT])));
+    success(&s.hook(&with(&env, &[SPLIT, ("STOOP_FULL", "1")])));
     s.write("tests/a.out", "changed\n");
     let out = s.hook(&with(&env, &[SPLIT]));
     assert_eq!(decision(&out), "full", "{}", stderr(&out));
@@ -774,29 +775,22 @@ fn t_listed_identity_is_its_own() {
     );
 }
 
-/// The skip line counts each input once. A unit that reads only inputs that other units read adds its own file, and
-/// nothing more.
+/// The skip line counts each input once: its count is the number of distinct inputs the bundle's table holds, however
+/// many versions list each one.
 #[test]
 fn t_skip_line_counts_distinct_inputs() {
-    let skip_with = |extra: bool| {
-        let s = Suite::new();
-        if extra {
-            s.write("tests/d.t", "src/c.src\n");
-        }
-        success(&passed(&s, &[], &[SPLIT]));
-        s.write("docs/extra.md", "x\n");
-        let out = split(&s, &[]);
-        success(&out);
-        skip_counts(&stderr(&out))
-    };
-    let (units, inputs) = skip_with(false);
-    let (more_units, more_inputs) = skip_with(true);
-    assert_eq!((units, more_units), (3, 4));
-    assert_eq!(
-        more_inputs,
-        inputs + 1,
-        "3 units name {inputs} inputs; 4 units name {more_inputs}"
-    );
+    let s = Suite::new();
+    s.write("tests/d.t", "src/c.src\n");
+    success(&passed(&s, &[], &[SPLIT]));
+    s.write("docs/extra.md", "x\n");
+    let out = split(&s, &[]);
+    success(&out);
+    let (units, inputs) = skip_counts(&stderr(&out));
+    let table = s.bundle().expect("a suite bundle")["table"]
+        .as_array()
+        .expect("a table")
+        .len();
+    assert_eq!((units, inputs), (4, table), "{}", stderr(&out));
 }
 
 /// A change that every unit reads is global only while a unit holds the old content. Once a pass has recorded every unit
@@ -872,6 +866,24 @@ fn t_busy_lock_keeps_the_skip() {
     success(&out);
     assert!(
         stderr(&out).contains("no tracked input changed"),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// E15 for an output that only the full form writes: a changed one is named as changed, not as missing.
+#[test]
+fn t_e15_a_changed_output_is_named_changed() {
+    let env = [("T_WRITE_FULL", "full.out")];
+    let s = Suite::new();
+    success(&s.hook(&env));
+    edit(&s, 2);
+    success(&s.hook(&with(&env, &[SPLIT])));
+    s.write("full.out", "changed\n");
+    let out = s.hook(&with(&env, &[SPLIT]));
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("output full.out is changed"),
         "{}",
         stderr(&out)
     );
