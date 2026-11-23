@@ -563,8 +563,9 @@ fn an_expired_unit_proof_is_affected() {
     assert_eq!(decision(&out), "full", "{}", stderr(&out));
 }
 
-/// The cost of an engine skip against a legacy hit, at `STOOP_BENCH_UNITS` units (256, 1024 or 4096). It prints both
-/// times and their ratio. Spec S7 stops W7-1 when a skip costs more than three legacy hits at 1024 units.
+/// The cost of an engine skip against a legacy hit at `STOOP_BENCH_UNITS` roster units (256, 1024 or 4096). It prints
+/// the median of five runs of each and their ratio. Spec S7 stops W7-1 when a skip costs more than three legacy hits at
+/// 1024 units.
 #[test]
 #[ignore = "a measurement: STOOP_BENCH_UNITS sets the roster size (256, 1024 or 4096)"]
 fn decide_cost() {
@@ -573,32 +574,52 @@ fn decide_cost() {
         .and_then(|value| value.parse().ok())
         .unwrap_or(256);
     let s = Suite::new();
-    for n in 0..units {
+    // `Suite::new` writes three units, so these fill the rest and the roster is `units` in all.
+    for n in 0..units.saturating_sub(3) {
         s.write(&format!("tests/u{n:05}.t"), "src/c.src\n");
     }
     success(&passed(&s, &[], &[SPLIT]));
     // A forced full run records the whole proof for the tree as it is now.
     success(&s.hook(&[("STOOP_FULL", "1")]));
-    let started = Instant::now();
-    let hit = split(&s, &[]);
-    let hit_ms = started.elapsed().as_secs_f64() * 1e3;
-    success(&hit);
-    assert!(stderr(&hit).contains("stoop: skip "), "{}", stderr(&hit));
+    let hit_ms = median_ms(|| {
+        let started = Instant::now();
+        let hit = split(&s, &[]);
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        success(&hit);
+        assert!(stderr(&hit).contains("stoop: skip "), "{}", stderr(&hit));
+        assert!(
+            !stderr(&hit).contains("no tracked input changed"),
+            "{}",
+            stderr(&hit)
+        );
+        ms
+    });
     // A new file in a directory that the full command lists changes the whole proof, and no unit reads it.
     s.write("docs/extra.md", "x\n");
-    let started = Instant::now();
-    let skip = split(&s, &[]);
-    let skip_ms = started.elapsed().as_secs_f64() * 1e3;
-    success(&skip);
-    assert!(
-        stderr(&skip).contains("no tracked input changed"),
-        "{}",
-        stderr(&skip)
-    );
+    let skip_ms = median_ms(|| {
+        let started = Instant::now();
+        let skip = split(&s, &[]);
+        let ms = started.elapsed().as_secs_f64() * 1e3;
+        success(&skip);
+        assert!(
+            stderr(&skip).contains("no tracked input changed"),
+            "{}",
+            stderr(&skip)
+        );
+        ms
+    });
     eprintln!(
         "decide_cost units={units} legacy_hit_ms={hit_ms:.1} engine_skip_ms={skip_ms:.1} ratio={:.2}",
         skip_ms / hit_ms
     );
+}
+
+/// The median of five runs of `run`, in milliseconds. One run on a shared runner is too noisy to compare two paths that
+/// differ by a few milliseconds.
+fn median_ms(mut run: impl FnMut() -> f64) -> f64 {
+    let mut samples: Vec<f64> = (0..5).map(|_| run()).collect();
+    samples.sort_by(f64::total_cmp);
+    samples[2]
 }
 
 /// T18: a unit proof made under another environment is affected, even when the whole proof's environment matches. The
