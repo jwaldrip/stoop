@@ -645,8 +645,12 @@ fn t18_a_unit_proof_made_under_another_environment_is_affected() {
     );
     let out = split(&s, &[]);
     success(&out);
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
-    assert_eq!(s.launches().len(), 1, "the full form launches once");
+    assert_eq!(decision(&out), "pass", "{}", stderr(&out));
+    assert_eq!(
+        s.launches().len(),
+        3,
+        "the attribution pass launches each unit once"
+    );
 }
 
 /// T19: a unit that left the roster and no longer exists keeps no proof after a skip. The skip drops its versions, and
