@@ -507,8 +507,9 @@ fn is_regular(root: &Path, key: &str) -> bool {
 ///   entries (`f:` and `x:`).
 /// - Added units: roster units under this directory that the whole proof never read, so they did not exist when it was
 ///   recorded. Each is valid or affected, and an affected unit launches in this run, so each is covered either way.
-/// - Added files: files under this directory that a valid unit proof reads, or that an affected unit names as an input,
-///   and that the whole proof does not hold (`covered_reads` and `rerun_reads`).
+/// - Added files: regular files under this directory that a valid unit proof reads, or that an affected unit's stored proof
+///   names, and that the whole proof does not hold (`covered_reads` and `rerun_reads`). A directory or a link is never
+///   excused (rv32). A name that only a stored proof names is checked after the launches (`unread_excuses`, rv34).
 ///
 /// The root never excuses an added name. The candidate is the current names without the added names, plus the lost
 /// names. It must give the recorded digest exactly, so any other added or removed name is a change.
