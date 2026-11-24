@@ -205,6 +205,19 @@ fn no_verdict_names(ran: &Output, path: &str) {
     assert!(stderr(ran).contains(&line), "{}", stderr(ran));
 }
 
+/// The full command takes the decision, because a changed input is read only by units that left the roster (PR 86
+/// review round 2). Its exit is the verdict, and the reason names the input.
+fn full_form(name: &str, ran: &Output, launches: &[String], direct_code: i32, path: &str) {
+    assert_eq!(code(ran), direct_code, "{name}: {}", stderr(ran));
+    assert_eq!(
+        launches.first().map(String::as_str),
+        Some(""),
+        "{name}: {launches:?}"
+    );
+    let reason = format!("{path} changed and only units that left the roster read it");
+    assert!(stderr(ran).contains(&reason), "{name}: {}", stderr(ran));
+}
+
 // ---- Wrong verdicts: the reader goes in the same step as the flag fails ----
 
 /// x01: `c`, the only unit that reads the runner-only test's file and flag, is deleted while `a` changes and the flag
@@ -216,9 +229,9 @@ fn r2_x01_a_deleted_reader_and_a_subset_in_one_step() {
     s.remove("tests/c.flag");
     s.write("tests/a.t", "src/shared.src\n\n");
     s.write("tests/z.flag", "fail\n");
-    let (_, ran, _, direct_code) = judge("x01", &s, &TU, true);
+    let (_, ran, launches, direct_code) = judge("x01", &s, &TU, true);
     same_verdict("x01", &ran, direct_code);
-    no_verdict_names(&ran, "tests/z.flag");
+    full_form("x01", &ran, &launches, direct_code, "tests/z.flag");
 }
 
 /// x01c: `c.t` is renamed to `d.t`, whose listing drops the runner-only test, while the flag turns to `fail`.
@@ -228,9 +241,9 @@ fn r2_x01c_a_renamed_reader_in_one_step() {
     s.remove("tests/c.t");
     s.write("tests/d.t", "src/c.src\n");
     s.write("tests/z.flag", "fail\n");
-    let (_, ran, _, direct_code) = judge("x01c", &s, &TU, true);
+    let (_, ran, launches, direct_code) = judge("x01c", &s, &TU, true);
     same_verdict("x01c", &ran, direct_code);
-    no_verdict_names(&ran, "tests/z.flag");
+    full_form("x01c", &ran, &launches, direct_code, "tests/z.flag");
 }
 
 /// x02: `c` stops reading the runner-only test in the same step as its flag turns to `fail`.
@@ -411,4 +424,75 @@ fn r2_c5_an_engine_skip_reports_units_on_the_status_descriptor() {
         .unwrap_or_else(|error| panic!("the status line is not JSON ({error}): {report:?}"));
     assert_eq!(decided["decision"], "skipped", "{decided}");
     assert_eq!(decided["how"], "units", "{decided}");
+}
+
+/// The seed 33 shape: a unit is added, and the only reader of a changed source is deleted, in one step. The full command
+/// decides, so the run exits as the full command does.
+#[test]
+fn r2_departed_only_reader_of_a_changed_source_takes_the_full_form() {
+    let s = zlearned();
+    s.write("tests/n.t", "src/shared.src\n");
+    s.remove("tests/c.t");
+    s.write("src/c.src", "changed\n");
+    let (_, ran, launches, direct_code) = judge("seed33", &s, &TU, true);
+    full_form("seed33", &ran, &launches, direct_code, "src/c.src");
+}
+
+/// The seed 11089 shape with another source: a unit that reads it alone is deleted while a unit is added.
+#[test]
+fn r2_departed_only_reader_of_a_second_source_takes_the_full_form() {
+    let s = zsuite();
+    s.write(
+        "tests/c.t",
+        "src/c.src\ntests/z.u\ntests/z.flag\nsrc/d.src\n",
+    );
+    learned(&s, &TU);
+    s.write("tests/n.t", "src/shared.src\n");
+    s.remove("tests/c.t");
+    s.write("src/d.src", "changed\n");
+    let (_, ran, launches, direct_code) = judge("seed11089", &s, &TU, true);
+    full_form("seed11089", &ran, &launches, direct_code, "src/d.src");
+}
+
+/// The whole roster is affected in the same step, and the only reader of the failing flag is a departed unit: the whole
+/// roster pass takes the full form too, because no launch reads the flag.
+#[test]
+fn r2_e17_departed_only_reader_of_a_failing_flag_takes_the_full_form() {
+    let s = zlearned();
+    s.remove("tests/c.t");
+    s.remove("tests/c.flag");
+    s.write("tests/a.t", "src/shared.src\n\n");
+    s.write("tests/b.t", "src/shared.src\n\n\n");
+    s.write("tests/z.flag", "fail\n");
+    let (_, ran, launches, direct_code) = judge("e17", &s, &TU, true);
+    full_form("e17", &ran, &launches, direct_code, "tests/z.flag");
+}
+
+/// A departed unit that shares a changed source with a live unit leaves the live unit's new proof to read it, so the
+/// run stays a subset.
+#[test]
+fn r2_a_departed_reader_shared_with_a_live_unit_stays_a_subset() {
+    let s = zsuite();
+    s.write("tests/a.t", "src/shared.src\nsrc/both.src\n");
+    s.write(
+        "tests/c.t",
+        "src/c.src\ntests/z.u\ntests/z.flag\nsrc/both.src\n",
+    );
+    learned(&s, &TU);
+    s.remove("tests/c.t");
+    s.write("src/both.src", "changed\n");
+    let (_, ran, launches, direct_code) = judge("shared-live", &s, &TU, true);
+    same_verdict("shared-live", &ran, direct_code);
+    assert_eq!(launches, ["tests/a.t"], "{}", stderr(&ran));
+}
+
+/// A departed unit whose inputs did not change does not take the full form: the change is to a live unit alone.
+#[test]
+fn r2_an_unchanged_input_of_a_departed_reader_stays_a_subset() {
+    let s = zlearned();
+    s.remove("tests/c.t");
+    s.write("tests/a.t", "src/shared.src\n\n");
+    let (_, ran, launches, direct_code) = judge("unchanged", &s, &TU, true);
+    same_verdict("unchanged", &ran, direct_code);
+    assert_eq!(launches, ["tests/a.t"], "{}", stderr(&ran));
 }
