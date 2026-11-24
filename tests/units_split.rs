@@ -823,6 +823,8 @@ impl Model {
                     Flag::Removed => {
                         if s.path(&path).exists() {
                             s.remove(&path);
+                            // A unit that stops reading its flag has lost a reader since the last full run (spec 3.8).
+                            self.lost = true;
                         }
                     }
                 }
