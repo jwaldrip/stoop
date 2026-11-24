@@ -137,7 +137,7 @@ fn launch(frame: &Frame<'_, '_>, mut pass: Pass, plan: &Plan) -> Outcome {
     for name in run::HOOK_ENV {
         std::env::set_var(name, "");
     }
-    ran.unread = attribution::unread_excuses(&pass, &plan.excused, &ran.proven);
+    ran.unread = attribution::unread_excuses(&plan.excused, &ran.proven);
     let status = attribution::finish(&mut pass, frame.lookup, frame.pending, &ran, planned, quiet);
     Outcome {
         status,

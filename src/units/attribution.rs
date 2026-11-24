@@ -18,7 +18,7 @@ use crate::input::Input;
 use crate::pathutil::to_key;
 use crate::proof::now;
 use crate::run::{self, How, Lookup, Outcome, RunCx};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
@@ -177,8 +177,8 @@ pub(super) struct Ran {
     pub(super) stopped: Option<(usize, Violation)>,
     /// The skipped units whose proofs the run's writes broke (spec 3.7): at most one per level.
     pub(super) breaches: Vec<Breach>,
-    /// The units whose new proof this run stored (spec 3.10, rv34).
-    pub(super) proven: BTreeSet<String>,
+    /// The units whose new proof this run stored, with the keys their launches read by content (spec 3.10, rv34, rv38).
+    pub(super) proven: BTreeMap<String, BTreeSet<String>>,
     /// The excused names that no new proof of this run reads by content (spec 3.10, rv34).
     pub(super) unread: Vec<Unread>,
 }
@@ -210,7 +210,7 @@ pub(super) fn launch_each(
         over_budget: 0,
         stopped: None,
         breaches: Vec::new(),
-        proven: BTreeSet::new(),
+        proven: BTreeMap::new(),
         unread: Vec::new(),
     };
     let mut listing_breach: Option<Breach> = None;
@@ -290,7 +290,7 @@ pub(super) fn launch_each(
                             let stored =
                                 pass.record(&launch.unit, &kept.inputs, &kept.outputs, now());
                             if matches!(stored, Stored::Stored) {
-                                ran.proven.insert(unit.clone());
+                                ran.proven.insert(unit.clone(), observed.content.clone());
                             }
                             match stored {
                                 Stored::OverBudget => ran.over_budget += 1,
@@ -462,27 +462,20 @@ pub(super) fn finish(
     exit_status(ran.status, no_verdict)
 }
 
-/// The excused names that no new proof of this run reads by content (spec 3.10, rv34). A unit counts only when this run
-/// stored its new proof, and the proof must hold the name as a regular file (`f:` or `x:`), as `covered_reads` takes it.
+/// The excused names that no new proof of this run reads by content (spec 3.10, rv34, rv38). A unit counts only when this
+/// run stored its new proof and its launch read the name's content. A stat is not a read, so a name only stat'ed is unread.
 pub(super) fn unread_excuses(
-    pass: &Pass,
     excused: &[Excused],
-    proven: &BTreeSet<String>,
+    proven: &BTreeMap<String, BTreeSet<String>>,
 ) -> Vec<Unread> {
     excused
         .iter()
         .filter(|excused| {
-            !excused
-                .units
-                .iter()
-                .filter(|unit| proven.contains(*unit))
-                .any(|unit| {
-                    let (inputs, _) = pass.held_of(unit);
-                    inputs.iter().any(|input| {
-                        input.path == excused.path
-                            && (input.id.starts_with("f:") || input.id.starts_with("x:"))
-                    })
-                })
+            !excused.units.iter().any(|unit| {
+                proven
+                    .get(unit)
+                    .is_some_and(|read| read.contains(&excused.path))
+            })
         })
         .map(|excused| Unread {
             path: excused.path.clone(),

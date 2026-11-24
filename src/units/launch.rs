@@ -21,7 +21,7 @@ pub(crate) struct Observed {
     /// The keys the launch wrote, in scope and not ignored (spec 3.3, step 1).
     pub(crate) writes: BTreeSet<String>,
     /// The keys the launch read by content (spec 3.3, step 2).
-    content: BTreeSet<String>,
+    pub(super) content: BTreeSet<String>,
     /// Whether the launch listed the root and that listing is recorded (spec 3.5).
     root_listed: bool,
     /// The top-level names that the launch wrote or created, which the root guard does not count (spec 3.5).
