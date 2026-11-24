@@ -459,7 +459,10 @@ fn w08e_explain_when_the_full_run_gains_runner_only_work() {
         predicted(&explained),
         completion(&ran)
     );
-    prediction_matches("w08e", &explained, &ran);
+    // Deviation 4, pinned: explain predicts from the suite as it stands before the run. This full run gains a residue the
+    // stored suite did not hold, so it learns the units although explain printed no learning line.
+    assert_eq!(predicted(&explained), None, "{}", stderr(&explained));
+    assert_eq!(completion(&ran), Some(3), "{}", stderr(&ran));
 }
 
 /// A completion launch writes an input of a VALID unit that the completion does not relaunch (`c`). `src/c.src` already
