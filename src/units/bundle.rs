@@ -1118,7 +1118,12 @@ pub(crate) fn record(store: &Path, pending: &Pending, key: &str, digest: &str, p
     {
         bundle.residue = Residue::default();
     }
-    store_residue(&mut bundle, &proof.inputs, digest, pending.listings());
+    // The residue of a new whole proof stays unknown until completion measures it against valid versions. The versions
+    // this bundle holds may be stale (a unit whose flag is gone still names it), so measuring them here would store a
+    // count that a later subset trusts. A residue already known for this proof stays (spec 3.8, PR 86 review round 2).
+    if !residue_known(&bundle.residue, digest) {
+        bundle.residue = Residue::default();
+    }
     let _ = write_bundle(&area, &bundle);
 }
 
@@ -3350,10 +3355,11 @@ mod pass_tests {
         assert_eq!(units.keys().collect::<Vec<_>>(), [&"tests/a.t".to_owned()]);
     }
 
-    /// Spec 3.8, point ii: a record stores the residue of its own proof once every roster unit holds a version. The
-    /// residue is the proof's inputs that neither a listing nor a unit version covers. It is provisional.
+    /// Spec 3.8, point ii, as amended by PR 86 review round 2: a record of a new whole proof leaves its residue unknown,
+    /// even when every roster unit holds a version. The versions held may be stale, so the residue is measured by completion
+    /// against valid versions instead. The residue is the proof's inputs that neither a listing nor a unit version covers.
     #[test]
-    fn a_record_stores_the_residue_of_its_proof_when_every_unit_holds_a_version() {
+    fn a_record_leaves_the_residue_unknown_when_every_unit_holds_a_version() {
         let roster = ["tests/a.t", "tests/b.t"];
         let mut bundle = bundle_for(pending_for(&roster), "key");
         bundle.table = vec![input("src/shared"), input("src/own")];
@@ -3368,10 +3374,9 @@ mod pass_tests {
         let proof = whole_proof(&[".", "tests", "src/shared", "lint", "/usr/bin/od"]);
         record_until_stored(&dir, &roster, &[".", "tests"], "key", "p-whole", &proof);
         let stored_residue = stored(&dir, &id).residue;
-        assert!(matches!(stored_residue.state, ResidueState::Provisional));
-        assert_eq!(stored_residue.count, 2);
-        assert_eq!(stored_residue.paths, ["/usr/bin/od", "lint"]);
-        assert_eq!(stored_residue.whole.as_deref(), Some("p-whole"));
+        assert!(matches!(stored_residue.state, ResidueState::None));
+        assert_eq!(stored_residue.count, 0);
+        assert!(stored_residue.paths.is_empty());
     }
 
     /// A roster unit without a version leaves the residue unknown, whatever the proof reads.
