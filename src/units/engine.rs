@@ -1159,6 +1159,30 @@ mod tests {
         );
     }
 
+    /// A skip counts the roster's inputs only (spec 3.12). A unit that left the roster adds none, though its versions
+    /// still make the skip drop them (E16). Killed by counting every table entry.
+    #[test]
+    fn a_skip_counts_only_the_roster_units_inputs() {
+        let table = vec![
+            input("tests/a.t", "f:1"),
+            input("src/shared.src", "f:2"),
+            input("tests/gone.t", "f:3"),
+            input("src/gone.src", "f:4"),
+        ];
+        let units = vec![
+            ("tests/a.t", vec![version(1_000, vec![0, 1])]),
+            ("tests/gone.t", vec![version(1_000, vec![2, 3])]),
+        ];
+        let (view, _) = view_of(units, table);
+        let roster = vec!["tests/a.t".to_owned()];
+        let skip = skipped(&judged(&roster, 0), &view);
+        assert_eq!((skip.units, skip.inputs, skip.drop), (1, 2, true));
+        assert_eq!(
+            skip_line("key", &skip),
+            "stoop: skip key: no tracked input changed (1 units, 2 inputs)"
+        );
+    }
+
     fn input(path: &str, id: &str) -> Input {
         Input {
             path: path.to_owned(),

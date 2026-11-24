@@ -1131,32 +1131,6 @@ fn a_skip_with_nothing_to_drop_writes_nothing() {
     );
 }
 
-/// The skip line and explain's tracked line count the same inputs once a unit has left the roster (spec 3.12).
-#[test]
-fn the_skip_line_counts_the_roster_units_inputs_only() {
-    let s = Suite::new();
-    success(&passed(&s, &[], &[SPLIT]));
-    s.remove("tests/c.t");
-    // The first run after the removal is the full form, since the removed reads were the last readers (spec 3.8, item 1 of
-    // PR 86 review round 1). The run after it is the skip that this test counts.
-    success(&split(&s, &[]));
-    let out = split(&s, &[]);
-    success(&out);
-    assert_eq!(decision(&out), "skip", "{}", stderr(&out));
-    let (units, inputs) = skip_counts(&stderr(&out));
-    // Explain also prints the unit universe's line, which has no input count. The suite's line, with its inputs, is the one
-    // a skip is checked against.
-    let tracked = stderr(&explain(&s, &[]))
-        .lines()
-        .find(|line| line.starts_with("stoop: tracked ") && line.contains(" inputs; "))
-        .expect("a tracked line with its inputs")
-        .to_owned();
-    assert!(
-        tracked.starts_with(&format!("stoop: tracked {units} units, {inputs} inputs;")),
-        "the skip counts {units} units and {inputs} inputs; the tracked line is {tracked}"
-    );
-}
-
 /// E10 (spec 3.10): when the whole proof is gone, another stored proof does not stand in for it.
 #[test]
 fn a_whole_proof_that_is_gone_is_not_replaced_by_another() {
