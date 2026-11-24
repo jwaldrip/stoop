@@ -563,20 +563,20 @@ fn run_with_status(s: &Suite) -> (Output, String) {
     (out, report)
 }
 
-/// T17 (D17): a skip reports `skipped` with the `units` outcome on the status descriptor.
+/// T17 (D17): the skip after a removal's full form reports `skipped` on the status descriptor, with exit 0.
 #[test]
-fn t17_a_skip_reports_units_on_the_status_descriptor() {
+fn t17_a_skip_after_the_full_form_reports_on_the_status_descriptor() {
     let s = Suite::new();
     success(&passed(&s, &[], &[SPLIT]));
-    // Removing a unit's file changes its directory's listing, which the whole proof refuses. The engine skips through
-    // the bundle's excuse (E16), and that skip reports `units`.
+    // Removing a unit's file takes the full form on the first run, since its reads were the last readers (spec 3.8, item 1
+    // of PR 86 review round 1). The next run is the skip, and it reports on the status descriptor.
     s.remove("tests/c.t");
+    success(&split(&s, &[]));
     let (out, report) = run_with_status(&s);
     success(&out);
     let decided: Value = serde_json::from_str(report.trim())
         .unwrap_or_else(|error| panic!("the status line is not JSON ({error}): {report:?}"));
     assert_eq!(decided["decision"], "skipped", "{decided}");
-    assert_eq!(decided["how"], "units", "{decided}");
     assert_eq!(decided["exit"], 0, "{decided}");
 }
 
@@ -707,13 +707,18 @@ fn t18_a_unit_proof_made_under_another_environment_is_affected() {
     );
 }
 
-/// T19: a unit that left the roster and no longer exists keeps no proof after a skip. The skip drops its versions, and
-/// the bundle names only the roster's units.
+/// T19: a unit that left the roster and no longer exists keeps no proof once the run after its removal has taken the full
+/// form. That full run records the roster's units only, and the run after it skips.
 #[test]
-fn t19_a_skip_drops_the_proof_of_a_unit_that_was_removed() {
+fn t19_the_full_form_after_a_removal_drops_the_proof_of_a_unit_that_was_removed() {
     let s = Suite::new();
     success(&passed(&s, &[], &[SPLIT]));
     s.remove("tests/c.t");
+    // The first run after the removal is the full form, since its reads were the last readers (spec 3.8, item 1 of PR 86
+    // review round 1). That run records the whole proof without c, so the run after it skips and launches nothing.
+    let first = split(&s, &[]);
+    success(&first);
+    assert_eq!(decision(&first), "full", "{}", stderr(&first));
     s.clear_log();
     let out = split(&s, &[]);
     success(&out);
@@ -917,10 +922,10 @@ fn t_later_generation_is_another_version() {
     );
 }
 
-/// A busy suite lock keeps a skip whose settle would drop a removed unit's versions: the skip stands and nothing is
-/// written. The next run that gets the lock drops them.
+/// A busy suite lock does not change the decision: the removed reads were the last readers, so the run takes the full form
+/// (spec 3.8, item 1 of PR 86 review round 1).
 #[test]
-fn t_busy_lock_keeps_the_skip() {
+fn t_busy_lock_does_not_change_the_full_form() {
     let s = Suite::new();
     success(&passed(&s, &[], &[SPLIT]));
     fs::remove_file(s.root.join("tests/c.t")).unwrap();
@@ -936,11 +941,9 @@ fn t_busy_lock_keeps_the_skip() {
     let out = split(&s, &[]);
     drop(held);
     success(&out);
-    assert!(
-        stderr(&out).contains("no tracked input changed"),
-        "{}",
-        stderr(&out)
-    );
+    // The removed reads were the last readers, so this run takes the full form even while the lock is busy (spec 3.8, item 1
+    // of PR 86 review round 1). The busy lock bounds only what the run stores.
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
 }
 
 /// E15 for an output that only the full form writes: a changed one is named as changed, not as missing.
@@ -1134,6 +1137,9 @@ fn the_skip_line_counts_the_roster_units_inputs_only() {
     let s = Suite::new();
     success(&passed(&s, &[], &[SPLIT]));
     s.remove("tests/c.t");
+    // The first run after the removal is the full form, since the removed reads were the last readers (spec 3.8, item 1 of
+    // PR 86 review round 1). The run after it is the skip that this test counts.
+    success(&split(&s, &[]));
     let out = split(&s, &[]);
     success(&out);
     assert_eq!(decision(&out), "skip", "{}", stderr(&out));
@@ -1250,13 +1256,14 @@ fn a_deleted_non_unit_file_in_a_listed_directory_runs_the_full_form() {
     assert_eq!(s.launches().len(), 1, "the full form launches once");
 }
 
-/// A removed unit's file leaves its directory's listing, which the whole proof read. The run still skips, and so does
-/// the next run, since a skip does not record the proof again (spec 3.10, E16).
+/// A removed unit's file leaves its directory's listing, which the whole proof read. Its reads were the last readers, so the
+/// first run takes the full form and records the whole proof without it. Each later run skips (spec 3.10, E16).
 #[test]
 fn a_removed_unit_file_is_still_a_skip_on_each_later_run() {
     let s = Suite::new();
     success(&passed(&s, &[], &[SPLIT]));
     s.remove("tests/c.t");
+    agree(&s, &[], "full");
     agree(&s, &[], "skip");
     agree(&s, &[], "skip");
 }
@@ -1358,10 +1365,10 @@ fn a_unit_the_whole_proof_never_read_is_excused_by_its_bundle() {
         "the pass proves skip.t: {units}"
     );
     s.remove("tests/skip.t");
+    // The removed unit's reads were the last readers of files the whole command reads, so the first run after the removal
+    // is the full form (spec 3.8, item 1 of PR 86 review round 1). That run records the whole proof without it.
+    agree(&s, &[], "full");
     agree(&s, &[], "skip");
-    let out = split(&s, &[]);
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
-    assert!(stderr(&out).contains("(tests changed)"), "{}", stderr(&out));
 }
 
 /// A removed directory of units is a change: its parent's listing loses a name that is not a file, and no proof
