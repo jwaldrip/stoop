@@ -1081,6 +1081,13 @@ pub(crate) fn record(store: &Path, pending: &Pending, key: &str, digest: &str, p
         ),
     };
     // Only the roster's units keep a version (C19). A unit that left the roster is no longer a claim about this suite.
+    let removed = bundle_readers(
+        &table,
+        units
+            .iter()
+            .filter(|(unit, _)| pending.roster.units.binary_search(*unit).is_err())
+            .flat_map(|(_, versions)| versions.iter()),
+    );
     units.retain(|unit, _| pending.roster.units.binary_search(unit).is_ok());
     let suite = pending.suite.clone();
     let origin = pending.origin.clone();
@@ -1103,6 +1110,14 @@ pub(crate) fn record(store: &Path, pending: &Pending, key: &str, digest: &str, p
         residue,
         state,
     };
+    if !removed.is_empty()
+        && lost_reader(
+            &removed,
+            &bundle_readers(&bundle.table, bundle.units.values().flatten()),
+        )
+    {
+        bundle.residue = Residue::default();
+    }
     store_residue(&mut bundle, &proof.inputs, digest, pending.listings());
     let _ = write_bundle(&area, &bundle);
 }
@@ -1141,6 +1156,49 @@ fn store_residue(bundle: &mut SuiteBundleV1, whole: &[Input], digest: &str, list
 /// Whether `residue` is known for `digest`: it has a state, and it was measured for that proof.
 fn residue_known(residue: &Residue, digest: &str) -> bool {
     !matches!(residue.state, ResidueState::None) && residue.whole.as_deref() == Some(digest)
+}
+
+/// Whether an input id names content that a proof verifies: a file, a link, a listing, an absence or an unreadable mark.
+/// A stat-only read carries another id and checks metadata, not content (spec 3.8).
+pub(crate) fn content_id(id: &str) -> bool {
+    id == "a"
+        || id == "u"
+        || ["f:", "x:", "dl:", "l:"]
+            .iter()
+            .any(|prefix| id.starts_with(prefix))
+}
+
+/// Each path that some inputs name, with whether one of those names is a content read (spec 3.8).
+pub(crate) fn reader_map<'a>(inputs: impl Iterator<Item = &'a Input>) -> BTreeMap<String, bool> {
+    let mut out: BTreeMap<String, bool> = BTreeMap::new();
+    for input in inputs {
+        let content = content_id(&input.id);
+        *out.entry(input.path.clone()).or_insert(false) |= content;
+    }
+    out
+}
+
+/// The readers of the versions in `versions`, read through the bundle's table.
+fn bundle_readers<'a>(
+    table: &[Input],
+    versions: impl Iterator<Item = &'a UnitVersion>,
+) -> BTreeMap<String, bool> {
+    let len = table.len();
+    reader_map(
+        versions
+            .flat_map(|version| undelta(&version.inputs, len).unwrap_or_default())
+            .map(|index| &table[index as usize]),
+    )
+}
+
+/// Whether a path that `removed` reads has lost its last reader in `now` (spec 3.8). A path with no reader left is lost,
+/// and so is one whose last content reader is gone while only a stat-only read remains. Losing either makes the residue
+/// unknown until a full run measures it again.
+pub(crate) fn lost_reader(removed: &BTreeMap<String, bool>, now: &BTreeMap<String, bool>) -> bool {
+    removed.iter().any(|(path, content)| match now.get(path) {
+        None => true,
+        Some(now_content) => *content && !now_content,
+    })
 }
 
 /// The paths of the inputs of every unit version the bundle holds: what the units' own runs read (spec 3.8).
@@ -1298,6 +1356,9 @@ type Snapshot = (
 /// One attribution pass. It holds the suite lock until it is dropped, so no other stoop changes
 /// the suite meanwhile, and it rewrites the bundle after each stored proof.
 pub(crate) struct Pass {
+    /// Set when a version write took the last reader of a path (spec 3.8). The residue is unknown until a full run
+    /// measures it again.
+    residue_lost: bool,
     area: Area,
     _lock: File,
     bundle: SuiteBundleV1,
@@ -1352,6 +1413,10 @@ impl Pass {
             inputs: delta(&inputs),
             outputs: delta(&outputs),
         };
+        let removed = bundle_readers(
+            &self.bundle.table,
+            self.bundle.units.get(unit).into_iter().flatten(),
+        );
         let previous = self.bundle.units.insert(unit.to_owned(), vec![version]);
         if self.keep {
             self.compact_table();
@@ -1367,6 +1432,15 @@ impl Pass {
         if !valid_bundle(&self.bundle, &self.bundle.suite) {
             self.refuse(unit, previous, mark, snapshot);
             return Stored::WriteFailed;
+        }
+        if !removed.is_empty()
+            && lost_reader(
+                &removed,
+                &bundle_readers(&self.bundle.table, self.bundle.units.values().flatten()),
+            )
+        {
+            self.bundle.residue = Residue::default();
+            self.residue_lost = true;
         }
         self.dirty = true;
         if !self.due(Instant::now()) {
@@ -1550,6 +1624,10 @@ impl Pass {
     /// Stores the residue of the suite's whole proof when a pass ends (spec 3.8, point i). The proof is the one of
     /// `proofs` whose digest is the bundle's `whole`. Without it, the residue stays unknown.
     pub(crate) fn settle_residue(&mut self, proofs: &[Proof], listings: &[String]) {
+        // A version write took the last reader of a path, so the residue stays unknown until a full run measures it.
+        if self.residue_lost {
+            return;
+        }
         let Some(digest) = self.bundle.whole.clone() else {
             return;
         };
@@ -1625,6 +1703,7 @@ fn start_with(
     let stored = !matches!(bundle.residue.state, ResidueState::None);
     bundle.residue = Residue::default();
     Start::Pass(Pass {
+        residue_lost: false,
         area,
         _lock: held,
         bundle,
@@ -1695,6 +1774,7 @@ pub(crate) fn keep<T, D>(
         units: pending.roster.units.clone(),
     };
     let mut pass = Pass {
+        residue_lost: false,
         area,
         _lock: held,
         interned: interned_of(&bundle.table),
@@ -1968,9 +2048,25 @@ pub(crate) fn drop_stale(
     let Some(mut bundle) = bundle_for(&area, pending, key) else {
         return Settled::Failed;
     };
+    let removed = bundle_readers(
+        &bundle.table,
+        bundle
+            .units
+            .iter()
+            .filter(|(unit, _)| pending.roster.units.binary_search(*unit).is_err())
+            .flat_map(|(_, versions)| versions.iter()),
+    );
     bundle
         .units
         .retain(|unit, _| pending.roster.units.binary_search(unit).is_ok());
+    if !removed.is_empty()
+        && lost_reader(
+            &removed,
+            &bundle_readers(&bundle.table, bundle.units.values().flatten()),
+        )
+    {
+        bundle.residue = Residue::default();
+    }
     compact(&mut bundle);
     match write_bundle(&area, &bundle) {
         Ok(()) => Settled::Written,
@@ -3916,6 +4012,56 @@ mod keep_tests {
 
     fn paths(entries: &[Input]) -> Vec<String> {
         entries.iter().map(|entry| entry.path.clone()).collect()
+    }
+
+    #[test]
+    fn a_path_whose_last_content_reader_turns_stat_only_is_lost() {
+        let content = BTreeMap::from([("src/a.src".to_owned(), true)]);
+        let stat_only = BTreeMap::from([("src/a.src".to_owned(), false)]);
+        let gone = BTreeMap::new();
+        assert!(
+            lost_reader(&content, &stat_only),
+            "a content read turned stat-only is a loss"
+        );
+        assert!(
+            lost_reader(&content, &gone),
+            "a path with no reader left is a loss"
+        );
+        assert!(
+            !lost_reader(&content, &content),
+            "a path still read by content is not lost"
+        );
+        assert!(
+            !lost_reader(&stat_only, &stat_only),
+            "a stat-only path stays stat-only"
+        );
+        assert!(
+            !lost_reader(&BTreeMap::new(), &gone),
+            "no removed reader, no loss"
+        );
+    }
+
+    #[test]
+    fn a_path_another_unit_still_reads_is_not_lost() {
+        let table = vec![input("src/shared.src")];
+        let one = version(vec![0]);
+        let other = version(vec![0]);
+        let removed = bundle_readers(&table, std::iter::once(&one));
+        let now = bundle_readers(&table, [&one, &other].into_iter());
+        assert!(
+            !lost_reader(&removed, &now),
+            "the other unit still reads the path"
+        );
+    }
+
+    #[test]
+    fn only_content_ids_read_content() {
+        assert!(content_id("f:1"));
+        assert!(content_id("x:1"));
+        assert!(content_id("dl:1"));
+        assert!(content_id("a"));
+        assert!(!content_id("s:1"));
+        assert!(!content_id("stat:1"));
     }
 
     #[test]

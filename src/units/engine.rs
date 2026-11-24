@@ -310,7 +310,19 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
         Err(reason) => return verdict(Decision::Full(Some(reason)), shown, clean),
     };
     if affected.is_empty() {
-        return verdict(Decision::Skip(skipped(cx, view)), shown, clean);
+        let skip = skipped(cx, view);
+        // A skip that drops the versions of units that left the roster takes the full form when those versions hold the
+        // last reader of a path (spec 3.8, E16). The full run measures the residue again, without them.
+        if skip.drop && units_that_left_held_a_reader(cx, view) {
+            return verdict(
+                Decision::Full(Some(
+                    "the units that left the roster read files that no unit reads now".to_owned(),
+                )),
+                shown,
+                clean,
+            );
+        }
+        return verdict(Decision::Skip(skip), shown, clean);
     }
     // E17 and E18: the affected units launch one at a time. Units that are all affected make the attribution pass.
     let whole = affected.len() == cx.roster.len();
@@ -367,6 +379,27 @@ pub(super) fn learn(cx: &Judged<'_>, view: &View) -> Result<Vec<String>, &'stati
 pub(super) fn holds(cx: &Judged<'_>, view: &View) -> bool {
     let current = Current::of(cx.root, &checked(cx, view));
     analyse(cx, view, &current).is_empty()
+}
+
+/// Whether the versions of the units that left the roster hold the last reader of a path that the roster's units no
+/// longer read (spec 3.8). The view holds what each version reads.
+fn units_that_left_held_a_reader(cx: &Judged<'_>, view: &View) -> bool {
+    let readers = |in_roster: bool| {
+        bundle::reader_map(
+            view.units
+                .iter()
+                .filter(|(unit, _)| cx.roster.binary_search(*unit).is_ok() == in_roster)
+                .flat_map(|(_, versions)| versions.iter())
+                .flat_map(|version| {
+                    version
+                        .inputs
+                        .iter()
+                        .map(|&index| &view.table[index as usize])
+                }),
+        )
+    };
+    let removed = readers(false);
+    !removed.is_empty() && bundle::lost_reader(&removed, &readers(true))
 }
 
 fn verdict(decision: Decision, affected: Option<Vec<(String, String)>>, clean: bool) -> Verdict {
