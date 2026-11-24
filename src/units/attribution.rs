@@ -181,6 +181,9 @@ pub(super) struct Ran {
     pub(super) proven: BTreeMap<String, BTreeSet<String>>,
     /// The excused names that no new proof of this run reads by content (spec 3.10, rv34).
     pub(super) unread: Vec<Unread>,
+    /// The changed inputs of the whole proof that no kept version and no new proof of this run reads by content (spec
+    /// 3.10, PR 86 review round 2). Nothing covers them after the run, so the run has no verdict.
+    pub(super) uncovered: Vec<String>,
     /// The first unit whose launch failed, in launch order. A learning run names it as the disagreement (spec 3.10).
     pub(super) failed: Option<String>,
 }
@@ -214,6 +217,7 @@ pub(super) fn launch_each(
         breaches: Vec::new(),
         proven: BTreeMap::new(),
         unread: Vec::new(),
+        uncovered: Vec::new(),
         failed: None,
     };
     let mut listing_breach: Option<Breach> = None;
@@ -462,9 +466,21 @@ pub(super) fn finish(
         for unread in &ran.unread {
             say(quiet, unread.line());
         }
+        for path in &ran.uncovered {
+            say(
+                quiet,
+                format!(
+                    "stoop: this run has no verdict (exit 125): {} changed, and no unit's new proof reads it",
+                    safe(path)
+                ),
+            );
+        }
     }
-    let no_verdict =
-        ran.unlaunched || stopped_early || !ran.breaches.is_empty() || !ran.unread.is_empty();
+    let no_verdict = ran.unlaunched
+        || stopped_early
+        || !ran.breaches.is_empty()
+        || !ran.unread.is_empty()
+        || !ran.uncovered.is_empty();
     exit_status(ran.status, no_verdict)
 }
 
@@ -487,6 +503,19 @@ pub(super) fn unread_excuses(
             path: excused.path.clone(),
             units: excused.units.clone(),
         })
+        .collect()
+}
+
+/// The changed inputs that no new proof of this run reads by content (spec 3.10, PR 86 review round 2). Only a launch can
+/// cover an input that the kept versions do not read, so an input stays uncovered when no launched unit read it.
+pub(super) fn uncovered_inputs(
+    uncovered: &[String],
+    proven: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<String> {
+    uncovered
+        .iter()
+        .filter(|path| !proven.values().any(|read| read.contains(path.as_str())))
+        .cloned()
         .collect()
 }
 

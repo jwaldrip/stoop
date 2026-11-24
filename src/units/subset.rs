@@ -67,7 +67,7 @@ pub(crate) fn execute(
             Attempt::Decided(engine::unrun())
         }
         Kept::Unavailable => Attempt::Decided(engine::unrun()),
-        Kept::Declined(verdict) => Attempt::Decided(verdict),
+        Kept::Declined(verdict) => Attempt::Decided(*verdict),
         Kept::Locked(pass, plan) => {
             let frame = Frame {
                 cx,
@@ -259,6 +259,7 @@ fn launch(frame: &Frame<'_, '_>, mut pass: Pass, plan: &Plan) -> Outcome {
         std::env::set_var(name, "");
     }
     ran.unread = attribution::unread_excuses(&plan.excused, &ran.proven);
+    ran.uncovered = attribution::uncovered_inputs(&plan.uncovered, &ran.proven);
     let status = attribution::finish(&mut pass, frame.lookup, frame.pending, &ran, planned, quiet);
     Outcome {
         status,
@@ -382,6 +383,7 @@ mod tests {
             inputs: 7,
             affected,
             excused: Vec::new(),
+            uncovered: Vec::new(),
         });
         assert!(
             line.starts_with(

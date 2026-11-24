@@ -88,6 +88,9 @@ pub(crate) struct Plan {
     /// The names that the listing check excused through the affected units' stored proofs (spec 3.10). Each needs a new
     /// proof of this run that reads it by content, or the run has no verdict.
     pub(crate) excused: Vec<Excused>,
+    /// The whole proof's content inputs that changed and that no kept version reads, in path order (spec 3.10, PR 86
+    /// review round 2). A new proof of this run must read each by content, or the run has no verdict.
+    pub(crate) uncovered: Vec<String>,
 }
 
 /// One affected unit (spec 3.9): its reason, which the header and explain name, and the inputs that changed for its
@@ -326,11 +329,13 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
     }
     // E17 and E18: the affected units launch one at a time. Units that are all affected make the attribution pass.
     let whole = affected.len() == cx.roster.len();
+    let uncovered = uncovered_changes(cx, view, &current, proof);
     let plan = Plan {
         units: cx.roster.len(),
         inputs: skipped(cx, view).inputs,
         affected,
         excused,
+        uncovered,
     };
     verdict(
         if whole {
@@ -345,15 +350,15 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
 
 /// The decision of a locked run that launches units (spec 3.10). `Ok` carries the plan for E17 and E18. `Err` carries
 /// the verdict of every other decision, which the run takes as it stands.
-pub(super) fn judge_units(cx: &Judged<'_>, view: &View) -> Result<Plan, Verdict> {
+pub(super) fn judge_units(cx: &Judged<'_>, view: &View) -> Result<Plan, Box<Verdict>> {
     let verdict = judge(cx, view);
     match verdict.decision {
         Decision::Pass(plan) | Decision::Subset(plan) => Ok(plan),
-        decision => Err(Verdict {
+        decision => Err(Box::new(Verdict {
             decision,
             affected: verdict.affected,
             clean: verdict.clean,
-        }),
+        })),
     }
 }
 
@@ -405,6 +410,45 @@ fn units_that_left_held_a_reader(cx: &Judged<'_>, view: &View) -> bool {
     };
     let removed = readers(false);
     !removed.is_empty() && bundle::lost_reader(&removed, &readers(true))
+}
+
+/// The whole proof's content inputs that a subset or an attribution pass must see covered (spec 3.10, PR 86 review round
+/// 2). A kept version is a roster unit's valid version, and it holds the identity of each path it reads by content, so
+/// such an input is covered. An input that no kept version reads, and whose identity moved since the whole proof, is
+/// uncovered: only a new proof of this run can vouch for it. A deleted input is not one. Its readers are affected, or
+/// they departed, and the loss is taken in full at the next run (spec 3.8, item 1).
+fn uncovered_changes(
+    cx: &Judged<'_>,
+    view: &View,
+    current: &Current,
+    proof: &Proof,
+) -> Vec<String> {
+    let kept: BTreeSet<&str> = cx
+        .roster
+        .iter()
+        .filter_map(|unit| view.units.get(unit))
+        .flatten()
+        .filter(|version| version_reasons(cx, view, current, version).0.is_empty())
+        .flat_map(|version| version.inputs.iter())
+        .map(|&index| &view.table[index as usize])
+        .filter(|input| bundle::content_id(&input.id))
+        .map(|input| input.path.as_str())
+        .collect();
+    let inputs: Vec<&Input> = proof
+        .inputs
+        .iter()
+        .filter(|input| bundle::content_id(&input.id) && !input.id.starts_with("dl:"))
+        .filter(|input| !kept.contains(input.path.as_str()))
+        .collect();
+    let fresh = Current::of(cx.root, &inputs);
+    let mut paths: Vec<String> = inputs
+        .iter()
+        .filter(|&&input| !fresh.holds(input) && !fresh.absent(input))
+        .map(|&input| input.path.clone())
+        .collect();
+    paths.sort();
+    paths.dedup();
+    paths
 }
 
 fn verdict(decision: Decision, affected: Option<Vec<(String, String)>>, clean: bool) -> Verdict {
