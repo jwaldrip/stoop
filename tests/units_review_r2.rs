@@ -500,6 +500,21 @@ fn r2_an_unchanged_input_of_a_departed_reader_stays_a_subset() {
     assert_eq!(launches, ["tests/a.t"], "{}", stderr(&ran));
 }
 
+/// The D19 shape with the switch off (PR 86 review round 2, switch-off parity): a cold run, then a changed run that
+/// passes by the attribution pass, store the residue as main measures it, provisional against the held versions. The
+/// bundle that the switch off writes must be the one main writes.
+#[test]
+fn r2_switch_off_record_stores_main_residue_measurement() {
+    let s = Suite::new();
+    s.remove("tests/c.t");
+    success(&s.hook(&[]));
+    edit(&s, 2);
+    success(&s.hook(&[]));
+    let stored = residue(&s);
+    assert_eq!(stored["state"], "provisional", "{stored}");
+    assert_eq!(stored["whole"], bundle(&s)["whole"], "{stored}");
+}
+
 // ---- E3: units that read other tests' flags, and runner-only test files, as data ----
 
 fn count_from_env(name: &str, default: usize) -> usize {

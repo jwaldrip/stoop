@@ -1041,8 +1041,17 @@ fn write_bytes(area: &Area, suite: &str, bytes: &[u8]) -> io::Result<()> {
 }
 
 /// Best effort only: no diagnostic or decision changes when a bundle cannot be saved. Both arguments are borrowed, so a
-/// learning run that follows the record still holds them (spec 3.10, completion).
-pub(crate) fn record(store: &Path, pending: &Pending, key: &str, digest: &str, proof: &Proof) {
+/// learning run that follows the record still holds them (spec 3.10, completion). With the switch off the residue is
+/// measured as main measures it, so the bundle is the one main writes (PR 86 review round 2, switch-off parity). With the
+/// switch on, a residue is kept only when it is already known for this proof, and stored unknown otherwise.
+pub(crate) fn record(
+    store: &Path,
+    pending: &Pending,
+    key: &str,
+    digest: &str,
+    proof: &Proof,
+    split: bool,
+) {
     let Ok(Some(area)) = Area::open(store, true) else {
         return;
     };
@@ -1110,19 +1119,23 @@ pub(crate) fn record(store: &Path, pending: &Pending, key: &str, digest: &str, p
         residue,
         state,
     };
-    if !removed.is_empty()
-        && lost_reader(
-            &removed,
-            &bundle_readers(&bundle.table, bundle.units.values().flatten()),
-        )
-    {
-        bundle.residue = Residue::default();
-    }
-    // The residue of a new whole proof stays unknown until completion measures it against valid versions. The versions
-    // this bundle holds may be stale (a unit whose flag is gone still names it), so measuring them here would store a
-    // count that a later subset trusts. A residue already known for this proof stays (spec 3.8, PR 86 review round 2).
-    if !residue_known(&bundle.residue, digest) {
-        bundle.residue = Residue::default();
+    if !split {
+        store_residue(&mut bundle, &proof.inputs, digest, pending.listings());
+    } else {
+        if !removed.is_empty()
+            && lost_reader(
+                &removed,
+                &bundle_readers(&bundle.table, bundle.units.values().flatten()),
+            )
+        {
+            bundle.residue = Residue::default();
+        }
+        // The residue of a new whole proof stays unknown until completion measures it against valid versions. The versions
+        // this bundle holds may be stale (a unit whose flag is gone still names it), so measuring them here would store a
+        // count that a later subset trusts. A residue already known for this proof stays (spec 3.8, PR 86 review round 2).
+        if !residue_known(&bundle.residue, digest) {
+            bundle.residue = Residue::default();
+        }
     }
     let _ = write_bundle(&area, &bundle);
 }
@@ -3249,7 +3262,7 @@ mod pass_tests {
         // called again until the bundle carries the digest it records, within 2 s. Only then are the digests asserted.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let stored = loop {
-            record(&dir, &pending_for(&roster), "key", "p-1", &proof());
+            record(&dir, &pending_for(&roster), "key", "p-1", &proof(), true);
             let area = Area::open(&dir, false).unwrap().unwrap();
             if let ReadBundle::Current(bundle) = read_bundle(&area, &id) {
                 if bundle.whole.as_deref() == Some("p-1") {
@@ -3315,7 +3328,7 @@ mod pass_tests {
         loop {
             let mut pending = pending_for(roster);
             pending.listings = listings.iter().map(|path| (*path).to_owned()).collect();
-            record(dir, &pending, key, digest, proof);
+            record(dir, &pending, key, digest, proof, true);
             let area = Area::open(dir, false).unwrap().unwrap();
             if let ReadBundle::Current(bundle) = read_bundle(&area, &id) {
                 if bundle.whole.as_deref() == Some(digest) {
