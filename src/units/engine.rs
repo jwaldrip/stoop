@@ -452,10 +452,22 @@ fn uncovered_changes(
         .filter(|input| bundle::content_id(&input.id) && !input.id.starts_with("dl:"))
         .filter(|input| !kept.contains(input.path.as_str()))
         .collect();
+    // A deleted input that a stored version of a roster unit reads is not excused: that unit may stop reading it in this
+    // step, and then no launch can check the absence it leaves (PR 86 review round 3).
+    let live: BTreeSet<&str> = cx
+        .roster
+        .iter()
+        .filter_map(|unit| view.units.get(unit))
+        .flatten()
+        .flat_map(|version| version.inputs.iter())
+        .map(|&index| view.table[index as usize].path.as_str())
+        .collect();
     let fresh = Current::of(cx.root, &inputs);
     let mut paths: Vec<String> = inputs
         .iter()
-        .filter(|&&input| !fresh.holds(input) && !fresh.absent(input))
+        .filter(|&&input| {
+            !fresh.holds(input) && (!fresh.absent(input) || live.contains(input.path.as_str()))
+        })
         .map(|&input| input.path.clone())
         .collect();
     paths.sort();

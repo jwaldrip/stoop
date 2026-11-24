@@ -1021,7 +1021,10 @@ fn r3_retry_after_a_stat_only_no_verdict_cannot_be_a_skip() {
     assert_eq!(launches, ["tests/c.t"]);
     no_verdict_names(&first, "tests/z.flag");
     let facts = bundle(&s);
-    eprintln!("r3-stat new inputs for c: {:?}", stored_reads(&facts, &["tests/c.t".to_owned()]));
+    eprintln!(
+        "r3-stat new inputs for c: {:?}",
+        stored_reads(&facts, &["tests/c.t".to_owned()])
+    );
     for input in facts["table"].as_array().unwrap() {
         if input["path"] == "tests/z.flag" {
             eprintln!("r3-stat stored identity: {input}");
@@ -1113,10 +1116,17 @@ fn r3_completion_blocked_by_ci_lock_or_read_only_store_fails_safe() {
         s.write("setup.src", "setup changed\n");
         let lock = (mode == "busy").then(|| {
             let lock = File::open(path.with_extension("lock")).unwrap();
-            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+            assert_eq!(
+                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
             lock
         });
-        let env = if mode == "ci" { with(&TU, &[("CI", "1")]) } else { TU.to_vec() };
+        let env = if mode == "ci" {
+            with(&TU, &[("CI", "1")])
+        } else {
+            TU.to_vec()
+        };
         if mode == "read-only" {
             fs::set_permissions(parent, fs::Permissions::from_mode(0o555)).unwrap();
         }
@@ -1128,8 +1138,16 @@ fn r3_completion_blocked_by_ci_lock_or_read_only_store_fails_safe() {
         drop(lock);
         success(&first);
         assert_eq!(launched(&s), [""], "{mode}: {}", stderr(&first));
-        assert!(stderr(&first).contains("stoop: recorded "), "{mode}: {}", stderr(&first));
-        assert!(!stderr(&first).contains("busy"), "{mode}: {}", stderr(&first));
+        assert!(
+            stderr(&first).contains("stoop: recorded "),
+            "{mode}: {}",
+            stderr(&first)
+        );
+        assert!(
+            !stderr(&first).contains("busy"),
+            "{mode}: {}",
+            stderr(&first)
+        );
         if mode == "ci" {
             assert_eq!(known(&s), None, "{mode}: {}", residue(&s));
         } else {
@@ -1150,11 +1168,22 @@ fn r3_killed_completion_leaves_the_new_whole_proof_unmatched() {
     s.write("tests/c.t", "src/c.src\n");
     s.write("setup.src", "setup changed\n");
     let fifo = s.fifo();
-    let env = with(&TU, &[("T_FIFO", fifo.to_str().unwrap()), ("T_FIFO_AT", "tests/c.t")]);
+    let env = with(
+        &TU,
+        &[
+            ("T_FIFO", fifo.to_str().unwrap()),
+            ("T_FIFO_AT", "tests/c.t"),
+        ],
+    );
     let mut command = s.stoop(&s.root);
-    command.args(["run", "--root"]).arg(&s.root).args(["--", "./t", HOOK]);
+    command
+        .args(["run", "--root"])
+        .arg(&s.root)
+        .args(["--", "./t", HOOK]);
     command.env(SPLIT.0, SPLIT.1).envs(env.iter().copied());
-    command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
     let mut child = spawning(|| command.spawn()).unwrap();
     release(meet(&fifo)); // full form
     let writer = meet(&fifo); // c in completion, after the whole proof is saved
@@ -1163,7 +1192,9 @@ fn r3_killed_completion_leaves_the_new_whole_proof_unmatched() {
     drop(writer);
     assert_ne!(bundle(&s)["whole"], whole);
     assert_eq!(known(&s), None, "{}", residue(&s));
-    assert!(stored_reads(&bundle(&s), &["tests/c.t".to_owned()]).contains(&"tests/z.flag".to_owned()));
+    assert!(
+        stored_reads(&bundle(&s), &["tests/c.t".to_owned()]).contains(&"tests/z.flag".to_owned())
+    );
     s.write("tests/z.flag", "fail\n");
     let (_, retry, launches, oracle) = judge("r3-sigkill", &s, &TU, true);
     assert_eq!(oracle, 1);
@@ -1173,10 +1204,22 @@ fn r3_killed_completion_leaves_the_new_whole_proof_unmatched() {
 
 fn r3_control_run(s: &Suite, binary: &Path) -> Output {
     let mut command = std::process::Command::new(binary);
-    command.current_dir(&s.root).stdin(std::process::Stdio::null()).env_clear();
-    command.env("PATH", "/usr/bin:/bin").env("HOME", &s.outside).env("LOG", &s.log);
-    command.env("STOOP_LEARN_VOLATILE", "0").env(SPLIT.0, SPLIT.1).envs(TU);
-    command.args(["run", "--root"]).arg(&s.root).args(["--", "./t", HOOK]);
+    command
+        .current_dir(&s.root)
+        .stdin(std::process::Stdio::null())
+        .env_clear();
+    command
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &s.outside)
+        .env("LOG", &s.log);
+    command
+        .env("STOOP_LEARN_VOLATILE", "0")
+        .env(SPLIT.0, SPLIT.1)
+        .envs(TU);
+    command
+        .args(["run", "--root"])
+        .arg(&s.root)
+        .args(["--", "./t", HOOK]);
     s.clear_log();
     spawning(|| command.output()).unwrap()
 }
@@ -1238,9 +1281,37 @@ fn r3_merge_base_control_for_both_wrong_verdicts() {
     for replace_with_stat in [false, true] {
         assert_eq!(r3_control_case(base, replace_with_stat), ((1, 1), (1, 1)));
         let result = r3_control_case(head, replace_with_stat);
-        if result.0.0 == 0 || result.1.0 == 0 {
+        if result.0 .0 == 0 || result.1 .0 == 0 {
             wrong.push((replace_with_stat, result));
         }
     }
-    assert!(wrong.is_empty(), "R3 REGRESSION: head false pass where the merge base fails correctly: {wrong:?}");
+    assert!(
+        wrong.is_empty(),
+        "R3 REGRESSION: head false pass where the merge base fails correctly: {wrong:?}"
+    );
+}
+
+/// PR 86 review round 3, the stat-only reader of a deleted flag. `c` keeps listing the flag, but only stats it, and the
+/// runner-only test requires the flag to exist. Deleting the flag changes `c`'s input, so the subset launches `c`. Its
+/// new proof stats the absence and reads no content, so nothing vouches for the flag: the run gives no verdict, and its
+/// retry takes the full form. Neither may pass.
+#[test]
+fn r3_a_stat_only_reader_of_a_deleted_flag_cannot_pass() {
+    let s = zsuite();
+    let fixture = include_str!("fixtures/hook/t");
+    let stat_anchor = "cat \"$ROOT/$line\"";
+    let missing_anchor = "if [ -f \"$flag\" ] && grep -q fail \"$flag\"; then";
+    assert_eq!(fixture.matches(stat_anchor).count(), 1);
+    assert_eq!(fixture.matches(missing_anchor).count(), 1);
+    let body = fixture
+        .replace(stat_anchor, "case $line in\nstat:*) test -e \"$ROOT/${line#stat:}\" ;;\n*) cat \"$ROOT/$line\" ;;\nesac")
+        .replace(missing_anchor, "if { [ \"$1\" = tests/z.u ] && [ ! -f \"$flag\" ]; } || { [ -f \"$flag\" ] && grep -q fail \"$flag\"; }; then");
+    s.write("tests/c.t", "src/c.src\ntests/z.u\nstat:tests/z.flag\n");
+    r3_spec_runner(&s, &body);
+    s.remove("tests/z.flag");
+    let (_, run, _, oracle) = judge("r3-stat-deleted", &s, &TU, true);
+    assert_eq!(oracle, 1);
+    same_verdict("r3-stat-deleted", &run, oracle);
+    let (_, retry, _, oracle) = judge("r3-stat-deleted-retry", &s, &TU, true);
+    same_verdict("r3-stat-deleted-retry", &retry, oracle);
 }
