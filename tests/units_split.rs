@@ -890,15 +890,15 @@ struct Tally {
     exemptions: usize,
 }
 
-/// M1: over seeded sequences of edits, the subject's verdict (with `STOOP_SPLIT=1`) equals the verdict of the runner run
-/// directly, with `T_U=1`, so the full form also runs the runner-only tests. Its status is never 125 or 2, and every
-/// launched argument is a roster unit. A no-op after a passing run launches nothing, unless the engine names the residue
-/// as its reason (spec 3.8). Then the full form runs once, the subject exits as the runner does, and the run is an
-/// exemption: the next no-op must skip, and so must every no-op until a step that is not a no-op. A sweep counts its
-/// exemptions against its no-ops after a passing run, and fails above `EXEMPTION_LIMIT_PERCENT`, so a refusal that never
-/// clears cannot hide behind the exemption. Seeds come from `STOOP_MODEL_FIRST` (1 by default) for `STOOP_MODEL_SEEDS`
-/// (4 by default), and steps from `STOOP_MODEL_STEPS` (30). A step applies one operation, or two in about three steps in
-/// ten, before its run.
+/// M1: over seeded sequences of edits, the subject's verdict (with `STOOP_SPLIT=1`) equals the direct runner's, with
+/// `T_U=1`, so the full form also runs the runner-only tests. A 125 is accepted only when the oracle passes, the exact
+/// no-verdict line names a path a launched unit stopped listing in this step, and the sequence stays within the bound.
+/// Every acceptance is printed. Status 2 is never accepted, and every launched argument is a roster unit. A no-op after
+/// a passing run launches nothing, unless the engine names the residue as its reason (spec 3.8). Then the full form runs
+/// once and must match the runner. The next no-op must skip, and so must every no-op until a step that is not a no-op.
+/// A sweep fails above `EXEMPTION_LIMIT_PERCENT` exempt no-ops after a passing run. Seeds come from `STOOP_MODEL_FIRST`
+/// (1 by default) for `STOOP_MODEL_SEEDS` (4 by default), and steps from `STOOP_MODEL_STEPS` (30). A step applies one
+/// operation, or two in about three steps in ten, before its run.
 #[test]
 fn model_split_runs_give_the_full_runs_verdict() {
     let first = count_from_env("STOOP_MODEL_FIRST", 1);
