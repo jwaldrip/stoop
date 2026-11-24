@@ -14,7 +14,7 @@ mod units_common;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Output;
+use std::process::{Output, Stdio};
 use units_common::*;
 
 /// The switch that turns the engine on (spec 3.1).
@@ -416,6 +416,49 @@ fn a_failing_excusing_unit_keeps_its_old_proof_until_a_lost_read_is_detected() {
         );
         same_verdict(mode, &after_refusal);
     }
+}
+
+/// A unit that stats a changed input launches first, so its proof replaces its version and reaches the disk before the
+/// run ends. The run is killed while its second unit holds, after that write and before the run settles. The next run
+/// must not skip on the stat: the runner-only test reads the input's content and fails (PR 86 review round 3).
+#[test]
+fn a_kill_after_a_stat_only_replacement_leaves_the_residue_unknown() {
+    let s = review_suite();
+    s.write("tests/z.u", "src/c.src\n");
+    s.write("tests/z.flag", "ok\n");
+    let env = [
+        ("T_U", "1"),
+        ("T_STAT_REL", "tests/z.flag"),
+        ("T_STAT_AT", "tests/a.t"),
+    ];
+    proven(&s, &env);
+    s.write("tests/z.flag", "fail\n");
+    edit(&s, 3);
+    let fifo = s.fifo();
+    let fifo_text = fifo.display().to_string();
+    let hold = [("T_FIFO", fifo_text.as_str()), ("T_FIFO_AT", "tests/b.t")];
+    let mut command = s.stoop(&s.root);
+    command
+        .args(["run", "--root"])
+        .arg(&s.root)
+        .args(["--", "./t", HOOK])
+        .env(SPLIT.0, SPLIT.1)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in env.iter().chain(&hold) {
+        command.env(name, value);
+    }
+    let mut child = spawning(|| command.spawn()).unwrap();
+    let writer = meet(&fifo);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(writer);
+    let judged = judge(&s, &env);
+    assert_eq!(
+        judged.direct, 1,
+        "the full command runs tests/z.u and fails"
+    );
+    same_verdict("kill", &judged);
 }
 
 /// rv35: `c` names `tests/z.u`, absent when the full command passed. When `z.u` appears and `c`'s new proof reads it by content,
