@@ -451,10 +451,12 @@ int main(void) {
         assert_eq!(f.log(), "pytest\n");
     }
 
-    // The shim gives the tracer the child's stop before the parent's fork event on every
-    // run, whichever order the kernel reports them in. When the tracer resumes the child
-    // before it knows the child's lineage, the shim returns the child's next event before
-    // the held fork event, so the lost lineage shows up in the observation below.
+    // The shim gives the tracer the child's stop before the parent's fork event. When the
+    // kernel reports the fork event first, the shim holds it, and an early resume of the
+    // child with PTRACE_CONT or PTRACE_DETACH fails this test: after CONT the shim returns
+    // the child's next event first, and after DETACH it cannot wait for the child at all.
+    // A PTRACE_SYSCALL resume is not reliably caught here, and nothing is held when the
+    // kernel reports the child's stop first.
     #[test]
     fn child_stop_before_fork_event_keeps_lineage() {
         let f = Fixture::new();
@@ -497,6 +499,9 @@ static void record(const char *order) {
     }
 }
 
+// A resume of the held child before the parent's fork event is returned sets child_resumed.
+// The Rust test above catches CONT and DETACH. PTRACE_SYSCALL is flagged too, but a
+// SYSCALL resume is not reliably caught by that test.
 long ptrace(enum __ptrace_request request, ...) {
     static long (*real_ptrace)(enum __ptrace_request, ...);
     if (!real_ptrace) real_ptrace = dlsym(RTLD_NEXT, "ptrace");
