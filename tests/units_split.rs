@@ -687,6 +687,8 @@ struct Model {
     runner_sources: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
     full: std::collections::BTreeSet<usize>,
     runners_at_full: std::collections::BTreeSet<usize>,
+    readers_full: std::collections::BTreeSet<String>,
+    lost: bool,
 }
 
 impl Model {
@@ -712,6 +714,8 @@ impl Model {
             runner_sources: Default::default(),
             full: Default::default(),
             runners_at_full: Default::default(),
+            readers_full: Default::default(),
+            lost: false,
         };
         for _ in 0..6 {
             model.add(s, rng);
@@ -750,6 +754,38 @@ impl Model {
             .flatten()
             .copied()
             .collect()
+    }
+
+    /// Every input that the live units and runner-only tests read now: each unit's file and flag, each runner's file, and
+    /// each source that a unit or runner lists.
+    fn readers_now(&self) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        for id in &self.units {
+            out.insert(unit_path(*id));
+            out.insert(flag_path(*id));
+        }
+        for id in &self.runners {
+            out.insert(runner_path(*id));
+        }
+        for source in self
+            .sources
+            .values()
+            .chain(self.runner_sources.values())
+            .flatten()
+        {
+            out.insert(format!("src/s{source}"));
+        }
+        out
+    }
+
+    /// Sets the loss flag when an input that the last full run read has no reader now. The flag is sticky: the engine
+    /// keeps the residue unknown from the moment a version write takes the last reader (spec 3.8, item 1) until a full
+    /// run measures it again.
+    fn note_losses(&mut self) {
+        let now = self.readers_now();
+        if self.readers_full.iter().any(|path| !now.contains(path)) {
+            self.lost = true;
+        }
     }
 
     /// The next operation. A unit is added only up to nine, and deleted only while two remain. Names are renamed or
@@ -1008,6 +1044,7 @@ fn run_model(seed: u64, steps: usize) {
         stderr(&cold)
     );
     model.full = model.listing_now();
+    model.readers_full = model.readers_now();
     let mut passing = true;
     // Set by a refused no-op whose full form ran: the next step, when it is a no-op, must skip.
     let mut owed = false;
@@ -1020,6 +1057,8 @@ fn run_model(seed: u64, steps: usize) {
             model.apply(&s, &mut rng, op);
             ops.push(op);
         }
+        model.note_losses();
+        let lost = model.lost;
         let noop = ops.iter().all(|op| matches!(op, Op::Noop));
         operations.push(format!("step {step}: {ops:?}"));
         let roster = model.roster();
@@ -1069,11 +1108,33 @@ fn run_model(seed: u64, steps: usize) {
                     "a no-op right after a full run must skip: {}",
                     report()
                 ),
-                None if !runner_new => assert!(
+                None if !runner_new && !lost => assert!(
                     launches.is_empty(),
                     "a no-op after a passing run launched: {}",
                     report()
                 ),
+                // M1 exemption (PR 86 review round 1): a unit stopped reading a file since the last full run, so the residue
+                // is unknown (spec 3.8, item 1). The full form may run once; the no-op after it must skip.
+                None if !runner_new => {
+                    if !launches.is_empty() {
+                        assert_eq!(
+                            launches,
+                            [""],
+                            "a refused no-op must run the full form once: {}",
+                            report()
+                        );
+                        assert!(
+                            stderr(&subject)
+                                .contains("the full command has not been matched to its units yet"),
+                            "{}",
+                            report()
+                        );
+                        println!(
+                            "M1 exemption: seed {seed}, step {step}: a unit stopped reading a file since the last full run; the full form runs once"
+                        );
+                        owed = true;
+                    }
+                }
                 // A refused no-op may run the full form once. So may a no-op after a runner-only test was added since the
                 // last full pass: its name is no unit, so the listing of `tests` no longer matches the whole proof's.
                 _ => {
@@ -1123,6 +1184,8 @@ fn run_model(seed: u64, steps: usize) {
         if subject_code == 0 && launches == [""] {
             model.full = model.listing_now();
             model.runners_at_full = model.runners.iter().copied().collect();
+            model.readers_full = model.readers_now();
+            model.lost = false;
         }
         passing = subject_code == 0;
     }
