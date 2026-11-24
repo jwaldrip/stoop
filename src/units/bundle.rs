@@ -2243,10 +2243,11 @@ pub(crate) fn confirm(
 }
 
 /// Whether the suite's store can take a new entry, for `stoop explain` to predict a learning run (spec 3.10). An absent
-/// store is not refused, because the run creates it. Nothing is created or written here.
-pub(crate) fn writable(store: &Path, id: &str) -> bool {
+/// store is not refused, because the run creates it. Nothing is created or written here: the check reads the directory's
+/// write permission and makes no entry (PR 86 review round 2, c3).
+pub(crate) fn writable(store: &Path) -> bool {
     match Area::open(store, false) {
-        Ok(Some(area)) => area.writable(id),
+        Ok(Some(area)) => area.writable_dir(),
         Ok(None) => true,
         Err(_) => false,
     }

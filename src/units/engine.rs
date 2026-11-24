@@ -1070,7 +1070,7 @@ pub(crate) fn learn_line(
         return None;
     }
     attribution::roster_screen(cx, hook, config, pending).ok()?;
-    if !bundle::writable(store, pending.suite()) {
+    if !bundle::writable(store) {
         return None;
     }
     let judged = Judged::new(cx, pending, &[], max_age);

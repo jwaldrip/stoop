@@ -8,6 +8,7 @@ use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -307,6 +308,16 @@ impl Suite {
             for entry in entries {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
+                    // A directory's stamp changes when an entry in it is made or removed, even one removed again.
+                    let meta = fs::metadata(&path).unwrap();
+                    let stamp = format!(
+                        "{:?} {} {}",
+                        meta.modified().unwrap(),
+                        meta.ctime(),
+                        meta.ctime_nsec()
+                    );
+                    let rel = path.strip_prefix(&self.root).unwrap().to_path_buf();
+                    files.insert(rel, stamp.into_bytes());
                     pending.push(path);
                 } else {
                     let rel = path.strip_prefix(&self.root).unwrap().to_path_buf();
