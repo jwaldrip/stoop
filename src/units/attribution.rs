@@ -411,15 +411,25 @@ pub(super) fn finish(
     planned: usize,
     quiet: bool,
 ) -> i32 {
-    // A run with no verdict (exit 125) leaves the residue unknown, so the next run takes the full form (spec 3.8, PR 86
-    // review round 3). The residue is measured only by a run that gives a verdict.
     let stopped_early = matches!(&ran.stopped, Some((index, _)) if index + 1 < planned);
     let no_verdict = ran.unlaunched
         || stopped_early
         || !ran.breaches.is_empty()
         || !ran.unread.is_empty()
         || !ran.uncovered.is_empty();
-    pass.settle_residue(&lookup.proofs, pending.listings(), no_verdict);
+    // A stored version that reads a path no run covered may read it by stat only, so the residue is unknown, and the next
+    // run takes the full form (spec 3.8, PR 86 review round 3). Other no-verdict runs keep the residue they measured.
+    let stored_uncovered = pass.held().iter().any(|(_, inputs, _)| {
+        inputs
+            .iter()
+            .any(|input| ran.uncovered.contains(&input.path))
+    });
+    let unknown = stopped_early
+        || ran.unlaunched
+        || !ran.breaches.is_empty()
+        || !ran.unread.is_empty()
+        || stored_uncovered;
+    pass.settle_residue(&lookup.proofs, pending.listings(), unknown);
     let id = pending.suite();
     // The state a stopped run stores is decided by `disabling` (spec 3.6). It is stored under the lock this run holds.
     if let Some(Disabling {
