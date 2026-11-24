@@ -4149,6 +4149,50 @@ mod keep_tests {
     }
 
     #[test]
+    fn w20_shape_a_subset_that_drops_the_last_readers_loses_the_residue() {
+        let units = ["tests/a.t", "tests/b.t", "tests/c.t"];
+        let mut held = BTreeMap::new();
+        held.insert("tests/a.t".to_owned(), vec![version(vec![0])]);
+        held.insert("tests/b.t".to_owned(), vec![version(vec![0])]);
+        // c reads src/c.src, the runner-only test and its flag as data.
+        held.insert("tests/c.t".to_owned(), vec![version(vec![0, 1, 1])]);
+        let table = vec![
+            input("src/c.src"),
+            input("tests/z.u"),
+            input("tests/z.flag"),
+        ];
+        let mut bundle = bundle_for(pending_for(&units), "key", table, held);
+        // The residue is known and empty for the stored whole proof, as after a completion.
+        bundle.residue = Residue {
+            state: ResidueState::Provisional,
+            paths: Vec::new(),
+            count: 0,
+            whole: Some("p-1".to_owned()),
+        };
+        let dir = seed("w20-shape", &bundle);
+        let pending = pending_for(&units);
+        let mut pass = kept(&dir, &pending);
+        assert!(matches!(
+            pass.record("tests/c.t", &[input("src/c.src")], &[], 2),
+            Stored::Stored
+        ));
+        assert!(
+            pass.residue_lost,
+            "dropping the last readers of tests/z.u and tests/z.flag loses the residue"
+        );
+        drop(pass);
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        let ReadBundle::Current(stored) = read_bundle(&area, pending.suite()) else {
+            panic!("the bundle is current")
+        };
+        assert!(
+            matches!(stored.residue.state, ResidueState::None),
+            "the residue on disk is unknown: the write must carry the reset, not the residue measured before it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_kept_pass_drops_the_versions_of_units_that_left_the_roster() {
         let all = ["tests/a.t", "tests/gone.t"];
         let mut held = BTreeMap::new();
