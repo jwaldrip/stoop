@@ -42,6 +42,7 @@ fn review_runner() -> String {
         "\tif [ -n \"${T_LS_DIR:-}\" ] && [ \"${T_LS_AT:-}\" = \"$1\" ]; then ls \"$ROOT/$T_LS_DIR\" > /dev/null; fi\n",
         "\tif [ -n \"${T_READ_ABS:-}\" ] && [ \"${T_READ_ABS_AT:-}\" = \"$1\" ]; then cat \"$T_READ_ABS\" > /dev/null; fi\n",
         "\tif [ -n \"${T_BIG_AT:-}\" ] && [ \"$T_BIG_AT\" = \"$1\" ] && [ -d \"${T_BIG_DIR:-/nonexistent}\" ]; then find \"$T_BIG_DIR\" -type f -exec cat {} + > /dev/null; fi\n",
+        "\tif [ -n \"${T_STAT_REL:-}\" ] && [ \"${T_STAT_AT:-}\" = \"$1\" ]; then test -e \"$ROOT/$T_STAT_REL\"; fi\n",
     );
     let notes = concat!(
         "note \"changed_inputs_file=$(flat \"${STOOP_CHANGED_INPUTS_FILE:-}\")\"\n",
@@ -467,5 +468,116 @@ fn rv17_changed_inputs_are_sorted_root_relative_and_inside_the_root() {
     assert_eq!(
         note(&launches[1], "inputs_file_text"),
         Some("src/shared.src")
+    );
+}
+
+/// Writes `count` files under `big/` whose cwd-relative paths, joined by newlines, are exactly `total` bytes.
+fn exact_big(s: &Suite, total: usize, count: usize, body: &str) -> Vec<String> {
+    let budget = total - (count - 1);
+    let (base, rem) = (budget / count, budget % count);
+    (0..count)
+        .map(|i| {
+            let len = base + usize::from(i < rem);
+            let mut name = format!("{i:05}");
+            while name.len() < len - 4 {
+                name.push('n');
+            }
+            let path = format!("big/{name}");
+            assert_eq!(path.len(), len);
+            s.write(&path, body);
+            path
+        })
+        .collect()
+}
+
+/// A subset of `a` whose changed inputs are exactly `total` bytes. Returns the variable, the list file's text, whether the
+/// variable was set, and the run's status.
+fn changed_inputs_at(total: usize) -> (String, String, bool, i32) {
+    let s = review_suite();
+    let env = [("T_BIG_AT", "tests/a.t"), ("T_BIG_DIR", "big")];
+    let paths = exact_big(&s, total, 640, "one\n");
+    attributed(&s, &env);
+    for path in &paths {
+        s.write(path, "two\n");
+    }
+    s.clear_log();
+    let out = split(&s, &env);
+    let launches = s.launches();
+    assert_eq!(launches.len(), 1, "{}", stderr(&out));
+    let set = note(&launches[0], "changed_inputs_set") == Some("set");
+    let var = launches[0].env("changed_inputs").to_owned();
+    let file = note(&launches[0], "inputs_file_text")
+        .unwrap_or_default()
+        .to_owned();
+    (var, file, set, code(&out))
+}
+
+/// rv36: changed inputs of exactly 64 KiB are exported whole, and the list file carries them.
+#[test]
+fn rv36_changed_inputs_of_exactly_64_kib_are_exported() {
+    let (var, file, set, status) = changed_inputs_at(65_536);
+    assert_eq!(status, 0);
+    assert!(set, "the variable is exported at exactly 64 KiB");
+    assert_eq!(var.len(), 65_536);
+    assert_eq!(file, var);
+}
+
+/// rv36b: one byte over 64 KiB leaves the variable unset, and the list file carries the whole list.
+#[test]
+fn rv36b_changed_inputs_one_byte_over_64_kib_leave_the_variable_unset() {
+    let (var, file, set, status) = changed_inputs_at(65_537);
+    assert_eq!(status, 0);
+    assert!(!set, "the variable must be unset");
+    assert!(var.is_empty());
+    assert_eq!(file.len(), 65_537);
+}
+
+/// rv38: `c` names `tests/z.u` when the full command passed, so the name is absent. Then `c` stops naming it and only stats
+/// it, and `z.u` appears as a failing runner-only test. A stat is not a read by content, so the run has no verdict (exit
+/// 125) and names the file, where the full command fails.
+#[test]
+fn rv38_a_name_the_new_proof_only_stats_is_not_a_pass() {
+    let s = review_suite();
+    let env = [
+        ("T_U", "1"),
+        ("T_STAT_REL", "tests/z.u"),
+        ("T_STAT_AT", "tests/c.t"),
+    ];
+    s.write("tests/z.flag", "fail\n");
+    s.write("tests/c.t", "src/c.src\ntests/z.u\n");
+    attributed(&s, &env);
+    s.write("tests/c.t", "src/c.src\n");
+    s.write("tests/z.u", "src/c.src\n");
+    let judged = judge(&s, &env);
+    assert_eq!(
+        judged.direct, 1,
+        "the full command runs tests/z.u and fails"
+    );
+    assert_eq!(code(&judged.ran), 125, "{}", stderr(&judged.ran));
+    assert!(
+        stderr(&judged.ran).contains("tests/z.u"),
+        "{}",
+        stderr(&judged.ran)
+    );
+}
+
+/// rv43: `c` reads `src/dead.src`, which the full run never read, then stops, while a new unit changes the listing of
+/// `tests`. `src/dead.src` never appeared and the listing of `src` is unchanged, so no name is excused and the run is 0.
+#[test]
+fn rv43_a_unit_that_stops_reading_a_file_the_full_run_never_read_is_not_125() {
+    let s = Suite::new();
+    attributed(&s, &[]);
+    s.write("tests/c.t", "src/c.src\nsrc/dead.src\n");
+    let first = judge(&s, &[]);
+    same_verdict("rv43-first", &first);
+    s.write("tests/c.t", "src/c.src\n");
+    s.write("tests/d.t", "src/c.src\n");
+    let judged = judge(&s, &[]);
+    assert_eq!(judged.direct, 0);
+    assert_eq!(
+        code(&judged.ran),
+        0,
+        "a false no-verdict: {}",
+        stderr(&judged.ran)
     );
 }
