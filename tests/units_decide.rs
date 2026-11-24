@@ -48,8 +48,9 @@ fn split(s: &Suite, env: &[(&str, &str)]) -> Output {
     s.hook(&with(&[SPLIT], env))
 }
 
-/// A suite whose units hold proofs: a cold full run under `env`, then a change that starts the attribution pass,
-/// run under `env` and `switch`. Returns the pass's output.
+/// A suite whose units hold proofs: a cold run under `env` with the switch off, then a change and a run under `env` and
+/// `switch`. With the switch on, that run is the full form, and its completion learns every unit's proof. Returns the
+/// run's output.
 fn passed(s: &Suite, env: &[(&str, &str)], switch: &[(&str, &str)]) -> Output {
     success(&s.hook(env));
     edit(s, 2);
@@ -248,27 +249,36 @@ fn t4_residue_takes_the_full_form_and_names_it() {
     assert_eq!(s.launches().len(), 1, "the full form launches once");
 }
 
-/// T5 (D5): a unit that fails in the pass keeps no proof, so the residue is not matched to the units. The next change
-/// takes the full form.
+/// T5 (D5), replaced for W7-3. On the base, a unit that fails in the pass keeps no proof, so the residue is not matched
+/// to the units, and the next change takes the full form with the reason "not matched yet". With the switch on there is
+/// no pass, and a failing full run records nothing (C1 and C2 in units_completion.rs pin the failing cases). This test
+/// reaches the same reason another way: a recorded run in CI learns nothing, and a unit that joined the roster after the
+/// last proof has no proof to measure the residue with.
 #[test]
-fn t5_a_failing_unit_leaves_the_residue_unmatched() {
+fn t5_a_recorded_run_that_learns_nothing_leaves_the_residue_unmatched() {
     let s = Suite::new();
-    success(&s.hook(&[]));
-    s.write("tests/b.flag", "fail\n");
-    edit(&s, 2);
-    let pass = split(&s, &[]);
-    assert_eq!(code(&pass), 1, "{}", stderr(&pass));
+    success(&passed(&s, &[], &[SPLIT]));
+    // A unit joins the roster, and the change leaves the whole proof behind. The CI run takes the full form and records
+    // the whole proof, but learns no unit proof, so the new unit has none.
+    s.write("tests/d.t", "src/c.src\n");
+    edit(&s, 3);
+    success(&split(&s, &[("CI", "true")]));
+    // Another change leaves the recorded whole proof behind, and its residue is unknown. The run takes the full form and
+    // says so. Its completion then learns a, b and d, the units with no current proof.
+    edit(&s, 4);
     s.clear_log();
-    // The failing full command learned no unit proof, so the next run has no residue to match. It takes the
-    // full form.
     let out = split(&s, &[]);
     assert_eq!(decision(&out), "full", "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("src/shared.src changed"),
+        stderr(&out).contains("the full command has not been matched to its units yet"),
         "{}",
         stderr(&out)
     );
-    assert_eq!(s.launches().len(), 1, "the full form launches once");
+    assert_eq!(
+        s.launches().len(),
+        4,
+        "the full form, then a, b and d, which hold no current proof"
+    );
 }
 
 /// T6 (D6): a change to a file that every unit reads is a change to the whole suite. The full form runs, and the
