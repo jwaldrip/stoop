@@ -364,6 +364,11 @@ pub(super) fn learn(cx: &Judged<'_>, view: &View) -> Result<Vec<String>, &'stati
     if view.disabled.is_some() {
         return Err("the suite is disabled");
     }
+    // The residue that completion measures belongs to the whole proof the bundle holds. A bundle that holds another proof
+    // was written by another run, so this run learns nothing (spec 3.10, PR 86 review round 1).
+    if !cx.proofs.iter().any(|proof| proof.digest() == view.whole) {
+        return Err("the bundle holds another whole proof");
+    }
     let wanted = view.residue.as_ref().is_none_or(|(count, _)| *count > 0);
     if !wanted {
         return Err("the residue is known and empty");
@@ -1235,6 +1240,14 @@ mod tests {
         let roster = vec!["tests/b.t".to_owned()];
         let covered = covered_reads(&judged(&roster, 0), &view, &current, &BTreeSet::new());
         assert!(!covered.contains("tests/a.flag"), "{covered:?}");
+    }
+
+    #[test]
+    fn learn_declines_a_bundle_that_holds_another_whole_proof() {
+        let table = vec![input("tests/a.t", "f:1")];
+        let (view, _) = view_of(vec![("tests/a.t", vec![version(1_000, vec![0])])], table);
+        let roster = vec!["tests/a.t".to_owned(), "tests/b.t".to_owned()];
+        assert!(learn(&judged(&roster, 0), &view).is_err());
     }
 
     #[test]

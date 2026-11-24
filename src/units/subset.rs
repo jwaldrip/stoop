@@ -104,7 +104,7 @@ pub(crate) fn learn(
     }
     let ignore = attribution::ignore_for(cx, store);
     let guard = attribution::guard_of(cx, &ignore);
-    let judged = Judged::new(cx, pending, &[], max_age);
+    let judged = Judged::new(cx, pending, std::slice::from_ref(proof), max_age);
     let (mut pass, units) = match bundle::keep(store, pending, key, guard, |view| {
         engine::learn(&judged, view)
     }) {
@@ -176,9 +176,14 @@ pub(crate) fn learn(
     // Every roster unit holds a proof, so the residue is measured exactly (spec 3.8, point iii). A busy lock, or a bundle
     // that no longer holds, leaves the residue in the state it had.
     if !disabled && complete {
-        let _ = bundle::confirm(store, pending, key, &proof.inputs, |view| {
-            engine::holds(&judged, view)
-        });
+        let _ = bundle::confirm(
+            store,
+            pending,
+            key,
+            &proof.digest(),
+            &proof.inputs,
+            |view| engine::holds(&judged, view),
+        );
     }
 }
 

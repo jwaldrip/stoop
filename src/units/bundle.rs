@@ -2144,6 +2144,7 @@ pub(crate) fn confirm(
     store: &Path,
     pending: &Pending,
     key: &str,
+    proof_digest: &str,
     whole: &[Input],
     holds: impl FnOnce(&View) -> bool,
 ) -> Settled {
@@ -2164,6 +2165,11 @@ pub(crate) fn confirm(
     let Some(mut bundle) = bundle_for(&area, pending, key) else {
         return Settled::Failed;
     };
+    // The residue is labelled with the whole proof the bundle holds, so this run may label it only when that proof is the
+    // one it measured (spec 3.8, point iii). Another proof means another run wrote the bundle: decline.
+    if bundle.whole.as_deref() != Some(proof_digest) {
+        return Settled::Declined;
+    }
     let Some(digest) = bundle.whole.clone() else {
         return Settled::Failed;
     };
@@ -4062,6 +4068,33 @@ mod keep_tests {
         assert!(content_id("a"));
         assert!(!content_id("s:1"));
         assert!(!content_id("stat:1"));
+    }
+
+    #[test]
+    fn a_confirm_for_another_whole_proof_is_declined() {
+        let units = ["tests/a.t", "tests/b.t"];
+        let mut held = BTreeMap::new();
+        held.insert("tests/a.t".to_owned(), vec![version(vec![0])]);
+        held.insert("tests/b.t".to_owned(), vec![version(vec![0])]);
+        let mut bundle = bundle_for(pending_for(&units), "key", vec![input("src/a.src")], held);
+        bundle.whole = Some("p-1".to_owned());
+        let dir = seed("confirm-other-proof", &bundle);
+        let pending = pending_for(&units);
+        let outcome = confirm(&dir, &pending, "key", "p-2", &[input("src/a.src")], |_| {
+            true
+        });
+        assert!(
+            matches!(outcome, Settled::Declined),
+            "a bundle that holds another proof declines"
+        );
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        let ReadBundle::Current(stored) = read_bundle(&area, pending.suite()) else {
+            panic!("the bundle is current")
+        };
+        assert!(
+            matches!(stored.residue.state, ResidueState::None),
+            "the residue is as it was"
+        );
     }
 
     #[test]
