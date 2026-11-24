@@ -530,12 +530,19 @@ fn departed_only_change(
 /// review round 3). A launch does not vouch for an absence unless it reads the path by content, and a failed open is no
 /// content read. A unit that still lists the path may also stop listing it in this step. The full command decides it.
 fn absent_reader_change(cx: &Judged<'_>, view: &View, proof: &Proof) -> Option<String> {
+    // A departed unit's own file is not checked here: the full command no longer runs that unit, so its absence changes
+    // no verdict. Its other inputs, and every input of a unit still in the roster, are checked.
     let live: BTreeSet<&str> = view
         .units
-        .values()
-        .flatten()
-        .flat_map(|version| version.inputs.iter())
-        .map(|&index| view.table[index as usize].path.as_str())
+        .iter()
+        .flat_map(|(unit, versions)| {
+            let roster = cx.roster.binary_search(unit).is_ok();
+            versions
+                .iter()
+                .flat_map(|version| version.inputs.iter())
+                .map(|&index| view.table[index as usize].path.as_str())
+                .filter(move |path| roster || *path != unit.as_str())
+        })
         .collect();
     let inputs: Vec<&Input> = proof
         .inputs
