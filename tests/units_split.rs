@@ -669,26 +669,16 @@ enum Op {
     Noop,
 }
 
-/// The model's state: which units and runner-only tests exist, how many edits have been made, and what the model knows of
-/// each file's history. A removed name is in `deleted` or `deleted_runners`. `listed` and `runner_listed` hold every source
-/// index that a file ever listed, and `sources` and `runner_sources` hold the indices that a file lists now. `full` holds
-/// the sources that the units and runners listed when the last full run passed, which is what the whole proof records.
+/// The model's state: which units and runner-only tests exist, how many edits have been made, and which names were
+/// removed. `runners_at_full` holds the runner-only tests that existed when the last passing full run ran.
 struct Model {
     units: Vec<usize>,
     next: usize,
     revision: usize,
     deleted: std::collections::BTreeSet<usize>,
-    listed: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
-    sources: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
     runners: Vec<usize>,
-    deleted_runners: std::collections::BTreeSet<usize>,
     next_runner: usize,
-    runner_listed: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
-    runner_sources: std::collections::BTreeMap<usize, std::collections::BTreeSet<usize>>,
-    full: std::collections::BTreeSet<usize>,
     runners_at_full: std::collections::BTreeSet<usize>,
-    readers_full: std::collections::BTreeSet<String>,
-    lost: bool,
 }
 
 impl Model {
@@ -705,17 +695,9 @@ impl Model {
             next: 0,
             revision: 0,
             deleted: Default::default(),
-            listed: Default::default(),
-            sources: Default::default(),
             runners: Vec::new(),
-            deleted_runners: Default::default(),
             next_runner: 0,
-            runner_listed: Default::default(),
-            runner_sources: Default::default(),
-            full: Default::default(),
             runners_at_full: Default::default(),
-            readers_full: Default::default(),
-            lost: false,
         };
         for _ in 0..6 {
             model.add(s, rng);
@@ -732,60 +714,13 @@ impl Model {
         self.rewrite(s, rng, id);
     }
 
-    /// Writes unit `id`'s file, and records the sources that it lists.
-    fn rewrite(&mut self, s: &Suite, rng: &mut Rng, id: usize) {
-        let listed = write_unit(s, rng, id);
-        self.listed
-            .entry(id)
-            .or_default()
-            .extend(listed.iter().copied());
-        self.sources.insert(id, listed.into_iter().collect());
+    /// Writes unit `id`'s file.
+    fn rewrite(&self, s: &Suite, rng: &mut Rng, id: usize) {
+        write_unit(s, rng, id);
     }
 
     fn roster(&self) -> Vec<String> {
         self.units.iter().map(|id| unit_path(*id)).collect()
-    }
-
-    /// The sources that the units and the runner-only tests list now.
-    fn listing_now(&self) -> std::collections::BTreeSet<usize> {
-        self.sources
-            .values()
-            .chain(self.runner_sources.values())
-            .flatten()
-            .copied()
-            .collect()
-    }
-
-    /// Every input that the live units and runner-only tests read now: each unit's file and flag, each runner's file, and
-    /// each source that a unit or runner lists.
-    fn readers_now(&self) -> std::collections::BTreeSet<String> {
-        let mut out = std::collections::BTreeSet::new();
-        for id in &self.units {
-            out.insert(unit_path(*id));
-            out.insert(flag_path(*id));
-        }
-        for id in &self.runners {
-            out.insert(runner_path(*id));
-        }
-        for source in self
-            .sources
-            .values()
-            .chain(self.runner_sources.values())
-            .flatten()
-        {
-            out.insert(format!("src/s{source}"));
-        }
-        out
-    }
-
-    /// Sets the loss flag when an input that the last full run read has no reader now. The flag is sticky: the engine
-    /// keeps the residue unknown from the moment a version write takes the last reader (spec 3.8, item 1) until a full
-    /// run measures it again.
-    fn note_losses(&mut self) {
-        let now = self.readers_now();
-        if self.readers_full.iter().any(|path| !now.contains(path)) {
-            self.lost = true;
-        }
     }
 
     /// The next operation. A unit is added only up to nine, and deleted only while two remain. Names are renamed or
@@ -823,8 +758,6 @@ impl Model {
                     Flag::Removed => {
                         if s.path(&path).exists() {
                             s.remove(&path);
-                            // A unit that stops reading its flag has lost a reader since the last full run (spec 3.8).
-                            self.lost = true;
                         }
                     }
                 }
@@ -844,7 +777,6 @@ impl Model {
             Op::Delete(k) => {
                 let id = self.units.remove(k);
                 self.deleted.insert(id);
-                self.sources.remove(&id);
                 s.remove(&unit_path(id));
                 if s.path(&flag_path(id)).exists() {
                     s.remove(&flag_path(id));
@@ -868,11 +800,6 @@ impl Model {
                 if s.path(&flag_path(old)).exists() {
                     fs::rename(s.path(&flag_path(old)), s.path(&flag_path(new))).unwrap();
                 }
-                let listed = self.listed.get(&old).cloned().unwrap_or_default();
-                self.listed.insert(new, listed);
-                if let Some(sources) = self.sources.remove(&old) {
-                    self.sources.insert(new, sources);
-                }
             }
             Op::Readd(id) => {
                 self.deleted.remove(&id);
@@ -883,17 +810,10 @@ impl Model {
                 let id = self.next_runner;
                 self.next_runner += 1;
                 self.runners.push(id);
-                let listed = write_listing(s, rng, &runner_path(id));
-                self.runner_listed
-                    .entry(id)
-                    .or_default()
-                    .extend(listed.iter().copied());
-                self.runner_sources.insert(id, listed.into_iter().collect());
+                write_listing(s, rng, &runner_path(id));
             }
             Op::RunnerDelete(k) => {
                 let id = self.runners.remove(k);
-                self.deleted_runners.insert(id);
-                self.runner_sources.remove(&id);
                 s.remove(&runner_path(id));
             }
             Op::Noop => {}
@@ -909,9 +829,9 @@ fn flag_path(id: usize) -> String {
     format!("tests/m{id}.flag")
 }
 
-/// Writes unit `id`'s file, with one to three distinct sources, and returns those sources.
-fn write_unit(s: &Suite, rng: &mut Rng, id: usize) -> Vec<usize> {
-    write_listing(s, rng, &unit_path(id))
+/// Writes unit `id`'s file, with one to three distinct sources.
+fn write_unit(s: &Suite, rng: &mut Rng, id: usize) {
+    write_listing(s, rng, &unit_path(id));
 }
 
 /// A runner-only test's file: a `*.u` file that the full form runs under `T_U`, and that no unit covers.
@@ -919,8 +839,8 @@ fn runner_path(id: usize) -> String {
     format!("tests/r{id}.u")
 }
 
-/// Writes the file at `rel` with one to three distinct sources, each on its own line, and returns those sources.
-fn write_listing(s: &Suite, rng: &mut Rng, rel: &str) -> Vec<usize> {
+/// Writes the file at `rel` with one to three distinct sources, each on its own line.
+fn write_listing(s: &Suite, rng: &mut Rng, rel: &str) {
     let count = 1 + rng.below(3);
     let mut sources: Vec<usize> = Vec::new();
     while sources.len() < count {
@@ -934,7 +854,6 @@ fn write_listing(s: &Suite, rng: &mut Rng, rel: &str) -> Vec<usize> {
         .map(|source| format!("src/s{source}\n"))
         .collect();
     s.write(rel, &body);
-    sources
 }
 
 fn count_from_env(name: &str, default: usize) -> usize {
@@ -944,96 +863,90 @@ fn count_from_env(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+/// The largest share, in percent, of no-ops after a passing run that a sweep may run by exemption. An engine that refused
+/// most of its no-ops would pass the exemption on each of them, so a sweep above this share fails.
+const EXEMPTION_LIMIT_PERCENT: usize = 10;
+
+/// A sweep with fewer no-ops after a passing run than this is too short to measure a share, so it only prints its counts.
+const MIN_POST_NOOPS: usize = 50;
+
+/// The engine's text when the residue is unknown (spec 3.8, item 1), and the words that open and close a named residue.
+const UNKNOWN_RESIDUE: &str = "the full command has not been matched to its units yet";
+const NAMED_RESIDUE: &str = "the full command reads ";
+const NAMED_RESIDUE_END: &str = "no unit's own run reads";
+
+/// What a sweep counted: the no-ops after a passing run, and the exempt full runs among them.
+#[derive(Default)]
+struct Tally {
+    post_noops: usize,
+    exemptions: usize,
+}
+
 /// M1: over seeded sequences of edits, the subject's verdict (with `STOOP_SPLIT=1`) equals the verdict of the runner run
 /// directly, with `T_U=1`, so the full form also runs the runner-only tests. Its status is never 125 or 2, and every
-/// launched argument is a roster unit. A no-op after a passing run launches nothing, unless the stored residue refuses it.
-/// Then the full form runs once, its residue names only what `residue_owner` allows, and the next no-op must skip.
-/// Seeds come from `STOOP_MODEL_FIRST` (1 by default) for `STOOP_MODEL_SEEDS` (4 by default), and steps from
-/// `STOOP_MODEL_STEPS` (30). A step applies one operation, or two in about three steps in ten, before its run.
+/// launched argument is a roster unit. A no-op after a passing run launches nothing, unless the engine names the residue
+/// as its reason (spec 3.8). Then the full form runs once, the subject exits as the runner does, and the run is an
+/// exemption: the next no-op must skip, and so must every no-op until a step that is not a no-op. A sweep counts its
+/// exemptions against its no-ops after a passing run, and fails above `EXEMPTION_LIMIT_PERCENT`, so a refusal that never
+/// clears cannot hide behind the exemption. Seeds come from `STOOP_MODEL_FIRST` (1 by default) for `STOOP_MODEL_SEEDS`
+/// (4 by default), and steps from `STOOP_MODEL_STEPS` (30). A step applies one operation, or two in about three steps in
+/// ten, before its run.
 #[test]
 fn model_split_runs_give_the_full_runs_verdict() {
     let first = count_from_env("STOOP_MODEL_FIRST", 1);
     let seeds = count_from_env("STOOP_MODEL_SEEDS", 4);
     let steps = count_from_env("STOOP_MODEL_STEPS", 30);
+    let mut tally = Tally::default();
     for seed in first..first + seeds {
-        run_model(seed as u64, steps);
+        run_model(seed as u64, steps, &mut tally);
+    }
+    let Tally {
+        post_noops,
+        exemptions,
+    } = tally;
+    let share = if post_noops == 0 {
+        0.0
+    } else {
+        exemptions as f64 * 100.0 / post_noops as f64
+    };
+    println!(
+        "M1 sweep: seeds {first}..{}: {post_noops} no-ops after a passing run, {exemptions} exempt full runs ({share:.2}%)",
+        first + seeds
+    );
+    if post_noops >= MIN_POST_NOOPS {
+        assert!(
+            exemptions * 100 <= post_noops * EXEMPTION_LIMIT_PERCENT,
+            "M1 guard: {exemptions} of {post_noops} no-ops after a passing run ran the full form by exemption, above {EXEMPTION_LIMIT_PERCENT}%"
+        );
     }
 }
 
-/// The residue the engine stored, when it is known for the proof it belongs to and counts paths above zero. That residue
-/// refuses a no-op with the residue reason (spec 3.8, E12). The paths are the first ones the bundle stores.
-fn stored_residue(s: &Suite) -> Option<(usize, Vec<String>)> {
+/// The residue count the engine stored, when it is known for the proof it belongs to and counts paths above zero. That
+/// residue refuses a no-op with the named residue (spec 3.8, E12).
+fn stored_residue_count(s: &Suite) -> Option<usize> {
     let bundle = s.bundle()?;
     let residue = &bundle["residue"];
     let known = residue["state"] != "none"
         && !bundle["whole"].is_null()
         && residue["whole"] == bundle["whole"];
     let count = residue["count"].as_u64()? as usize;
-    if !known || count == 0 {
-        return None;
-    }
-    let paths: Vec<String> = residue["paths"]
-        .as_array()?
-        .iter()
-        .filter_map(|path| path.as_str().map(str::to_owned))
-        .collect();
-    Some((count, paths))
+    (known && count > 0).then_some(count)
 }
 
-/// Whether the model's own history allows the stored residue to name `path` (spec 3.8). A file of a live unit, or a
-/// source that a live unit lists now, is a defect. A file of a deleted unit or runner-only test is allowed, and so is a
-/// file of a live runner-only test, which the full command reads and no unit does. A source is allowed when a deleted
-/// unit or a runner-only test ever listed it, or when the last full pass listed it and no unit lists it now.
-fn residue_owner(model: &Model, path: &str) -> Result<(), String> {
-    let live_unit_file = model
-        .units
-        .iter()
-        .any(|id| path == unit_path(*id) || path == flag_path(*id));
-    if live_unit_file {
-        return Err("it is a file of a live unit".to_owned());
-    }
-    let deleted_unit_file = model
-        .deleted
-        .iter()
-        .any(|id| path == unit_path(*id) || path == flag_path(*id));
-    let runner_file = model.runners.iter().any(|id| path == runner_path(*id))
-        || model
-            .deleted_runners
-            .iter()
-            .any(|id| path == runner_path(*id));
-    if deleted_unit_file || runner_file {
-        return Ok(());
-    }
-    let Some(source) = path
-        .strip_prefix("src/s")
-        .and_then(|n| n.parse::<usize>().ok())
-    else {
-        return Err("no deleted unit or runner-only test read it".to_owned());
-    };
-    if model
-        .sources
-        .values()
-        .any(|listed| listed.contains(&source))
-    {
-        return Err("a live unit lists that source now".to_owned());
-    }
-    let deleted_listed = model.deleted.iter().any(|id| {
-        model
-            .listed
-            .get(id)
-            .is_some_and(|listed| listed.contains(&source))
-    });
-    let runner_listed = model
-        .runner_listed
-        .values()
-        .any(|listed| listed.contains(&source));
-    if deleted_listed || runner_listed || model.full.contains(&source) {
-        return Ok(());
-    }
-    Err("no deleted unit listed it, and the last full pass did not list it".to_owned())
+/// The residue reason the subject printed on its full run, in the engine's words: the unknown residue, or a named one
+/// with its count (spec 3.8).
+fn residue_reason(text: &str) -> Option<String> {
+    text.lines().find_map(|line| {
+        if line.contains(UNKNOWN_RESIDUE) {
+            return Some(UNKNOWN_RESIDUE.to_owned());
+        }
+        let start = line.find(NAMED_RESIDUE)?;
+        let end = line[start..].find(NAMED_RESIDUE_END)? + start + NAMED_RESIDUE_END.len();
+        Some(line[start..end].to_owned())
+    })
 }
 
-fn run_model(seed: u64, steps: usize) {
+fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
     let s = Suite::new();
     let mut rng = Rng::new(seed);
     let mut model = Model::start(&s, &mut rng);
@@ -1045,11 +958,9 @@ fn run_model(seed: u64, steps: usize) {
         "seed {seed}: the cold run failed: {}",
         stderr(&cold)
     );
-    model.full = model.listing_now();
-    model.readers_full = model.readers_now();
     let mut passing = true;
-    // Set by a refused no-op whose full form ran: the next step, when it is a no-op, must skip.
-    let mut owed = false;
+    // Set by a no-op whose exempt full run ran. Until the next step that is not a no-op, every no-op must skip.
+    let mut exempted = false;
     let mut operations: Vec<String> = Vec::new();
     for step in 1..=steps {
         let count = if rng.below(10) < 3 { 2 } else { 1 };
@@ -1059,18 +970,18 @@ fn run_model(seed: u64, steps: usize) {
             model.apply(&s, &mut rng, op);
             ops.push(op);
         }
-        model.note_losses();
-        let lost = model.lost;
         let noop = ops.iter().all(|op| matches!(op, Op::Noop));
+        if !noop {
+            exempted = false;
+        }
         operations.push(format!("step {step}: {ops:?}"));
         let roster = model.roster();
         // The residue the engine stored before this step's run: the decision that the run makes reads it.
         let stored = if noop && passing {
-            stored_residue(&s)
+            stored_residue_count(&s)
         } else {
             None
         };
-        let owed_now = std::mem::take(&mut owed);
         let runner_new = model
             .runners
             .iter()
@@ -1104,90 +1015,51 @@ fn run_model(seed: u64, steps: usize) {
             assert!(roster.contains(launch), "a non-unit argument: {}", report());
         }
         if noop && passing {
-            match &stored {
-                _ if owed_now => assert!(
+            tally.post_noops += 1;
+            if exempted {
+                assert!(
                     launches.is_empty(),
-                    "a no-op right after a full run must skip: {}",
+                    "a no-op right after an exempt full run must skip: {}",
                     report()
-                ),
-                None if !runner_new && !lost => assert!(
-                    launches.is_empty(),
-                    "a no-op after a passing run launched: {}",
+                );
+            } else if launches.is_empty() {
+                assert!(
+                    !runner_new || stored.is_some(),
+                    "a no-op skipped a runner-only test added since the last full pass: {}",
                     report()
-                ),
-                // M1 exemption (PR 86 review round 1): a unit stopped reading a file since the last full run, so the residue
-                // is unknown (spec 3.8, item 1). The full form may run once; the no-op after it must skip.
-                None if !runner_new => {
-                    if !launches.is_empty() {
-                        assert_eq!(
-                            launches,
-                            [""],
-                            "a refused no-op must run the full form once: {}",
+                );
+            } else {
+                assert_eq!(
+                    launches,
+                    [""],
+                    "a refused no-op must run the full form once: {}",
+                    report()
+                );
+                assert_eq!(subject_code, code(&oracle), "{}", report());
+                let text = stderr(&subject);
+                if runner_new && stored.is_none() {
+                    // A runner-only test added since the last full pass changes the listing of `tests`, so the model
+                    // requires this one full run. It is not an exemption.
+                    assert!(
+                        text.contains("tests changed"),
+                        "a runner-only test added since the last full pass must change the listing: {}",
+                        report()
+                    );
+                } else {
+                    let reason = residue_reason(&text).unwrap_or_else(|| {
+                        panic!(
+                            "a no-op after a passing run launched without a residue reason: {}",
                             report()
-                        );
-                        assert!(
-                            stderr(&subject)
-                                .contains("the full command has not been matched to its units yet"),
-                            "{}",
-                            report()
-                        );
-                        println!(
-                            "M1 exemption: seed {seed}, step {step}: a unit stopped reading a file since the last full run; the full form runs once"
-                        );
-                        owed = true;
-                    }
+                        )
+                    });
+                    println!("M1 exemption: seed {seed}, step {step}: {reason}");
+                    tally.exemptions += 1;
                 }
-                // A refused no-op may run the full form once. So may a no-op after a runner-only test was added since the
-                // last full pass: its name is no unit, so the listing of `tests` no longer matches the whole proof's.
-                _ => {
-                    if launches.is_empty() {
-                        assert!(
-                            stored.is_some(),
-                            "a no-op skipped a runner-only test added since the last full pass: {}",
-                            report()
-                        );
-                    } else {
-                        assert_eq!(
-                            launches,
-                            [""],
-                            "a refused no-op must run the full form once: {}",
-                            report()
-                        );
-                        match &stored {
-                            Some((count, paths)) => {
-                                assert!(
-                                    stderr(&subject).contains("the full command reads "),
-                                    "{}",
-                                    report()
-                                );
-                                for path in paths {
-                                    if let Err(why) = residue_owner(&model, path) {
-                                        panic!(
-                                            "the residue of {count} files names {path}, and {why}: {}",
-                                            report()
-                                        );
-                                    }
-                                }
-                                println!(
-                                    "M1 exemption: seed {seed}, step {step}: a residue of {count} files; the full form runs once"
-                                );
-                            }
-                            None => assert!(
-                                stderr(&subject).contains("tests changed"),
-                                "a runner-only test added since the last full pass must change the listing: {}",
-                                report()
-                            ),
-                        }
-                        owed = true;
-                    }
-                }
+                exempted = true;
             }
         }
         if subject_code == 0 && launches == [""] {
-            model.full = model.listing_now();
             model.runners_at_full = model.runners.iter().copied().collect();
-            model.readers_full = model.readers_now();
-            model.lost = false;
         }
         passing = subject_code == 0;
     }
