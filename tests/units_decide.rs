@@ -1040,9 +1040,10 @@ fn explain_of_a_disabled_suite_prints_what_the_switch_off_prints() {
     assert_eq!(code(&on), code(&off));
 }
 
-/// E9 (spec 3.12): explain before any unit proof, and while a pass is due, prints what the switch-off path prints,
-/// apart from its last line. That line says what a passing full run would launch, and only the switch-on explain
-/// prints it, so the comparison drops it and the test checks it separately.
+/// E9 (spec 3.12): explain before any unit proof, and while a pass is due, prints the switch-off lines apart from its
+/// decision and its last line. With the switch on, E9 is the full command, so the decision line differs by design: the
+/// switch-off explain names the attribution pass that the switch-on explain no longer runs. The last line says what a
+/// passing full run would launch, and only the switch-on explain prints it.
 #[test]
 fn explain_before_any_unit_proof_prints_what_the_switch_off_prints() {
     let s = Suite::new();
@@ -1058,10 +1059,21 @@ fn explain_before_any_unit_proof_prints_what_the_switch_off_prints() {
     let off = aged(&explain_switch(&s, &[], false));
     let on = aged(&explain_switch(&s, &[], true));
     assert_eq!(on.lines().last(), Some(COMPLETION_LINE), "{on}");
+    assert!(on.contains("stoop: would run full "), "{on}");
+    assert!(
+        off.contains("stoop: would run an attribution pass: 3 launches"),
+        "{off}"
+    );
+    let rest = |text: &str| -> String {
+        text.lines()
+            .filter(|line| !line.starts_with("stoop: would run"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
     assert_eq!(
-        without_completion(&on),
-        off,
-        "E9 prints what the switch off prints"
+        rest(&without_completion(&on)),
+        rest(&off),
+        "apart from the decision, the switch-on explain prints what the switch-off explain prints"
     );
 }
 
