@@ -314,8 +314,11 @@ fn listings(
 fn no_verdict_path(out: &std::process::Output) -> Option<String> {
     stderr(out).lines().find_map(|line| {
         let rest = line.strip_prefix("stoop: this run has no verdict (exit 125): ")?;
-        let named = rest.strip_suffix(", and no unit's new proof reads it")?;
-        named.strip_suffix(" changed").map(str::to_owned)
+        let (named, _) = rest.split_once(", and no unit's new proof reads it")?;
+        named
+            .strip_suffix(" changed")
+            .or_else(|| named.strip_suffix(" appeared"))
+            .map(str::to_owned)
     })
 }
 

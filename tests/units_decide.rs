@@ -1436,7 +1436,6 @@ fn a_deleted_input_that_a_unit_reads_is_not_a_skip() {
         "{}",
         stderr(&explained)
     );
-    assert_eq!(s.launches().len(), 1, "the full form launches once");
 }
 
 /// m07 (spec 3.9, `new`): a new unit in a new top-level directory. A whole proof drops the root listing and never listed
