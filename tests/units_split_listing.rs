@@ -424,6 +424,10 @@ fn a_failing_excusing_unit_keeps_its_old_proof_until_a_lost_read_is_detected() {
 #[test]
 fn a_kill_after_a_stat_only_replacement_leaves_the_residue_unknown() {
     let s = review_suite();
+    // The cold run's residue must name nothing: `c` reads the runner-only test's file, `a` stats its flag, and `c`'s own
+    // flag makes `c` run grep, which the full command reads too.
+    s.write("tests/c.flag", "ok\n");
+    s.write("tests/c.t", "src/c.src\ntests/z.u\n");
     s.write("tests/z.u", "src/c.src\n");
     s.write("tests/z.flag", "ok\n");
     let env = [
