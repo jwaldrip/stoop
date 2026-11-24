@@ -1074,23 +1074,21 @@ pub(crate) fn learn_line(
         return None;
     }
     let judged = Judged::new(cx, pending, &[], max_age);
-    let (lacking, trigger) = match bundle::view(store, pending, key) {
-        None => (pending.units().len(), true),
+    // A changed run records its whole proof, which leaves the residue unknown unless the bundle already holds a known
+    // residue for that same proof (`record`, PR 86 review round 2). Completion then learns each unit without a valid
+    // version, whatever the residue was before the run. Explain cannot tell the same-proof case before the run, so it
+    // names those units here.
+    let lacking = match bundle::view(store, pending, key) {
+        None => pending.units().len(),
         Some(view) => {
             if view.disabled.is_some() {
                 return None;
             }
             let current = Current::of(cx.root, &checked(&judged, &view));
-            let lacking = analyse(&judged, &view, &current).len();
-            let unknown = pending
-                .units()
-                .iter()
-                .any(|unit| view.units.get(unit).is_none_or(Vec::is_empty));
-            let trigger = unknown || view.residue.as_ref().is_none_or(|(count, _)| *count > 0);
-            (lacking, trigger)
+            analyse(&judged, &view, &current).len()
         }
     };
-    (trigger && lacking > 0).then(|| {
+    (lacking > 0).then(|| {
         format!(
             "stoop: if the full command passes, would launch {lacking} units without a current proof, one launch each"
         )
