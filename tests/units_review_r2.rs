@@ -998,3 +998,249 @@ fn r2_e3_flag_readers_model() {
         failures.first().cloned().unwrap_or_default()
     );
 }
+
+// Independent delta-review probes. The runner is a disposable fixture in each test.
+fn r3_spec_runner(s: &Suite, body: &str) {
+    s.executable("t", body);
+    learned(s, &TU);
+    assert_eq!(known(s), Some(0), "{}", residue(s));
+}
+
+#[test]
+fn r3_retry_after_a_stat_only_no_verdict_cannot_be_a_skip() {
+    let s = zsuite();
+    let fixture = include_str!("fixtures/hook/t");
+    let old = "cat \"$ROOT/$line\"";
+    assert_eq!(fixture.matches(old).count(), 1);
+    let body = fixture.replace(old, "case $line in\nstat:*) test -e \"$ROOT/${line#stat:}\" ;;\n*) cat \"$ROOT/$line\" ;;\nesac");
+    r3_spec_runner(&s, &body);
+    s.write("tests/c.t", "src/c.src\ntests/z.u\nstat:tests/z.flag\n");
+    s.write("tests/z.flag", "fail\n");
+    let (_, first, launches, oracle) = judge("r3-stat-first", &s, &TU, true);
+    assert_eq!(oracle, 1);
+    assert_eq!(launches, ["tests/c.t"]);
+    no_verdict_names(&first, "tests/z.flag");
+    let facts = bundle(&s);
+    eprintln!("r3-stat new inputs for c: {:?}", stored_reads(&facts, &["tests/c.t".to_owned()]));
+    for input in facts["table"].as_array().unwrap() {
+        if input["path"] == "tests/z.flag" {
+            eprintln!("r3-stat stored identity: {input}");
+        }
+    }
+    let (_, retry, _, oracle) = judge("r3-stat-retry", &s, &TU, true);
+    same_verdict("r3-stat-retry", &retry, oracle);
+}
+
+#[test]
+fn r3_retry_after_an_actual_lost_read_cannot_be_a_skip() {
+    let s = zlearned();
+    s.write("tests/c.t", "src/c.src\ntests/z.u\n");
+    s.write("tests/z.flag", "fail\n");
+    let (_, first, launches, oracle) = judge("r3-drop-first", &s, &TU, true);
+    assert_eq!(oracle, 1);
+    assert_eq!(launches, ["tests/c.t"]);
+    no_verdict_names(&first, "tests/z.flag");
+    assert_eq!(known(&s), None, "{}", residue(&s));
+    let (_, retry, launches, oracle) = judge("r3-drop-retry", &s, &TU, true);
+    same_verdict("r3-drop-retry", &retry, oracle);
+    assert_eq!(launches, [""]);
+}
+
+#[test]
+fn r3_removing_the_file_and_its_last_reader_cannot_pass() {
+    let s = zsuite();
+    let fixture = include_str!("fixtures/hook/t");
+    let anchor = "if [ -f \"$flag\" ] && grep -q fail \"$flag\"; then";
+    assert_eq!(fixture.matches(anchor).count(), 1);
+    let body = fixture.replace(anchor, "if { [ \"$1\" = tests/z.u ] && [ ! -f \"$flag\" ]; } || { [ -f \"$flag\" ] && grep -q fail \"$flag\"; }; then");
+    r3_spec_runner(&s, &body);
+    s.write("tests/c.t", "src/c.src\ntests/z.u\n");
+    s.remove("tests/z.flag");
+    let (_, run, _, oracle) = judge("r3-file-removal", &s, &TU, true);
+    assert_eq!(oracle, 1);
+    same_verdict("r3-file-removal", &run, oracle);
+}
+
+#[test]
+fn r3_off_record_then_on_checks_the_dropped_content() {
+    let s = zlearned();
+    s.write("tests/c.t", "src/c.src\n");
+    s.write("setup.src", "setup changed\n");
+    s.clear_log();
+    success(&s.hook(&TU));
+    assert_eq!(launched(&s), [""]);
+    assert_eq!(residue(&s)["state"], "provisional");
+    assert_eq!(known(&s), Some(0));
+    s.write("tests/z.flag", "fail\n");
+    let (_, run, _, oracle) = judge("r3-off-on-stale", &s, &TU, true);
+    assert_eq!(oracle, 1);
+    same_verdict("r3-off-on-stale", &run, oracle);
+    no_verdict_names(&run, "tests/z.flag");
+    let (_, retry, launches, oracle) = judge("r3-off-on-retry", &s, &TU, true);
+    same_verdict("r3-off-on-retry", &retry, oracle);
+    assert_eq!(launches, [""]);
+}
+
+#[test]
+fn r3_switch_on_after_off_full_with_no_unit_proofs() {
+    let s = zsuite();
+    success(&s.hook(&TU));
+    assert!(bundle(&s)["units"].as_object().unwrap().is_empty());
+    s.write("tests/z.flag", "fail\n");
+    let (_, run, launches, oracle) = judge("r3-off-on-e9", &s, &TU, true);
+    assert_eq!(oracle, 1);
+    assert_eq!(code(&run), 1);
+    assert_eq!(launches, [""]);
+    s.write("tests/z.flag", "ok\n");
+    s.write("setup.src", "setup changed\n");
+    let (_, learned, launches, oracle) = judge("r3-off-on-learn", &s, &TU, true);
+    same_verdict("r3-off-on-learn", &learned, oracle);
+    assert_eq!(launches, ["", "tests/a.t", "tests/b.t", "tests/c.t"]);
+    assert_eq!(residue(&s)["state"], "confirmed");
+}
+
+#[test]
+fn r3_completion_blocked_by_ci_lock_or_read_only_store_fails_safe() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::PermissionsExt;
+
+    for mode in ["ci", "busy", "read-only"] {
+        let s = zlearned();
+        let path = s.bundle_path().unwrap();
+        let parent = path.parent().unwrap();
+        let before = s.bundle_bytes();
+        s.write("tests/c.t", "src/c.src\n");
+        s.write("setup.src", "setup changed\n");
+        let lock = (mode == "busy").then(|| {
+            let lock = File::open(path.with_extension("lock")).unwrap();
+            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) }, 0);
+            lock
+        });
+        let env = if mode == "ci" { with(&TU, &[("CI", "1")]) } else { TU.to_vec() };
+        if mode == "read-only" {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+        s.clear_log();
+        let first = split(&s, &env);
+        if mode == "read-only" {
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        drop(lock);
+        success(&first);
+        assert_eq!(launched(&s), [""], "{mode}: {}", stderr(&first));
+        assert!(stderr(&first).contains("stoop: recorded "), "{mode}: {}", stderr(&first));
+        assert!(!stderr(&first).contains("busy"), "{mode}: {}", stderr(&first));
+        if mode == "ci" {
+            assert_eq!(known(&s), None, "{mode}: {}", residue(&s));
+        } else {
+            assert_eq!(s.bundle_bytes(), before, "{mode}: suite bundle changed");
+        }
+        s.write("tests/z.flag", "fail\n");
+        let (_, retry, launches, oracle) = judge(mode, &s, &env, true);
+        assert_eq!(oracle, 1, "{mode}");
+        assert_eq!(code(&retry), 1, "{mode}: {}", stderr(&retry));
+        assert_eq!(launches, [""], "{mode}: {}", stderr(&retry));
+    }
+}
+
+#[test]
+fn r3_killed_completion_leaves_the_new_whole_proof_unmatched() {
+    let s = zlearned();
+    let whole = bundle(&s)["whole"].clone();
+    s.write("tests/c.t", "src/c.src\n");
+    s.write("setup.src", "setup changed\n");
+    let fifo = s.fifo();
+    let env = with(&TU, &[("T_FIFO", fifo.to_str().unwrap()), ("T_FIFO_AT", "tests/c.t")]);
+    let mut command = s.stoop(&s.root);
+    command.args(["run", "--root"]).arg(&s.root).args(["--", "./t", HOOK]);
+    command.env(SPLIT.0, SPLIT.1).envs(env.iter().copied());
+    command.stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null());
+    let mut child = spawning(|| command.spawn()).unwrap();
+    release(meet(&fifo)); // full form
+    let writer = meet(&fifo); // c in completion, after the whole proof is saved
+    child.kill().unwrap();
+    assert!(!child.wait().unwrap().success());
+    drop(writer);
+    assert_ne!(bundle(&s)["whole"], whole);
+    assert_eq!(known(&s), None, "{}", residue(&s));
+    assert!(stored_reads(&bundle(&s), &["tests/c.t".to_owned()]).contains(&"tests/z.flag".to_owned()));
+    s.write("tests/z.flag", "fail\n");
+    let (_, retry, launches, oracle) = judge("r3-sigkill", &s, &TU, true);
+    assert_eq!(oracle, 1);
+    assert_eq!(code(&retry), 1, "{}", stderr(&retry));
+    assert_eq!(launches, [""]);
+}
+
+fn r3_control_run(s: &Suite, binary: &Path) -> Output {
+    let mut command = std::process::Command::new(binary);
+    command.current_dir(&s.root).stdin(std::process::Stdio::null()).env_clear();
+    command.env("PATH", "/usr/bin:/bin").env("HOME", &s.outside).env("LOG", &s.log);
+    command.env("STOOP_LEARN_VOLATILE", "0").env(SPLIT.0, SPLIT.1).envs(TU);
+    command.args(["run", "--root"]).arg(&s.root).args(["--", "./t", HOOK]);
+    s.clear_log();
+    spawning(|| command.output()).unwrap()
+}
+
+/// The same warmed state on each binary. Start with a measured, non-empty residue. A later passing full run is
+/// what learns the newly added cross-read on the PR, while the merge base still has the non-empty residue.
+fn r3_control_case(binary: &Path, replace_with_stat: bool) -> ((i32, i32), (i32, i32)) {
+    let s = zsuite();
+    let fixture = include_str!("fixtures/hook/t");
+    let stat_anchor = "cat \"$ROOT/$line\"";
+    let missing_anchor = "if [ -f \"$flag\" ] && grep -q fail \"$flag\"; then";
+    assert_eq!(fixture.matches(stat_anchor).count(), 1);
+    assert_eq!(fixture.matches(missing_anchor).count(), 1);
+    let fixture = fixture
+        .replace(stat_anchor, "case $line in\nstat:*) test -e \"$ROOT/${line#stat:}\" ;;\n*) cat \"$ROOT/$line\" ;;\nesac")
+        .replace(missing_anchor, "if { [ \"$1\" = tests/z.u ] && [ ! -f \"$flag\" ]; } || { [ -f \"$flag\" ] && grep -q fail \"$flag\"; }; then");
+    s.executable("t", &fixture);
+    s.write("tests/c.t", "src/c.src\ntests/z.u\n");
+    success(&r3_control_run(&s, binary));
+    edit(&s, 2);
+    let warm = r3_control_run(&s, binary);
+    success(&warm);
+    assert!(known(&s).is_some_and(|count| count > 0), "{}", residue(&s));
+    s.write("tests/c.t", "src/c.src\ntests/z.u\ntests/z.flag\n");
+    s.write("setup.src", "force a changed full command\n");
+    let full = r3_control_run(&s, binary);
+    success(&full);
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
+    eprintln!("R3 CONTROL after full: binary={binary:?} stat={replace_with_stat} launches={:?} residue={}", launched(&s), residue(&s));
+    if replace_with_stat {
+        s.write("tests/c.t", "src/c.src\ntests/z.u\nstat:tests/z.flag\n");
+        s.write("tests/z.flag", "fail\n");
+    } else {
+        s.write("tests/c.t", "src/c.src\ntests/z.u\n");
+        s.remove("tests/z.flag");
+    }
+    let mut results = [(0, 0); 2];
+    for (attempt, result) in results.iter_mut().enumerate() {
+        let run = r3_control_run(&s, binary);
+        let launches = launched(&s);
+        let oracle = direct(&s, &TU);
+        assert_eq!(oracle, 1);
+        if code(&run) == 125 {
+            no_verdict_names(&run, "tests/z.flag");
+        }
+        *result = (code(&run), oracle);
+        eprintln!("R3 CONTROL verdict: binary={binary:?} stat={replace_with_stat} try={attempt} exit={} direct={oracle} launches={launches:?} residue={}\n{}", code(&run), residue(&s), stderr(&run));
+    }
+    (results[0], results[1])
+}
+
+#[test]
+#[ignore = "requires STOOP_REVIEW_BASE_BIN"]
+fn r3_merge_base_control_for_both_wrong_verdicts() {
+    let base = std::env::var_os("STOOP_REVIEW_BASE_BIN").expect("set the merge-base binary");
+    let base = Path::new(&base);
+    let head = Path::new(env!("CARGO_BIN_EXE_stoop"));
+    let mut wrong = Vec::new();
+    for replace_with_stat in [false, true] {
+        assert_eq!(r3_control_case(base, replace_with_stat), ((1, 1), (1, 1)));
+        let result = r3_control_case(head, replace_with_stat);
+        if result.0.0 == 0 || result.1.0 == 0 {
+            wrong.push((replace_with_stat, result));
+        }
+    }
+    assert!(wrong.is_empty(), "R3 REGRESSION: head false pass where the merge base fails correctly: {wrong:?}");
+}
