@@ -241,8 +241,38 @@ impl World {
     }
 }
 
-/// Runs one seeded sequence. Every step's subject verdict must equal the runner's, its status is never 2 or 125, and
-/// every launched argument is a unit of the roster.
+/// The sources that each unit lists, one per line, for the units whose files exist now. The model reads them before and
+/// after each step, so its own history shows which unit stopped reading a path (PR 86 review round 2).
+fn listings(
+    s: &Suite,
+    units: &[String],
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    units
+        .iter()
+        .filter_map(|unit| {
+            let text = std::fs::read_to_string(s.path(unit)).ok()?;
+            let lines: std::collections::BTreeSet<String> = text
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect();
+            Some((unit.clone(), lines))
+        })
+        .collect()
+}
+
+/// The path that a designed no-verdict line names, when the run printed exactly that line (PR 86 review round 2).
+fn no_verdict_path(out: &std::process::Output) -> Option<String> {
+    stderr(out).lines().find_map(|line| {
+        let rest = line.strip_prefix("stoop: this run has no verdict (exit 125): ")?;
+        let named = rest.strip_suffix(", and no unit's new proof reads it")?;
+        named.strip_suffix(" changed").map(str::to_owned)
+    })
+}
+
+/// Runs one seeded sequence. Every step's subject verdict must equal the runner's, and its status is never 2. A status of
+/// 125 is accepted only as the designed no-verdict: the exact line, and an affected unit that stopped reading the path in
+/// that step (PR 86 review round 2). Every launched argument is a unit of the roster.
 fn run_world(seed: u64, steps: usize, runner_only: bool) -> Result<(), String> {
     let s = Suite::new();
     let mut rng = Rng::new(seed);
@@ -260,7 +290,9 @@ fn run_world(seed: u64, steps: usize, runner_only: bool) -> Result<(), String> {
         ));
     }
     let mut log: Vec<String> = Vec::new();
+    let mut no_verdicts = 0usize;
     for step in 1..=steps {
+        let before = listings(&s, &world.units);
         let count = 1 + rng.below(3);
         let mut ops = Vec::new();
         for _ in 0..count {
@@ -284,10 +316,31 @@ fn run_world(seed: u64, steps: usize, runner_only: bool) -> Result<(), String> {
             )
         };
         let subject_code = code(&subject);
-        if subject_code == 2 || subject_code == 125 {
-            return Err(report("a status of 2 or 125"));
+        if subject_code == 2 {
+            return Err(report("a status of 2"));
         }
-        if (subject_code == 0) != (code(&oracle) == 0) {
+        if subject_code == 125 {
+            // The designed no-verdict (PR 86 review round 2): an affected unit stopped reading a changed source, and no
+            // new proof reads it. The line must be exact, and this step's own listings must show that stop.
+            let Some(path) = no_verdict_path(&subject) else {
+                return Err(report("a status of 125 without the no-verdict line"));
+            };
+            let after = listings(&s, &world.units);
+            let stopped = world.units.iter().any(|unit| {
+                before.get(unit).is_some_and(|old| old.contains(&path))
+                    && after.get(unit).is_some_and(|new| !new.contains(&path))
+            });
+            if !stopped {
+                return Err(report(&format!(
+                    "the no-verdict line names {path}, which no affected unit stopped reading"
+                )));
+            }
+            no_verdicts += 1;
+            println!("NO VERDICT ACCEPTED (x02 shape): seed {seed}, step {step}, {path}");
+            if no_verdicts * 3 > steps {
+                return Err(report("too many no-verdicts in one sequence"));
+            }
+        } else if (subject_code == 0) != (code(&oracle) == 0) {
             return Err(report("WRONG VERDICT"));
         }
         if let Some(bad) = launches
