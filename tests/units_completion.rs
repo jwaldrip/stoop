@@ -339,3 +339,22 @@ fn c10_a_top_level_unit_added_after_a_passing_full_run_is_skipped_by_the_documen
         );
     }
 }
+
+/// C11: under `STOOP_OFF` the run is untraced, so explain predicts no learning. The line that a switch-on explain prints
+/// for a learning run is absent, where the same explain without `STOOP_OFF` prints it.
+#[test]
+fn c11_explain_under_stoop_off_predicts_no_learning() {
+    let s = Suite::new();
+    let traced = explain(&s, &[]);
+    assert!(
+        stderr(&traced).contains(COMPLETION_LINE),
+        "{}",
+        stderr(&traced)
+    );
+    let untraced = explain(&s, &[("STOOP_OFF", "1")]);
+    assert!(
+        !stderr(&untraced).contains("would launch"),
+        "{}",
+        stderr(&untraced)
+    );
+}

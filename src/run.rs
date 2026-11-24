@@ -1526,9 +1526,17 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     // Explain adds the line of a learning run after a full command (spec 3.12, W7-3): the units that the passing run
     // would learn. It comes last, and nothing else is predicted for it.
     let records = units_refusal(&cx, config_invalid, independent_false).is_none();
-    if explain && split && !o.quiet && runs_full && records && !env_switch("STOOP_OFF", true) {
+    if explain && split && !o.quiet && runs_full && records {
         if let Some(line) = roster.and_then(|pending| {
-            units::engine::learn_line(&cx, &config, pending, &volatile_store, &key, max_age)
+            units::engine::learn_line(
+                &cx,
+                &config,
+                pending,
+                &lookup,
+                &volatile_store,
+                &key,
+                max_age,
+            )
         }) {
             suite_lines.get_or_insert_with(Vec::new).push(line);
         }

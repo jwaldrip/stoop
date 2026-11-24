@@ -975,11 +975,18 @@ pub(crate) fn learn_line(
     cx: &RunCx<'_>,
     config: &Config,
     pending: &Pending,
+    lookup: &Lookup,
     store: &Path,
     key: &str,
     max_age: u64,
 ) -> Option<String> {
     let hook = cx.hook.as_ref()?;
+    // An untraced run learns nothing. `screen` names that refusal first, so this reads no environment variable itself.
+    if let Err(attribution::Refusal::Off) =
+        attribution::screen(cx, hook, config, lookup, Ok(pending))
+    {
+        return None;
+    }
     attribution::roster_screen(cx, hook, config, pending).ok()?;
     if !bundle::writable(store, pending.suite()) {
         return None;
