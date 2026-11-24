@@ -736,6 +736,7 @@ impl World {
                 let body = World::sources(rng);
                 s.write(path, &body);
                 self.runners.push(path.clone());
+                s.write(&flag_of(path), "ok\n");
             }
             Step::RunnerDelete(path) => {
                 s.remove(path);
@@ -867,6 +868,7 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
         let runner = world.fresh("u");
         let body = World::sources(&mut rng);
         s.write(&runner, &body);
+        s.write(&flag_of(&runner), "ok\n");
         world.runners.push(runner);
     }
     for _ in 0..5 {

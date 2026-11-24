@@ -1426,17 +1426,17 @@ fn a_deleted_input_that_a_unit_reads_is_not_a_skip() {
     let ran = split(&s, &[]);
     assert_eq!(
         decision(&explained),
-        "subset",
+        "full",
         "explain: {}",
         stderr(&explained)
     );
-    assert_eq!(decision(&ran), "subset", "run: {}", stderr(&ran));
-    assert_eq!(s.launches().len(), 1, "the subset launches c alone");
+    assert_eq!(decision(&ran), "full", "run: {}", stderr(&ran));
     assert!(
-        stderr(&explained).contains("stoop: affected tests/c.t: src/c.src changed"),
+        stderr(&explained).contains("src/c.src was removed"),
         "{}",
         stderr(&explained)
     );
+    assert_eq!(s.launches().len(), 1, "the full form launches once");
 }
 
 /// m07 (spec 3.9, `new`): a new unit in a new top-level directory. A whole proof drops the root listing and never listed
