@@ -1557,7 +1557,14 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             .into_iter()
             .find(|proof| proof.digest() == *digest)
         {
-            units::bundle::record(&volatile_store, &pending, &outcome.key, digest, &proof);
+            units::bundle::record(
+                &volatile_store,
+                &pending,
+                &outcome.key,
+                digest,
+                &proof,
+                split,
+            );
             // Completion (spec 3.10, W7-3): a passing, recorded first-run form learns the unit proofs that it leaves
             // without a valid version, after its verdict is settled.
             if split {
