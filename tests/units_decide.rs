@@ -373,6 +373,9 @@ fn t11_a_unit_that_leaves_the_roster_while_its_file_stays_is_named() {
     success(&passed(&s, &branch, &[SPLIT]));
     git(&s, &["rm", "--cached", "-q", "tests/c.t"]);
     s.write(".gitignore", "tests/c.t\n");
+    // The whole proof still matches, so the legacy lookup would hit. A tracked input changes in the same step, so the
+    // engine judges the roster and names the unit that left it.
+    edit(&s, 3);
     s.clear_log();
     let out = split(&s, &branch);
     success(&out);
@@ -393,6 +396,9 @@ fn t12_a_disabled_suite_takes_the_full_form_and_names_it() {
     // The pass disables the suite: its first unit reads another unit's file (spec 3.3, check b).
     passed(&s, &env, &[SPLIT]);
     assert_eq!(state(&s)["status"], "disabled", "{}", state(&s));
+    // The whole proof still matches, so the legacy lookup would hit. A tracked input changes in the same step, so the
+    // engine judges the disabled suite at step E8.
+    edit(&s, 3);
     s.clear_log();
     let out = split(&s, &env);
     assert_eq!(decision(&out), "full", "{}", stderr(&out));
@@ -571,6 +577,9 @@ fn an_expired_unit_proof_is_affected() {
         }
     }
     fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+    // The whole proof still matches, so an expired proof alone is a legacy hit. A tracked input changes in the same step.
+    // Every unit is then affected (by its age, and a and b also by the input), so the run is the attribution pass.
+    edit(&s, 3);
     let explained = explain(&s, &[]);
     assert!(
         stderr(&explained).contains("stoop: affected tests/a.t: proof expired"),
@@ -1415,13 +1424,16 @@ fn a_deleted_input_that_a_unit_reads_is_not_a_skip() {
 }
 
 /// m07 (spec 3.9, `new`): a new unit in a new top-level directory. A whole proof drops the root listing and never listed
-/// the new directory, so only the new-unit reason keeps the run from a skip. The full command runs the unit, and it fails.
+/// the new directory, so the legacy lookup hits unless a tracked input changes. This test changes one in the same step,
+/// so the engine judges the new unit, which keeps the run from a skip. The full command runs the unit, and it fails.
 #[test]
 fn a_new_unit_in_a_new_top_level_directory_is_not_a_skip() {
     let s = Suite::new();
     success(&passed(&s, &[], &[SPLIT]));
     s.write("extra/z.t", "src/c.src\n");
     s.write("extra/z.flag", "fail\n");
+    // As above, a new top-level directory alone is a legacy hit. A tracked input changes in the same step.
+    edit(&s, 3);
     let direct = s.direct(&s.root, &[], &[]);
     assert_eq!(code(&direct), 1, "{}", stderr(&direct));
     let explained = explain(&s, &[]);
@@ -1436,13 +1448,17 @@ fn a_new_unit_in_a_new_top_level_directory_is_not_a_skip() {
 }
 
 /// m07, the root variant: a new unit at the top level. The whole proof has no root listing that shows the new name, so
-/// only the new-unit reason keeps the run from a skip.
+/// the legacy lookup hits unless a tracked input changes. This test changes one in the same step, so the engine judges
+/// the new unit, and that keeps the run from a skip.
 #[test]
 fn a_new_unit_at_the_top_level_is_not_a_skip() {
     let s = Suite::new();
     success(&passed(&s, &[], &[SPLIT]));
     s.write("z.t", "src/c.src\n");
     s.write("z.flag", "fail\n");
+    // A top-level name added alone is a legacy hit, since the whole proof does not list the root. A tracked input
+    // changes in the same step, so the engine judges the new unit.
+    edit(&s, 3);
     let direct = s.direct(&s.root, &[], &[]);
     assert_eq!(code(&direct), 1, "{}", stderr(&direct));
     let out = split(&s, &[]);
@@ -1477,10 +1493,15 @@ fn an_earlier_generation_bundle_is_not_a_view() {
     bundle["generation"] = Value::from(1);
     fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
     s.write("docs/readme.md", "edited\n");
+    // The docs edit alone is a legacy hit. A tracked input changes in the same step, so the bundle's generation decides:
+    // the view refuses it, and the legacy path runs the full command.
+    edit(&s, 3);
     let explained = explain(&s, &[]);
     assert_ne!(decision(&explained), "skip", "{}", stderr(&explained));
+    assert_eq!(decision(&explained), "full", "{}", stderr(&explained));
     let out = split(&s, &[]);
     assert_ne!(decision(&out), "skip", "{}", stderr(&out));
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
     assert!(
         !stderr(&out).contains("no tracked input changed"),
         "{}",
