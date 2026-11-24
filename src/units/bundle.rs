@@ -1201,6 +1201,17 @@ pub(crate) fn lost_reader(removed: &BTreeMap<String, bool>, now: &BTreeMap<Strin
     })
 }
 
+/// The paths of `removed` that no reader in `now` covers, by the rule of [`lost_reader`]. Each path is judged alone.
+fn losses(removed: &BTreeMap<String, bool>, now: &BTreeMap<String, bool>) -> Vec<String> {
+    let mut lost = Vec::new();
+    for (path, content) in removed {
+        if lost_reader(&BTreeMap::from([(path.clone(), *content)]), now) {
+            lost.push(path.clone());
+        }
+    }
+    lost
+}
+
 /// The paths of the inputs of every unit version the bundle holds: what the units' own runs read (spec 3.8).
 fn covered_paths(bundle: &SuiteBundleV1) -> BTreeSet<&str> {
     let len = bundle.table.len();
@@ -1353,6 +1364,7 @@ type Snapshot = (
     BTreeMap<String, u32>,
     Residue,
     bool,
+    BTreeSet<String>,
 );
 
 /// One attribution pass. It holds the suite lock until it is dropped, so no other stoop changes
@@ -1361,6 +1373,9 @@ pub(crate) struct Pass {
     /// Set when a version write took the last reader of a path (spec 3.8). The residue is unknown until a full run
     /// measures it again.
     residue_lost: bool,
+    /// The paths whose last content reader a write or a drop of this pass took. `settle_residue` decides whether a later
+    /// write of the pass read them again (spec 3.8, item 1).
+    lost_paths: BTreeSet<String>,
     area: Area,
     _lock: File,
     bundle: SuiteBundleV1,
@@ -1405,6 +1420,7 @@ impl Pass {
                 self.interned.clone(),
                 self.bundle.residue.clone(),
                 self.residue_lost,
+                self.lost_paths.clone(),
             )
         });
         let inputs = self.indices(inputs);
@@ -1425,15 +1441,7 @@ impl Pass {
         if self.keep {
             self.compact_table();
         }
-        if !removed.is_empty()
-            && lost_reader(
-                &removed,
-                &bundle_readers(&self.bundle.table, self.bundle.units.values().flatten()),
-            )
-        {
-            self.bundle.residue = Residue::default();
-            self.residue_lost = true;
-        }
+        self.note_losses(&removed);
         let Ok(bytes) = serde_json::to_vec(&self.bundle) else {
             self.refuse(unit, previous, mark, snapshot);
             return Stored::WriteFailed;
@@ -1505,12 +1513,13 @@ impl Pass {
         mark: usize,
         snapshot: Option<Snapshot>,
     ) {
-        if let Some((units, table, interned, residue, lost)) = snapshot {
+        if let Some((units, table, interned, residue, lost, lost_paths)) = snapshot {
             self.bundle.units = units;
             self.bundle.table = table;
             self.interned = interned;
             self.bundle.residue = residue;
             self.residue_lost = lost;
+            self.lost_paths = lost_paths;
             return;
         }
         match previous {
@@ -1541,16 +1550,40 @@ impl Pass {
             .collect();
     }
 
+    /// Notes the paths that `removed` read with content and that no version reads with content now (spec 3.8, item 1).
+    /// The residue is unknown from here until `settle_residue` finds each of them read again.
+    fn note_losses(&mut self, removed: &BTreeMap<String, bool>) {
+        if removed.is_empty() {
+            return;
+        }
+        let now = bundle_readers(&self.bundle.table, self.bundle.units.values().flatten());
+        let lost = losses(removed, &now);
+        if !lost.is_empty() {
+            self.bundle.residue = Residue::default();
+            self.residue_lost = true;
+            self.lost_paths.extend(lost);
+        }
+    }
+
     /// Drops the versions of units that left the roster, and compacts the table (spec 3.11). A pass starts with no
     /// versions, so only a kept run has any to drop. Returns whether anything changed.
     fn prune(&mut self) -> bool {
         let units = self.bundle.units.len();
         let table = self.bundle.table.len();
         let roster = &self.bundle.roster.units;
+        let dropped = bundle_readers(
+            &self.bundle.table,
+            self.bundle
+                .units
+                .iter()
+                .filter(|(unit, _)| roster.binary_search(*unit).is_err())
+                .flat_map(|(_, versions)| versions.iter()),
+        );
         self.bundle
             .units
             .retain(|unit, _| roster.binary_search(unit).is_ok());
         self.compact_table();
+        self.note_losses(&dropped);
         let changed = self.bundle.units.len() != units || self.bundle.table.len() != table;
         self.dirty |= changed;
         changed
@@ -1630,9 +1663,19 @@ impl Pass {
     /// Stores the residue of the suite's whole proof when a pass ends (spec 3.8, point i). The proof is the one of
     /// `proofs` whose digest is the bundle's `whole`. Without it, the residue stays unknown.
     pub(crate) fn settle_residue(&mut self, proofs: &[Proof], listings: &[String]) {
-        // A version write took the last reader of a path, so the residue stays unknown until a full run measures it.
+        // A write or a drop took the last reader of a path (spec 3.8, item 1). The residue stays unknown while a path that
+        // it lost has no content reader in the final versions, where a kept version counts as much as a written one.
         if self.residue_lost {
-            return;
+            let readers = bundle_readers(&self.bundle.table, self.bundle.units.values().flatten());
+            if self
+                .lost_paths
+                .iter()
+                .any(|path| readers.get(path) != Some(&true))
+            {
+                return;
+            }
+            self.lost_paths.clear();
+            self.residue_lost = false;
         }
         let Some(digest) = self.bundle.whole.clone() else {
             return;
@@ -1710,6 +1753,7 @@ fn start_with(
     bundle.residue = Residue::default();
     Start::Pass(Pass {
         residue_lost: false,
+        lost_paths: BTreeSet::new(),
         area,
         _lock: held,
         bundle,
@@ -1781,6 +1825,7 @@ pub(crate) fn keep<T, D>(
     };
     let mut pass = Pass {
         residue_lost: false,
+        lost_paths: BTreeSet::new(),
         area,
         _lock: held,
         interned: interned_of(&bundle.table),
