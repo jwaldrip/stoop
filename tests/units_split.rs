@@ -51,8 +51,9 @@ fn split(s: &Suite, env: &[(&str, &str)]) -> Output {
     s.hook(&with(&[SPLIT], env))
 }
 
-/// A cold full run, then a change to the shared source and a run under `env`. That run is the attribution pass,
-/// which launches every unit once. Returns the pass's output.
+/// A cold full run, which learns a proof for every unit (completion, spec 3.10), then a change to the shared source
+/// and a run under `env`. That run is a subset of the units that read the source. Under an `env` that makes the full
+/// form run, the full command runs and completion then relaunches those units once. Returns the run's output.
 fn passed(s: &Suite, env: &[(&str, &str)]) -> Output {
     success(&split(s, env));
     edit(s, 2);
@@ -144,17 +145,31 @@ fn hold_lock(s: &Suite) -> File {
     file
 }
 
-/// S1: a cold full run, then the first change is an attribution pass that launches every unit once.
+/// S1: a cold full run learns a proof for every unit (completion, spec 3.10), so the first change after it is a
+/// subset: the two units that read the changed source run, one launch each, under the subset header.
 #[test]
-fn s1_cold_then_the_first_change_is_a_pass() {
+fn s1_cold_run_completes_then_the_first_change_is_a_subset() {
     let s = Suite::new();
-    success(&split(&s, &[]));
+    s.clear_log();
+    let cold = split(&s, &[]);
+    success(&cold);
+    assert!(
+        stderr(&cold)
+            .contains("stoop: attribution pass after the full run: 3 units, one launch each"),
+        "{}",
+        stderr(&cold)
+    );
+    assert_eq!(launched(&s), ["", "tests/a.t", "tests/b.t", "tests/c.t"]);
     edit(&s, 2);
     s.clear_log();
     let out = split(&s, &[]);
     success(&out);
-    assert!(pass_line(&out), "{}", stderr(&out));
-    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t", "tests/c.t"]);
+    assert!(!pass_line(&out), "{}", stderr(&out));
+    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t"]);
+    assert_header(
+        &out,
+        "; run 2 (src/shared.src changed): tests/a.t, tests/b.t",
+    );
 }
 
 /// S2b: after a pass, an edit to the shared source runs `a` and then `b`, one launch each, under the subset header.
@@ -337,7 +352,8 @@ fn s10b_the_unit_variables_name_units_and_the_changed_inputs_name_the_input() {
     }
 }
 
-/// S11: `T_U` makes the full form run a `*.u` file that no unit covers, so every change is a full run.
+/// S11: `T_U` makes the full form run a `*.u` file that no unit covers, so every change is a full run. Completion
+/// then relaunches `a` and `b`, whose proofs the change made stale.
 #[test]
 fn s11_t_u_makes_every_change_a_full_run() {
     let s = Suite::new();
@@ -348,7 +364,7 @@ fn s11_t_u_makes_every_change_a_full_run() {
     let out = split(&s, &env);
     success(&out);
     assert!(full(&out), "{}", stderr(&out));
-    assert_eq!(launched(&s), [""]);
+    assert_eq!(launched(&s), ["", "tests/a.t", "tests/b.t"]);
 }
 
 /// S12: a filter that covers the `*.u` file the full form runs allows subsets, so an edit to `src/c.src` runs `c`.
@@ -370,7 +386,8 @@ fn s12_the_covering_filter_allows_subsets() {
     assert_header(&out, "; run 1 (src/c.src changed): tests/c.t");
 }
 
-/// S13: `T_LINT` makes the full form run a script that no unit covers, so every change is a full run.
+/// S13: `T_LINT` makes the full form run a script that no unit covers, so every change is a full run. Completion
+/// then relaunches `a` and `b`, whose proofs the change made stale.
 #[test]
 fn s13_t_lint_makes_every_change_a_full_run() {
     let s = Suite::new();
@@ -381,7 +398,7 @@ fn s13_t_lint_makes_every_change_a_full_run() {
     let out = split(&s, &env);
     success(&out);
     assert!(full(&out), "{}", stderr(&out));
-    assert_eq!(launched(&s), [""]);
+    assert_eq!(launched(&s), ["", "tests/a.t", "tests/b.t"]);
 }
 
 /// S15: a `{unit}` run whose unit `b` fails keeps `b` affected, so the next run launches it again.
@@ -1384,29 +1401,19 @@ fn a_unit_file_replaced_by_a_directory_holding_a_failing_unit_is_not_a_skip() {
     assert_eq!(launched(&s), [""]);
 }
 
-/// A unit deleted before it has a proof leaves reads in the whole proof that no unit can attribute (spec 3.8). The pass
-/// after the deletion measures the residue, so the next no-op is refused on it and runs the full form once, with the
-/// residue reason. That full run records the whole proof again, so the no-op after it skips.
+/// A unit deleted before it had a proof. The cold run ran under `CI`, which learns no proofs, so no unit held one.
+/// The first run after the deletion takes the full command, since no unit holds a proof, and its completion launches
+/// the units that remain, one launch each. The next run skips.
 #[test]
 fn a_unit_deleted_before_it_had_a_proof_takes_one_full_run_then_skips() {
     let s = Suite::new();
-    success(&split(&s, &[]));
+    success(&split(&s, &[("CI", "true")]));
     fs::remove_file(s.path("tests/c.t")).unwrap();
     s.clear_log();
     let pass = split(&s, &[]);
     success(&pass);
-    assert!(pass_line(&pass), "{}", stderr(&pass));
-    s.clear_log();
-    let refused = split(&s, &[]);
-    success(&refused);
-    assert!(full(&refused), "{}", stderr(&refused));
-    assert!(
-        stderr(&refused).contains("the full command reads ")
-            && stderr(&refused).contains("tests/c.t"),
-        "{}",
-        stderr(&refused)
-    );
-    assert_eq!(launched(&s), [""]);
+    assert!(full(&pass), "{}", stderr(&pass));
+    assert_eq!(launched(&s), ["", "tests/a.t", "tests/b.t"]);
     s.clear_log();
     let explained = explain(&s, &[]);
     let out = split(&s, &[]);
