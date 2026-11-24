@@ -451,6 +451,12 @@ int main(void) {
         assert_eq!(f.log(), "pytest\n");
     }
 
+    // The shim gives the tracer the child's stop before the parent's fork event. When the
+    // kernel reports the fork event first, the shim holds it, and an early resume of the
+    // child with PTRACE_CONT or PTRACE_DETACH fails this test: after CONT the shim returns
+    // the child's next event first, and after DETACH it cannot wait for the child at all.
+    // A PTRACE_SYSCALL resume is not reliably caught here, and nothing is held when the
+    // kernel reports the child's stop first.
     #[test]
     fn child_stop_before_fork_event_keeps_lineage() {
         let f = Fixture::new();
@@ -462,18 +468,40 @@ int main(void) {
         let source = r#"
 #define _GNU_SOURCE
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/ptrace.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+// Phase 0 waits for the first event. Phase 1 has returned the child's stop and holds the
+// parent's fork event. Phase 2 has finished the hold. Phase 3 is an early resume: the
+// child's next event goes first. Phase 4 has returned the held fork event.
 static pid_t held, child;
 static int held_status, phase, child_resumed;
 
+static void __attribute__((noreturn)) fail(const char *message) {
+    (void)!write(2, message, strlen(message));
+    _exit(97);
+}
+
+static void record(const char *order) {
+    const char *path = getenv("ORDER_LOG");
+    int fd = path ? open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600) : -1;
+    if (fd >= 0) {
+        (void)!write(fd, order, strlen(order));
+        close(fd);
+    }
+}
+
+// A resume of the held child before the parent's fork event is returned sets child_resumed.
+// The Rust test above catches CONT and DETACH. PTRACE_SYSCALL is flagged too, but a
+// SYSCALL resume is not reliably caught by that test.
 long ptrace(enum __ptrace_request request, ...) {
     static long (*real_ptrace)(enum __ptrace_request, ...);
     if (!real_ptrace) real_ptrace = dlsym(RTLD_NEXT, "ptrace");
@@ -483,7 +511,8 @@ long ptrace(enum __ptrace_request request, ...) {
     void *addr = va_arg(args, void *);
     void *data = va_arg(args, void *);
     va_end(args);
-    if ((request == PTRACE_CONT || request == PTRACE_SYSCALL) && pid == child)
+    if (phase == 1 && pid == child &&
+        (request == PTRACE_CONT || request == PTRACE_SYSCALL || request == PTRACE_DETACH))
         child_resumed = 1;
     return real_ptrace(request, pid, addr, data);
 }
@@ -491,12 +520,20 @@ long ptrace(enum __ptrace_request request, ...) {
 pid_t waitpid(pid_t pid, int *status, int options) {
     static pid_t (*real_waitpid)(pid_t, int *, int);
     if (!real_waitpid) real_waitpid = dlsym(RTLD_NEXT, "waitpid");
-    if (pid == -1 && phase == 2) {
+    if (pid == -1 && phase == 1) {
         if (child_resumed) {
+            // The tracer resumed the child before it saw the parent's fork event, so the
+            // child's next event goes first. Bounded, so a stalled child fails loudly.
             phase = 3;
-            return real_waitpid(pid, status, options);
+            for (int i = 0; i < 5000; i++) {
+                pid_t next = real_waitpid(child, status, __WALL | WNOHANG);
+                if (next == child) return next;
+                if (next < 0 && errno != EINTR) fail("order shim: waiting for the resumed child failed\n");
+                usleep(1000);
+            }
+            fail("order shim: the resumed child produced no event\n");
         }
-        phase = 4;
+        phase = 2;
         *status = held_status;
         return held;
     }
@@ -506,24 +543,38 @@ pid_t waitpid(pid_t pid, int *status, int options) {
         return held;
     }
     pid_t result = real_waitpid(pid, status, options);
-    if (pid == -1 && phase == 0 && result > 0 && WIFSTOPPED(*status)) {
-        int event = (*status >> 16) & 255;
-        if (event == PTRACE_EVENT_FORK || event == PTRACE_EVENT_VFORK || event == PTRACE_EVENT_CLONE) {
-            held = result;
-            held_status = *status;
-            result = real_waitpid(pid, status, options);
-            if (result > 0 && WIFSTOPPED(*status) && WSTOPSIG(*status) == SIGSTOP) {
-                child = result;
-                phase = 2;
-                const char *path = getenv("ORDER_LOG");
-                int fd = path ? open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600) : -1;
-                if (fd >= 0) { write(fd, "x", 1); close(fd); }
-            } else {
-                phase = 3;
-            }
-        }
+    if (pid != -1 || phase != 0 || result <= 0 || !WIFSTOPPED(*status)) return result;
+    int event = (*status >> 16) & 255;
+    if (event == 0 && WSTOPSIG(*status) == SIGSTOP) {
+        record("child-stop-first");
+        phase = 2;
+        return result;
     }
-    return result;
+    if (event != PTRACE_EVENT_FORK && event != PTRACE_EVENT_VFORK && event != PTRACE_EVENT_CLONE) {
+        return result;
+    }
+    held = result;
+    held_status = *status;
+    unsigned long message = 0;
+    if (ptrace(PTRACE_GETEVENTMSG, held, (void *)0, &message) < 0) fail("order shim: no child pid\n");
+    child = (pid_t)message;
+    for (int i = 0; i < 5000; i++) {
+        int child_status = 0;
+        pid_t got = real_waitpid(child, &child_status, __WALL | WNOHANG);
+        if (got == child) {
+            if (!WIFSTOPPED(child_status) || WSTOPSIG(child_status) != SIGSTOP) {
+                fail("order shim: the child did not stop with SIGSTOP\n");
+            }
+            *status = child_status;
+            record("child-stop-first");
+            phase = 1;
+            return child;
+        }
+        if (got < 0 && errno != EINTR) fail("order shim: waiting for the child failed\n");
+        usleep(1000);
+    }
+    record("child-stop-timeout");
+    fail("order shim: the child's stop never arrived\n");
 }
 "#;
         let lib = compile(&f, source, "order-lib", &["-shared", "-fPIC", "-ldl"]);
@@ -535,7 +586,11 @@ pid_t waitpid(pid_t pid, int *status, int options) {
             .output()
             .unwrap();
         one_observation(&output, "stoop: observed pytest via sh (diagnostic only)");
-        assert_eq!(fs::read_to_string(f.root.join("order-log")).unwrap(), "x");
+        assert_eq!(
+            fs::read_to_string(f.root.join("order-log")).unwrap_or_default(),
+            "child-stop-first",
+            "the child's stop must reach the tracer before its parent's fork event",
+        );
         assert_eq!(f.log(), "pytest\n");
     }
 
