@@ -339,6 +339,18 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
             clean,
         );
     }
+    // A deleted input that a stored version of a roster unit reads takes the full form before any launch (PR 86 review
+    // round 3). No launch can vouch for an absence it does not read by content.
+    if let Some(path) = absent_reader_change(cx, view, proof) {
+        return verdict(
+            Decision::Full(Some(format!(
+                "{} was removed, and a unit's stored proof reads it",
+                safe(&path)
+            ))),
+            shown,
+            clean,
+        );
+    }
     // E17 and E18: the affected units launch one at a time. Units that are all affected make the attribution pass.
     let whole = affected.len() == cx.roster.len();
     let uncovered = uncovered_changes(cx, view, &current, proof);
@@ -452,22 +464,10 @@ fn uncovered_changes(
         .filter(|input| bundle::content_id(&input.id) && !input.id.starts_with("dl:"))
         .filter(|input| !kept.contains(input.path.as_str()))
         .collect();
-    // A deleted input that a stored version of a roster unit reads is not excused: that unit may stop reading it in this
-    // step, and then no launch can check the absence it leaves (PR 86 review round 3).
-    let live: BTreeSet<&str> = cx
-        .roster
-        .iter()
-        .filter_map(|unit| view.units.get(unit))
-        .flatten()
-        .flat_map(|version| version.inputs.iter())
-        .map(|&index| view.table[index as usize].path.as_str())
-        .collect();
     let fresh = Current::of(cx.root, &inputs);
     let mut paths: Vec<String> = inputs
         .iter()
-        .filter(|&&input| {
-            !fresh.holds(input) && (!fresh.absent(input) || live.contains(input.path.as_str()))
-        })
+        .filter(|&&input| !fresh.holds(input) && !fresh.absent(input))
         .map(|&input| input.path.clone())
         .collect();
     paths.sort();
@@ -520,6 +520,34 @@ fn departed_only_change(
     let mut paths: Vec<String> = inputs
         .iter()
         .filter(|input| !fresh.holds(input) && !fresh.absent(input))
+        .map(|input| input.path.clone())
+        .collect();
+    paths.sort();
+    paths.into_iter().next()
+}
+
+/// The first changed whole-proof input that is absent now, and that a stored version of a roster unit reads (PR 86
+/// review round 3). A launch does not vouch for an absence unless it reads the path by content, and a failed open is no
+/// content read. A unit that still lists the path may also stop listing it in this step. The full command decides it.
+fn absent_reader_change(cx: &Judged<'_>, view: &View, proof: &Proof) -> Option<String> {
+    let live: BTreeSet<&str> = cx
+        .roster
+        .iter()
+        .filter_map(|unit| view.units.get(unit))
+        .flatten()
+        .flat_map(|version| version.inputs.iter())
+        .map(|&index| view.table[index as usize].path.as_str())
+        .collect();
+    let inputs: Vec<&Input> = proof
+        .inputs
+        .iter()
+        .filter(|input| bundle::content_id(&input.id) && !input.id.starts_with("dl:"))
+        .filter(|input| live.contains(input.path.as_str()))
+        .collect();
+    let fresh = Current::of(cx.root, &inputs);
+    let mut paths: Vec<String> = inputs
+        .iter()
+        .filter(|input| !fresh.holds(input) && fresh.absent(input))
         .map(|input| input.path.clone())
         .collect();
     paths.sort();
