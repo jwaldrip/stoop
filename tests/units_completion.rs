@@ -249,6 +249,14 @@ fn c7_a_completion_relaunches_only_the_units_without_a_valid_proof() {
     s.write("tests/z.flag", "ok\n");
     success(&split(&s, &env));
     s.write("tests/c.t", "src/c.src\n\n");
+    let predicted = explain(&s, &env);
+    assert!(
+        stderr(&predicted).contains(
+            "stoop: if the full command passes, would launch 1 units without a current proof, one launch each"
+        ),
+        "{}",
+        stderr(&predicted)
+    );
     s.clear_log();
     let out = split(&s, &env);
     success(&out);
