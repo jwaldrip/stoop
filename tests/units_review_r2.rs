@@ -973,8 +973,12 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
             let after = e3_listings(&s, &world.units);
             let stopped = world.units.iter().any(|unit| {
                 launches.contains(unit)
-                    && before.get(unit).is_some_and(|old| old.contains(&path))
-                    && after.get(unit).is_some_and(|new| !new.contains(&path))
+                    && after.get(unit).is_some_and(|new| {
+                        // A launched unit that reads the path by stat only now, or that stopped listing it (PR 86 round 3).
+                        new.contains(&format!("stat:{path}"))
+                            || (before.get(unit).is_some_and(|old| old.contains(&path))
+                                && !new.contains(&path))
+                    })
             });
             if !stopped {
                 return Err(report(&format!(
