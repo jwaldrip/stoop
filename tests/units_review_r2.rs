@@ -499,3 +499,487 @@ fn r2_an_unchanged_input_of_a_departed_reader_stays_a_subset() {
     same_verdict("unchanged", &ran, direct_code);
     assert_eq!(launches, ["tests/a.t"], "{}", stderr(&ran));
 }
+
+// ---- E3: units that read other tests' flags, and runner-only test files, as data ----
+
+fn count_from_env(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+struct Rng(u64);
+
+impl Rng {
+    fn new(seed: u64) -> Rng {
+        Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1)
+    }
+
+    fn draw(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.0 = x;
+        x
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.draw() % n.max(1) as u64) as usize
+    }
+}
+
+fn flag_of(path: &str) -> String {
+    format!("{}.flag", path.rsplit_once('.').unwrap().0)
+}
+
+#[derive(Clone, Debug)]
+enum Step {
+    Flag(String, &'static str),
+    Source(usize),
+    Rewrite(String),
+    Add(String),
+    Delete(String),
+    Readd(String),
+    Rename(String, String),
+    Runner(String),
+    RunnerDelete(String),
+    Setup,
+    /// `FOO` takes this value for the subject and the runner from this step on.
+    Env(usize),
+    /// The subject runs with `STOOP_FULL=1` in this step.
+    Forced,
+    Noop,
+}
+
+struct World {
+    units: Vec<String>,
+    runners: Vec<String>,
+    deleted: Vec<String>,
+    next: usize,
+    revision: usize,
+    foo: usize,
+    forced: bool,
+}
+
+impl World {
+    fn fresh(&mut self, ext: &str) -> String {
+        let name = format!("tests/m{}.{ext}", self.next);
+        self.next += 1;
+        name
+    }
+
+    /// One or two sources. Then, two times in three when a runner-only test exists, that test's file and flag; or one
+    /// time in three, another unit's flag. All read as data, by `cat`.
+    fn listing(&self, rng: &mut Rng, own: &str) -> String {
+        let mut lines: Vec<String> = Vec::new();
+        let count = 1 + rng.below(2);
+        while lines.len() < count {
+            let source = format!("src/s{}", rng.below(4));
+            if !lines.contains(&source) {
+                lines.push(source);
+            }
+        }
+        match rng.below(3) {
+            0 | 1 if !self.runners.is_empty() => {
+                let runner = self.runners[rng.below(self.runners.len())].clone();
+                lines.push(flag_of(&runner));
+                lines.push(runner);
+            }
+            2 => {
+                let others: Vec<&String> = self.units.iter().filter(|unit| *unit != own).collect();
+                if !others.is_empty() {
+                    lines.push(flag_of(others[rng.below(others.len())]));
+                }
+            }
+            _ => {}
+        }
+        lines.iter().map(|line| format!("{line}\n")).collect()
+    }
+
+    fn sources(rng: &mut Rng) -> String {
+        format!("src/s{}\n", rng.below(4))
+    }
+
+    fn pick(&mut self, rng: &mut Rng) -> Step {
+        let units = self.units.len();
+        let choice = rng.below(19);
+        match choice {
+            0..=2 => {
+                let kind = ["fail", "ok", "removed"][choice];
+                let pool: Vec<String> = self.units.iter().chain(&self.runners).cloned().collect();
+                Step::Flag(pool[rng.below(pool.len())].clone(), kind)
+            }
+            3 | 4 => Step::Source(rng.below(4)),
+            5..=7 => Step::Rewrite(self.units[rng.below(units)].clone()),
+            8 if units < 8 => Step::Add(self.fresh("t")),
+            9 if units > 2 => Step::Delete(self.units[rng.below(units)].clone()),
+            10 if !self.deleted.is_empty() && units < 8 => {
+                Step::Readd(self.deleted[rng.below(self.deleted.len())].clone())
+            }
+            11 if units > 2 => {
+                let from = self.units[rng.below(units)].clone();
+                Step::Rename(from, self.fresh("t"))
+            }
+            12 | 13 if self.runners.len() < 2 => Step::Runner(self.fresh("u")),
+            14 if !self.runners.is_empty() => {
+                Step::RunnerDelete(self.runners[rng.below(self.runners.len())].clone())
+            }
+            15 => Step::Setup,
+            17 => Step::Env(rng.below(3)),
+            18 => Step::Forced,
+            _ => Step::Noop,
+        }
+    }
+
+    fn apply(&mut self, s: &Suite, rng: &mut Rng, step: &Step) {
+        match step {
+            Step::Flag(path, kind) => {
+                let flag = flag_of(path);
+                match *kind {
+                    "fail" => s.write(&flag, "fail\n"),
+                    "ok" => s.write(&flag, "ok\n"),
+                    _ => {
+                        if s.path(&flag).exists() {
+                            s.remove(&flag);
+                        }
+                    }
+                }
+            }
+            Step::Source(n) => {
+                self.revision += 1;
+                s.write(
+                    &format!("src/s{n}"),
+                    &format!("revision {}\n", self.revision),
+                );
+            }
+            Step::Rewrite(path) => {
+                let body = self.listing(rng, path);
+                s.write(path, &body);
+            }
+            Step::Add(path) | Step::Readd(path) => {
+                let body = self.listing(rng, path);
+                s.write(path, &body);
+                self.deleted.retain(|gone| gone != path);
+                self.units.push(path.clone());
+                self.units.sort();
+            }
+            Step::Delete(path) => {
+                s.remove(path);
+                self.units.retain(|unit| unit != path);
+                self.deleted.push(path.clone());
+            }
+            Step::Rename(from, to) => {
+                fs::rename(s.path(from), s.path(to)).unwrap();
+                self.units.retain(|unit| unit != from);
+                self.deleted.push(from.clone());
+                self.units.push(to.clone());
+                self.units.sort();
+                // Half the time the new name lists its own reads, so a rename can also drop the old name's data reads.
+                if rng.below(2) == 0 {
+                    let body = self.listing(rng, to);
+                    s.write(to, &body);
+                }
+            }
+            Step::Runner(path) => {
+                let body = World::sources(rng);
+                s.write(path, &body);
+                self.runners.push(path.clone());
+            }
+            Step::RunnerDelete(path) => {
+                s.remove(path);
+                if s.path(&flag_of(path)).exists() {
+                    s.remove(&flag_of(path));
+                }
+                self.runners.retain(|other| other != path);
+            }
+            Step::Setup => {
+                self.revision += 1;
+                s.write("setup.src", &format!("setup {}\n", self.revision));
+            }
+            Step::Env(value) => self.foo = *value,
+            Step::Forced => self.forced = true,
+            Step::Noop => {}
+        }
+    }
+}
+
+/// Each roster unit's listed data inputs, captured before and after a model step.
+fn e3_listings(
+    s: &Suite,
+    units: &[String],
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    units
+        .iter()
+        .filter_map(|unit| {
+            let text = fs::read_to_string(s.path(unit)).ok()?;
+            Some((
+                unit.clone(),
+                text.lines()
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            ))
+        })
+        .collect()
+}
+
+fn e3_no_verdict_path(out: &Output) -> Option<String> {
+    stderr(out).lines().find_map(|line| {
+        let rest = line.strip_prefix("stoop: this run has no verdict (exit 125): ")?;
+        let named = rest.strip_suffix(", and no unit's new proof reads it")?;
+        named.strip_suffix(" changed").map(str::to_owned)
+    })
+}
+
+/// The paths that the stored versions of `units` read, by the bundle's table (`stored` is the bundle before the run).
+fn stored_reads(stored: &Value, units: &[String]) -> Vec<String> {
+    let table = stored["table"].as_array().cloned().unwrap_or_default();
+    let mut out = Vec::new();
+    for unit in units {
+        for version in stored["units"][unit.as_str()]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+        {
+            let mut index: u64 = 0;
+            for (at, step) in version["inputs"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .enumerate()
+            {
+                let step = step.as_u64().unwrap_or(0);
+                index = if at == 0 { step } else { index + step };
+                if let Some(path) = table
+                    .get(index as usize)
+                    .and_then(|entry| entry["path"].as_str())
+                {
+                    out.push(path.to_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
+#[derive(Default)]
+struct E3Tally {
+    steps: usize,
+    gap_current: usize,
+    gap_stored: usize,
+    no_verdict: usize,
+}
+
+/// One E3 sequence. The documented covered-file gap permits a pass only when each failed test's flag is listed by a
+/// current unit. A flag read only by a stale version is a wrong verdict. Exit 125 is accepted only with the exact
+/// no-verdict line and a launched unit that stopped listing the named path in this step.
+fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
+    let s = Suite::new();
+    let mut rng = Rng::new(seed);
+    for unit in ["tests/a.t", "tests/b.t", "tests/c.t"] {
+        s.remove(unit);
+    }
+    s.remove("e2e/x.u");
+    for n in 0..4 {
+        s.write(&format!("src/s{n}"), "source\n");
+    }
+    let mut world = World {
+        units: Vec::new(),
+        runners: Vec::new(),
+        deleted: Vec::new(),
+        next: 0,
+        revision: 0,
+        foo: 0,
+        forced: false,
+    };
+    for _ in 0..2 {
+        let runner = world.fresh("u");
+        let body = World::sources(&mut rng);
+        s.write(&runner, &body);
+        world.runners.push(runner);
+    }
+    for _ in 0..5 {
+        let unit = world.fresh("t");
+        world.units.push(unit);
+    }
+    world.units.sort();
+    for unit in world.units.clone() {
+        let body = world.listing(&mut rng, &unit);
+        s.write(&unit, &body);
+    }
+    let cold = split(&s, &[("T_U", "1"), ("FOO", "0")]);
+    if code(&cold) != 0 {
+        return Err(format!(
+            "seed {seed}: the cold run failed: {}",
+            stderr(&cold)
+        ));
+    }
+    let mut log: Vec<String> = Vec::new();
+    let mut no_verdicts = 0usize;
+    for step in 1..=steps {
+        let before = e3_listings(&s, &world.units);
+        let count = 1 + rng.below(3);
+        let mut ops = Vec::new();
+        world.forced = false;
+        for _ in 0..count {
+            let op = world.pick(&mut rng);
+            world.apply(&s, &mut rng, &op);
+            ops.push(op);
+        }
+        log.push(format!("step {step}: {ops:?}"));
+        let foo = world.foo.to_string();
+        let env: Vec<(&str, &str)> = vec![("T_U", "1"), ("FOO", foo.as_str())];
+        let mut subject_env = env.clone();
+        if world.forced {
+            subject_env.push(("STOOP_FULL", "1"));
+        }
+        let stored = s.bundle().unwrap_or(Value::Null);
+        s.clear_log();
+        let subject = split(&s, &subject_env);
+        let launches = launched(&s);
+        s.clear_log();
+        let oracle = s.direct(&s.root, &[], &env);
+        let failed: Vec<String> = s
+            .launches()
+            .iter()
+            .flat_map(|launch| {
+                launch
+                    .lines
+                    .iter()
+                    .filter_map(|line| line.strip_prefix("failed=").map(str::to_owned))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        s.clear_log();
+        tally.steps += 1;
+        let report = |why: &str| {
+            let files: Vec<String> = world
+                .units
+                .iter()
+                .chain(&world.runners)
+                .map(|test| {
+                    format!(
+                        "{test} = {:?}, flag {:?}",
+                        fs::read_to_string(s.path(test)).unwrap_or_default(),
+                        fs::read_to_string(s.path(&flag_of(test))).ok()
+                    )
+                })
+                .collect();
+            format!(
+                "{why}\nseed {seed}, step {step}\noperations:\n  {}\nfiles now:\n  {}\nsubject exit {}, oracle exit {}, oracle failed {failed:?}, launches {launches:?}\nsubject stderr:\n{}",
+                log.join("\n  "),
+                files.join("\n  "),
+                code(&subject),
+                code(&oracle),
+                stderr(&subject)
+            )
+        };
+        let subject_code = code(&subject);
+        if subject_code == 2 {
+            return Err(report("a status of 2"));
+        }
+        if let Some(bad) = launches
+            .iter()
+            .find(|launch| !launch.is_empty() && !world.units.contains(launch))
+        {
+            return Err(report(&format!("a launch named {bad}, not a roster unit")));
+        }
+        if subject_code == 125 {
+            let Some(path) = e3_no_verdict_path(&subject) else {
+                return Err(report("a status of 125 without the no-verdict line"));
+            };
+            let after = e3_listings(&s, &world.units);
+            let stopped = world.units.iter().any(|unit| {
+                launches.contains(unit)
+                    && before.get(unit).is_some_and(|old| old.contains(&path))
+                    && after.get(unit).is_some_and(|new| !new.contains(&path))
+            });
+            if !stopped {
+                return Err(report(&format!(
+                    "the no-verdict line names {path}, which no launched unit stopped reading"
+                )));
+            }
+            no_verdicts += 1;
+            tally.no_verdict += 1;
+            println!("NO VERDICT ACCEPTED (E3): seed {seed}, step {step}, {path}");
+            if no_verdicts * 3 > steps {
+                return Err(report("too many no-verdicts in one sequence"));
+            }
+            continue;
+        }
+        if (subject_code == 0) == (code(&oracle) == 0) {
+            continue;
+        }
+        if subject_code != 0 {
+            return Err(report(
+                "WRONG VERDICT: the subject failed and the runner passed",
+            ));
+        }
+        let listed_now = |flag: &str| {
+            world.units.iter().any(|unit| {
+                fs::read_to_string(s.path(unit))
+                    .map(|body| body.lines().any(|line| line == flag))
+                    .unwrap_or(false)
+            })
+        };
+        let reads = stored_reads(&stored, &world.units);
+        let current = !failed.is_empty() && failed.iter().all(|test| listed_now(&flag_of(test)));
+        let stored_gap = !failed.is_empty()
+            && failed.iter().all(|test| {
+                let flag = flag_of(test);
+                listed_now(&flag) || reads.contains(&flag)
+            });
+        if current {
+            tally.gap_current += 1;
+            println!(
+                "E3 covered-file gap (a current unit lists the flag): seed {seed}, step {step}"
+            );
+            continue;
+        }
+        if stored_gap {
+            tally.gap_stored += 1;
+            return Err(report(
+                "WRONG VERDICT beyond the current reading: only a roster unit's stored version read the flag",
+            ));
+        }
+        return Err(report(
+            "WRONG VERDICT beyond the covered-file gap: no roster unit reads the failed test's flag",
+        ));
+    }
+    Ok(())
+}
+
+/// E3. Seeds from `STOOP_R2_FIRST` (1) for `STOOP_R2_SEEDS` (4), steps from `STOOP_R2_STEPS` (30). Every failing seed
+/// is reported, and the first one in full.
+#[test]
+fn r2_e3_flag_readers_model() {
+    let first = count_from_env("STOOP_R2_FIRST", 1) as u64;
+    let seeds = count_from_env("STOOP_R2_SEEDS", 4) as u64;
+    let steps = count_from_env("STOOP_R2_STEPS", 30);
+    let mut tally = E3Tally::default();
+    let mut failures = Vec::new();
+    for seed in first..first + seeds {
+        if let Err(why) = run_e3(seed, steps, &mut tally) {
+            println!("E3 FAILING SEED {seed}");
+            failures.push(why);
+        }
+    }
+    println!(
+        "E3 sweep: seeds {first}..{}: {} steps, {} covered-file gap steps, {} steps beyond the current reading, {} accepted no-verdicts, {} failing seeds",
+        first + seeds - 1,
+        tally.steps,
+        tally.gap_current,
+        tally.gap_stored,
+        tally.no_verdict,
+        failures.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "{} failing seeds; first:\n{}",
+        failures.len(),
+        failures.first().cloned().unwrap_or_default()
+    );
+}
