@@ -526,14 +526,13 @@ fn departed_only_change(
     paths.into_iter().next()
 }
 
-/// The first changed whole-proof input that is absent now, and that a stored version of a roster unit reads (PR 86
+/// The first changed whole-proof input that is absent now, and that a stored version of any unit reads, live or departed (PR 86
 /// review round 3). A launch does not vouch for an absence unless it reads the path by content, and a failed open is no
 /// content read. A unit that still lists the path may also stop listing it in this step. The full command decides it.
 fn absent_reader_change(cx: &Judged<'_>, view: &View, proof: &Proof) -> Option<String> {
-    let live: BTreeSet<&str> = cx
-        .roster
-        .iter()
-        .filter_map(|unit| view.units.get(unit))
+    let live: BTreeSet<&str> = view
+        .units
+        .values()
         .flatten()
         .flat_map(|version| version.inputs.iter())
         .map(|&index| view.table[index as usize].path.as_str())
