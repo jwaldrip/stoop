@@ -417,8 +417,16 @@ pub(super) fn finish(
         || !ran.breaches.is_empty()
         || !ran.unread.is_empty()
         || !ran.uncovered.is_empty();
-    // A stored version that reads a path no run covered may read it by stat only, so the residue is unknown, and the next
-    // run takes the full form (spec 3.8, PR 86 review round 3). Other no-verdict runs keep the residue they measured.
+    // A new version can discard the evidence that excused an appeared name, or retain it as a stat rather than a
+    // content read. A failing unit keeps its old version, so an excuse named only by such units remains represented:
+    // their stale proofs will make them affected again on the next run.
+    let replaced_unread = ran.unread.iter().any(|unread| {
+        unread
+            .units
+            .iter()
+            .any(|unit| ran.proven.contains_key(unit))
+    });
+    // Likewise, only a version stored by this run can turn an uncovered content input into a stat-only input.
     let stored_uncovered = pass.held().iter().any(|(unit, inputs, _)| {
         ran.proven.contains_key(unit)
             && inputs
@@ -428,7 +436,7 @@ pub(super) fn finish(
     let unknown = stopped_early
         || ran.unlaunched
         || !ran.breaches.is_empty()
-        || !ran.unread.is_empty()
+        || replaced_unread
         || stored_uncovered;
     pass.settle_residue(&lookup.proofs, pending.listings(), unknown);
     let id = pending.suite();

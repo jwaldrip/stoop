@@ -349,6 +349,73 @@ fn rv34b_a_failing_launch_wins_over_the_no_verdict() {
         stderr(&judged.ran)
     );
     same_verdict("rv34b", &judged);
+    assert_eq!(s.bundle().unwrap()["residue"]["state"], "none");
+    s.write("tests/a.flag", "ok\n");
+    let next = judge(&s, &env);
+    assert_eq!(next.direct, 1);
+    assert_eq!(category(&next.ran), "full", "{}", stderr(&next.ran));
+    same_verdict("rv34b-next", &next);
+}
+
+/// An appearing runner-only test was named by `c`'s old proof. If `c` fails, that proof remains and the unchanged retry
+/// must fail again. Once `c` passes after dropping or only statting the names, its replacement cannot excuse a skip.
+#[test]
+fn a_failing_excusing_unit_keeps_its_old_proof_until_a_lost_read_is_detected() {
+    for mode in ["drop", "stat"] {
+        let s = review_suite();
+        if mode == "stat" {
+            let runner = review_runner();
+            let anchor = "cat \"$ROOT/$line\"";
+            assert_eq!(runner.matches(anchor).count(), 1);
+            let runner = runner.replace(
+                anchor,
+                "case $line in\nstat:*) test -e \"$ROOT/${line#stat:}\" ;;\n*) cat \"$ROOT/$line\" ;;\nesac",
+            );
+            s.executable("t", &runner);
+        }
+        let env = [("T_U", "1")];
+        s.write("tests/c.flag", "ok\n");
+        s.write("tests/c.t", "src/c.src\ntests/z.u\ntests/z.flag\n");
+        proven(&s, &env);
+        s.write(
+            "tests/c.t",
+            if mode == "stat" {
+                "src/c.src\nstat:tests/z.flag\n"
+            } else {
+                "src/c.src\n"
+            },
+        );
+        s.write("tests/c.flag", "fail\n");
+        s.write("tests/z.u", "src/c.src\n");
+        s.write("tests/z.flag", "fail\n");
+        let first = judge(&s, &env);
+        assert_eq!(first.direct, 1, "{mode}");
+        assert_eq!(code(&first.ran), 1, "{mode}: {}", stderr(&first.ran));
+        assert_eq!(first.launches, ["tests/c.t"], "{mode}");
+        assert_ne!(s.bundle().unwrap()["residue"]["state"], "none", "{mode}");
+
+        let retry = judge(&s, &env);
+        assert_eq!(retry.direct, 1, "{mode}");
+        assert_eq!(code(&retry.ran), 1, "{mode}: {}", stderr(&retry.ran));
+        assert_eq!(retry.launches, ["tests/c.t"], "{mode}");
+
+        s.write("tests/c.flag", "ok\n");
+        let refusal = judge(&s, &env);
+        assert_eq!(refusal.direct, 1, "{mode}");
+        assert_eq!(code(&refusal.ran), 125, "{mode}: {}", stderr(&refusal.ran));
+        assert_eq!(refusal.launches, ["tests/c.t"], "{mode}");
+        assert_eq!(s.bundle().unwrap()["residue"]["state"], "none", "{mode}");
+
+        let after_refusal = judge(&s, &env);
+        assert_eq!(after_refusal.direct, 1, "{mode}");
+        assert_eq!(
+            category(&after_refusal.ran),
+            "full",
+            "{mode}: {}",
+            stderr(&after_refusal.ran)
+        );
+        same_verdict(mode, &after_refusal);
+    }
 }
 
 /// rv35: `c` names `tests/z.u`, absent when the full command passed. When `z.u` appears and `c`'s new proof reads it by content,

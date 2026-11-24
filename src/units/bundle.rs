@@ -1686,9 +1686,9 @@ impl Pass {
         listings: &[String],
         no_verdict: bool,
     ) {
-        // A split run with no verdict leaves the residue unknown (spec 3.8, PR 86 review round 3). Its stored versions may
-        // read a path by stat only, so a residue measured from them would let a later run skip on a proof that no launch
-        // checked by content. A switch-off pass keeps main's residue, which is the switch-off parity rule.
+        // When a split run may have lost coverage, its residue stays unknown. A stored version can read a path by stat
+        // only, so measuring it as covered would let a later run skip without checking content. A switch-off pass keeps
+        // main's residue, which is the switch-off parity rule.
         if no_verdict && self.keep {
             if !matches!(self.bundle.residue.state, ResidueState::None) {
                 self.dirty = true;

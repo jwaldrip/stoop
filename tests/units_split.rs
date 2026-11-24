@@ -405,7 +405,8 @@ fn s13_t_lint_makes_every_change_a_full_run() {
     assert_eq!(launched(&s), ["", "tests/a.t", "tests/b.t"]);
 }
 
-/// S15: a `{unit}` run whose unit `b` fails keeps `b` affected, so the next run launches it again.
+/// S15: a failed launch keeps its old proof, including the absent flag that excused its appearance. The unchanged retry
+/// still launches `b` and fails; after the flag is fixed, `b` alone passes and the following unchanged run skips.
 #[test]
 fn a_failing_unit_stays_affected_until_it_passes() {
     let s = Suite::new();
@@ -419,11 +420,25 @@ fn a_failing_unit_stays_affected_until_it_passes() {
     let out = run(&s);
     assert_eq!(code(&out), 1, "{}", stderr(&out));
     assert_eq!(launched(&s), ["tests/a.t", "tests/b.t"]);
+    assert_ne!(
+        s.bundle().unwrap()["residue"]["state"],
+        "none",
+        "a failed launch did not replace its old proof"
+    );
+    s.clear_log();
+    let retry = run(&s);
+    assert_eq!(code(&retry), 1, "{}", stderr(&retry));
+    assert_eq!(launched(&s), ["tests/b.t"], "{}", stderr(&retry));
     s.write("tests/b.flag", "ok\n");
     s.clear_log();
     let out = run(&s);
     success(&out);
-    assert_eq!(launched(&s), ["tests/b.t"]);
+    assert_eq!(launched(&s), ["tests/b.t"], "{}", stderr(&out));
+    s.clear_log();
+    let unchanged = run(&s);
+    success(&unchanged);
+    assert!(skipped(&unchanged), "{}", stderr(&unchanged));
+    assert!(launched(&s).is_empty());
 }
 
 /// S16: three partial runs, each changing one unit's inputs, lose nothing. The next unchanged run skips.
