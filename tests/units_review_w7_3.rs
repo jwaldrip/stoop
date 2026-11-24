@@ -443,7 +443,7 @@ fn w08_explain_predicts_the_completion_in_every_full_state() {
 }
 
 /// Deviation 4 probe: a full run (environment change) that also gains work no unit does (a runner-only test, `T_U`).
-/// The residue before the run is known and empty, so explain predicts no learning; the run's new residue is not empty.
+/// The residue before the run is known and empty, but the run records a new proof, so explain names what completion learns.
 #[test]
 fn w08e_explain_when_the_full_run_gains_runner_only_work() {
     let s = Suite::new();
@@ -459,9 +459,9 @@ fn w08e_explain_when_the_full_run_gains_runner_only_work() {
         predicted(&explained),
         completion(&ran)
     );
-    // Deviation 4, pinned: explain predicts from the suite as it stands before the run. This full run gains a residue the
-    // stored suite did not hold, so it learns the units although explain printed no learning line.
-    assert_eq!(predicted(&explained), None, "{}", stderr(&explained));
+    // The run records a new proof, which leaves the residue unknown, so explain names the three units that completion
+    // learns, as the run does (PR 86 review round 2, cc0cf08).
+    assert_eq!(predicted(&explained), Some(3), "{}", stderr(&explained));
     assert_eq!(completion(&ran), Some(3), "{}", stderr(&ran));
 }
 
