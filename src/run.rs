@@ -1493,8 +1493,9 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         lookup.why = reason;
     }
     // The one call that dispatches an attribution pass (spec 3.1). Removing this statement returns every hooked run
-    // to the legacy path. A full decision of the engine skips it.
-    if !engine_full {
+    // to the legacy path. A full decision of the engine skips it. Under the switch no attribution pass decides a
+    // verdict: the full command does (spec 3.10, issue #84), so the call is skipped there too.
+    if !engine_full && !split {
         if let Some(outcome) = pending.as_ref().and_then(|pending| {
             units::attribution::pass(&cx, &config, &lookup, pending, &volatile_store, &key)
         }) {
@@ -1504,7 +1505,7 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
     // Explain adds lines to a suite's decision (spec 4.16). A full decision of the engine prints its own lines after the
     // legacy full form's decision line (spec 3.12). Every other decision prints the switch-off lines, which are computed
     // while the context is whole.
-    let suite_lines = match after_full {
+    let mut suite_lines = match after_full {
         Some(lines) => Some(lines),
         None => (explain && !o.quiet)
             .then(|| {
@@ -1521,7 +1522,18 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             })
             .flatten(),
     };
-    let outcome = legacy_finish(cx, key, lookup);
+    let runs_full = lookup.hit_idx.is_none() || cx.full_reason.is_some();
+    // Explain adds the line of a learning run after a full command (spec 3.12, W7-3): the units that the passing run
+    // would learn. It comes last, and nothing else is predicted for it.
+    let records = units_refusal(&cx, config_invalid, independent_false).is_none();
+    if explain && split && !o.quiet && runs_full && records && !env_switch("STOOP_OFF", true) {
+        if let Some(line) = roster.and_then(|pending| {
+            units::engine::learn_line(&cx, &config, pending, &volatile_store, &key, max_age)
+        }) {
+            suite_lines.get_or_insert_with(Vec::new).push(line);
+        }
+    }
+    let outcome = legacy_finish(&cx, key, lookup);
     for line in suite_lines.into_iter().flatten() {
         eprintln!("{line}");
     }
@@ -1537,7 +1549,20 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
             .into_iter()
             .find(|proof| proof.digest() == *digest)
         {
-            units::bundle::record(&volatile_store, pending, &outcome.key, digest, proof);
+            units::bundle::record(&volatile_store, &pending, &outcome.key, digest, &proof);
+            // Completion (spec 3.10, W7-3): a passing, recorded first-run form learns the unit proofs that it leaves
+            // without a valid version, after its verdict is settled.
+            if split {
+                units::subset::learn(
+                    &cx,
+                    &config,
+                    &pending,
+                    &proof,
+                    &volatile_store,
+                    &outcome.key,
+                    max_age,
+                );
+            }
         }
     }
     outcome
@@ -1668,7 +1693,7 @@ fn legacy_lookup(cx: &RunCx<'_>, key: &str) -> Lookup {
     }
 }
 
-fn legacy_finish(cx: RunCx<'_>, key: String, lookup: Lookup) -> Outcome {
+fn legacy_finish(cx: &RunCx<'_>, key: String, lookup: Lookup) -> Outcome {
     let Lookup {
         proofs,
         hit_idx,
@@ -1747,7 +1772,7 @@ fn legacy_finish(cx: RunCx<'_>, key: String, lookup: Lookup) -> Outcome {
     let ignore = Ignore::new(&o.ignore, Some(&root.join(".stoopignore")), &o.transient);
     let real_root = std::fs::canonicalize(root).unwrap_or_else(|_| root.clone());
     let trace = match launch_traced(
-        &cx,
+        cx,
         &o.argv,
         &ignore,
         &real_root,
@@ -1834,8 +1859,8 @@ fn legacy_finish(cx: RunCx<'_>, key: String, lookup: Lookup) -> Outcome {
                 cwd: Some(rel_cwd.clone()),
                 scope: scope.clone(),
                 provenance: Some(trace::Provenance::current()),
-                env: cx.env_now,
-                env_excluded: cx.env_excluded,
+                env: cx.env_now.clone(),
+                env_excluded: cx.env_excluded.clone(),
                 inputs,
                 outputs,
                 probes,

@@ -25,7 +25,7 @@ use std::io;
 use std::path::Path;
 
 /// The output the pass names when it disables a suite for an over-budget set of proofs (spec 3.6).
-const OVER_BUDGET: &str = "unit proofs exceed 8 MiB";
+pub(super) const OVER_BUDGET: &str = "unit proofs exceed 8 MiB";
 
 /// Runs the attribution pass when every condition of spec 3.1 holds. `None` leaves the run to the legacy path,
 /// which then runs exactly as it did before this module existed.
@@ -181,6 +181,8 @@ pub(super) struct Ran {
     pub(super) proven: BTreeMap<String, BTreeSet<String>>,
     /// The excused names that no new proof of this run reads by content (spec 3.10, rv34).
     pub(super) unread: Vec<Unread>,
+    /// The first unit whose launch failed, in launch order. A learning run names it as the disagreement (spec 3.10).
+    pub(super) failed: Option<String>,
 }
 
 /// The launches of a pass or a subset, one traced launch per unit in `units` order (spec 3.3, 3.7, 3.11). Each launch
@@ -212,6 +214,7 @@ pub(super) fn launch_each(
         breaches: Vec::new(),
         proven: BTreeMap::new(),
         unread: Vec::new(),
+        failed: None,
     };
     let mut listing_breach: Option<Breach> = None;
     for (index, unit) in units.iter().enumerate() {
@@ -334,6 +337,9 @@ pub(super) fn launch_each(
             };
         // The first nonzero status in roster order. A failing unit never stops the pass (spec 3.9).
         ran.status = keep(ran.status, unit_status);
+        if unit_status != 0 && ran.failed.is_none() {
+            ran.failed = Some(unit.clone());
+        }
         if ran.stopped.is_some() {
             break;
         }
@@ -602,14 +608,25 @@ pub(crate) fn screen<'p>(
     if lookup.proofs.is_empty() {
         return Err(Refusal::NoProof);
     }
-    // 4 and 5: a CI job and an opted-out suite keep the full command.
+    // 4 to 7: a CI job, an opted-out suite, and a roster that cannot be launched as units keep the full command.
+    roster_screen(cx, hook, config, pending)?;
+    Ok(pending)
+}
+
+/// Spec 3.1, checks 4 to 7. `screen` runs them for an attribution pass, and a learning run after its full command runs
+/// them too (spec 3.10, completion), without the first-run gates that `screen` applies.
+pub(crate) fn roster_screen(
+    cx: &RunCx<'_>,
+    hook: &Hook,
+    config: &Config,
+    pending: &Pending,
+) -> Result<(), Refusal> {
     if policy::ci() {
         return Err(Refusal::Ci);
     }
     if config.splitting_disabled(&hook.original, cx.rel_cwd) {
         return Err(Refusal::Disabled);
     }
-    // 6 and 7: every placeholder must stand for one unit, and every unit of the roster must expand.
     if !expand::supported(hook) {
         return Err(Refusal::Form);
     }
@@ -619,7 +636,7 @@ pub(crate) fn screen<'p>(
     if !expand::lines_fit(hook, pending.units(), cx.root, cx.cwd) {
         return Err(Refusal::Line);
     }
-    Ok(pending)
+    Ok(())
 }
 
 /// The two lines `stoop explain` adds to a suite's decision (spec 4.16): the tracked counts, then

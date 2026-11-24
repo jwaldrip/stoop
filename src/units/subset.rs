@@ -6,6 +6,7 @@
 
 use super::attribution;
 use super::bundle::{self, Kept, Pass, Pending};
+use super::config::Config;
 use super::engine::{self, Judged, Plan, Verdict, NAMED};
 use super::expand;
 use super::hook::{render, safe, Hook};
@@ -13,6 +14,7 @@ use super::independence::{Named, Roster};
 use super::launch::SkippedUnit;
 use crate::ignore::Ignore;
 use crate::input::Input;
+use crate::proof::Proof;
 use crate::run::{self, How, Lookup, Outcome, RunCx};
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsString;
@@ -78,6 +80,120 @@ pub(crate) fn execute(
             Attempt::Ran(launch(&frame, pass, &plan))
         }
     }
+}
+
+/// Completion (spec 3.10, W7-3). After a passing, recorded first-run form, launches each roster unit that holds no valid
+/// version, one launch each in roster order, so that a later changed run can be a subset. The verdict is the full
+/// command's, so nothing here changes its status. The suite lock is taken and the bundle judged again (`engine::learn`),
+/// and each launch is judged as an attribution pass judges it. A violation, a unit that fails alone or the budget
+/// disables the suite (spec 3.6). A busy lock or a refusal learns nothing and prints nothing.
+pub(crate) fn learn(
+    cx: &RunCx<'_>,
+    config: &Config,
+    pending: &Pending,
+    proof: &Proof,
+    store: &Path,
+    key: &str,
+    max_age: u64,
+) {
+    let Some(hook) = cx.hook.as_ref() else {
+        return;
+    };
+    if attribution::roster_screen(cx, hook, config, pending).is_err() {
+        return;
+    }
+    let ignore = attribution::ignore_for(cx, store);
+    let guard = attribution::guard_of(cx, &ignore);
+    let judged = Judged::new(cx, pending, &[], max_age);
+    let (mut pass, units) = match bundle::keep(store, pending, key, guard, |view| {
+        engine::learn(&judged, view)
+    }) {
+        Kept::Locked(pass, units) => (pass, units),
+        Kept::Busy | Kept::Unavailable | Kept::Declined(_) => return,
+    };
+    pass.set_phase("completion");
+    let quiet = cx.o.quiet;
+    if !units.is_empty() {
+        say(
+            quiet,
+            format!(
+                "stoop: attribution pass after the full run: {} units, one launch each",
+                units.len()
+            ),
+        );
+    }
+    let real_root = std::fs::canonicalize(cx.root).unwrap_or_else(|_| cx.root.clone());
+    let roster = Roster::new(pending.units());
+    let mut named = Named::default();
+    for (unit, inputs, outputs) in pass.held() {
+        named.store(&unit, &paths(&inputs), &paths(&outputs));
+    }
+    let ran = attribution::launch_each(
+        cx,
+        hook,
+        &ignore,
+        &mut pass,
+        &units,
+        &roster,
+        &mut named,
+        &[],
+        &HashMap::new(),
+        &real_root,
+    );
+    for name in run::HOOK_ENV {
+        std::env::set_var(name, "");
+    }
+    let id = pending.suite();
+    let mut disabled = false;
+    if let Some((code, label, keep_units)) = failure(&ran) {
+        let stored = if keep_units {
+            pass.disable(code, &label)
+        } else {
+            pass.disable_without_versions(code, &label)
+        };
+        if stored.is_ok() {
+            say(
+                quiet,
+                format!(
+                    "stoop: suite {id} disabled: {label}; run 'stoop forget --units {id}' after fixing it"
+                ),
+            );
+        } else {
+            // The state could not be stored, so no proof may stay usable under an enabled suite.
+            pass.remove_bundle();
+            say(
+                quiet,
+                format!(
+                    "stoop: suite {id} could not store that it is disabled; its unit proofs are removed"
+                ),
+            );
+        }
+        disabled = true;
+    }
+    let held: BTreeSet<String> = pass.held().into_iter().map(|(unit, _, _)| unit).collect();
+    let complete = pending.units().iter().all(|unit| held.contains(unit));
+    drop(pass);
+    // Every roster unit holds a proof, so the residue is measured exactly (spec 3.8, point iii). A busy lock, or a bundle
+    // that no longer holds, leaves the residue in the state it had.
+    if !disabled && complete {
+        let _ = bundle::confirm(store, pending, key, &proof.inputs, |view| {
+            engine::holds(&judged, view)
+        });
+    }
+}
+
+/// What a learning run stores when one of its launches stops it (spec 3.6, 3.10): the violation that a launch broke,
+/// then the unit that failed alone while the full command passed, then the budget. The flag says whether the unit
+/// proofs are kept.
+fn failure(ran: &attribution::Ran) -> Option<(&'static str, String, bool)> {
+    if let Some((_, violation)) = &ran.stopped {
+        return Some((violation.code(), violation.label(), true));
+    }
+    if let Some(unit) = &ran.failed {
+        let label = format!("{} failed alone while the full command passed", safe(unit));
+        return Some(("disagreement", label, true));
+    }
+    (ran.over_budget > 0).then(|| ("over_budget", attribution::OVER_BUDGET.to_owned(), false))
 }
 
 /// Launches the units of `plan` in roster order, one traced launch each, under the lock that `pass` holds (spec 3.11).

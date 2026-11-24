@@ -52,7 +52,8 @@ fn on(value: &OsStr) -> bool {
 
 /// What the engine decides for one hooked run (spec 3.10). The first step that matches decides.
 pub(crate) enum Decision {
-    /// Steps E1 to E9: the switch-off path decides. An attribution pass starts when no unit has a proof yet.
+    /// Steps E1 to E7: the switch-off path decides, with the reason it gives. A forced run, or a run whose screen refuses,
+    /// keeps that path, which is the full command.
     Legacy,
     /// Step E8 for a disabled suite: the full command runs, for this reason.
     Disabled(String),
@@ -235,13 +236,14 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
             false,
         );
     }
-    // E9: no roster unit has a proof yet, so the attribution pass decides.
+    // E9: no roster unit has a proof yet. The full command decides the verdict, and its passing run learns the unit
+    // proofs (spec 3.10, completion; issue #84). No attribution pass may decide here: its verdict is not the full one.
     if cx.roster.iter().all(|unit| {
         view.units
             .get(unit)
             .is_none_or(|versions| versions.is_empty())
     }) {
-        return verdict(Decision::Legacy, None, false);
+        return verdict(Decision::Full(None), None, false);
     }
     let proof = cx.proofs.iter().find(|proof| proof.digest() == view.whole);
     let current = Current::of(cx.root, &checked(cx, view));
@@ -341,6 +343,30 @@ pub(super) fn judge_units(cx: &Judged<'_>, view: &View) -> Result<Plan, Verdict>
             clean: verdict.clean,
         }),
     }
+}
+
+/// Completion (spec 3.10, W7-3), judged under the suite lock after a recorded full run. The run learns when the residue
+/// it left is unknown or not empty, and then launches each roster unit with no valid version, in roster order. It
+/// declines when the suite is disabled or the residue is known and empty, so no learning is needed.
+pub(super) fn learn(cx: &Judged<'_>, view: &View) -> Result<Vec<String>, &'static str> {
+    if view.disabled.is_some() {
+        return Err("the suite is disabled");
+    }
+    let wanted = view.residue.as_ref().is_none_or(|(count, _)| *count > 0);
+    if !wanted {
+        return Err("the residue is known and empty");
+    }
+    let current = Current::of(cx.root, &checked(cx, view));
+    Ok(analyse(cx, view, &current)
+        .into_iter()
+        .map(|affected| affected.unit)
+        .collect())
+}
+
+/// Whether every roster unit holds a valid version now, which lets the residue be confirmed (spec 3.8, point iii).
+pub(super) fn holds(cx: &Judged<'_>, view: &View) -> bool {
+    let current = Current::of(cx.root, &checked(cx, view));
+    analyse(cx, view, &current).is_empty()
 }
 
 fn verdict(decision: Decision, affected: Option<Vec<(String, String)>>, clean: bool) -> Verdict {
@@ -940,6 +966,46 @@ pub(crate) fn explain_after(
         lines.push(format!("stoop: affected: (+{more} more)"));
     }
     lines
+}
+
+/// The line explain prints for a full command whose passing run learns the unit proofs (spec 3.12, W7-3). It reads the
+/// suite as it stands and writes nothing. A unit with no version leaves the residue unknown after the run, so the line is
+/// exact for that case. Otherwise the current residue stands in for the residue that the run measures afterwards.
+pub(crate) fn learn_line(
+    cx: &RunCx<'_>,
+    config: &Config,
+    pending: &Pending,
+    store: &Path,
+    key: &str,
+    max_age: u64,
+) -> Option<String> {
+    let hook = cx.hook.as_ref()?;
+    attribution::roster_screen(cx, hook, config, pending).ok()?;
+    if !bundle::writable(store, pending.suite()) {
+        return None;
+    }
+    let judged = Judged::new(cx, pending, &[], max_age);
+    let (lacking, trigger) = match bundle::view(store, pending, key) {
+        None => (pending.units().len(), true),
+        Some(view) => {
+            if view.disabled.is_some() {
+                return None;
+            }
+            let current = Current::of(cx.root, &checked(&judged, &view));
+            let lacking = analyse(&judged, &view, &current).len();
+            let unknown = pending
+                .units()
+                .iter()
+                .any(|unit| view.units.get(unit).is_none_or(Vec::is_empty));
+            let trigger = unknown || view.residue.as_ref().is_none_or(|(count, _)| *count > 0);
+            (lacking, trigger)
+        }
+    };
+    (trigger && lacking > 0).then(|| {
+        format!(
+            "stoop: if the full command passes, would launch {lacking} units without a current proof, one launch each"
+        )
+    })
 }
 
 /// The disagreement check (spec 3.10, E1): a full command that fails while every unit's proof held disables the suite.

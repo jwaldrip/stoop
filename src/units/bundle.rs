@@ -35,7 +35,7 @@ const LOCK_ATTEMPTS: usize = 3;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Origin {
     kind: String,
     cwd: String,
@@ -45,7 +45,7 @@ struct Origin {
     invocation: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Roster {
     source: String,
     units: Vec<String>,
@@ -1040,8 +1040,9 @@ fn write_bytes(area: &Area, suite: &str, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-/// Best effort only: no diagnostic or decision changes when a bundle cannot be saved.
-pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, proof: Proof) {
+/// Best effort only: no diagnostic or decision changes when a bundle cannot be saved. Both arguments are borrowed, so a
+/// learning run that follows the record still holds them (spec 3.10, completion).
+pub(crate) fn record(store: &Path, pending: &Pending, key: &str, digest: &str, proof: &Proof) {
     let Ok(Some(area)) = Area::open(store, true) else {
         return;
     };
@@ -1054,13 +1055,13 @@ pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, pr
         ReadBundle::Current(bundle) => Some(bundle),
         ReadBundle::Missing | ReadBundle::Corrupt => None,
     };
-    let Some(provenance) = proof.provenance else {
+    let Some(provenance) = proof.provenance.clone() else {
         return;
     };
     let guard = LaunchGuard {
-        env: proof.env,
-        env_excluded: proof.env_excluded,
-        ignore: proof.ignore.unwrap_or_default(),
+        env: proof.env.clone(),
+        env_excluded: proof.env_excluded.clone(),
+        ignore: proof.ignore.clone().unwrap_or_default(),
     };
     let guard_digest = guard.digest();
     // A full run keeps the suite's state whatever its roster: only `forget --units` or a generation bump clears a
@@ -1081,13 +1082,10 @@ pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, pr
     };
     // Only the roster's units keep a version (C19). A unit that left the roster is no longer a claim about this suite.
     units.retain(|unit, _| pending.roster.units.binary_search(unit).is_ok());
-    let Pending {
-        suite,
-        origin,
-        roster,
-        policy,
-        listings,
-    } = pending;
+    let suite = pending.suite.clone();
+    let origin = pending.origin.clone();
+    let roster = pending.roster.clone();
+    let policy = pending.policy.clone();
     let mut bundle = SuiteBundleV1 {
         v: VERSION,
         generation: GENERATION,
@@ -1105,7 +1103,7 @@ pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, pr
         residue,
         state,
     };
-    store_residue(&mut bundle, &proof.inputs, digest, &listings);
+    store_residue(&mut bundle, &proof.inputs, digest, pending.listings());
     let _ = write_bundle(&area, &bundle);
 }
 
@@ -2041,6 +2039,59 @@ pub(crate) fn disable_full(
     };
     write_bundle(&area, &bundle)?;
     Ok(true)
+}
+
+/// Under the suite lock, judges the bundle with `holds`. When it holds, stores the residue of `whole`, the whole proof's
+/// inputs, as confirmed: it is measured against the versions that the bundle holds now (spec 3.8, point iii). A busy
+/// lock, a bundle that does not hold, or a bundle that cannot be written leaves the residue as it was.
+pub(crate) fn confirm(
+    store: &Path,
+    pending: &Pending,
+    key: &str,
+    whole: &[Input],
+    holds: impl FnOnce(&View) -> bool,
+) -> Settled {
+    let Ok(Some(area)) = Area::open(store, false) else {
+        return Settled::Failed;
+    };
+    let _lock = match lock(&area, &pending.suite) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Settled::Busy,
+        Err(_) => return Settled::Failed,
+    };
+    let Some(view) = view_in(&area, pending, key) else {
+        return Settled::Failed;
+    };
+    if !holds(&view) {
+        return Settled::Declined;
+    }
+    let Some(mut bundle) = bundle_for(&area, pending, key) else {
+        return Settled::Failed;
+    };
+    let Some(digest) = bundle.whole.clone() else {
+        return Settled::Failed;
+    };
+    let (count, paths) = residue::uncovered(whole, pending.listings(), &covered_paths(&bundle));
+    bundle.residue = Residue {
+        state: ResidueState::Confirmed,
+        paths,
+        count,
+        whole: Some(digest),
+    };
+    match write_bundle(&area, &bundle) {
+        Ok(()) => Settled::Written,
+        Err(_) => Settled::Failed,
+    }
+}
+
+/// Whether the suite's store can take a new entry, for `stoop explain` to predict a learning run (spec 3.10). An absent
+/// store is not refused, because the run creates it. Nothing is created or written here.
+pub(crate) fn writable(store: &Path, id: &str) -> bool {
+    match Area::open(store, false) {
+        Ok(Some(area)) => area.writable(id),
+        Ok(None) => true,
+        Err(_) => false,
+    }
 }
 
 /// Checked on read only: each version's indices must lie below the table and strictly increase.
@@ -3039,7 +3090,7 @@ mod pass_tests {
         // called again until the bundle carries the digest it records, within 2 s. Only then are the digests asserted.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let stored = loop {
-            record(&dir, pending_for(&roster), "key", "p-1", proof());
+            record(&dir, &pending_for(&roster), "key", "p-1", &proof());
             let area = Area::open(&dir, false).unwrap().unwrap();
             if let ReadBundle::Current(bundle) = read_bundle(&area, &id) {
                 if bundle.whole.as_deref() == Some("p-1") {
@@ -3105,7 +3156,7 @@ mod pass_tests {
         loop {
             let mut pending = pending_for(roster);
             pending.listings = listings.iter().map(|path| (*path).to_owned()).collect();
-            record(dir, pending, key, digest, proof.clone());
+            record(dir, &pending, key, digest, proof);
             let area = Area::open(dir, false).unwrap().unwrap();
             if let ReadBundle::Current(bundle) = read_bundle(&area, &id) {
                 if bundle.whole.as_deref() == Some(digest) {
