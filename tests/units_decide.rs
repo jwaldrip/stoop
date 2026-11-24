@@ -395,7 +395,13 @@ fn t11_a_unit_that_leaves_the_roster_while_its_file_stays_is_named() {
         "{}",
         stderr(&out)
     );
-    assert_eq!(s.launches().len(), 1, "the full form launches once");
+    // The full form launches once. Its passing run then learns the two units that remain: the change made their proofs
+    // stale, and `tests/c.t` is no longer a unit. So the run makes three launches in all.
+    assert_eq!(
+        s.launches().len(),
+        3,
+        "the full form, then the two remaining units, which hold no current proof"
+    );
 }
 
 /// T12 (D12): a disabled suite takes the full form, and the reason names the suite and its state.
