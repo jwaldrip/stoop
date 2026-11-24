@@ -106,7 +106,7 @@ enum ResultSource {
     Receipt { decoder: String },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ResidueState {
     None,
@@ -114,7 +114,7 @@ enum ResidueState {
     Confirmed,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Residue {
     state: ResidueState,
     /// The first `residue::STORED` paths, in sorted order. `count` is how many paths the residue holds in all.
@@ -1351,6 +1351,8 @@ type Snapshot = (
     BTreeMap<String, Vec<UnitVersion>>,
     Vec<Input>,
     BTreeMap<String, u32>,
+    Residue,
+    bool,
 );
 
 /// One attribution pass. It holds the suite lock until it is dropped, so no other stoop changes
@@ -1401,6 +1403,8 @@ impl Pass {
                 self.bundle.units.clone(),
                 self.bundle.table.clone(),
                 self.interned.clone(),
+                self.bundle.residue.clone(),
+                self.residue_lost,
             )
         });
         let inputs = self.indices(inputs);
@@ -1421,6 +1425,15 @@ impl Pass {
         if self.keep {
             self.compact_table();
         }
+        if !removed.is_empty()
+            && lost_reader(
+                &removed,
+                &bundle_readers(&self.bundle.table, self.bundle.units.values().flatten()),
+            )
+        {
+            self.bundle.residue = Residue::default();
+            self.residue_lost = true;
+        }
         let Ok(bytes) = serde_json::to_vec(&self.bundle) else {
             self.refuse(unit, previous, mark, snapshot);
             return Stored::WriteFailed;
@@ -1432,15 +1445,6 @@ impl Pass {
         if !valid_bundle(&self.bundle, &self.bundle.suite) {
             self.refuse(unit, previous, mark, snapshot);
             return Stored::WriteFailed;
-        }
-        if !removed.is_empty()
-            && lost_reader(
-                &removed,
-                &bundle_readers(&self.bundle.table, self.bundle.units.values().flatten()),
-            )
-        {
-            self.bundle.residue = Residue::default();
-            self.residue_lost = true;
         }
         self.dirty = true;
         if !self.due(Instant::now()) {
@@ -1501,10 +1505,12 @@ impl Pass {
         mark: usize,
         snapshot: Option<Snapshot>,
     ) {
-        if let Some((units, table, interned)) = snapshot {
+        if let Some((units, table, interned, residue, lost)) = snapshot {
             self.bundle.units = units;
             self.bundle.table = table;
             self.interned = interned;
+            self.bundle.residue = residue;
+            self.residue_lost = lost;
             return;
         }
         match previous {
