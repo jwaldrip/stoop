@@ -195,6 +195,16 @@ fn zlearned() -> Suite {
     s
 }
 
+/// A run without a verdict exits 125, and its line names the changed input that no kept proof and no new proof reads
+/// (PR 86 review round 2). The x01, x01c and x02 runs must print it.
+fn no_verdict_names(ran: &Output, path: &str) {
+    assert_eq!(code(ran), 125, "{}", stderr(ran));
+    let line = format!(
+        "stoop: this run has no verdict (exit 125): {path} changed, and no unit's new proof reads it"
+    );
+    assert!(stderr(ran).contains(&line), "{}", stderr(ran));
+}
+
 // ---- Wrong verdicts: the reader goes in the same step as the flag fails ----
 
 /// x01: `c`, the only unit that reads the runner-only test's file and flag, is deleted while `a` changes and the flag
@@ -208,6 +218,7 @@ fn r2_x01_a_deleted_reader_and_a_subset_in_one_step() {
     s.write("tests/z.flag", "fail\n");
     let (_, ran, _, direct_code) = judge("x01", &s, &TU, true);
     same_verdict("x01", &ran, direct_code);
+    no_verdict_names(&ran, "tests/z.flag");
 }
 
 /// x01c: `c.t` is renamed to `d.t`, whose listing drops the runner-only test, while the flag turns to `fail`.
@@ -219,6 +230,7 @@ fn r2_x01c_a_renamed_reader_in_one_step() {
     s.write("tests/z.flag", "fail\n");
     let (_, ran, _, direct_code) = judge("x01c", &s, &TU, true);
     same_verdict("x01c", &ran, direct_code);
+    no_verdict_names(&ran, "tests/z.flag");
 }
 
 /// x02: `c` stops reading the runner-only test in the same step as its flag turns to `fail`.
@@ -229,6 +241,7 @@ fn r2_x02_a_unit_that_stops_reading_in_the_step_its_flag_fails() {
     s.write("tests/z.flag", "fail\n");
     let (_, ran, _, direct_code) = judge("x02", &s, &TU, true);
     same_verdict("x02", &ran, direct_code);
+    no_verdict_names(&ran, "tests/z.flag");
 }
 
 /// x03a: a full run that the engine takes for another reason (here `setup.src`, which every unit reads, changed) records
