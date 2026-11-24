@@ -419,10 +419,11 @@ pub(super) fn finish(
         || !ran.uncovered.is_empty();
     // A stored version that reads a path no run covered may read it by stat only, so the residue is unknown, and the next
     // run takes the full form (spec 3.8, PR 86 review round 3). Other no-verdict runs keep the residue they measured.
-    let stored_uncovered = pass.held().iter().any(|(_, inputs, _)| {
-        inputs
-            .iter()
-            .any(|input| ran.uncovered.contains(&input.path))
+    let stored_uncovered = pass.held().iter().any(|(unit, inputs, _)| {
+        ran.proven.contains_key(unit)
+            && inputs
+                .iter()
+                .any(|input| ran.uncovered.contains(&input.path))
     });
     let unknown = stopped_early
         || ran.unlaunched
