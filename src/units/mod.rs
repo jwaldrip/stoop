@@ -11,6 +11,7 @@ pub(crate) mod launch;
 pub(crate) mod policy;
 mod registry;
 pub(crate) mod residue;
+pub(crate) mod subset;
 pub(crate) mod universe;
 
 pub(super) use registry::diagnostic;

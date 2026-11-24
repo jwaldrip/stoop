@@ -1,14 +1,16 @@
 //! One traced unit launch, judged (spec 3.3 to 3.5). `judge` decides what the launch proves or what it breaks.
-//! The checks run in the order of spec 3.3, so the first breach found is the one reported. A pass runs a
-//! launch per unit; subsets and completion launches will share this judgement.
+//! The checks run in the order of spec 3.3, so the first breach found is the one reported. A pass runs a launch per
+//! unit, and a subset runs its affected units the same way. `listing` checks what a launch did to the listings of the
+//! units a subset skipped (spec 3.7).
 
 use super::independence::{self, Named, Roster, Violation, Written};
 use crate::ignore::Ignore;
-use crate::pathutil::to_key;
+use crate::pathutil::{from_key, to_key};
 use crate::run::{assemble_with, Assembled, RootListing};
 use crate::trace::Trace;
 use std::collections::BTreeSet;
 use std::ffi::OsString;
+use std::fs;
 use std::io;
 use std::path::Path;
 
@@ -19,7 +21,7 @@ pub(crate) struct Observed {
     /// The keys the launch wrote, in scope and not ignored (spec 3.3, step 1).
     pub(crate) writes: BTreeSet<String>,
     /// The keys the launch read by content (spec 3.3, step 2).
-    content: BTreeSet<String>,
+    pub(super) content: BTreeSet<String>,
     /// Whether the launch listed the root and that listing is recorded (spec 3.5).
     root_listed: bool,
     /// The top-level names that the launch wrote or created, which the root guard does not count (spec 3.5).
@@ -136,7 +138,7 @@ fn root_guard(cx: &Context<'_>, observed: &Observed) -> Result<(), String> {
 /// launch, and one after the launch when the launch listed the root.
 pub(crate) fn root_names(root: &Path) -> io::Result<BTreeSet<OsString>> {
     let mut names = BTreeSet::new();
-    for entry in std::fs::read_dir(root)? {
+    for entry in fs::read_dir(root)? {
         names.insert(entry?.file_name());
     }
     Ok(names)
@@ -161,4 +163,183 @@ fn top_names(trace: &Trace, root: &Path, real_root: &Path) -> BTreeSet<OsString>
         }
     }
     names
+}
+
+/// A unit that a subset keeps without launching it, with what its proof names (spec 3.7). `listed` holds the
+/// directories its listings name, root-relative with "" for the root. `paths` holds every path its proof names,
+/// and the unit's own file, which a launch must not write.
+pub(crate) struct SkippedUnit {
+    pub(crate) unit: String,
+    pub(crate) listed: Vec<String>,
+    pub(crate) paths: Vec<String>,
+}
+
+/// The listing level of the 125 rule (spec 3.7). A key that this launch changed, whose parent directory a skipped
+/// unit lists, leaves that unit's proof broken without a write to any file it names. A key counts as changed when the
+/// run created it or removed it, judged by its prior in the trace, and a directory the run created counts as changed.
+/// Returns the first changed key in key order, with the directory it changed and the skipped unit that lists it.
+pub(crate) fn listing(
+    skipped: &[SkippedUnit],
+    root: &Path,
+    real_root: &Path,
+    trace: &Trace,
+) -> Option<(String, String, String)> {
+    if skipped.iter().all(|skip| skip.listed.is_empty()) {
+        return None;
+    }
+    let mut changed: BTreeSet<String> = trace
+        .keys
+        .values()
+        .filter(|key| !key.starts_with('/') && entry_changed(root, trace, key))
+        .cloned()
+        .collect();
+    changed.extend(
+        trace
+            .created_dirs
+            .iter()
+            .filter_map(|dir| key_under(root, real_root, dir)),
+    );
+    for key in &changed {
+        let parent = Path::new(key)
+            .parent()
+            .map_or_else(String::new, |parent| parent.to_string_lossy().into_owned());
+        for skip in skipped {
+            if let Some(dir) = skip
+                .listed
+                .iter()
+                .find(|listed| dir_name(listed) == dir_name(&parent))
+            {
+                return Some((skip.unit.clone(), key.clone(), dir.clone()));
+            }
+        }
+    }
+    None
+}
+
+/// The directory a listing names, with the root spelled one way. A proof spells the root `.`, and a key's parent is
+/// empty for an entry at the root (spec 3.7).
+fn dir_name(text: &str) -> &str {
+    if text.is_empty() {
+        "."
+    } else {
+        text
+    }
+}
+
+/// Whether the run changed the entry at `key`: it was absent and now exists, or it existed and is gone. A key with no
+/// recorded prior counts as changed, which is the conservative reading.
+fn entry_changed(root: &Path, trace: &Trace, key: &str) -> bool {
+    let exists = fs::symlink_metadata(from_key(root, key)).is_ok();
+    match trace.priors.get(key).map(String::as_str) {
+        Some("a") => exists,
+        Some(_) => !exists,
+        None => true,
+    }
+}
+
+/// The root-relative key of a path the run created, when it lies under the root.
+fn key_under(root: &Path, real_root: &Path, path: &Path) -> Option<String> {
+    let relative = path
+        .strip_prefix(root)
+        .or_else(|_| path.strip_prefix(real_root))
+        .ok()?;
+    relative.to_str().map(str::to_owned)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::trace::Trace;
+    use std::path::PathBuf;
+
+    fn skipped(unit: &str, listed: &[&str]) -> SkippedUnit {
+        SkippedUnit {
+            unit: unit.into(),
+            listed: listed.iter().map(|dir| dir.to_string()).collect(),
+            paths: vec![unit.into()],
+        }
+    }
+
+    /// A fresh root that holds the files `names` lists, under a name of its own.
+    fn root(name: &str, names: &[&str]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("stoop-listing-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        for file in names {
+            let path = dir.join(file);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"x").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_new_entry_in_the_root_is_a_breach_for_a_skipped_unit_that_lists_the_root() {
+        let dir = root("new-root", &["new.top"]);
+        let mut trace = Trace::default();
+        trace
+            .keys
+            .insert(PathBuf::from("new.top"), "new.top".into());
+        trace.priors.insert("new.top".into(), "a".into());
+        let found = listing(&[skipped("tests/c.t", &[""])], &dir, &dir, &trace);
+        assert_eq!(
+            found,
+            Some(("tests/c.t".into(), "new.top".into(), "".into()))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_entry_the_run_removed_from_a_listed_directory_is_a_breach() {
+        let dir = root("gone", &[]);
+        let mut trace = Trace::default();
+        trace
+            .keys
+            .insert(PathBuf::from("tests/gone.t"), "tests/gone.t".into());
+        trace.priors.insert("tests/gone.t".into(), "f:00".into());
+        let found = listing(&[skipped("tests/c.t", &["tests"])], &dir, &dir, &trace);
+        assert_eq!(
+            found,
+            Some(("tests/c.t".into(), "tests/gone.t".into(), "tests".into()))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_directory_the_run_created_is_a_changed_entry() {
+        let dir = root("created", &["tests2/x"]);
+        let mut trace = Trace::default();
+        trace.created_dirs.push(dir.join("tests2"));
+        let found = listing(&[skipped("tests/c.t", &[""])], &dir, &dir, &trace);
+        assert_eq!(
+            found,
+            Some(("tests/c.t".into(), "tests2".into(), "".into()))
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_change_outside_the_listed_directories_is_not_a_breach() {
+        let dir = root("elsewhere", &["src/new.src"]);
+        let mut trace = Trace::default();
+        trace
+            .keys
+            .insert(PathBuf::from("src/new.src"), "src/new.src".into());
+        trace.priors.insert("src/new.src".into(), "a".into());
+        let found = listing(&[skipped("tests/c.t", &["tests"])], &dir, &dir, &trace);
+        assert_eq!(found, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_entry_that_is_as_it_was_is_not_a_breach() {
+        let dir = root("same", &["tests/a.t"]);
+        let mut trace = Trace::default();
+        trace
+            .keys
+            .insert(PathBuf::from("tests/a.t"), "tests/a.t".into());
+        trace.priors.insert("tests/a.t".into(), "f:00".into());
+        let found = listing(&[skipped("tests/c.t", &["tests"])], &dir, &dir, &trace);
+        assert_eq!(found, None);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

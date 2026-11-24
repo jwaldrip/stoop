@@ -77,8 +77,11 @@ fn decision(out: &Output) -> &'static str {
         "skip"
     } else if log.contains("stoop: attribution pass: ")
         || log.contains("would run an attribution pass: ")
+        || log.contains("(attribution pass): ")
     {
         "pass"
+    } else if log.contains("inputs; run ") || log.contains(" units affected, one launch each)") {
+        "subset"
     } else if log.contains("run full ") {
         "full"
     } else {
@@ -341,8 +344,12 @@ fn t10_a_new_unit_is_not_skipped() {
     s.clear_log();
     let out = split(&s, &[]);
     success(&out);
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
-    assert_eq!(s.launches().len(), 1, "the full form launches once");
+    assert_eq!(decision(&out), "subset", "{}", stderr(&out));
+    assert_eq!(
+        s.launches().len(),
+        1,
+        "the subset launches the new unit alone"
+    );
 }
 
 /// T11 (D11): a unit that Git ignores after its pass leaves the roster while its file stays. The next run takes the
@@ -560,7 +567,12 @@ fn an_expired_unit_proof_is_affected() {
     );
     s.clear_log();
     let out = split(&s, &[]);
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert_eq!(decision(&out), "pass", "{}", stderr(&out));
+    assert_eq!(
+        s.launches().len(),
+        3,
+        "the attribution pass launches each unit once"
+    );
 }
 
 /// The cost of an engine skip against a legacy hit at `STOOP_BENCH_UNITS` roster units (256, 1024 or 4096). It prints
@@ -642,8 +654,12 @@ fn t18_a_unit_proof_made_under_another_environment_is_affected() {
     );
     let out = split(&s, &[]);
     success(&out);
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
-    assert_eq!(s.launches().len(), 1, "the full form launches once");
+    assert_eq!(decision(&out), "pass", "{}", stderr(&out));
+    assert_eq!(
+        s.launches().len(),
+        3,
+        "the attribution pass launches each unit once"
+    );
 }
 
 /// T19: a unit that left the roster and no longer exists keeps no proof after a skip. The skip drops its versions, and
@@ -673,13 +689,17 @@ fn t20_a_change_that_not_every_unit_reads_is_not_global() {
     s.clear_log();
     let out = split(&s, &[]);
     success(&out);
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert_eq!(decision(&out), "subset", "{}", stderr(&out));
     assert!(
         !stderr(&out).contains("every unit reads it"),
         "{}",
         stderr(&out)
     );
-    assert_eq!(s.launches().len(), 1, "the full form launches once");
+    assert_eq!(
+        s.launches().len(),
+        2,
+        "the subset launches a and b, each once"
+    );
 }
 
 /// T21: explain names the units a change affects and no others: the two that read the changed source, not the third.
@@ -749,7 +769,7 @@ fn t_e15_listed_output_is_affected_not_global() {
     success(&s.hook(&with(&env, &[SPLIT, ("STOOP_FULL", "1")])));
     s.write("tests/a.out", "changed\n");
     let out = s.hook(&with(&env, &[SPLIT]));
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert_eq!(decision(&out), "subset", "{}", stderr(&out));
     assert!(
         stderr(&out).contains("output tests/a.out changed"),
         "{}",
@@ -1333,11 +1353,12 @@ fn a_deleted_input_that_a_unit_reads_is_not_a_skip() {
     let ran = split(&s, &[]);
     assert_eq!(
         decision(&explained),
-        "full",
+        "subset",
         "explain: {}",
         stderr(&explained)
     );
-    assert_eq!(decision(&ran), "full", "run: {}", stderr(&ran));
+    assert_eq!(decision(&ran), "subset", "run: {}", stderr(&ran));
+    assert_eq!(s.launches().len(), 1, "the subset launches c alone");
     assert!(
         stderr(&explained).contains("stoop: affected tests/c.t: src/c.src changed"),
         "{}",
@@ -1362,7 +1383,7 @@ fn a_new_unit_in_a_new_top_level_directory_is_not_a_skip() {
         stderr(&explained)
     );
     let out = split(&s, &[]);
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert_eq!(decision(&out), "subset", "{}", stderr(&out));
     assert_eq!(code(&out), 1, "{}", stderr(&out));
 }
 
@@ -1377,7 +1398,7 @@ fn a_new_unit_at_the_top_level_is_not_a_skip() {
     let direct = s.direct(&s.root, &[], &[]);
     assert_eq!(code(&direct), 1, "{}", stderr(&direct));
     let out = split(&s, &[]);
-    assert_eq!(decision(&out), "full", "{}", stderr(&out));
+    assert_eq!(decision(&out), "subset", "{}", stderr(&out));
     assert_eq!(code(&out), 1, "{}", stderr(&out));
 }
 

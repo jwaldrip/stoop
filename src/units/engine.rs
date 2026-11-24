@@ -1,8 +1,10 @@
 //! The decision engine (spec 3.9 and 3.10). With `STOOP_SPLIT` on, a changed run of a hooked suite decides from the unit
-//! proofs in its bundle whether it may skip. W7-1 acts on one decision, a skip when no unit is affected. Every other
-//! decision takes the full command, which is the switch-off path, with the reason the spec gives. Explain takes the same
-//! decision without the suite lock and prints the same lines (spec 3.12). Nothing here writes, except `settle` and
-//! `disagree`, which run under the suite lock.
+//! proofs in its bundle which units are affected. A run with none skips (E16). A run whose affected units are the whole
+//! roster is an attribution pass that keeps versions (E17), and any other affected set is a subset, one launch per unit
+//! (E18). Both run under the suite lock, which decides again before it launches (`subset`). Every other decision takes
+//! the full command, which is the switch-off path, with the reason the spec gives. Explain takes the same decision
+//! without the suite lock and prints the same lines (spec 3.12). Nothing here writes, except `settle` and `disagree`,
+//! which run under the suite lock.
 
 use super::attribution;
 use super::bundle::{self, LaunchGuard, Pending, Settled, Version, View};
@@ -14,14 +16,14 @@ use crate::input::{identify, list_hash_of_names, par_map, Input};
 use crate::pathutil::from_key;
 use crate::proof::{now, Proof};
 use crate::run::{Lookup, RunCx};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{fs, io};
 
 /// How many affected units explain names before it counts the rest (spec 3.12).
-const NAMED: usize = 20;
+pub(super) const NAMED: usize = 20;
 
 /// The reason of a unit that has no proof (spec 3.9).
 const NEW: &str = "new";
@@ -54,10 +56,14 @@ pub(crate) enum Decision {
     Legacy,
     /// Step E8 for a disabled suite: the full command runs, for this reason.
     Disabled(String),
-    /// Steps E10 to E15, and E17 and E18 in W7-1: the full command runs. `None` keeps the legacy reason.
+    /// Steps E10 to E15: the full command runs. `None` keeps the legacy reason.
     Full(Option<String>),
     /// Step E16: no unit is affected, so the run skips.
     Skip(Skipped),
+    /// Step E17: every unit of the roster is affected, so the attribution pass runs and keeps versions.
+    Pass(Plan),
+    /// Step E18: some units are affected, so one launch runs for each of them, and the rest keep their proofs.
+    Subset(Plan),
 }
 
 /// A skip, with the counts its line names (spec 3.12).
@@ -68,6 +74,34 @@ pub(crate) struct Skipped {
     pub(crate) inputs: usize,
     /// Whether the bundle holds versions of units that left the roster. A skip drops them under the suite lock.
     pub(crate) drop: bool,
+}
+
+/// The affected set of a decision that launches units (spec 3.9, E17 and E18), in roster order.
+pub(crate) struct Plan {
+    /// The roster's units.
+    pub(crate) units: usize,
+    /// The distinct inputs that the roster's proofs name, which the subset header counts.
+    pub(crate) inputs: usize,
+    /// The affected units, in roster order.
+    pub(crate) affected: Vec<Affected>,
+    /// The names that the listing check excused through the affected units' stored proofs (spec 3.10). Each needs a new
+    /// proof of this run that reads it by content, or the run has no verdict.
+    pub(crate) excused: Vec<Excused>,
+}
+
+/// One affected unit (spec 3.9): its reason, which the header and explain name, and the inputs that changed for its
+/// proof, which `STOOP_CHANGED_INPUTS` names for its launch (spec 3.11). A unit that has no proof changed no input.
+pub(crate) struct Affected {
+    pub(crate) unit: String,
+    pub(crate) why: String,
+    pub(crate) changed: Vec<String>,
+}
+
+/// A name that an affected unit's stored proof named, and that the listing of a directory in the whole proof holds as an
+/// added name (spec 3.10, rv32 and rv34). `units` are the affected units whose stored proofs named it.
+pub(crate) struct Excused {
+    pub(crate) path: String,
+    pub(crate) units: Vec<String>,
 }
 
 /// A decision with what explain prints for it.
@@ -125,8 +159,17 @@ fn plain() -> Verdict {
     }
 }
 
+/// The verdict of a locked run that keeps the full command for no engine reason: the legacy path decides (spec 3.10).
+pub(super) fn unrun() -> Verdict {
+    Verdict {
+        decision: Decision::Full(None),
+        affected: None,
+        clean: false,
+    }
+}
+
 /// What a decision reads besides the bundle: the roster, the candidate whole proofs, the environment now and the clock.
-struct Judged<'a> {
+pub(super) struct Judged<'a> {
     root: &'a Path,
     suite: &'a str,
     roster: &'a [String],
@@ -137,7 +180,7 @@ struct Judged<'a> {
 }
 
 impl<'a> Judged<'a> {
-    fn new(
+    pub(super) fn new(
         cx: &'a RunCx<'_>,
         pending: &'a Pending,
         proofs: &'a [Proof],
@@ -236,7 +279,7 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
         }
     }
     // E13 onward: the affected units are known, and explain shows them.
-    let shown = Some(affected.clone());
+    let shown = Some(pairs(&affected));
     if whole_guard(proof) != cx.guard {
         return verdict(
             Decision::Full(Some(
@@ -259,15 +302,45 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
     if let Some(reason) = output_missing(cx, view, proof) {
         return verdict(Decision::Full(Some(reason)), shown, clean);
     }
+    // E16 to E18 each need every listing that the whole proof holds to be as it was (see `listings_change`).
+    let excused = match listings_change(cx, view, &current, proof, &affected) {
+        Ok(excused) => excused,
+        Err(reason) => return verdict(Decision::Full(Some(reason)), shown, clean),
+    };
     if affected.is_empty() {
-        // E16 also needs every listing that the whole proof holds to be as it was (see `listings_change`).
-        if let Some(reason) = listings_change(cx, view, proof) {
-            return verdict(Decision::Full(Some(reason)), shown, clean);
-        }
         return verdict(Decision::Skip(skipped(cx, view)), shown, clean);
     }
-    // E17 and E18: W7-1 has no subset, so the full command runs for the legacy reason.
-    verdict(Decision::Full(None), shown, clean)
+    // E17 and E18: the affected units launch one at a time. Units that are all affected make the attribution pass.
+    let whole = affected.len() == cx.roster.len();
+    let plan = Plan {
+        units: cx.roster.len(),
+        inputs: skipped(cx, view).inputs,
+        affected,
+        excused,
+    };
+    verdict(
+        if whole {
+            Decision::Pass(plan)
+        } else {
+            Decision::Subset(plan)
+        },
+        shown,
+        clean,
+    )
+}
+
+/// The decision of a locked run that launches units (spec 3.10). `Ok` carries the plan for E17 and E18. `Err` carries
+/// the verdict of every other decision, which the run takes as it stands.
+pub(super) fn judge_units(cx: &Judged<'_>, view: &View) -> Result<Plan, Verdict> {
+    let verdict = judge(cx, view);
+    match verdict.decision {
+        Decision::Pass(plan) | Decision::Subset(plan) => Ok(plan),
+        decision => Err(Verdict {
+            decision,
+            affected: verdict.affected,
+            clean: verdict.clean,
+        }),
+    }
 }
 
 fn verdict(decision: Decision, affected: Option<Vec<(String, String)>>, clean: bool) -> Verdict {
@@ -278,11 +351,28 @@ fn verdict(decision: Decision, affected: Option<Vec<(String, String)>>, clean: b
     }
 }
 
-/// Step E16 for listings (spec 3.10). A skip also needs the listings that the whole proof holds to be as they were. The
-/// residue leaves out the listings of the catalog walk, so a name that a walked directory gained or lost is seen by no
-/// unit's proof, unless a unit lists that directory itself. The whole proof's own `dl:` entries see it. The first changed
-/// directory in path order is named, as the legacy lookup names a changed input.
-fn listings_change(cx: &Judged<'_>, view: &View, proof: &Proof) -> Option<String> {
+/// The reason and unit of each affected unit, as explain names them.
+fn pairs(affected: &[Affected]) -> Vec<(String, String)> {
+    affected
+        .iter()
+        .map(|affected| (affected.unit.clone(), affected.why.clone()))
+        .collect()
+}
+
+/// The listing check of spec 3.10, which runs before the skip (E16) and before a subset or an attribution pass (E17 and
+/// E18). Every listing that the whole proof holds must be as it was, or its difference must be excused as `listing_holds`
+/// allows. The residue leaves out the listings of the catalog walk, so a name that a walked directory gained or lost is
+/// seen by no unit's proof, unless a unit lists that directory itself. The whole proof's own `dl:` entries see it. The
+/// first directory that is not excused is named in path order, as the legacy lookup names a changed input. When every
+/// difference is excused, the names that the stored proofs of affected units excused are returned, so that the run can
+/// see a new proof read each one by content (spec 3.10, rv34).
+fn listings_change(
+    cx: &Judged<'_>,
+    view: &View,
+    current: &Current,
+    proof: &Proof,
+    affected: &[Affected],
+) -> Result<Vec<Excused>, String> {
     let mut entries: Vec<&Input> = proof
         .inputs
         .iter()
@@ -290,26 +380,148 @@ fn listings_change(cx: &Judged<'_>, view: &View, proof: &Proof) -> Option<String
         .filter(|input| input.id.starts_with("dl:"))
         .collect();
     entries.sort_by(|a, b| a.path.cmp(&b.path));
+    // A run usually finds every listing as it was, and then no excuse is read.
+    let same = par_map(&entries, |input| listing_matches(cx.root, input));
+    if same.iter().all(|&same| same) {
+        return Ok(Vec::new());
+    }
+    let recorded: BTreeSet<&str> = proof
+        .inputs
+        .iter()
+        .chain(&proof.outputs)
+        .filter(|input| input.id != "a")
+        .map(|input| input.path.as_str())
+        .collect();
+    let valid = covered_reads(cx, view, current, &recorded);
+    let rerun = rerun_reads(view, affected, &recorded);
+    let mut covered = valid.clone();
+    covered.extend(rerun.keys().cloned());
     let moved = par_map(&entries, |input| {
-        !listing_holds(cx.root, view, input, proof)
+        !listing_holds(cx.root, view, cx.roster, input, proof, &covered)
     });
-    entries
+    if let Some(reason) = entries
         .iter()
         .zip(moved)
         .find_map(|(input, moved)| moved.then(|| format!("{} changed", safe(&input.path))))
+    {
+        return Err(reason);
+    }
+    // A name is excused here only in a listed directory whose listing changed, when no valid proof reads it, the whole
+    // proof did not hold it, and it is a regular file now. Where a listing holds, none of its names appeared (rv43).
+    let changed: BTreeSet<&str> = entries
+        .iter()
+        .zip(&same)
+        .filter(|(input, held)| !**held && !matches!(input.path.as_str(), "" | "."))
+        .map(|(input, _)| input.path.as_str())
+        .collect();
+    Ok(rerun
+        .into_iter()
+        .filter(|(path, _)| {
+            !valid.contains(path)
+                && !recorded.contains(path.as_str())
+                && Path::new(path)
+                    .parent()
+                    .and_then(Path::to_str)
+                    .is_some_and(|dir| changed.contains(dir))
+                && is_regular(cx.root, path)
+        })
+        .map(|(path, units)| Excused { path, units })
+        .collect())
 }
 
-/// Whether a listing that the whole proof records still holds (spec 3.10, E16). The current names must give the recorded
-/// digest. If they do not, the difference may only be names that were lost. The candidate is the current names plus the
-/// lost names, and it must give the recorded digest exactly, so an added name, a rename, or a lost name that the proof
-/// never recorded is a change.
+/// Whether the names that a listing holds now give the digest that the whole proof records for it (spec 3.10, E16).
+fn listing_matches(root: &Path, recorded: &Input) -> bool {
+    match (
+        recorded.id.strip_prefix("dl:"),
+        listed(&from_key(root, &recorded.path)),
+    ) {
+        (Some(digest), Some(mut names)) => list_hash_of_names(&mut names) == digest,
+        _ => false,
+    }
+}
+
+/// The paths that a valid version of a roster unit reads by content, and that the whole proof did not hold as present
+/// (spec 3.10, E16). A file such as a unit's flag can appear after the whole proof. The unit's version verified its
+/// identity, so the unit's own proof covers the file. A version that does not hold covers nothing, and neither does a
+/// unit that has left the roster.
+fn covered_reads(
+    cx: &Judged<'_>,
+    view: &View,
+    current: &Current,
+    recorded: &BTreeSet<&str>,
+) -> BTreeSet<String> {
+    let mut reads = BTreeSet::new();
+    for unit in cx.roster {
+        for version in view.units.get(unit).into_iter().flatten() {
+            if !version_reasons(cx, view, current, version).0.is_empty() {
+                continue;
+            }
+            for &index in &version.inputs {
+                let input = &view.table[index as usize];
+                let content = input.id.starts_with("f:") || input.id.starts_with("x:");
+                if content && !recorded.contains(input.path.as_str()) {
+                    reads.insert(input.path.clone());
+                }
+            }
+        }
+    }
+    reads
+}
+
+/// The paths that the stored versions of an affected roster unit name, and that the whole proof did not hold as present,
+/// each with the affected units that name it (spec 3.10, E17 and E18). The unit launches in this run, and its new proof
+/// decides what it reads, so a path is named whatever its kind: a flag file that the unit stats as absent is covered when
+/// it appears (spec 3.10, flag files and S9). Every version of an affected unit is stale, and none is required to hold.
+fn rerun_reads(
+    view: &View,
+    affected: &[Affected],
+    recorded: &BTreeSet<&str>,
+) -> BTreeMap<String, Vec<String>> {
+    let mut reads: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for changed in affected {
+        for version in view.units.get(&changed.unit).into_iter().flatten() {
+            for &index in &version.inputs {
+                let input = &view.table[index as usize];
+                if !recorded.contains(input.path.as_str()) {
+                    let units = reads.entry(input.path.clone()).or_default();
+                    if !units.contains(&changed.unit) {
+                        units.push(changed.unit.clone());
+                    }
+                }
+            }
+        }
+    }
+    reads
+}
+
+/// Whether a root-relative key is a regular file now. A link is judged as a link, not by its target (spec 3.10, rv32).
+fn is_regular(root: &Path, key: &str) -> bool {
+    fs::symlink_metadata(from_key(root, key)).is_ok_and(|meta| meta.is_file())
+}
+
+/// Whether a listing that the whole proof records still holds (spec 3.10, E16, as amended for STOP 4 and for files a
+/// unit reads). The current names must give the recorded digest. If they do not, the difference must be explained
+/// exactly, by three kinds of name:
 ///
-/// The lost names are the entries under this directory that are absent now, from two sources: the bundle's units with
-/// versions (the former members of the roster), and the whole proof's own regular-file entries (`f:` and `x:`). A
-/// non-unit name that the full command only listed was never opened or stat'ed, so the whole proof holds no entry for
-/// it, and the bundle holds no version for it. A non-unit file that the full command did read is in the residue, which
-/// E12 refuses before this check runs. So no non-unit name can be a lost name.
-fn listing_holds(root: &Path, view: &View, recorded: &Input, proof: &Proof) -> bool {
+/// - Lost names: the entries under this directory that are absent now, from two sources: the bundle's units with
+///   versions (the former members of the roster), and the whole proof's own regular-file
+///   entries (`f:` and `x:`).
+/// - Added units: roster units under this directory that the whole proof never read, so they did not exist when it was
+///   recorded. Each is valid or affected, and an affected unit launches in this run, so each is covered either way.
+/// - Added files: regular files under this directory that a valid unit proof reads, or that an affected unit's stored proof
+///   names, and that the whole proof does not hold (`covered_reads` and `rerun_reads`). A directory or a link is never
+///   excused (rv32). A name that only a stored proof names is checked after the launches (`unread_excuses`, rv34).
+///
+/// The root never excuses an added name. The candidate is the current names without the added names, plus the lost
+/// names. It must give the recorded digest exactly, so any other added or removed name is a change.
+fn listing_holds(
+    root: &Path,
+    view: &View,
+    roster: &[String],
+    recorded: &Input,
+    proof: &Proof,
+    covered: &BTreeSet<String>,
+) -> bool {
     let (Some(digest), Some(mut names)) = (
         recorded.id.strip_prefix("dl:"),
         listed(&from_key(root, &recorded.path)),
@@ -321,6 +533,30 @@ fn listing_holds(root: &Path, view: &View, recorded: &Input, proof: &Proof) -> b
     }
     let dir = Path::new(&recorded.path);
     let under = |key: &str| Path::new(key).parent() == Some(dir);
+    // Every entry that the whole proof read by content or by stat. A unit that existed when the proof was recorded read
+    // its own file, so its path is among these.
+    let read_entries: BTreeSet<&str> = proof
+        .inputs
+        .iter()
+        .filter(|read| read.id.starts_with("f:") || read.id.starts_with("x:"))
+        .map(|read| read.path.as_str())
+        .collect();
+    // The root never excuses an added name. Elsewhere, a roster unit that the whole proof never read did not exist when
+    // the proof was recorded. Each roster unit is either valid or affected, and an affected unit launches in this run, so
+    // each such unit is excused here. `judge` runs this check before both the skip and the subset.
+    let excused = !matches!(recorded.path.as_str(), "" | ".");
+    let added: BTreeSet<Vec<u8>> = roster
+        .iter()
+        .filter(|unit| excused && under(unit.as_str()) && !read_entries.contains(unit.as_str()))
+        .map(String::as_str)
+        .chain(covered.iter().map(String::as_str))
+        .filter(|path| excused && under(path))
+        .filter_map(|path| {
+            Path::new(path)
+                .file_name()
+                .map(|name| name.as_encoded_bytes().to_vec())
+        })
+        .collect();
     let lost: BTreeSet<Vec<u8>> = view
         .units
         .iter()
@@ -341,8 +577,14 @@ fn listing_holds(root: &Path, view: &View, recorded: &Input, proof: &Proof) -> b
                 .map(|name| name.as_encoded_bytes().to_vec())
         })
         .collect();
-    names.extend(lost);
-    list_hash_of_names(&mut names) == digest
+    // An added name is excused only while it is a regular file now (rv32): a directory, a link or another type is a change.
+    let regular = regular_names(&from_key(root, &recorded.path));
+    let mut candidate: Vec<Vec<u8>> = names
+        .into_iter()
+        .filter(|name| !(added.contains(name) && regular.contains(name)))
+        .collect();
+    candidate.extend(lost);
+    list_hash_of_names(&mut candidate) == digest
 }
 
 /// The entry names of a listed directory as `identify` reads them. An absent path lists as no names. `None` when the
@@ -356,6 +598,20 @@ fn listed(dir: &Path) -> Option<Vec<Vec<u8>>> {
         Err(_) if is_absent(dir) => Some(Vec::new()),
         _ => None,
     }
+}
+
+/// The names of the regular files in a directory now, by each entry's own type, so a link is not one (spec 3.10, rv32).
+fn regular_names(dir: &Path) -> BTreeSet<Vec<u8>> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return BTreeSet::new();
+    };
+    entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let regular = entry.file_type().ok()?.is_file();
+            regular.then(|| entry.file_name().as_encoded_bytes().to_vec())
+        })
+        .collect()
 }
 
 /// Whether a path does not exist, which `identify` records as `a` inside the root.
@@ -432,33 +688,49 @@ impl Current {
 
 /// Step E13 (spec 3.9): the roster units whose proof no longer holds, each with its reason, in roster order. A unit
 /// holds when one of its versions holds, and each version is judged against its own stamp, guard and entries.
-fn analyse(cx: &Judged<'_>, view: &View, current: &Current) -> Vec<(String, String)> {
+fn analyse(cx: &Judged<'_>, view: &View, current: &Current) -> Vec<Affected> {
     let mut affected = Vec::new();
     for unit in cx.roster {
-        let versions: Vec<Vec<String>> = view
+        let judged: Vec<(Vec<String>, Vec<String>)> = view
             .units
             .get(unit)
             .into_iter()
             .flatten()
             .map(|version| version_reasons(cx, view, current, version))
             .collect();
-        if versions.is_empty() {
-            affected.push((unit.clone(), NEW.to_owned()));
-        } else if versions.iter().all(|reasons| !reasons.is_empty()) {
-            affected.push((unit.clone(), summary(&versions[0])));
+        if judged.is_empty() {
+            affected.push(Affected {
+                unit: unit.clone(),
+                why: NEW.to_owned(),
+                changed: Vec::new(),
+            });
+        } else if judged.iter().all(|(reasons, _)| !reasons.is_empty()) {
+            let mut changed: Vec<String> = judged
+                .iter()
+                .flat_map(|(_, changed)| changed.iter().cloned())
+                .collect();
+            changed.sort();
+            changed.dedup();
+            affected.push(Affected {
+                unit: unit.clone(),
+                why: summary(&judged[0].0),
+                changed,
+            });
         }
     }
     affected
 }
 
 /// Why one version no longer holds, in the order spec 3.9 gives: its age, its environment, its inputs and its outputs.
+/// It also returns the inputs that changed, as root-relative keys (spec 3.11).
 fn version_reasons(
     cx: &Judged<'_>,
     view: &View,
     current: &Current,
     version: &Version,
-) -> Vec<String> {
+) -> (Vec<String>, Vec<String>) {
     let mut reasons = Vec::new();
+    let mut changed = Vec::new();
     if cx.max_age > 0 && cx.now.saturating_sub(version.created) > cx.max_age {
         reasons.push("proof expired".to_owned());
     }
@@ -469,6 +741,7 @@ fn version_reasons(
         let input = &view.table[index as usize];
         if !current.holds(input) {
             reasons.push(format!("{} changed", safe(&input.path)));
+            changed.push(input.path.clone());
         }
     }
     for &index in &version.outputs {
@@ -482,7 +755,7 @@ fn version_reasons(
             reasons.push(format!("output {} {verb}", safe(&output.path)));
         }
     }
-    reasons
+    (reasons, changed)
 }
 
 /// The reason a unit prints: its first reason, and how many more it has (spec 3.9).
@@ -773,5 +1046,88 @@ mod tests {
             skip_line("key", &skip),
             "stoop: skip key: no tracked input changed (3 units, 7 inputs)"
         );
+    }
+
+    fn input(path: &str, id: &str) -> Input {
+        Input {
+            path: path.to_owned(),
+            id: id.to_owned(),
+            oid: None,
+            oid_basis: None,
+        }
+    }
+
+    /// A view whose table is `table` and whose units are `units`, with every table entry as it is now on disk.
+    fn view_of(units: Vec<(&str, Vec<Version>)>, table: Vec<Input>) -> (View, Current) {
+        let current = Current(
+            table
+                .iter()
+                .map(|entry| (entry.path.clone(), [Some(entry.id.clone()), None]))
+                .collect(),
+        );
+        let view = View {
+            whole: "whole".to_owned(),
+            disabled: None,
+            table,
+            units: units
+                .into_iter()
+                .map(|(unit, versions)| (unit.to_owned(), versions))
+                .collect(),
+            residue: None,
+        };
+        (view, current)
+    }
+
+    fn version(created: u64, inputs: Vec<u32>) -> Version {
+        Version {
+            created,
+            guard: "g".to_owned(),
+            inputs,
+            outputs: Vec::new(),
+        }
+    }
+
+    fn judged<'a>(roster: &'a [String], max_age: u64) -> Judged<'a> {
+        Judged {
+            root: Path::new("."),
+            suite: "suite",
+            roster,
+            proofs: &[],
+            guard: "g".to_owned(),
+            max_age,
+            now: 1_000,
+        }
+    }
+
+    #[test]
+    fn a_file_a_valid_roster_version_reads_is_covered() {
+        let table = vec![input("tests/a.t", "f:1"), input("tests/a.flag", "f:2")];
+        let (view, current) = view_of(vec![("tests/a.t", vec![version(1_000, vec![0, 1])])], table);
+        let roster = vec!["tests/a.t".to_owned()];
+        let covered = covered_reads(&judged(&roster, 0), &view, &current, &BTreeSet::new());
+        assert!(covered.contains("tests/a.flag"), "{covered:?}");
+    }
+
+    #[test]
+    fn a_file_read_only_by_an_expired_version_is_not_covered() {
+        let table = vec![input("tests/a.t", "f:1"), input("tests/a.flag", "f:2")];
+        let versions = vec![version(1_000, vec![0]), version(1, vec![0, 1])];
+        let (view, current) = view_of(vec![("tests/a.t", versions)], table);
+        let roster = vec!["tests/a.t".to_owned()];
+        let covered = covered_reads(&judged(&roster, 100), &view, &current, &BTreeSet::new());
+        assert!(!covered.contains("tests/a.flag"), "{covered:?}");
+    }
+
+    #[test]
+    fn a_file_read_only_by_a_version_of_a_unit_that_left_the_roster_is_not_covered() {
+        let table = vec![input("tests/b.t", "f:1"), input("tests/a.flag", "f:2")];
+        let units = vec![
+            ("tests/a.t", vec![version(1_000, vec![1])]),
+            ("tests/b.t", vec![version(1_000, vec![0])]),
+        ];
+        let (view, current) = view_of(units, table);
+        let roster = vec!["tests/b.t".to_owned()];
+        let covered = covered_reads(&judged(&roster, 0), &view, &current, &BTreeSet::new());
+        assert!(!covered.contains("tests/a.flag"), "{covered:?}");
     }
 }

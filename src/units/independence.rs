@@ -128,6 +128,18 @@ impl Named {
                 .push(unit.to_owned());
         }
     }
+
+    /// Forgets the names one unit's stored proof gave, when that proof is replaced (spec 3.11). A name that a
+    /// different unit still gives stays.
+    pub(crate) fn forget(&mut self, unit: &str, inputs: &[String], outputs: &[String]) {
+        for (names, paths) in [(&mut self.inputs, inputs), (&mut self.outputs, outputs)] {
+            for path in paths {
+                if let Some(units) = names.get_mut(path) {
+                    units.retain(|named| named.as_str() != unit);
+                }
+            }
+        }
+    }
 }
 
 /// Check (b): the launch read, by content, the file of a roster unit that is not one of its members. `content`
