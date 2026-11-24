@@ -331,3 +331,14 @@ fn model_readds_and_renames_give_the_full_runs_verdict() {
 fn model_runner_only_tests_give_the_full_runs_verdict() {
     check_range(true);
 }
+
+/// The two seeds of the PR 82 reviewer's model whose first changed runs gave the wrong verdict before the fix: seed 2059
+/// at step 30 and seed 2091 at step 14 (issue #84). The default range does not reach them, so they run by name.
+#[test]
+fn model_seeds_that_found_issue_84_agree_with_the_runner() {
+    for seed in [2059, 2091] {
+        if let Err(why) = run_world(seed, 30, true) {
+            panic!("{why}");
+        }
+    }
+}
