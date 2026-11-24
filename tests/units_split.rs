@@ -1049,8 +1049,44 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
             )
         };
         let subject_code = code(&subject);
-        assert!(subject_code != 2 && subject_code != 125, "{}", report());
-        assert_eq!(subject_code == 0, code(&oracle) == 0, "{}", report());
+        assert!(subject_code != 2, "{}", report());
+        if subject_code == 125 {
+            // The designed no-verdict (PR 86 review round 2), accepted under the bounded rule of the runner models: the exact
+            // line, an oracle that passes, no no-op after a passing run, and an affected unit that dropped the named path from
+            // its listed lines in this step, read from the files the model wrote. Every use is printed and bounded.
+            assert!(
+                !(noop && passing),
+                "a no-op after a passing run gave no verdict: {}",
+                report()
+            );
+            let path = model_no_verdict_path(&subject).unwrap_or_else(|| {
+                panic!("a status of 125 without the no-verdict line: {}", report())
+            });
+            assert_eq!(
+                code(&oracle),
+                0,
+                "a status of 125 where the full command fails: {}",
+                report()
+            );
+            let after = model_listed_lines(&s, &roster);
+            assert!(
+                launches.iter().any(|unit| {
+                    before.get(unit).is_some_and(|old| old.contains(&path))
+                        && after.get(unit).is_some_and(|new| !new.contains(&path))
+                }),
+                "the no-verdict line names {path}, which no affected unit dropped in this step: {}",
+                report()
+            );
+            no_verdicts += 1;
+            println!("NO VERDICT ACCEPTED (M1): seed {seed}, step {step}, {path}");
+            assert!(
+                no_verdicts * 3 <= steps,
+                "too many no-verdicts in one sequence: {}",
+                report()
+            );
+        } else {
+            assert_eq!(subject_code == 0, code(&oracle) == 0, "{}", report());
+        }
         for launch in launches.iter().filter(|launch| !launch.is_empty()) {
             assert!(roster.contains(launch), "a non-unit argument: {}", report());
         }
