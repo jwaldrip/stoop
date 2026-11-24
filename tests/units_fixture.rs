@@ -18,13 +18,13 @@
 //! | running test P | With `T_WRITE_AT=P` (IF) and `T_WRITE` set, `written` goes to `T_WRITE` right before `cat P`. Then `cat P`. Then `cat <root>/<line>` for each non-empty line of P. Then `cat <root>/setup.src`. With `T_WRITE_EACH=1`, `written` goes to `${P%.*}.out` after those reads. Then the FIFO hold, if `T_FIFO` is set. Then the test fails if `${P%.*}.flag` contains `fail`, or, in the test-word form, if `T_FAIL_ALONE=P` (IF). Logs `ran=P`, and `failed=P` on failure. A missing P fails the test. |
 //! | `T_IGNORE=1` | With test words: reads nothing and exits 0. It exits before the purity programs run (see the test-words row). A plain `T_WRITE` still writes first. The no-argument form is unaffected. |
 //! | `T_STAT_UNIT=1` | With test words: `test -e P` instead of running it. Logs `statted=P`. |
-//! | `T_FIFO=<path>`, `T_FIFO_AT=<P>` | One `read < $T_FIFO` per invocation, after the first test that reads its files (or after the test logged as `T_FIFO_AT` has read its files). |
+//! | `T_FIFO=<path>`, `T_FIFO_AT=<P>` | One `read < $T_FIFO` per invocation, after the first test that reads its files (or after the test logged as `T_FIFO_AT` has read its files). Then it appends P to `<path>.passed`, the marker that a release waits for. |
 //! | `T_IF=<path>` | The toggle for the rows marked (IF). |
 //! | `T_WRITE=<path>` (IF) | Writes `written` to that path, relative to the cwd, once per invocation before any test. With `T_WRITE_AT` set it writes only in that test's invocation: see the next row. |
 //! | `T_WRITE_AT=<P>` (IF) | Narrows `T_WRITE` to the invocation that runs test P, written right before P's reads. P must exist and be run, not statted by `T_STAT_UNIT`. The path rules depend on the form. In the no-argument form the write runs after the runner has moved to the root, so a relative `T_WRITE` path is root-relative, as `T_WRITE_FULL` is, and P is spelled as the roster lists it: root-relative, for example `tests/b.t`. In the test-word form the write stays relative to the cwd, and P is spelled as the test word is: relative to the cwd, for example `../tests/b.t` from `docs`. |
 //! | `T_WRITE_EACH=1` | Each test P writes `written` to `${P%.*}.out` after its reads, in every invocation that runs it. Not (IF). |
 //! | `T_WRITE_FULL=<path>` | The no-argument form writes `written` to the path after it moves to the root and before its first test, so a relative path is root-relative. Not (IF). |
-//! | `T_READ_OTHER=<path>` (IF) | Reads that path once per invocation, relative to the cwd. |
+//! | `T_READ_OTHER=<path>` (IF) | Reads that path once per invocation, relative to the cwd. A FIFO is read one line, then its `<path>.passed` marker is written, as `T_FIFO` does. |
 //! | `T_STAT_OTHER=<path>` (IF) | Runs `test -e <path>` once per invocation, relative to the cwd, and logs `stat_other=<path>`. The answer does not change the exit status. |
 //! | `T_FAIL_FULL=1` (IF) | The no-argument form exits 1 after its tests. |
 //! | `T_FAIL_ALONE=<P>` (IF) | In the test-word form, test P fails after it has run. Its reads and the other tests are unchanged. |

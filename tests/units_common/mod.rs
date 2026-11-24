@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The hook every pin uses. Its inline filter is the roster; the full form runs the runner with no arguments.
 pub const HOOK: &str = "{changed:**/*.t|!slow/**}";
@@ -378,24 +378,83 @@ impl Launch {
     }
 }
 
-/// Wait until the runner opens the FIFO for reading, then return the writing end. The open
-/// blocks until a reader arrives, so this returns exactly when the runner reaches its hold.
-/// Dropping the returned file releases the runner.
-pub fn meet(fifo: &Path) -> File {
+/// A runner held at its FIFO hold, and the writer that releases it. See [`meet`] and [`release`].
+pub struct Held {
+    file: File,
+    fifo: PathBuf,
+}
+
+/// How long a release waits for the runner to pass its hold, and how often it looks.
+const HOLD_WAIT: Duration = Duration::from_secs(60);
+const HOLD_POLL: Duration = Duration::from_millis(20);
+
+/// Wait until the runner opens the FIFO for reading, then return the writer that releases it. The open blocks until a
+/// reader arrives. That reader is the runner's hold or the reader stoop opens to hash the FIFO (issue #87), so this can
+/// return before the runner reaches its hold. [`release`] works either way.
+pub fn meet(fifo: &Path) -> Held {
     let (sender, receiver) = mpsc::channel();
     let path = fifo.to_path_buf();
     thread::spawn(move || {
         let _ = sender.send(fs::OpenOptions::new().write(true).open(&path));
     });
-    receiver
+    let file = receiver
         .recv_timeout(Duration::from_secs(30))
         .expect("the runner never reached the FIFO")
-        .expect("open the FIFO for writing")
+        .expect("open the FIFO for writing");
+    Held {
+        file,
+        fifo: fifo.to_path_buf(),
+    }
 }
 
-/// Release a held runner with one line, then drop the writer.
-pub fn release(mut writer: File) {
-    writer.write_all(b"go\n").unwrap();
+/// The runner's pass marker for a FIFO: one line per hold it has passed, in `<fifo>.passed` (`fixtures/hook/t`).
+fn passes(fifo: &Path) -> usize {
+    let mut marker = fifo.as_os_str().to_owned();
+    marker.push(".passed");
+    fs::read_to_string(marker).map_or(0, |text| text.lines().count())
+}
+
+/// Release a runner held at its FIFO hold, and return once it has passed the hold.
+///
+/// Issue #87: stoop opens a FIFO that a traced command reads, to hash it, and that open can pair with the writer
+/// [`meet`] returned. A line written then is discarded when the pipe's last file closes, and the runner's own open
+/// waits for a writer that has gone, so the runner never passes. So the writer stays open until the runner passes,
+/// and the line goes in only once a reader is present (EPIPE means none is). A line stays in the pipe while a writer
+/// is open, so the first write that lands is the line the hold reads. Exactly one line is written, so none strays
+/// into a later hold on the same FIFO. Once issue #87 is fixed, the first write always lands and the retry never runs.
+pub fn release(held: Held) {
+    let Held { mut file, fifo } = held;
+    let before = passes(&fifo);
+    let deadline = Instant::now() + HOLD_WAIT;
+    while let Err(error) = file.write_all(b"go\n") {
+        assert_eq!(
+            error.kind(),
+            ErrorKind::BrokenPipe,
+            "write the release to {}",
+            fifo.display()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "no reader took the release on {}",
+            fifo.display()
+        );
+        thread::sleep(HOLD_POLL);
+    }
+    while passes(&fifo) == before {
+        assert!(
+            Instant::now() < deadline,
+            "the runner never passed its hold on {}; the log ends with {:?}",
+            fifo.display(),
+            last_line(&fifo)
+        );
+        thread::sleep(HOLD_POLL);
+    }
+}
+
+/// The last line of the suite's log, which sits beside its FIFOs (see [`Suite::fifo`]).
+fn last_line(fifo: &Path) -> String {
+    let log = fs::read_to_string(fifo.with_file_name("log")).unwrap_or_default();
+    log.lines().last().unwrap_or_default().to_owned()
 }
 
 /// Collect a child's output, failing rather than hanging when it does not finish.
