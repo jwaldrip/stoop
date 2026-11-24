@@ -139,6 +139,7 @@ pub(crate) fn learn(
         &[],
         &HashMap::new(),
         &real_root,
+        &[],
     );
     for name in run::HOOK_ENV {
         std::env::set_var(name, "");
@@ -243,6 +244,14 @@ fn launch(frame: &Frame<'_, '_>, mut pass: Pass, plan: &Plan) -> Outcome {
             .map(|affected| (affected.unit.clone(), affected.changed.clone()))
             .collect()
     };
+    // The paths that no kept version covers, and the names that appeared. A launch of this run must not cover one by a
+    // stat alone (spec 3.10, PR 86 review round 3).
+    let gaps: Vec<String> = plan
+        .uncovered
+        .iter()
+        .cloned()
+        .chain(plan.excused.iter().map(|excused| excused.path.clone()))
+        .collect();
     let mut ran = attribution::launch_each(
         cx,
         frame.hook,
@@ -254,6 +263,7 @@ fn launch(frame: &Frame<'_, '_>, mut pass: Pass, plan: &Plan) -> Outcome {
         &skipped,
         &changed,
         &real_root,
+        &gaps,
     );
     for name in run::HOOK_ENV {
         std::env::set_var(name, "");

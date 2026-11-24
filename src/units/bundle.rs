@@ -1678,6 +1678,15 @@ impl Pass {
         self.dirty = false;
     }
 
+    /// Marks the residue unknown in memory, before a proof that stats a changed input is written (spec 3.8, PR 86 review
+    /// round 3). The pass's next write stores it, so a run killed before it settles leaves no known residue beside it.
+    pub(crate) fn unsettle(&mut self) {
+        if !matches!(self.bundle.residue.state, ResidueState::None) {
+            self.bundle.residue = Residue::default();
+            self.dirty = true;
+        }
+    }
+
     /// Stores the residue of the suite's whole proof when a pass ends (spec 3.8, point i). The proof is the one of
     /// `proofs` whose digest is the bundle's `whole`. Without it, the residue stays unknown.
     pub(crate) fn settle_residue(

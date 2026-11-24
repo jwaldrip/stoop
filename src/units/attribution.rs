@@ -80,6 +80,7 @@ pub(crate) fn pass(
         &[],
         &HashMap::new(),
         &real_root,
+        &[],
     );
     for name in run::HOOK_ENV {
         std::env::set_var(name, "");
@@ -192,6 +193,8 @@ pub(super) struct Ran {
 /// is judged, and its proof replaces the unit's version when it holds. `named` holds the names the bundle's versions give,
 /// and `skipped` the units that are not launched, so a launch that breaks one of them is seen. `changed` gives each
 /// launched unit its changed inputs, which the launch exports as `STOOP_CHANGED_INPUTS` (spec 3.11).
+/// `gaps` names the changed inputs and the appeared names that no kept version covers. A proof that stats one of them is
+/// written with the residue unknown (`Pass::unsettle`, spec 3.8).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn launch_each(
     cx: &RunCx<'_>,
@@ -204,6 +207,7 @@ pub(super) fn launch_each(
     skipped: &[SkippedUnit],
     changed: &HashMap<String, Vec<String>>,
     real_root: &Path,
+    gaps: &[String],
 ) -> Ran {
     let quiet = cx.o.quiet;
     let forms = expand::list_forms(hook);
@@ -293,10 +297,20 @@ pub(super) fn launch_each(
                     };
                     match launch::judge(&context, &trace, &observed) {
                         Verdict::Proven(kept) => {
+                            // A stat of a gap path covers it by identity alone. Until the run settles, nothing marks the
+                            // residue unknown, so a kill now would leave a known residue beside this proof. Mark it
+                            // unknown before the write that stores the proof (spec 3.8, PR 86 review round 3).
+                            if kept.inputs.iter().any(|input| {
+                                gaps.contains(&input.path)
+                                    && !observed.content.contains(&input.path)
+                            }) {
+                                pass.unsettle();
+                            }
                             let (old_inputs, old_outputs) = pass.held_of(unit);
                             let stored =
                                 pass.record(&launch.unit, &kept.inputs, &kept.outputs, now());
-                            if matches!(stored, Stored::Stored) {
+                            // A failed write keeps the proof in memory, and the end of the pass writes it (spec 3.11).
+                            if matches!(stored, Stored::Stored | Stored::WriteFailed) {
                                 ran.proven.insert(unit.clone(), observed.content.clone());
                             }
                             match stored {
@@ -417,9 +431,9 @@ pub(super) fn finish(
         || !ran.breaches.is_empty()
         || !ran.unread.is_empty()
         || !ran.uncovered.is_empty();
-    // A new version can discard the evidence that excused an appeared name, or retain it as a stat rather than a
-    // content read. A failing unit keeps its old version, so an excuse named only by such units remains represented:
-    // their stale proofs will make them affected again on the next run.
+    // An appeared name that a replaced proof no longer reads by content is covered by nothing once the run ends. A unit
+    // that failed or stayed stale keeps the proof that names the name, and that proof relaunches the unit next run (PR 86
+    // review round 3).
     let replaced_unread = ran.unread.iter().any(|unread| {
         unread
             .units
