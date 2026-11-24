@@ -1423,19 +1423,28 @@ fn a_unit_deleted_before_it_had_a_proof_takes_one_full_run_then_skips() {
     assert!(s.launches().is_empty(), "a skip launches nothing");
 }
 
-/// A unit deleted after it had a proof leaves its reads attributed: the residue was measured while the unit existed, and
-/// it is not measured again while the whole proof is current. So the run skips.
+/// A unit deleted after it had a proof takes one full run, then skips. Its reads were the last readers of files that the
+/// full command reads, so the skip that would drop its versions takes the full form instead, which measures the residue
+/// again without the deleted unit. The run after it skips.
 #[test]
-fn a_unit_deleted_after_it_had_a_proof_stays_attributed_and_skips() {
+fn a_unit_deleted_after_it_had_a_proof_takes_one_full_run_then_skips() {
     let s = Suite::new();
     success(&passed(&s, &[]));
     fs::remove_file(s.path("tests/c.t")).unwrap();
     s.clear_log();
-    let explained = explain(&s, &[]);
     let out = split(&s, &[]);
     success(&out);
-    assert!(skipped(&explained), "{}", stderr(&explained));
-    assert!(skipped(&out), "{}", stderr(&out));
+    assert!(full(&out), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("the units that left the roster read files that no unit reads now"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(launched(&s), [""], "the full form runs once");
+    s.clear_log();
+    let next = split(&s, &[]);
+    success(&next);
+    assert!(skipped(&next), "{}", stderr(&next));
     assert!(s.launches().is_empty(), "a skip launches nothing");
 }
 

@@ -358,3 +358,23 @@ fn c11_explain_under_stoop_off_predicts_no_learning() {
         stderr(&untraced)
     );
 }
+
+/// C12 (review N8): a changed run with a recorded bundle and no unit proof is judged as the full form, so explain names
+/// the full command and never the attribution pass that the switch-off path would name.
+#[test]
+fn c12_explain_with_a_bundle_and_no_unit_proof_names_the_full_form() {
+    let s = Suite::new();
+    success(&s.hook(&[("CI", "true")]));
+    edit(&s, 2);
+    let explained = explain(&s, &[]);
+    assert!(
+        stderr(&explained).contains("stoop: would run full "),
+        "{}",
+        stderr(&explained)
+    );
+    assert!(
+        !stderr(&explained).contains("would run an attribution pass"),
+        "{}",
+        stderr(&explained)
+    );
+}
