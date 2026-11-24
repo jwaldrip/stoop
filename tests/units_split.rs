@@ -207,9 +207,9 @@ fn s3_appending_an_empty_line_to_c_runs_c_only() {
 }
 
 /// S5: a changed `setup.src` is read by every unit, so the run is full. The proof then holds the new `setup.src`,
-/// and the next change is an attribution pass, not a full run (C13).
+/// and the next change is a subset of the units that read it, not a full run (C13). Completion has relearned the others.
 #[test]
-fn s5_a_setup_change_runs_full_and_the_next_change_is_a_pass() {
+fn s5_a_setup_change_runs_full_and_the_next_change_is_a_subset() {
     let s = Suite::new();
     success(&passed(&s, &[]));
     s.write("setup.src", "setup changed\n");
@@ -225,8 +225,12 @@ fn s5_a_setup_change_runs_full_and_the_next_change_is_a_pass() {
     s.clear_log();
     let out = split(&s, &[]);
     success(&out);
-    assert!(pass_line(&out), "{}", stderr(&out));
-    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t", "tests/c.t"]);
+    assert!(
+        stderr(&out).contains("run 2 (src/shared.src changed): tests/a.t, tests/b.t"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t"]);
 }
 
 /// S6: a new unit has no proof, so it runs alone.
@@ -280,7 +284,7 @@ fn s7_literal_deleting_c_then_an_edit_to_shared_is_global() {
         "{}",
         stderr(&out)
     );
-    assert_eq!(launched(&s), [""]);
+    assert_eq!(launched(&s), ["", "tests/a.t", "tests/b.t"]);
     assert!(
         !stored_units(&s).iter().any(|unit| unit == "tests/c.t"),
         "the proof of a deleted unit was kept: {:?}",
@@ -331,7 +335,7 @@ fn s9b_with_t_ls_root_a_new_top_level_entry_is_global() {
         "{}",
         stderr(&out)
     );
-    assert_eq!(launched(&s), [""]);
+    assert_eq!(launched(&s), ["", "tests/a.t", "tests/b.t", "tests/c.t"]);
 }
 
 /// S10b: a launch's unit variables name only the unit, and `STOOP_CHANGED_INPUTS` names the changed input it has.
@@ -585,9 +589,9 @@ fn s22_explain_predicts_the_launches_the_next_run_makes() {
     assert_eq!(launched(&s), ["tests/a.t", "tests/b.t"]);
 }
 
-/// S22b: when every unit is affected, explain names the attribution pass, with one launch for each unit.
+/// S22b: when two of three units are affected, explain names the subset, with one launch for each of them.
 #[test]
-fn s22b_explain_names_the_attribution_pass_when_every_unit_is_affected() {
+fn s22b_explain_names_the_subset_when_two_of_three_units_are_affected() {
     let s = Suite::new();
     let env = [("FOO", "1")];
     success(&passed(&s, &[]));
@@ -595,16 +599,16 @@ fn s22b_explain_names_the_attribution_pass_when_every_unit_is_affected() {
     edit(&s, 3);
     let explained = explain(&s, &env);
     assert!(
-        stderr(&explained).contains("(attribution pass): 3 launches, one unit each"),
+        stderr(&explained).contains("(2 of 3 units affected, one launch each)"),
         "{}",
         stderr(&explained)
     );
 }
 
-/// G1: an environment change that a full run sees makes the next change an attribution pass, because every unit's
-/// proof was made under the old environment.
+/// G1: an environment change that a full run sees makes the next change a subset of the units that read the changed
+/// file, because completion relearns every unit under the new environment (PR 86 review round 2).
 #[test]
-fn g1_an_environment_change_seen_by_a_full_run_makes_the_next_change_a_pass() {
+fn g1_an_environment_change_seen_by_a_full_run_makes_the_next_change_a_subset() {
     let s = Suite::new();
     let env = [("FOO", "1")];
     success(&passed(&s, &[]));
@@ -619,8 +623,12 @@ fn g1_an_environment_change_seen_by_a_full_run_makes_the_next_change_a_pass() {
     s.clear_log();
     let out = split(&s, &env);
     success(&out);
-    assert!(pass_line(&out), "{}", stderr(&out));
-    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t", "tests/c.t"]);
+    assert!(
+        stderr(&out).contains("run 2 (src/shared.src changed): tests/a.t, tests/b.t"),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t"]);
 }
 
 /// The model test's random generator. A seed names one sequence on every platform.

@@ -297,7 +297,11 @@ fn t6_a_change_every_unit_reads_takes_the_full_form() {
         "{}",
         stderr(&out)
     );
-    assert_eq!(s.launches().len(), 1, "the full form launches once");
+    assert_eq!(
+        s.launches().len(),
+        4,
+        "the full form launches once, then completion relaunches the three units"
+    );
 }
 
 /// T7 (D7): a new environment variable changes every unit's environment. The full form runs, and the reason says so.
@@ -314,7 +318,11 @@ fn t7_a_new_environment_variable_takes_the_full_form() {
         "{}",
         stderr(&out)
     );
-    assert_eq!(s.launches().len(), 1, "the full form launches once");
+    assert_eq!(
+        s.launches().len(),
+        4,
+        "the full form launches once, then completion relaunches the three units"
+    );
 }
 
 /// T8 (D8): a unit's own output that a later run deletes is not kept, so the next run is not a skip.
