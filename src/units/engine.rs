@@ -327,6 +327,18 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
         }
         return verdict(Decision::Skip(skip), shown, clean);
     }
+    // E17 and E18 (spec 3.10, PR 86 review round 2, option B): a changed input that only units which left the roster read
+    // has no reader that a launch of this run could check. The full command decides it, before any launch.
+    if let Some(path) = departed_only_change(cx, view, proof, &affected) {
+        return verdict(
+            Decision::Full(Some(format!(
+                "{} changed and only units that left the roster read it",
+                safe(&path)
+            ))),
+            shown,
+            clean,
+        );
+    }
     // E17 and E18: the affected units launch one at a time. Units that are all affected make the attribution pass.
     let whole = affected.len() == cx.roster.len();
     let uncovered = uncovered_changes(cx, view, &current, proof);
@@ -449,6 +461,57 @@ fn uncovered_changes(
     paths.sort();
     paths.dedup();
     paths
+}
+
+/// The first changed whole-proof input, in path order, that only units which left the roster read by content (spec 3.10,
+/// PR 86 review round 2). A roster version, valid or stale, that reads an input keeps it out: the after-launch rule checks
+/// an input that an affected unit's stored version reads. An unchanged input is not a change, and a deleted input is not
+/// one either: its readers are affected or departed, and the next run takes the loss in full.
+fn departed_only_change(
+    cx: &Judged<'_>,
+    view: &View,
+    proof: &Proof,
+    affected: &[Affected],
+) -> Option<String> {
+    if affected.is_empty() {
+        return None;
+    }
+    // Each path, with whether a roster version reads it by content, and whether a departed version does.
+    let mut readers: BTreeMap<&str, (bool, bool)> = BTreeMap::new();
+    for (unit, versions) in &view.units {
+        let roster = cx.roster.binary_search(unit).is_ok();
+        for version in versions {
+            for &index in &version.inputs {
+                let input = &view.table[index as usize];
+                if bundle::content_id(&input.id) {
+                    let (live, gone) = readers.entry(input.path.as_str()).or_default();
+                    if roster {
+                        *live = true;
+                    } else {
+                        *gone = true;
+                    }
+                }
+            }
+        }
+    }
+    let inputs: Vec<&Input> = proof
+        .inputs
+        .iter()
+        .filter(|input| bundle::content_id(&input.id) && !input.id.starts_with("dl:"))
+        .filter(|input| {
+            readers
+                .get(input.path.as_str())
+                .is_some_and(|&(live, gone)| gone && !live)
+        })
+        .collect();
+    let fresh = Current::of(cx.root, &inputs);
+    let mut paths: Vec<String> = inputs
+        .iter()
+        .filter(|input| !fresh.holds(input) && !fresh.absent(input))
+        .map(|input| input.path.clone())
+        .collect();
+    paths.sort();
+    paths.into_iter().next()
 }
 
 fn verdict(decision: Decision, affected: Option<Vec<(String, String)>>, clean: bool) -> Verdict {
