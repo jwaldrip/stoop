@@ -237,3 +237,58 @@ fn c6_a_busy_suite_lock_stops_completion_silently() {
     assert!(!stderr(&out).contains("busy"), "{}", stderr(&out));
     assert_eq!(s.bundle(), before);
 }
+
+/// C7: while the full command leaves a residue that no unit names, every changed run is a full run, and its completion
+/// relaunches only the units whose proof no longer holds. Here `c` changes, and `a` and `b` keep their proofs.
+#[test]
+fn c7_a_completion_relaunches_only_the_units_without_a_valid_proof() {
+    let s = Suite::new();
+    s.remove("e2e/x.u");
+    let env = [("T_U", "1")];
+    s.write("tests/z.u", "src/c.src\n");
+    s.write("tests/z.flag", "ok\n");
+    success(&split(&s, &env));
+    s.write("tests/c.t", "src/c.src\n\n");
+    s.clear_log();
+    let out = split(&s, &env);
+    success(&out);
+    assert!(
+        stderr(&out).contains("stoop: run full "),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(launched(&s), ["", "tests/c.t"], "{}", stderr(&out));
+}
+
+/// C8: a unit whose launch writes the input of another unit breaks the independence check at completion. The suite is
+/// disabled with that violation in the completion phase, and the status is the full command's.
+#[test]
+fn c8_a_completion_violation_disables_the_suite() {
+    let s = Suite::new();
+    let out = split(&s, &[("T_WRITE", "src/c.src"), ("T_WRITE_AT", "tests/a.t")]);
+    assert_eq!(code(&out), 0, "{}", stderr(&out));
+    let state = state(&s);
+    assert_eq!(state["status"], "disabled", "{state}");
+    assert_eq!(state["code"], "wrote_input", "{state}");
+    assert_eq!(state["phase"], "completion", "{state}");
+}
+
+/// C9: with the switch off, a passing full run learns nothing. The cold run launches the full command only, and the next
+/// changed run is the switch-off attribution pass, as it was before the engine.
+#[test]
+fn c9_the_switch_off_learns_nothing_after_a_full_run() {
+    let s = Suite::new();
+    s.clear_log();
+    success(&s.hook(&[]));
+    assert_eq!(launched(&s), [""]);
+    edit(&s, 2);
+    s.clear_log();
+    let out = s.hook(&[]);
+    success(&out);
+    assert!(
+        stderr(&out).contains("stoop: attribution pass: "),
+        "{}",
+        stderr(&out)
+    );
+    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t", "tests/c.t"]);
+}

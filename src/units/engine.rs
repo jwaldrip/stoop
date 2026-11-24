@@ -1196,4 +1196,12 @@ mod tests {
         let covered = covered_reads(&judged(&roster, 0), &view, &current, &BTreeSet::new());
         assert!(!covered.contains("tests/a.flag"), "{covered:?}");
     }
+
+    #[test]
+    fn a_residue_is_confirmed_only_when_every_roster_unit_holds_a_version() {
+        let table = vec![input("tests/a.t", "f:1")];
+        let (view, _) = view_of(vec![("tests/a.t", vec![version(1_000, vec![0])])], table);
+        let roster = vec!["tests/a.t".to_owned(), "tests/b.t".to_owned()];
+        assert!(!holds(&judged(&roster, 0), &view));
+    }
 }
