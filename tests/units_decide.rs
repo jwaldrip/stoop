@@ -1321,9 +1321,8 @@ for f in "$@"; do
 done
 "#;
 
-/// The bundle excuses a unit's file that the whole proof listed and never read. Deleting it is not a change to its
-/// directory, so the run skips (E16). That skip drops the unit's version, and the whole proof holds no entry for the
-/// name, so the next run takes the full form for the directory's listing.
+/// The bundle excuses a unit's file that the whole proof listed and never read. The deleted unit's version held the last
+/// reader of a path that no unit reads now, so the first run takes the full form, and the run after it skips.
 #[test]
 fn a_unit_the_whole_proof_never_read_is_excused_by_its_bundle() {
     let s = Suite::new();
