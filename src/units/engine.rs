@@ -406,12 +406,13 @@ fn listings_change(
     {
         return Err(reason);
     }
-    // The root never excuses a name, so only names under a listed directory can be excused. A name is excused here
-    // when no valid proof reads it, the whole proof did not hold it, and it is a regular file now.
-    let dirs: BTreeSet<&str> = entries
+    // A name is excused here only in a listed directory whose listing changed, when no valid proof reads it, the whole
+    // proof did not hold it, and it is a regular file now. Where a listing holds, none of its names appeared (rv43).
+    let changed: BTreeSet<&str> = entries
         .iter()
-        .map(|input| input.path.as_str())
-        .filter(|dir| !matches!(*dir, "" | "."))
+        .zip(&same)
+        .filter(|(input, held)| !**held && !matches!(input.path.as_str(), "" | "."))
+        .map(|(input, _)| input.path.as_str())
         .collect();
     Ok(rerun
         .into_iter()
@@ -421,7 +422,7 @@ fn listings_change(
                 && Path::new(path)
                     .parent()
                     .and_then(Path::to_str)
-                    .is_some_and(|dir| dirs.contains(dir))
+                    .is_some_and(|dir| changed.contains(dir))
                 && is_regular(cx.root, path)
         })
         .map(|(path, units)| Excused { path, units })
