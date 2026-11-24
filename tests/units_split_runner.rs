@@ -21,6 +21,17 @@ fn stderr(out: &Output) -> String {
     text(&out.stderr)
 }
 
+/// The fake runner with one more reading (PR 86 review round 3): a listed line `stat:P` stats `P` and reads no content.
+fn stat_runner() -> String {
+    let fixture = include_str!("fixtures/hook/t");
+    let anchor = "cat \"$ROOT/$line\"";
+    assert_eq!(fixture.matches(anchor).count(), 1);
+    fixture.replace(
+        anchor,
+        "case $line in\nstat:*) test -e \"$ROOT/${line#stat:}\" ;;\n*) cat \"$ROOT/$line\" ;;\nesac",
+    )
+}
+
 /// The pinned hook under `env`, with the engine on.
 fn split(s: &Suite, env: &[(&str, &str)]) -> Output {
     let mut all = vec![SPLIT];
@@ -84,6 +95,10 @@ enum Op {
     DeleteRunnerOnly(String),
     /// The setup file, which every unit reads.
     Setup,
+    /// A unit's first listed source is stat-read instead of read (PR 86 review round 3): its line gains `stat:`.
+    StatLine(String),
+    /// A source file is removed, and each unit that lists it stops listing it in the same step (PR 86 review round 3).
+    DropSource(usize),
     Noop,
 }
 
@@ -170,6 +185,8 @@ impl World {
                 Op::Rename(from, self.fresh("t"))
             }
             11 => Op::Setup,
+            12 if units > 0 => Op::StatLine(self.units[rng.below(units)].clone()),
+            13 => Op::DropSource(rng.below(4)),
             14 | 15 if self.runner_only.len() < 3 => Op::AddRunnerOnly(self.fresh("u")),
             16 if !self.runner_only.is_empty() => {
                 Op::DeleteRunnerOnly(self.runner_only[rng.below(self.runner_only.len())].clone())
@@ -236,6 +253,38 @@ impl World {
                 self.revision += 1;
                 s.write("setup.src", &format!("setup {}\n", self.revision));
             }
+            Op::StatLine(path) => {
+                let body = fs::read_to_string(s.path(path)).unwrap_or_default();
+                let stated: String = body
+                    .lines()
+                    .enumerate()
+                    .map(|(index, line)| {
+                        if index == 0 && !line.starts_with("stat:") {
+                            format!("stat:{line}\n")
+                        } else {
+                            format!("{line}\n")
+                        }
+                    })
+                    .collect();
+                s.write(path, &stated);
+            }
+            Op::DropSource(n) => {
+                let source = format!("src/s{n}");
+                for unit in &self.units {
+                    let body = fs::read_to_string(s.path(unit)).unwrap_or_default();
+                    if body.lines().any(|line| line == source) {
+                        let kept: String = body
+                            .lines()
+                            .filter(|line| *line != source)
+                            .map(|line| format!("{line}\n"))
+                            .collect();
+                        s.write(unit, &kept);
+                    }
+                }
+                if s.path(&source).exists() {
+                    s.remove(&source);
+                }
+            }
             Op::Noop => {}
         }
     }
@@ -277,6 +326,7 @@ fn run_world(seed: u64, steps: usize, runner_only: bool) -> Result<(), String> {
     let s = Suite::new();
     let mut rng = Rng::new(seed);
     let mut world = World::start(&s, &mut rng);
+    s.executable("t", &stat_runner());
     let env: Vec<(&str, &str)> = if runner_only {
         vec![("T_U", "1")]
     } else {
@@ -291,12 +341,19 @@ fn run_world(seed: u64, steps: usize, runner_only: bool) -> Result<(), String> {
     }
     let mut log: Vec<String> = Vec::new();
     let mut no_verdicts = 0usize;
+    // An unchanged retry after a no-verdict (PR 86 review round 3): half the time, the step after a 125 applies nothing.
+    let mut last_125 = false;
     for step in 1..=steps {
         let before = listings(&s, &world.units);
-        let count = 1 + rng.below(3);
+        let forced_noop = last_125 && rng.below(2) == 0;
+        let count = if forced_noop { 1 } else { 1 + rng.below(3) };
         let mut ops = Vec::new();
         for _ in 0..count {
-            let op = world.pick(&mut rng, runner_only);
+            let op = if forced_noop {
+                Op::Noop
+            } else {
+                world.pick(&mut rng, runner_only)
+            };
             world.apply(&s, &mut rng, &op);
             ops.push(op);
         }
@@ -316,6 +373,7 @@ fn run_world(seed: u64, steps: usize, runner_only: bool) -> Result<(), String> {
             )
         };
         let subject_code = code(&subject);
+        last_125 = subject_code == 125;
         if subject_code == 2 {
             return Err(report("a status of 2"));
         }
@@ -327,12 +385,13 @@ fn run_world(seed: u64, steps: usize, runner_only: bool) -> Result<(), String> {
             };
             let after = listings(&s, &world.units);
             let stopped = world.units.iter().any(|unit| {
-                before.get(unit).is_some_and(|old| old.contains(&path))
+                launches.contains(unit)
+                    && before.get(unit).is_some_and(|old| old.contains(&path))
                     && after.get(unit).is_some_and(|new| !new.contains(&path))
             });
             if !stopped {
                 return Err(report(&format!(
-                    "the no-verdict line names {path}, which no affected unit stopped reading"
+                    "the no-verdict line names {path}, which no launched unit stopped reading"
                 )));
             }
             no_verdicts += 1;

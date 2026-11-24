@@ -549,6 +549,34 @@ fn flag_of(path: &str) -> String {
     format!("{}.flag", path.rsplit_once('.').unwrap().0)
 }
 
+/// A flag line that a unit lists: read by content, or stat-only (`stat:flag`) one time in three (PR 86 review round 3).
+fn flag_line(rng: &mut Rng, flag: &str) -> String {
+    if rng.below(3) == 0 {
+        format!("stat:{flag}")
+    } else {
+        flag.to_owned()
+    }
+}
+
+/// The fake runner with the round three readings (PR 86 review round 3): a listed line `stat:P` stats `P`, and a
+/// runner-only test (`*.u`) fails when its flag is absent, so that a removed flag can change the full command.
+fn e3_runner() -> String {
+    let stat = "cat \"$ROOT/$line\"";
+    let flag = "if [ -f \"$flag\" ] && grep -q fail \"$flag\"; then";
+    let fixture = include_str!("fixtures/hook/t");
+    assert_eq!(fixture.matches(stat).count(), 1);
+    assert_eq!(fixture.matches(flag).count(), 1);
+    fixture
+        .replace(
+            stat,
+            "case $line in\nstat:*) test -e \"$ROOT/${line#stat:}\" ;;\n*) cat \"$ROOT/$line\" ;;\nesac",
+        )
+        .replace(
+            flag,
+            "if { case \"$1\" in *.u) [ ! -f \"$flag\" ] ;; *) false ;; esac; } || { [ -f \"$flag\" ] && grep -q fail \"$flag\"; }; then",
+        )
+}
+
 #[derive(Clone, Debug)]
 enum Step {
     Flag(String, &'static str),
@@ -565,6 +593,9 @@ enum Step {
     Env(usize),
     /// The subject runs with `STOOP_FULL=1` in this step.
     Forced,
+    /// A runner-only test's flag is removed, and each unit that lists it stops listing it in the same step (PR 86 review
+    /// round 3).
+    RemoveAndDrop(String),
     Noop,
 }
 
@@ -599,13 +630,14 @@ impl World {
         match rng.below(3) {
             0 | 1 if !self.runners.is_empty() => {
                 let runner = self.runners[rng.below(self.runners.len())].clone();
-                lines.push(flag_of(&runner));
+                lines.push(flag_line(rng, &flag_of(&runner)));
                 lines.push(runner);
             }
             2 => {
                 let others: Vec<&String> = self.units.iter().filter(|unit| *unit != own).collect();
                 if !others.is_empty() {
-                    lines.push(flag_of(others[rng.below(others.len())]));
+                    let pick = rng.below(others.len());
+                    lines.push(flag_line(rng, &flag_of(others[pick])));
                 }
             }
             _ => {}
@@ -642,6 +674,9 @@ impl World {
                 Step::RunnerDelete(self.runners[rng.below(self.runners.len())].clone())
             }
             15 => Step::Setup,
+            16 if !self.runners.is_empty() => {
+                Step::RemoveAndDrop(self.runners[rng.below(self.runners.len())].clone())
+            }
             17 => Step::Env(rng.below(3)),
             18 => Step::Forced,
             _ => Step::Noop,
@@ -715,6 +750,24 @@ impl World {
             }
             Step::Env(value) => self.foo = *value,
             Step::Forced => self.forced = true,
+            Step::RemoveAndDrop(path) => {
+                let flag = flag_of(path);
+                let stated = format!("stat:{flag}");
+                for unit in &self.units {
+                    let body = fs::read_to_string(s.path(unit)).unwrap_or_default();
+                    if body.lines().any(|line| line == flag || line == stated) {
+                        let kept: String = body
+                            .lines()
+                            .filter(|line| *line != flag && *line != stated)
+                            .map(|line| format!("{line}\n"))
+                            .collect();
+                        s.write(unit, &kept);
+                    }
+                }
+                if s.path(&flag).exists() {
+                    s.remove(&flag);
+                }
+            }
             Step::Noop => {}
         }
     }
@@ -825,6 +878,7 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
         let body = world.listing(&mut rng, &unit);
         s.write(&unit, &body);
     }
+    s.executable("t", &e3_runner());
     let cold = split(&s, &[("T_U", "1"), ("FOO", "0")]);
     if code(&cold) != 0 {
         return Err(format!(
@@ -834,13 +888,20 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
     }
     let mut log: Vec<String> = Vec::new();
     let mut no_verdicts = 0usize;
+    // An unchanged retry after a 125 (PR 86 review round 3): half the time, the step after a 125 applies nothing.
+    let mut last_125 = false;
     for step in 1..=steps {
         let before = e3_listings(&s, &world.units);
-        let count = 1 + rng.below(3);
+        let forced_noop = last_125 && rng.below(2) == 0;
+        let count = if forced_noop { 1 } else { 1 + rng.below(3) };
         let mut ops = Vec::new();
         world.forced = false;
         for _ in 0..count {
-            let op = world.pick(&mut rng);
+            let op = if forced_noop {
+                Step::Noop
+            } else {
+                world.pick(&mut rng)
+            };
             world.apply(&s, &mut rng, &op);
             ops.push(op);
         }
@@ -893,6 +954,7 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
             )
         };
         let subject_code = code(&subject);
+        last_125 = subject_code == 125;
         if subject_code == 2 {
             return Err(report("a status of 2"));
         }
