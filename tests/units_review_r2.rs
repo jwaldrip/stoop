@@ -830,8 +830,8 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
             ops.push(op);
         }
         log.push(format!("step {step}: {ops:?}"));
-        let foo = world.foo.to_string();
-        let env: Vec<(&str, &str)> = vec![("T_U", "1"), ("FOO", foo.as_str())];
+        let foo_value = world.foo.to_string();
+        let env: Vec<(&str, &str)> = vec![("T_U", "1"), ("FOO", foo_value.as_str())];
         let mut subject_env = env.clone();
         if world.forced {
             subject_env.push(("STOOP_FULL", "1"));
