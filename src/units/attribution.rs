@@ -411,8 +411,15 @@ pub(super) fn finish(
     planned: usize,
     quiet: bool,
 ) -> i32 {
-    // The residue of the whole command, measured now that the run has launched every unit it could (spec 3.8).
-    pass.settle_residue(&lookup.proofs, pending.listings());
+    // A run with no verdict (exit 125) leaves the residue unknown, so the next run takes the full form (spec 3.8, PR 86
+    // review round 3). The residue is measured only by a run that gives a verdict.
+    let stopped_early = matches!(&ran.stopped, Some((index, _)) if index + 1 < planned);
+    let no_verdict = ran.unlaunched
+        || stopped_early
+        || !ran.breaches.is_empty()
+        || !ran.unread.is_empty()
+        || !ran.uncovered.is_empty();
+    pass.settle_residue(&lookup.proofs, pending.listings(), no_verdict);
     let id = pending.suite();
     // The state a stopped run stores is decided by `disabling` (spec 3.6). It is stored under the lock this run holds.
     if let Some(Disabling {
@@ -449,7 +456,6 @@ pub(super) fn finish(
     // A run with no failing launch has no verdict when a unit was not launched, when it stopped before its last
     // launch, or when a skipped unit's proof no longer holds because of the run's writes (spec 3.7). A stop says how
     // far it got (spec 3.12).
-    let stopped_early = matches!(&ran.stopped, Some((index, _)) if index + 1 < planned);
     if ran.status == 0 {
         if stopped_early {
             say(
@@ -476,11 +482,6 @@ pub(super) fn finish(
             );
         }
     }
-    let no_verdict = ran.unlaunched
-        || stopped_early
-        || !ran.breaches.is_empty()
-        || !ran.unread.is_empty()
-        || !ran.uncovered.is_empty();
     exit_status(ran.status, no_verdict)
 }
 

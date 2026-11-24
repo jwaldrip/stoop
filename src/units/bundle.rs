@@ -1680,7 +1680,22 @@ impl Pass {
 
     /// Stores the residue of the suite's whole proof when a pass ends (spec 3.8, point i). The proof is the one of
     /// `proofs` whose digest is the bundle's `whole`. Without it, the residue stays unknown.
-    pub(crate) fn settle_residue(&mut self, proofs: &[Proof], listings: &[String]) {
+    pub(crate) fn settle_residue(
+        &mut self,
+        proofs: &[Proof],
+        listings: &[String],
+        no_verdict: bool,
+    ) {
+        // A split run with no verdict leaves the residue unknown (spec 3.8, PR 86 review round 3). Its stored versions may
+        // read a path by stat only, so a residue measured from them would let a later run skip on a proof that no launch
+        // checked by content. A switch-off pass keeps main's residue, which is the switch-off parity rule.
+        if no_verdict && self.keep {
+            if !matches!(self.bundle.residue.state, ResidueState::None) {
+                self.dirty = true;
+            }
+            self.bundle.residue = Residue::default();
+            return;
+        }
         // A write or a drop took the last reader of a path (spec 3.8, item 1). The residue stays unknown while a path that
         // it lost has no content reader in the final versions, where a kept version counts as much as a written one.
         if self.residue_lost {
@@ -3459,13 +3474,35 @@ mod pass_tests {
         let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
         let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
         let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
-        pass.settle_residue(&[proof], &[]);
+        pass.settle_residue(&[proof], &[], false);
         drop(pass);
         let stored_residue = stored(&dir, &id).residue;
         assert!(matches!(stored_residue.state, ResidueState::Provisional));
         assert_eq!(stored_residue.paths, ["lint"]);
         assert_eq!(stored_residue.count, 1);
         assert_eq!(stored_residue.whole, Some(digest));
+    }
+
+    /// PR 86 review round 3, switch-off parity: a clear pass settles its residue as main does, also when its run has no
+    /// verdict. Only a split pass leaves the residue unknown.
+    #[test]
+    fn a_switch_off_pass_settles_its_residue_even_without_a_verdict() {
+        let roster = ["tests/a.t", "tests/b.t"];
+        let proof = whole_proof(&["src/shared", "lint"]);
+        let digest = proof.digest();
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.whole = Some(digest.clone());
+        let dir = seed("pass-no-verdict", &bundle);
+        let pending = pending_for(&roster);
+        let id = pending.suite().to_owned();
+        let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
+        let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
+        let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
+        pass.settle_residue(&[proof], &[], true);
+        drop(pass);
+        let stored_residue = stored(&dir, &id).residue;
+        assert!(matches!(stored_residue.state, ResidueState::Provisional));
+        assert_eq!(stored_residue.paths, ["lint"]);
     }
 
     /// A pass whose only write came first still stores its residue at its end: a single unit is written at once, so
@@ -3482,7 +3519,7 @@ mod pass_tests {
         let id = pending.suite().to_owned();
         let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
         let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
-        pass.settle_residue(&[proof], &[]);
+        pass.settle_residue(&[proof], &[], false);
         drop(pass);
         let stored_residue = stored(&dir, &id).residue;
         assert!(matches!(stored_residue.state, ResidueState::Provisional));
@@ -3662,7 +3699,7 @@ mod pass_tests {
         let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
         let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
         let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
-        pass.settle_residue(&[other], &[]);
+        pass.settle_residue(&[other], &[], false);
         drop(pass);
         let stored_residue = stored(&dir, &id).residue;
         assert!(matches!(stored_residue.state, ResidueState::None));
@@ -3686,7 +3723,7 @@ mod pass_tests {
         let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
         let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
         let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
-        pass.settle_residue(&[other, measured], &[]);
+        pass.settle_residue(&[other, measured], &[], false);
         drop(pass);
         let stored_residue = stored(&dir, &id).residue;
         assert_eq!(stored_residue.paths, ["lint"]);
@@ -4306,12 +4343,38 @@ mod keep_tests {
             pass.record("tests/m6.t", &[input("/usr/bin/grep")], &[], 3),
             Stored::Stored
         ));
-        pass.settle_residue(&[proof], &[]);
+        pass.settle_residue(&[proof], &[], false);
         assert!(
             !matches!(pass.bundle.residue.state, ResidueState::None),
             "the final versions read the path with content, so the residue stays known"
         );
         assert_eq!(pass.bundle.residue.count, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PR 86 review round 3: a split run that has no verdict (exit 125) leaves the residue unknown. Its stored versions
+    /// may read a path by stat only, and a residue measured from them would let a later run skip on that proof.
+    #[test]
+    fn a_split_run_without_a_verdict_leaves_the_residue_unknown() {
+        let units = ["tests/m5.t", "tests/m6.t"];
+        let proof = proof_of(&["/usr/bin/grep"]);
+        let held = BTreeMap::from([
+            ("tests/m5.t".to_owned(), vec![version(vec![0])]),
+            ("tests/m6.t".to_owned(), vec![version(vec![0])]),
+        ]);
+        let bundle = known_bundle(&units, vec![input("/usr/bin/grep")], held, &proof);
+        let dir = seed("no-verdict", &bundle);
+        let mut pass = kept(&dir, &pending_for(&units));
+        assert!(!matches!(pass.bundle.residue.state, ResidueState::None));
+        pass.settle_residue(&[proof], &[], true);
+        assert!(
+            matches!(pass.bundle.residue.state, ResidueState::None),
+            "a run with no verdict leaves the residue unknown"
+        );
+        assert!(
+            pass.dirty,
+            "the unknown residue is written when the pass ends"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -4341,7 +4404,7 @@ mod keep_tests {
             pass.record("tests/m6.t", &[stat], &[], 3),
             Stored::Stored
         ));
-        pass.settle_residue(&[proof], &[]);
+        pass.settle_residue(&[proof], &[], false);
         assert!(
             matches!(pass.bundle.residue.state, ResidueState::None),
             "a stat-only read does not give the path a content reader"
@@ -4365,7 +4428,7 @@ mod keep_tests {
             pass.record("tests/m5.t", &[], &[], 2),
             Stored::Stored
         ));
-        pass.settle_residue(&[proof], &[]);
+        pass.settle_residue(&[proof], &[], false);
         assert!(
             matches!(pass.bundle.residue.state, ResidueState::None),
             "nothing reads the path after the last write"
@@ -4386,7 +4449,7 @@ mod keep_tests {
         let bundle = known_bundle(&roster, vec![input("/usr/bin/grep")], held, &proof);
         let dir = seed("dropped", &bundle);
         let mut pass = kept(&dir, &pending_for(&roster));
-        pass.settle_residue(&[proof], &[]);
+        pass.settle_residue(&[proof], &[], false);
         assert!(
             matches!(pass.bundle.residue.state, ResidueState::None),
             "the dropped version was the last reader of the path"
@@ -4415,7 +4478,7 @@ mod keep_tests {
             matches!(pass.bundle.residue.state, ResidueState::Provisional),
             "m6 still reads the path, so the record does not reset the residue"
         );
-        pass.settle_residue(&[proof], &[]);
+        pass.settle_residue(&[proof], &[], false);
         assert!(!matches!(pass.bundle.residue.state, ResidueState::None));
         assert_eq!(pass.bundle.residue.count, 0);
         let _ = fs::remove_dir_all(&dir);
