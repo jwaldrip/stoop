@@ -954,6 +954,34 @@ fn residue_reason(text: &str) -> Option<String> {
     })
 }
 
+/// Each unit's listed lines, read from the files the model wrote, before or after a step (PR 86 review round 2).
+fn model_listed_lines(
+    s: &Suite,
+    units: &[String],
+) -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+    units
+        .iter()
+        .filter_map(|unit| {
+            let text = std::fs::read_to_string(s.path(unit)).ok()?;
+            let lines: std::collections::BTreeSet<String> = text
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect();
+            Some((unit.clone(), lines))
+        })
+        .collect()
+}
+
+/// The path that a no-verdict line names, when the run printed exactly that line (PR 86 review round 2).
+fn model_no_verdict_path(out: &Output) -> Option<String> {
+    stderr(out).lines().find_map(|line| {
+        let rest = line.strip_prefix("stoop: this run has no verdict (exit 125): ")?;
+        let named = rest.strip_suffix(", and no unit's new proof reads it")?;
+        named.strip_suffix(" changed").map(str::to_owned)
+    })
+}
+
 fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
     let s = Suite::new();
     let mut rng = Rng::new(seed);
@@ -970,7 +998,11 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
     // Set by a no-op whose exempt full run ran. Until the next step that is not a no-op, every no-op must skip.
     let mut exempted = false;
     let mut operations: Vec<String> = Vec::new();
+    let mut no_verdicts = 0usize;
     for step in 1..=steps {
+        // The units and their listed lines before this step's operations, read from the files the model wrote.
+        let before_units = model.roster();
+        let before = model_listed_lines(&s, &before_units);
         let count = if rng.below(10) < 3 { 2 } else { 1 };
         let mut ops = Vec::new();
         for _ in 0..count {
