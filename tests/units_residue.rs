@@ -137,10 +137,9 @@ fn i16b_the_pinned_fixture_has_an_empty_residue_after_a_pass() {
     );
 }
 
-/// I17: a forced full run records its own proof and leaves the residue unknown for a passing run to measure (PR 86 review
-/// round 2).
+/// I17: with the switch off, a forced full run records its own proof, and the residue is measured for that proof.
 #[test]
-fn i17_a_forced_full_run_records_its_proof_and_leaves_the_residue_unknown() {
+fn i17_a_forced_full_run_measures_the_residue_of_its_own_proof() {
     let s = Suite::new();
     success(&s.hook(&[("T_LINT", "1")]));
     edit(&s, 2);
@@ -149,7 +148,9 @@ fn i17_a_forced_full_run_records_its_proof_and_leaves_the_residue_unknown() {
     success(&s.hook(&[("T_LINT", "1"), ("STOOP_FULL", "1")]));
     let b = bundle(&s);
     assert_ne!(b["whole"], before, "the forced run records a new proof");
-    assert_eq!(b["residue"]["state"], "none", "{}", b["residue"]);
+    assert_eq!(b["residue"]["state"], "provisional", "{}", b["residue"]);
+    assert_eq!(b["residue"]["whole"], b["whole"], "{}", b["residue"]);
+    assert_eq!(paths(&b["residue"]), ["lint"], "{}", b["residue"]);
 }
 
 /// I18: a unit that fails in a pass has no version, so the pass leaves the residue unknown. It passes on a tree that
@@ -217,8 +218,8 @@ fn i21_a_program_only_the_full_command_runs_is_residue_by_absolute_path() {
     assert!(paths(&r).contains(&"/usr/bin/od".to_owned()), "{r}");
 }
 
-/// I22: a unit that leaves the roster is no longer a version, so its reads stop being covered. A forced run that drops it
-/// leaves the residue unknown, never known and empty; a passing run measures it (PR 86 review round 2).
+/// I22: with the switch off, a unit that leaves the roster no longer covers its reads, so the full command's read of
+/// its source is residue after a forced run.
 #[test]
 fn i22_a_unit_that_leaves_the_roster_stops_covering_its_reads() {
     let s = Suite::new();
@@ -230,7 +231,8 @@ fn i22_a_unit_that_leaves_the_roster_stops_covering_its_reads() {
     let units = bundle(&s)["units"].clone();
     assert!(units.get("tests/c.t").is_none(), "{units}");
     let r = residue(&s);
-    assert_eq!(r["state"], "none", "{r}");
+    assert_eq!(r["state"], "provisional", "{r}");
+    assert!(paths(&r).contains(&"src/c.src".to_owned()), "{r}");
 }
 
 /// I23: explain prints the residue line directly before the tracked line, so the residue reads with the counts it
