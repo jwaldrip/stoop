@@ -292,3 +292,42 @@ fn c9_the_switch_off_learns_nothing_after_a_full_run() {
     );
     assert_eq!(launched(&s), ["tests/a.t", "tests/b.t", "tests/c.t"]);
 }
+
+/// C10: the documented root-listing gap, pinned so that it is not read as a guarantee. A whole-command proof does not
+/// record the entry list of the repository root, so a unit added at the top level, with no other change, is skipped by the
+/// legacy hit. That holds with the switch off and with it on, after a passing full run. The test asserts the skip, and the
+/// runner's own status on the same tree shows the false pass.
+#[test]
+fn c10_a_top_level_unit_added_after_a_passing_full_run_is_skipped_by_the_documented_root_gap() {
+    for on in [false, true] {
+        let s = Suite::new();
+        let run = |s: &Suite| {
+            if on {
+                split(s, &[])
+            } else {
+                s.hook(&[])
+            }
+        };
+        success(&run(&s));
+        s.write("top.t", "src/c.src\n");
+        s.write("top.flag", "fail\n");
+        s.clear_log();
+        let out = run(&s);
+        assert_eq!(code(&out), 0, "switch on {on}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("stoop: skip "),
+            "switch on {on}: {}",
+            stderr(&out)
+        );
+        assert!(
+            launched(&s).is_empty(),
+            "switch on {on}: {:?}",
+            launched(&s)
+        );
+        assert_ne!(
+            code(&s.direct(&s.root, &[], &[])),
+            0,
+            "switch on {on}: the runner fails on top.t"
+        );
+    }
+}
