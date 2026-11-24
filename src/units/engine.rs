@@ -1380,6 +1380,38 @@ mod tests {
     }
 
     #[test]
+    fn learn_declines_when_the_residue_is_known_and_empty() {
+        let roster = vec!["tests/a.t".to_owned()];
+        let (mut view, _) = view_of(Vec::new(), Vec::new());
+        let proof = Proof {
+            created: 1,
+            argv: Vec::new(),
+            cwd: None,
+            scope: None,
+            provenance: None,
+            env: BTreeMap::new(),
+            inputs: Vec::new(),
+            outputs: Vec::new(),
+            removed: Vec::new(),
+            ignore: None,
+            priors: None,
+            unplannable: Vec::new(),
+            probes: BTreeMap::new(),
+            env_excluded: Vec::new(),
+        };
+        view.whole = proof.digest();
+        let proofs = [proof];
+        let cx = Judged {
+            proofs: &proofs,
+            ..judged(&roster, 0)
+        };
+        view.residue = Some((0, Vec::new()));
+        assert_eq!(learn(&cx, &view), Err("the residue is known and empty"));
+        view.residue = None;
+        assert!(learn(&cx, &view).is_ok());
+    }
+
+    #[test]
     fn a_residue_is_confirmed_only_when_every_roster_unit_holds_a_version() {
         let table = vec![input("tests/a.t", "f:1")];
         let (view, _) = view_of(vec![("tests/a.t", vec![version(1_000, vec![0])])], table);
