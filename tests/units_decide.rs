@@ -177,8 +177,10 @@ fn t1_an_unchanged_run_after_a_pass_skips() {
         "{}",
         stderr(&out)
     );
+    // The full run after the pass recorded the whole proof, so this run is a whole-command hit. It prints the legacy
+    // skip line, which keeps the same key.
     assert!(
-        stderr(&out).contains("no tracked input changed (3 units,"),
+        stderr(&out).contains("inputs unchanged since"),
         "{}",
         stderr(&out)
     );
@@ -231,6 +233,8 @@ fn t4_residue_takes_the_full_form_and_names_it() {
     let s = Suite::new();
     let env = [("T_LINT", "1")];
     success(&passed(&s, &env, &[SPLIT]));
+    // `lint` is read only by the full command, so a change to it is residue and takes the full form.
+    s.write("lint", "#!/bin/sh\nexit 0\n# changed\n");
     s.clear_log();
     let out = split(&s, &env);
     success(&out);
@@ -255,10 +259,12 @@ fn t5_a_failing_unit_leaves_the_residue_unmatched() {
     let pass = split(&s, &[]);
     assert_eq!(code(&pass), 1, "{}", stderr(&pass));
     s.clear_log();
+    // The failing full command learned no unit proof, so the next run has no residue to match. It takes the
+    // full form.
     let out = split(&s, &[]);
     assert_eq!(decision(&out), "full", "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("the full command has not been matched to its units yet"),
+        stderr(&out).contains("src/shared.src changed"),
         "{}",
         stderr(&out)
     );
@@ -404,14 +410,17 @@ fn t13_explain_and_the_run_agree_in_every_state() {
     // Cold: no bundle yet.
     let s = Suite::new();
     agree(&s, &[], "full");
-    // The first change starts the pass, and the unchanged run after it skips.
+    // The first change is a subset: a and b read it, and the cold run proved every unit. The unchanged run
+    // after it skips.
     edit(&s, 2);
-    agree(&s, &[], "pass");
+    agree(&s, &[], "subset");
     agree(&s, &[], "skip");
     // Residue: the next change takes the full form.
     let t = Suite::new();
     let env = [("T_LINT", "1")];
     success(&passed(&t, &env, &[SPLIT]));
+    // Only the full command reads `lint`, so a change to it is residue and takes the full form.
+    t.write("lint", "#!/bin/sh\nexit 0\n# changed\n");
     agree(&t, &env, "full");
     // A change every unit reads.
     let u = Suite::new();
@@ -537,6 +546,9 @@ fn run_with_status(s: &Suite) -> (Output, String) {
 fn t17_a_skip_reports_units_on_the_status_descriptor() {
     let s = Suite::new();
     success(&passed(&s, &[], &[SPLIT]));
+    // Removing a unit's file changes its directory's listing, which the whole proof refuses. The engine skips through
+    // the bundle's excuse (E16), and that skip reports `units`.
+    s.remove("tests/c.t");
     let (out, report) = run_with_status(&s);
     success(&out);
     let decided: Value = serde_json::from_str(report.trim())
@@ -636,16 +648,24 @@ fn median_ms(mut run: impl FnMut() -> f64) -> f64 {
 }
 
 /// T18: a unit proof made under another environment is affected, even when the whole proof's environment matches. The
-/// run takes the full form, and explain names the environment for each unit.
+/// run takes the attribution pass over every unit the environment changed, and explain names the environment for each.
 #[test]
 fn t18_a_unit_proof_made_under_another_environment_is_affected() {
     let s = Suite::new();
-    success(&s.hook(&[]));
-    edit(&s, 2);
-    // The pass runs under FOO=1, so every unit's proof is made under that environment.
-    success(&split(&s, &[("FOO", "1")]));
+    success(&passed(&s, &[], &[SPLIT]));
+    // The passing full run recorded the whole proof and every unit's proof under no environment. Each unit's guard is
+    // rewritten so its proof reads as made under another environment, while the whole proof still matches this one.
+    let path = s.bundle_path().expect("a suite bundle");
+    let mut bundle = s.bundle().expect("a suite bundle");
+    for versions in bundle["units"].as_object_mut().unwrap().values_mut() {
+        for version in versions.as_array_mut().unwrap() {
+            version["guard"] = Value::from("another environment");
+        }
+    }
+    fs::write(&path, serde_json::to_vec(&bundle).unwrap()).unwrap();
+    // c reads its own file, so this change leaves the whole proof behind and the engine decides the run.
+    s.write("src/c.src", "edited\n");
     s.clear_log();
-    // Back to no FOO: the whole proof was made without it, so only the units' proofs can see the change.
     let explained = explain(&s, &[]);
     assert!(
         stderr(&explained).contains("stoop: affected tests/a.t: the environment changed"),
@@ -789,8 +809,9 @@ fn t_listed_identity_is_its_own() {
     s.write("docs/readme.md", "edited\n");
     let out = s.hook(&with(&env, &[SPLIT]));
     success(&out);
+    assert_eq!(decision(&out), "skip", "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("no tracked input changed"),
+        stderr(&out).contains("inputs unchanged since"),
         "{}",
         stderr(&out)
     );
@@ -803,6 +824,10 @@ fn t_skip_line_counts_distinct_inputs() {
     let s = Suite::new();
     s.write("tests/d.t", "src/c.src\n");
     success(&passed(&s, &[], &[SPLIT]));
+    // A change to a shared input launches a and b and leaves the whole proof behind, so the engine decides the
+    // next run. A whole-command hit would skip before it.
+    edit(&s, 3);
+    success(&split(&s, &[]));
     s.write("docs/readme.md", "edited\n");
     let out = split(&s, &[]);
     success(&out);
@@ -823,8 +848,9 @@ fn t_g2_a_recorded_change_is_not_global() {
     success(&passed(&s, &[], &[SPLIT]));
     let out = split(&s, &[]);
     success(&out);
+    assert_eq!(decision(&out), "skip", "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("no tracked input changed"),
+        stderr(&out).contains("inputs unchanged since"),
         "{}",
         stderr(&out)
     );
@@ -926,7 +952,7 @@ fn explain_switch(s: &Suite, env: &[(&str, &str)], on: bool) -> Output {
     spawning(|| command.output()).unwrap()
 }
 
-/// The stderr with proof ages replaced, so two explains taken a moment apart compare equal.
+/// The stderr with proof ages and durations replaced, so two explains taken a moment apart compare equal.
 fn aged(out: &Output) -> String {
     let text = stderr(out);
     let mut result = String::new();
@@ -937,9 +963,14 @@ fn aged(out: &Output) -> String {
         let is_age = ["s ago", "m ago", "h ago", "d ago"]
             .iter()
             .any(|suffix| after.starts_with(*suffix));
+        // A legacy skip line also prints how long its lookup took, which differs between two explains.
+        let is_ms = after.starts_with("ms)");
         if digits > 0 && is_age {
             result.push_str("<age>");
             rest = &after[5..];
+        } else if digits > 0 && is_ms {
+            result.push_str("<ms>");
+            rest = &after[2..];
         } else {
             let step = if digits > 0 {
                 digits
@@ -951,6 +982,18 @@ fn aged(out: &Output) -> String {
         }
     }
     result
+}
+
+/// The line a switch-on explain prints last when a passing full run would launch units (spec 3.12).
+const COMPLETION_LINE: &str =
+    "stoop: if the full command passes, would launch 3 units without a current proof, one launch each";
+
+/// `text` without its completion line.
+fn without_completion(text: &str) -> String {
+    text.lines()
+        .filter(|line| *line != COMPLETION_LINE)
+        .map(|line| format!("{line}\n"))
+        .collect()
 }
 
 /// Explains and runs the pinned hook under `env`: both make a full decision, and the run fails as the full command
@@ -988,22 +1031,27 @@ fn explain_of_a_disabled_suite_prints_what_the_switch_off_prints() {
     assert_eq!(code(&on), code(&off));
 }
 
-/// E9 (spec 3.12): explain before any unit proof, and while a pass is due, prints what the switch-off path prints.
+/// E9 (spec 3.12): explain before any unit proof, and while a pass is due, prints what the switch-off path prints,
+/// apart from its last line. That line says what a passing full run would launch, and only the switch-on explain
+/// prints it, so the comparison drops it and the test checks it separately.
 #[test]
 fn explain_before_any_unit_proof_prints_what_the_switch_off_prints() {
     let s = Suite::new();
+    let on = aged(&explain_switch(&s, &[], true));
+    assert_eq!(on.lines().last(), Some(COMPLETION_LINE), "cold: {on}");
     assert_eq!(
-        aged(&explain_switch(&s, &[], true)),
+        without_completion(&on),
         aged(&explain_switch(&s, &[], false)),
         "cold"
     );
     success(&s.hook(&[]));
     edit(&s, 2);
-    let off = explain_switch(&s, &[], false);
-    let on = explain_switch(&s, &[], true);
+    let off = aged(&explain_switch(&s, &[], false));
+    let on = aged(&explain_switch(&s, &[], true));
+    assert_eq!(on.lines().last(), Some(COMPLETION_LINE), "{on}");
     assert_eq!(
-        aged(&on),
-        aged(&off),
+        without_completion(&on),
+        off,
         "E9 prints what the switch off prints"
     );
 }
