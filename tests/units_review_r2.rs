@@ -442,6 +442,7 @@ fn r2_departed_only_reader_of_a_changed_source_takes_the_full_form() {
 #[test]
 fn r2_departed_only_reader_of_a_second_source_takes_the_full_form() {
     let s = zsuite();
+    s.write("src/d.src", "original\n");
     s.write(
         "tests/c.t",
         "src/c.src\ntests/z.u\ntests/z.flag\nsrc/d.src\n",
@@ -450,7 +451,9 @@ fn r2_departed_only_reader_of_a_second_source_takes_the_full_form() {
     s.write("tests/n.t", "src/shared.src\n");
     s.remove("tests/c.t");
     s.write("src/d.src", "changed\n");
+    s.write("tests/z.flag", "fail\n");
     let (_, ran, launches, direct_code) = judge("seed11089", &s, &TU, true);
+    assert_eq!(direct_code, 1, "the runner-only test must fail");
     full_form("seed11089", &ran, &launches, direct_code, "src/d.src");
 }
 
