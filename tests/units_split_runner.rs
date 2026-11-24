@@ -2,6 +2,12 @@
 //! Each step applies one or more operations, then runs the subject (`STOOP_SPLIT=1`) and the runner run directly, and
 //! their verdicts must agree. Runner-only tests (`tests/*.u`) are named by no hook, so the full command runs them and
 //! no unit does. The first changed run of a suite with no unit proof is checked too: nothing exempts it.
+//! These tests drive the stoop binary and the fake runner under the tracer, so they run on Linux x86-64 and arm64
+//! only, as `units_split.rs` does.
+#![cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod units_common;
 
 use std::fs;

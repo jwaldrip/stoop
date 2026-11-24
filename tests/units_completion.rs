@@ -2,6 +2,12 @@
 //! first-run form learns the unit proofs that it leaves without a valid version, one launch each, after its own
 //! verdict is settled. Until a suite holds every unit's proof, a changed run takes the full form, so no attribution pass
 //! decides the verdict. The suite is the pinned fixture.
+//! These tests drive the stoop binary and the fake runner under the tracer, so they run on Linux x86-64 and arm64
+//! only, as `units_split.rs` does.
+#![cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
 mod units_common;
 
 use serde_json::Value;
