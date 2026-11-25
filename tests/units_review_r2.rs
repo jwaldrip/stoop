@@ -1147,6 +1147,7 @@ struct E3Tally {
     gap_stored: usize,
     no_verdict: usize,
     no_verdict_failing: usize,
+    no_verdict_delayed: usize,
 }
 
 /// E3 accepts only w22 and E5, plus retries of the same unchanged runner-only failures. Each category is bounded to a
@@ -1199,6 +1200,10 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
     let mut log: Vec<String> = Vec::new();
     let mut no_verdicts = 0usize;
     let mut failing_refusals = 0usize;
+    let mut delayed_refusals = 0usize;
+    let mut drops = ContentDrops::default();
+    let initial = e3_listings(&s, &world.units);
+    drops.observe(&ModelListings::new(), &initial, 0, &launched(&s), true);
     let mut divergence: Option<E3Diverged> = None;
     let mut gap_fires = 0usize;
     let mut sticky_retries = 0usize;
@@ -1268,6 +1273,14 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
             )
         };
         let subject_code = code(&subject);
+        let after = e3_listings(&s, &world.units);
+        drops.observe(
+            &before,
+            &after,
+            step,
+            &launches,
+            subject_code == 0 && launches.iter().any(String::is_empty),
+        );
         let noop = ops.iter().all(|op| matches!(op, Step::Noop));
         if false_pass_after_125(last_125, noop, subject_code, code(&oracle)) {
             return Err(report(
@@ -1297,7 +1310,6 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
             let Some(path) = no_verdict_changed(&subject) else {
                 return Err(report("a status of 125 without the no-verdict line"));
             };
-            let after = e3_listings(&s, &world.units);
             let stopped = world.units.iter().any(|unit| {
                 launches.contains(unit)
                     && before
@@ -1318,6 +1330,17 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
                 );
             } else if code(&oracle) == 0 && stopped {
                 println!("NO VERDICT ACCEPTED (E3): seed {seed}, step {step}, {path}");
+            } else if let (0, Some((unit, dropped_at))) =
+                (code(&oracle), drops.delayed(&path, step))
+            {
+                delayed_refusals += 1;
+                tally.no_verdict_delayed += 1;
+                if delayed_refusals * 3 > steps {
+                    return Err(report("too many delayed-drop refusals"));
+                }
+                println!(
+                    "DELAYED DROP REFUSAL (E3): seed {seed}, step {step}, {path}, dropped by {unit} at step {dropped_at}"
+                );
             } else {
                 return Err(report(&format!(
                     "unaccepted 125: {path} is unrelated to a failing runner and no passing-oracle reader stopped"
@@ -1461,7 +1484,7 @@ fn r2_e3_flag_readers_model() {
         }
     }
     println!(
-        "E3 sweep: seeds {first}..{}: {} steps, {} covered-file gap steps (w22={}, E5={}), {} sticky retries, {} steps beyond the current reading, {} accepted no-verdicts ({} on failing oracle), {} failing seeds",
+        "E3 sweep: seeds {first}..{}: {} steps, {} covered-file gap steps (w22={}, E5={}), {} sticky retries, {} steps beyond the current reading, {} accepted no-verdicts ({} on failing oracle, {} delayed drops), {} failing seeds",
         first + seeds - 1,
         tally.steps,
         tally.gap_current,
@@ -1471,6 +1494,7 @@ fn r2_e3_flag_readers_model() {
         tally.gap_stored,
         tally.no_verdict,
         tally.no_verdict_failing,
+        tally.no_verdict_delayed,
         failures.len()
     );
     assert!(
