@@ -1967,7 +1967,7 @@ fn t1_an_outside_root_input_change_beside_an_own_file_edit_takes_the_full_form()
         s.proofs().iter().any(|proof| {
             proof["inputs"].as_array().is_some_and(|inputs| {
                 inputs.iter().any(|input| {
-                    input["path"] == flag
+                    input["path"].as_str() == Some(flag.as_str())
                         && input["id"]
                             .as_str()
                             .is_some_and(|id| id.starts_with("f:") || id.starts_with("x:"))

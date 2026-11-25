@@ -1521,6 +1521,86 @@ mod tests {
         assert!(!covered.contains("tests/a.flag"), "{covered:?}");
     }
 
+    fn test_proof(inputs: Vec<Input>) -> Proof {
+        Proof {
+            created: 1,
+            argv: Vec::new(),
+            cwd: None,
+            scope: None,
+            provenance: None,
+            env: BTreeMap::new(),
+            inputs,
+            outputs: Vec::new(),
+            removed: Vec::new(),
+            ignore: None,
+            priors: None,
+            unplannable: Vec::new(),
+            probes: BTreeMap::new(),
+            env_excluded: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn uncovered_changes_do_not_ask_a_launch_to_read_a_deleted_file() {
+        let missing = format!(".stoop-missing-test-input-{}", std::process::id());
+        assert!(!Path::new(&missing).exists());
+        let proof = test_proof(vec![input(&missing, "f:old")]);
+        let (view, current) = view_of(Vec::new(), Vec::new());
+        assert!(uncovered_changes(&judged(&[], 0), &view, &current, &proof).is_empty());
+    }
+
+    #[test]
+    fn a_skip_cannot_drop_the_last_reader_of_a_whole_input() {
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let root =
+            std::env::temp_dir().join(format!("stoop-skip-last-reader-{}", std::process::id()));
+        fs::create_dir(&root).unwrap();
+        let root = Scratch(root);
+        fs::write(root.0.join("live.t"), "live").unwrap();
+        fs::write(root.0.join("only.dat"), "data").unwrap();
+        let live = input(
+            "live.t",
+            &identify(&root.0.join("live.t"), true, false).unwrap(),
+        );
+        let only = input(
+            "only.dat",
+            &identify(&root.0.join("only.dat"), true, false).unwrap(),
+        );
+        let proof = test_proof(vec![live.clone(), only.clone()]);
+        let guard = whole_guard(&proof);
+        let (mut view, _) = view_of(
+            vec![
+                ("live.t", vec![version(1_000, vec![0])]),
+                ("gone.t", vec![version(1_000, vec![1])]),
+            ],
+            vec![live, only],
+        );
+        for versions in view.units.values_mut() {
+            for version in versions {
+                version.guard = guard.clone();
+            }
+        }
+        view.whole = proof.digest();
+        view.residue = Some((0, Vec::new()));
+        let roster = vec!["live.t".to_owned()];
+        let proofs = [proof];
+        let cx = Judged {
+            root: &root.0,
+            proofs: &proofs,
+            guard,
+            ..judged(&roster, 0)
+        };
+        assert!(matches!(
+            judge(&cx, &view).decision,
+            Decision::Full(Some(reason)) if reason.contains("units that left the roster read files")
+        ));
+    }
+
     #[test]
     fn learn_declines_a_bundle_that_holds_another_whole_proof() {
         let table = vec![input("tests/a.t", "f:1")];
