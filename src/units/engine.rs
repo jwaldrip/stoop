@@ -355,6 +355,41 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
             clean,
         );
     }
+    // An appeared input in a directory the full proof never listed has no listing change to account for the runner's
+    // use of the name. Do not let a unit's read alone excuse that appearance.
+    if let Some(input) = proof
+        .inputs
+        .iter()
+        .filter(|input| input.id == "a")
+        .find(|input| {
+            let appeared = match current.id(input) {
+                Some(id) => id != "a",
+                None => {
+                    identify(&from_key(cx.root, &input.path), true, false).as_deref() != Some("a")
+                }
+            };
+            if !appeared {
+                return false;
+            }
+            let parent = Path::new(&input.path)
+                .parent()
+                .and_then(Path::to_str)
+                .unwrap_or("");
+            !proof.inputs.iter().chain(&proof.outputs).any(|entry| {
+                entry.id.starts_with("dl:")
+                    && (entry.path == parent || (parent.is_empty() && entry.path == "."))
+            })
+        })
+    {
+        return verdict(
+            Decision::Full(Some(format!(
+                "{} appeared in an unlisted directory",
+                safe(&input.path)
+            ))),
+            shown,
+            clean,
+        );
+    }
     // E16 to E18 each need every listing that the whole proof holds to be as it was (see `listings_change`).
     let excused = match listings_change(cx, view, &current, proof, &affected) {
         Ok(excused) => excused,
