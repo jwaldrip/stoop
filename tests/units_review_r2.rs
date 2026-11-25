@@ -3286,6 +3286,15 @@ fn r8_fresh_w22_requires_a_unit_to_run_against_the_changed_flag() {
         assert_eq!(launches, ["tests/c.t"]);
         assert!(actual_flag_reader);
         assert_eq!(shape, Some(E3Gap::W22));
+        let no_launched_reader = E3GapEvidence {
+            launched_stored_content: e3_stored_content_flag(&before, &s, &[], flag, &old_flag),
+            ..evidence
+        };
+        assert_eq!(
+            e3_gap(no_launched_reader),
+            None,
+            "a fresh W22 requires the launched stored flag reader"
+        );
     }
 }
 
