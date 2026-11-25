@@ -2127,3 +2127,180 @@ fn t1_an_own_file_edit_that_fails_its_unit_is_a_failing_subset() {
     assert_eq!(code(&run), 1, "{}", stderr(&run));
     assert_eq!(launches, ["tests/a.t"]);
 }
+
+fn r5_run_control(s: &Suite, binary: &Path, label: &str) {
+    let oracle = direct(s, &TU);
+    assert_eq!(oracle, 1, "{label}");
+    let mut exits = Vec::new();
+    for n in 0..2 {
+        let run = r3_control_run(s, binary);
+        eprintln!(
+            "R5 CONTROL {label} attempt={n}: exit={} direct={oracle} launches={:?} residue={}\n{}",
+            code(&run),
+            launched(s),
+            residue(s),
+            stderr(&run)
+        );
+        exits.push(code(&run));
+    }
+    assert_eq!(
+        exits,
+        [1, 1],
+        "{label}: the full command returned 1 on the same tree"
+    );
+}
+
+fn r5_dir_control(binary: &Path, head: bool, edit_unit: bool) {
+    let s = Suite::new();
+    s.remove("e2e/x.u");
+    s.remove("tests/c.t");
+    fs::create_dir_all(s.path("policy/zone")).unwrap();
+    let body = ow_script("[ ! -d \"$ROOT/policy/zone\" ]");
+    let old = "-o -path ./slow ";
+    assert_eq!(body.matches(old).count(), 2);
+    s.executable(
+        "t",
+        &body.replace(old, "-o -path ./slow -o -path ./policy "),
+    );
+    success(&r3_control_run(&s, binary));
+    edit(&s, 2);
+    success(&r3_control_run(&s, binary));
+    assert_eq!(known(&s), Some(0), "{}", residue(&s));
+    s.write("tests/c.t", "src/c.src\n");
+    s.write("setup.src", "refresh the whole proof for the new roster\n");
+    success(&r3_control_run(&s, binary));
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
+    assert_eq!(known(&s), if head { Some(0) } else { None });
+    assert!(
+        s.proofs().iter().all(|p| p["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["path"] == "policy/zone" && i["id"] == "d")),
+        "the whole proof must record the directory as an input, not a listing"
+    );
+    for unit in ["tests/a.t", "tests/b.t", "tests/c.t"] {
+        assert!(!stored_reads(&bundle(&s), &[unit.to_owned()]).contains(&"policy/zone".to_owned()));
+    }
+    fs::remove_dir(s.path("policy/zone")).unwrap();
+    if edit_unit {
+        s.write("tests/a.t", "src/shared.src\n\n");
+    }
+    r5_run_control(
+        &s,
+        binary,
+        &format!("removed-observed-directory head={head} edit={edit_unit}"),
+    );
+}
+
+#[test]
+#[ignore = "requires frozen merge-base binary"]
+fn r5_a_removed_catalog_directory_that_the_full_runner_statted_is_not_optional() {
+    let base = std::env::var_os("STOOP_REVIEW_BASE_BIN").expect("set the merge-base binary");
+    for edit in [false, true] {
+        r5_dir_control(Path::new(&base), false, edit);
+    }
+    for edit in [true, false] {
+        r5_dir_control(Path::new(env!("CARGO_BIN_EXE_stoop")), true, edit);
+    }
+}
+
+fn r5_statted_unit_control(binary: &Path, head: bool) {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Suite::new();
+    s.remove("e2e/x.u");
+    s.config("[units]\ndefault_branch = 'main'\n");
+    s.write(
+        ".stoopignore",
+        ".git\n.stoopignore\n.gitignore\n.stoop.toml\n",
+    );
+    s.write(".gitignore", "tests/d.t\n");
+    s.write("tests/d.t", "src/c.src\n");
+    let body = ow_script("[ -x \"$ROOT/tests/d.t\" ]");
+    let anchor = "case $line in\nabs:";
+    assert_eq!(body.matches(anchor).count(), 1);
+    let body = body.replace(
+        anchor,
+        "case $line in\nstat:*) test -e \"$ROOT/${line#stat:}\" ;;\nabs:",
+    );
+    let iter = "\tfor P in $(list_tests); do\n";
+    assert_eq!(body.matches(iter).count(), 1);
+    s.executable(
+        "t",
+        &body.replace(
+            iter,
+            "\tfor P in $(list_tests); do\n\t\t[ \"$P\" = tests/d.t ] && continue\n",
+        ),
+    );
+    s.git("review-feature");
+    let cold = r3_control_run(&s, binary);
+    eprintln!(
+        "R5 GIT COLD head={head}: launches={:?} bundles={}\n{}",
+        launched(&s),
+        s.bundle().is_some(),
+        stderr(&cold)
+    );
+    success(&cold);
+    edit(&s, 2);
+    let warm = r3_control_run(&s, binary);
+    eprintln!(
+        "R5 GIT WARM head={head}: launches={:?} bundles={}\n{}",
+        launched(&s),
+        s.bundle().is_some(),
+        stderr(&warm)
+    );
+    success(&warm);
+    assert!(known(&s).is_some_and(|n| n > 0), "{}", residue(&s));
+    s.write("tests/c.t", "src/c.src\nstat:tests/d.t\n");
+    s.write("setup.src", "refresh the cached roster\n");
+    success(&r3_control_run(&s, binary));
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
+    assert!(bundle(&s)["units"].get("tests/d.t").is_none());
+    assert!(
+        s.proofs().iter().all(|p| p["inputs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["path"] == "tests/d.t" && i["id"].as_str().unwrap().starts_with("f:"))),
+        "the old whole command only statted d.t"
+    );
+    if head {
+        assert_eq!(known(&s), Some(0), "{}", residue(&s));
+    } else {
+        assert!(known(&s).is_some_and(|n| n > 0), "{}", residue(&s));
+    }
+    let staged = spawning(|| {
+        std::process::Command::new("git")
+            .current_dir(&s.root)
+            .args(["add", "-f", "--", "tests/d.t"])
+            .output()
+    })
+    .unwrap();
+    assert!(staged.status.success(), "{}", text(&staged.stderr));
+    fs::set_permissions(s.path("tests/d.t"), fs::Permissions::from_mode(0o755)).unwrap();
+    r5_run_control(
+        &s,
+        binary,
+        &format!("previously-statted-new-roster-unit head={head}"),
+    );
+}
+
+#[test]
+#[ignore = "requires frozen merge-base binary"]
+fn r5_e2_a_formerly_ignored_unit_that_the_full_runner_only_statted_needs_full() {
+    let base = std::env::var_os("STOOP_REVIEW_BASE_BIN").expect("set the merge-base binary");
+    r5_statted_unit_control(Path::new(&base), false);
+    r5_statted_unit_control(Path::new(env!("CARGO_BIN_EXE_stoop")), true);
+}
+
+#[test]
+fn r5_a_head_removed_catalog_directory_is_not_optional() {
+    for edit in [true, false] {
+        r5_dir_control(Path::new(env!("CARGO_BIN_EXE_stoop")), true, edit);
+    }
+}
+
+#[test]
+fn r5_e2_head_formerly_ignored_statted_unit_needs_full() {
+    r5_statted_unit_control(Path::new(env!("CARGO_BIN_EXE_stoop")), true);
+}

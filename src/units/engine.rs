@@ -5,6 +5,28 @@
 //! the full command, which is the switch-off path, with the reason the spec gives. Explain takes the same decision
 //! without the suite lock and prints the same lines (spec 3.12). Nothing here writes, except `settle` and `disagree`,
 //! which run under the suite lock.
+//!
+//! Identity audit for the split decision. A proof records a path's state, not the purpose of the access. In particular,
+//! `f:` and `x:` can be produced by stat alone. The table names the consumer, the inference to examine and its control.
+//!
+//! | Consumer | Evidence actually held | Potential overclaim | Control |
+//! | --- | --- | --- | --- |
+//! | Roster guard | Whole `f:` or `x:` identifies a regular file | File access means roster membership | `r5_e2_a_formerly_ignored_unit_that_the_full_runner_only_statted_needs_full` |
+//! | Completion residue | A catalog path was walked | A listing covers a separate `d` stat | `r5_a_removed_catalog_directory_that_the_full_runner_statted_is_not_optional` |
+//! | Version coverage | A version names a path and identity | A regular-file identity proves a content read | `r3_retry_after_a_stat_only_no_verdict_cannot_be_a_skip` |
+//! | Changed content | A unit read a path by content | The runner uses it only through that unit | `w22_informational_the_documented_covered_file_gap` (accepted) |
+//! | Added name | A later unit reads a new regular file | The full runner uses the name only as data | `r4c_informational_an_appeared_runner_only_test_read_as_data` (accepted) |
+//! | Removed unit | A whole input named its old path | A departed unit's path cannot affect the runner | `r4_departed_unit_path_used_by_the_full_runner_is_not_optional` |
+//! | Whole directory | `d` records directory type, not a listing | A catalog listing also verifies the metadata input | `r5_a_head_removed_catalog_directory_is_not_optional` |
+//! | Whole listing | `dl:` identifies entry names | Equal names verify an entry's type or contents | `rv32_a_new_directory_that_an_affected_unit_names_is_not_excused` |
+//! | Whole absence | `a` records an absent in-root path | A parent listing always notices an appearance | `t1_an_absent_input_that_appears_in_an_unlisted_directory_takes_the_full_form` |
+//! | Whole link | `l:` identifies link text, not the target's contents | A unit or a parent listing vouches for the link | `a_unit_file_replaced_by_a_dangling_link_takes_the_full_form` |
+//! | Whole unreadable | `u` records an unreadable path | A catalog or a unit's later access proves it unchanged | The identity check must refuse a changed `u`. |
+//! | Outside root | The recorded identity covers a present path only | A changed outside input is unit-local | `t1_an_outside_root_input_change_beside_an_own_file_edit_takes_the_full_form` |
+//! | Outside absence | Missing outside paths are not recorded | Absence of an entry means absence is tracked | Documented baseline limitation. |
+//! | Whole output | A version names an output and its current identity | That standalone output proves the whole command's output | E15 checks outputs not named by versions. |
+//! | Listing loss | A regular-file entry or old unit identifies a lost name | Loss cannot matter to runner-only work | `r4_departed_unit_path_used_by_the_full_runner_is_not_optional` |
+//! | 125 and retry | A launch failed to establish an excused read | A stored stat can stand in for the missing read | `r3_retry_after_an_actual_lost_read_cannot_be_a_skip` |
 
 use super::attribution;
 use super::bundle::{self, LaunchGuard, Pending, Settled, Version, View};
