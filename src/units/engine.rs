@@ -1921,6 +1921,40 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn r6_own_file_type_changed_after_roster_discovery_takes_the_full_form() {
+        for kind in ["directory", "link"] {
+            let root = TreeDir::new(
+                &format!("own-type-{kind}"),
+                &[("live.t", "live"), ("other.t", "other")],
+            );
+            let (proof, view, roster) = two_units_judged(&root, Vec::new());
+            let path = root.0.join("live.t");
+            fs::remove_file(&path).unwrap();
+            if kind == "directory" {
+                fs::create_dir(&path).unwrap();
+            } else {
+                std::os::unix::fs::symlink("other.t", &path).unwrap();
+            }
+            let guard = whole_guard(&proof);
+            let proofs = [proof];
+            let cx = Judged {
+                root: &root.0,
+                proofs: &proofs,
+                guard,
+                ..judged(&roster, 0)
+            };
+            assert!(
+                matches!(
+                    judge(&cx, &view).decision,
+                    Decision::Full(Some(reason)) if reason.contains("changed its type or its execute bit")
+                ),
+                "{kind}"
+            );
+        }
+    }
+
     #[test]
     fn r5_an_own_file_content_change_stays_a_subset() {
         let root = TreeDir::new("content", &[("live.t", "live"), ("other.t", "other")]);
