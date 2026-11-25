@@ -6,6 +6,7 @@
 
 use super::bundle::{self, LaunchGuard, Pass, Pending, Scratch, Start, Stored};
 use super::config::Config;
+use super::engine::Excused;
 use super::expand;
 use super::hook::{safe, Base, FileMode, Hook};
 use super::independence::{Named, Roster, Violation, Written};
@@ -17,7 +18,7 @@ use crate::input::Input;
 use crate::pathutil::to_key;
 use crate::proof::now;
 use crate::run::{self, How, Lookup, Outcome, RunCx};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::fmt;
 use std::io;
@@ -79,6 +80,7 @@ pub(crate) fn pass(
         &[],
         &HashMap::new(),
         &real_root,
+        &[],
     );
     for name in run::HOOK_ENV {
         std::env::set_var(name, "");
@@ -145,6 +147,23 @@ impl Breach {
     }
 }
 
+/// A name that an affected unit's stored proof named, which the listing check excused, and that no new proof of this run
+/// reads by content (spec 3.10, rv34). Nothing covers the name after the run, so the run has no verdict.
+pub(super) struct Unread {
+    path: String,
+    units: Vec<String>,
+}
+
+impl Unread {
+    fn line(&self) -> String {
+        format!(
+            "stoop: this run has no verdict (exit 125): {} appeared, and no unit's new proof reads it; earlier proofs of {} named it",
+            safe(&self.path),
+            safe(&self.units.join(", "))
+        )
+    }
+}
+
 /// What a loop of launches came to (spec 3.7, 3.11).
 pub(super) struct Ran {
     /// The first nonzero launch status, in launch order.
@@ -159,6 +178,13 @@ pub(super) struct Ran {
     pub(super) stopped: Option<(usize, Violation)>,
     /// The skipped units whose proofs the run's writes broke (spec 3.7): at most one per level.
     pub(super) breaches: Vec<Breach>,
+    /// The units whose new proof this run stored, with the keys their launches read by content (spec 3.10, rv34, rv38).
+    pub(super) proven: BTreeMap<String, BTreeSet<String>>,
+    /// The excused names that no new proof of this run reads by content (spec 3.10, rv34).
+    pub(super) unread: Vec<Unread>,
+    /// The changed inputs of the whole proof that no kept version and no new proof of this run reads by content (spec
+    /// 3.10, PR 86 review round 2). Nothing covers them after the run, so the run has no verdict.
+    pub(super) uncovered: Vec<String>,
     /// The first unit whose launch failed, in launch order. A learning run names it as the disagreement (spec 3.10).
     pub(super) failed: Option<String>,
 }
@@ -167,6 +193,8 @@ pub(super) struct Ran {
 /// is judged, and its proof replaces the unit's version when it holds. `named` holds the names the bundle's versions give,
 /// and `skipped` the units that are not launched, so a launch that breaks one of them is seen. `changed` gives each
 /// launched unit its changed inputs, which the launch exports as `STOOP_CHANGED_INPUTS` (spec 3.11).
+/// `gaps` names the changed inputs and the appeared names that no kept version covers. A proof that stats one of them is
+/// written with the residue unknown (`Pass::unsettle`, spec 3.8).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn launch_each(
     cx: &RunCx<'_>,
@@ -179,6 +207,7 @@ pub(super) fn launch_each(
     skipped: &[SkippedUnit],
     changed: &HashMap<String, Vec<String>>,
     real_root: &Path,
+    gaps: &[String],
 ) -> Ran {
     let quiet = cx.o.quiet;
     let forms = expand::list_forms(hook);
@@ -190,6 +219,9 @@ pub(super) fn launch_each(
         over_budget: 0,
         stopped: None,
         breaches: Vec::new(),
+        proven: BTreeMap::new(),
+        unread: Vec::new(),
+        uncovered: Vec::new(),
         failed: None,
     };
     let mut listing_breach: Option<Breach> = None;
@@ -265,9 +297,22 @@ pub(super) fn launch_each(
                     };
                     match launch::judge(&context, &trace, &observed) {
                         Verdict::Proven(kept) => {
+                            // A stat of a gap path covers it by identity alone. Until the run settles, nothing marks the
+                            // residue unknown, so a kill now would leave a known residue beside this proof. Mark it
+                            // unknown before the write that stores the proof (spec 3.8, PR 86 review round 3).
+                            if kept.inputs.iter().any(|input| {
+                                gaps.contains(&input.path)
+                                    && !observed.content.contains(&input.path)
+                            }) {
+                                pass.unsettle();
+                            }
                             let (old_inputs, old_outputs) = pass.held_of(unit);
                             let stored =
                                 pass.record(&launch.unit, &kept.inputs, &kept.outputs, now());
+                            // A failed write keeps the proof in memory, and the end of the pass writes it (spec 3.11).
+                            if matches!(stored, Stored::Stored | Stored::WriteFailed) {
+                                ran.proven.insert(unit.clone(), observed.content.clone());
+                            }
                             match stored {
                                 Stored::OverBudget => ran.over_budget += 1,
                                 Stored::Stored | Stored::WriteFailed => {
@@ -381,9 +426,33 @@ pub(super) fn finish(
     quiet: bool,
 ) -> i32 {
     let stopped_early = matches!(&ran.stopped, Some((index, _)) if index + 1 < planned);
-    let no_verdict = ran.unlaunched || stopped_early || !ran.breaches.is_empty();
-    // The residue stays unknown when a launch did not run, stopped early, or broke a skipped unit's proof (spec 3.8).
-    pass.settle_residue(&lookup.proofs, pending.listings(), no_verdict);
+    let no_verdict = ran.unlaunched
+        || stopped_early
+        || !ran.breaches.is_empty()
+        || !ran.unread.is_empty()
+        || !ran.uncovered.is_empty();
+    // An appeared name that a replaced proof no longer reads by content is covered by nothing once the run ends. A unit
+    // that failed or stayed stale keeps the proof that names the name, and that proof relaunches the unit next run (PR 86
+    // review round 3).
+    let replaced_unread = ran.unread.iter().any(|unread| {
+        unread
+            .units
+            .iter()
+            .any(|unit| ran.proven.contains_key(unit))
+    });
+    // Likewise, only a version stored by this run can turn an uncovered content input into a stat-only input.
+    let stored_uncovered = pass.held().iter().any(|(unit, inputs, _)| {
+        ran.proven.contains_key(unit)
+            && inputs
+                .iter()
+                .any(|input| ran.uncovered.contains(&input.path))
+    });
+    let unknown = stopped_early
+        || ran.unlaunched
+        || !ran.breaches.is_empty()
+        || replaced_unread
+        || stored_uncovered;
+    pass.settle_residue(&lookup.proofs, pending.listings(), unknown);
     let id = pending.suite();
     // The state a stopped run stores is decided by `disabling` (spec 3.6). It is stored under the lock this run holds.
     if let Some(Disabling {
@@ -433,8 +502,55 @@ pub(super) fn finish(
         for breach in &ran.breaches {
             say(quiet, breach.line());
         }
+        for unread in &ran.unread {
+            say(quiet, unread.line());
+        }
+        for path in &ran.uncovered {
+            say(
+                quiet,
+                format!(
+                    "stoop: this run has no verdict (exit 125): {} changed, and no unit's new proof reads it",
+                    safe(path)
+                ),
+            );
+        }
     }
     exit_status(ran.status, no_verdict)
+}
+
+/// The excused names that no new proof of this run reads by content (spec 3.10, rv34, rv38). A unit counts only when this
+/// run stored its new proof and its launch read the name's content. A stat is not a read, so a name only stat'ed is unread.
+pub(super) fn unread_excuses(
+    excused: &[Excused],
+    proven: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<Unread> {
+    excused
+        .iter()
+        .filter(|excused| {
+            !excused.units.iter().any(|unit| {
+                proven
+                    .get(unit)
+                    .is_some_and(|read| read.contains(&excused.path))
+            })
+        })
+        .map(|excused| Unread {
+            path: excused.path.clone(),
+            units: excused.units.clone(),
+        })
+        .collect()
+}
+
+/// The changed inputs that no new proof of this run reads by content (spec 3.10, PR 86 review round 2). Only a launch can
+/// cover an input that the kept versions do not read, so an input stays uncovered when no launched unit read it.
+pub(super) fn uncovered_inputs(
+    uncovered: &[String],
+    proven: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<String> {
+    uncovered
+        .iter()
+        .filter(|path| !proven.values().any(|read| read.contains(path.as_str())))
+        .cloned()
+        .collect()
 }
 
 /// The paths of a list of inputs or outputs, in their order.

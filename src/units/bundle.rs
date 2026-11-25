@@ -1678,6 +1678,15 @@ impl Pass {
         self.dirty = false;
     }
 
+    /// Marks the residue unknown in memory, before a proof that stats a changed input is written (spec 3.8, PR 86 review
+    /// round 3). The pass's next write stores it, so a run killed before it settles leaves no known residue beside it.
+    pub(crate) fn unsettle(&mut self) {
+        if !matches!(self.bundle.residue.state, ResidueState::None) {
+            self.bundle.residue = Residue::default();
+            self.dirty = true;
+        }
+    }
+
     /// Stores the residue of the suite's whole proof when a pass ends (spec 3.8, point i). The proof is the one of
     /// `proofs` whose digest is the bundle's `whole`. Without it, the residue stays unknown.
     pub(crate) fn settle_residue(
@@ -2104,6 +2113,58 @@ pub(crate) enum Settled {
     Written,
     /// The bundle could not be read or written, so nothing was written.
     Failed,
+}
+
+/// Under the suite lock, reads the bundle again and asks `judge` whether the suite still skips. When it does, the
+/// versions of units that left the roster are dropped and the table is compacted (spec 3.11). A busy lock writes nothing.
+pub(crate) fn drop_stale(
+    store: &Path,
+    pending: &Pending,
+    key: &str,
+    judge: impl FnOnce(&View) -> bool,
+) -> Settled {
+    let Ok(Some(area)) = Area::open(store, false) else {
+        return Settled::Failed;
+    };
+    let _lock = match lock(&area, &pending.suite) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Settled::Busy,
+        Err(_) => return Settled::Failed,
+    };
+    let Some(view) = view_in(&area, pending, key) else {
+        return Settled::Failed;
+    };
+    if !judge(&view) {
+        return Settled::Declined;
+    }
+    // The view takes the bundle it reads, so the write reads it again under the same lock and checks it the same way.
+    let Some(mut bundle) = bundle_for(&area, pending, key) else {
+        return Settled::Failed;
+    };
+    let removed = bundle_readers(
+        &bundle.table,
+        bundle
+            .units
+            .iter()
+            .filter(|(unit, _)| pending.roster.units.binary_search(*unit).is_err())
+            .flat_map(|(_, versions)| versions.iter()),
+    );
+    bundle
+        .units
+        .retain(|unit, _| pending.roster.units.binary_search(unit).is_ok());
+    if !removed.is_empty()
+        && lost_reader(
+            &removed,
+            &bundle_readers(&bundle.table, bundle.units.values().flatten()),
+        )
+    {
+        bundle.residue = Residue::default();
+    }
+    compact(&mut bundle);
+    match write_bundle(&area, &bundle) {
+        Ok(()) => Settled::Written,
+        Err(_) => Settled::Failed,
+    }
 }
 
 /// Rebuilds the table from the entries that the versions still index, in table order, and renumbers the versions to it.
@@ -3822,6 +3883,158 @@ mod cost_tests {
                 at(&mut parse_ms, 0.95),
             );
         }
+        let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+/// The second judgment under the suite lock (spec 3.10, E16). A skip that drops versions is judged again under the lock,
+/// and what the lock reads is what the run takes. The suite here is one the lock reads as disabled. Its roster is
+/// `tests/a.t`, and it still holds a version of `tests/gone.t`, which a skip would drop.
+#[cfg(all(test, unix))]
+mod settle_tests {
+    use super::super::engine::{self, Decision};
+    use super::*;
+    use crate::run::{Lookup, Opts, RunCx};
+
+    fn input(path: &str) -> Input {
+        Input {
+            path: path.into(),
+            id: "f:00".into(),
+            oid: None,
+            oid_basis: None,
+        }
+    }
+
+    fn pending_for(units: &[&str]) -> Pending {
+        pending(PendingSpec {
+            argv: &["runner".into(), "{changed:*.t}".into()],
+            cwd: "",
+            scope: None,
+            label: None,
+            source: "filter",
+            filter: "*.t",
+            units: units.iter().map(|unit| unit.to_string()).collect(),
+            config: None,
+            config_suite: None,
+            listings: Vec::new(),
+        })
+        .unwrap()
+    }
+
+    fn version(index: u32) -> UnitVersion {
+        UnitVersion {
+            created: 1,
+            exact: true,
+            source: ResultSource::Exit,
+            guard: "g".into(),
+            inputs: delta(&[index]),
+            outputs: Vec::new(),
+        }
+    }
+
+    /// Writes the suite under `dir`, and returns its pending roster and the bundle's file.
+    fn locked_disabled(dir: &Path) -> (Pending, PathBuf) {
+        let _ = fs::remove_dir_all(dir);
+        let pending = pending_for(&["tests/a.t"]);
+        let shape = pending_for(&["tests/a.t"]);
+        let bundle = SuiteBundleV1 {
+            v: VERSION,
+            generation: GENERATION,
+            suite: shape.suite,
+            provenance: Provenance::current(),
+            origin: shape.origin,
+            whole_key_digest: digest_text("stoop whole key v1", "key"),
+            whole: Some("p-1".into()),
+            policy: shape.policy,
+            guard: LaunchGuard {
+                env: BTreeMap::new(),
+                env_excluded: Vec::new(),
+                ignore: Vec::new(),
+            },
+            guard_digest: "guard".into(),
+            roster: shape.roster,
+            table: vec![input("tests/a.t"), input("tests/gone.t")],
+            units: BTreeMap::from([
+                ("tests/a.t".to_owned(), vec![version(0)]),
+                ("tests/gone.t".to_owned(), vec![version(1)]),
+            ]),
+            residue: Residue::default(),
+            // A concurrent run disabled the suite after the unlocked decision.
+            state: SuiteState::Disabled {
+                code: "disagreement".into(),
+                phase: "full".into(),
+                label: "concurrent".into(),
+                at: 1,
+            },
+        };
+        let area = Area::open(dir, true).unwrap().unwrap();
+        write_bundle(&area, &bundle).unwrap();
+        let file = dir.join("units/v1").join(bundle_name(&pending.suite));
+        (pending, file)
+    }
+
+    /// Runs the second judgment for `pending` on the store at `dir`, as a skip that drops versions does.
+    fn settle_at(dir: &Path, pending: &Pending) -> Option<Decision> {
+        let root = dir.join("root");
+        fs::create_dir_all(&root).unwrap();
+        let o = Opts::default();
+        let rel_cwd = String::new();
+        let scope = None;
+        let store = crate::proof::Store::new(dir.join("proofs"));
+        let hook = None;
+        let full_reason = None;
+        let salt = None;
+        let cx = RunCx {
+            o: &o,
+            cwd: &root,
+            root: &root,
+            rel_cwd: &rel_cwd,
+            scope: &scope,
+            store: &store,
+            hook: &hook,
+            full_reason: &full_reason,
+            max_age: 0,
+            bypass: false,
+            explain: false,
+            observe_runners: true,
+            env_now: BTreeMap::new(),
+            env_excluded: Vec::new(),
+            salt: &salt,
+            remote: None,
+        };
+        let lookup = Lookup {
+            proofs: Vec::new(),
+            hit_idx: None,
+            why: String::new(),
+            t0: Instant::now(),
+        };
+        engine::settle(&cx, pending, &lookup, dir, "key", 0)
+    }
+
+    /// m39: a locked view that declines writes nothing, so the second judgment is what decides the drop.
+    #[test]
+    fn settle_writes_nothing_when_the_locked_view_declines() {
+        let dir = std::env::temp_dir().join(format!("stoop-settle-writes-{}", std::process::id()));
+        let (pending, file) = locked_disabled(&dir);
+        let before = fs::read(&file).unwrap();
+        settle_at(&dir, &pending);
+        assert_eq!(
+            fs::read(&file).unwrap(),
+            before,
+            "a declined settle writes nothing"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The sibling of m39: a declined settle returns the decision the lock reads, and the skip does not stand.
+    #[test]
+    fn settle_returns_the_decision_the_locked_view_reads() {
+        let dir = std::env::temp_dir().join(format!("stoop-settle-returns-{}", std::process::id()));
+        let (pending, _) = locked_disabled(&dir);
+        assert!(
+            matches!(settle_at(&dir, &pending), Some(Decision::Disabled(_))),
+            "the locked decision replaces the skip"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -1429,6 +1429,18 @@ fn run_internal(mut o: Opts, explain: bool, observe_runners: bool) -> Outcome {
         }
         other => (other, clean, affected),
     };
+    // A skip that drops versions of units that left the roster settles them under the suite lock, and may change its
+    // decision there (spec 3.10, E16). Explain writes nothing, so it never settles.
+    let decision = match decision {
+        Some(units::engine::Decision::Skip(skip)) if skip.drop && !explain => match &pending {
+            Some(pending) => Some(
+                units::engine::settle(&cx, pending, &lookup, &volatile_store, &key, max_age)
+                    .unwrap_or(units::engine::Decision::Skip(skip)),
+            ),
+            None => Some(units::engine::Decision::Skip(skip)),
+        },
+        other => other,
+    };
     // Explain prints a disabled suite's switch-off refusal (spec 3.12), so only a run takes the engine's reason.
     let decision = match decision {
         Some(units::engine::Decision::Disabled(_)) if explain => {
