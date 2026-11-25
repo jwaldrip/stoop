@@ -650,10 +650,10 @@ fn decide_cost() {
         );
         ms
     });
-    // A removed unit now takes the full form. Relearn after the removal, then add a unit-only flag so that the whole
-    // proof is stale but the affected unit has a current proof. The next no-op exercises an engine skip, not a legacy hit.
+    // A removed unit takes the full form. Record that full run with the switch on so it records the roster, then add a
+    // unit-only flag. The next no-op exercises an engine skip, not a legacy hit.
     s.remove("tests/u00000.t");
-    success(&passed(&s, &[], &[SPLIT]));
+    success(&s.hook(&[SPLIT, ("STOOP_FULL", "1")]));
     s.write("tests/a.flag", "ok\n");
     let changed = split(&s, &[]);
     success(&changed);
