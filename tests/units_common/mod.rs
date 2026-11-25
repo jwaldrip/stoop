@@ -488,6 +488,57 @@ pub fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
+/// The exact changed-path refusal, excluding bare, appeared-path, or suffixed diagnostic lines.
+pub fn no_verdict_changed(out: &Output) -> Option<String> {
+    text(&out.stderr).lines().find_map(|line| {
+        let path = line
+            .strip_prefix("stoop: this run has no verdict (exit 125): ")?
+            .strip_suffix(" changed, and no unit's new proof reads it")?;
+        (!path.is_empty()).then(|| path.to_owned())
+    })
+}
+
+/// Failed test paths recorded by the most recent direct runner.
+pub fn oracle_failed_tests(s: &Suite) -> Vec<String> {
+    s.launches()
+        .iter()
+        .flat_map(|launch| {
+            launch
+                .lines
+                .iter()
+                .filter_map(|line| line.strip_prefix("failed=").map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The refusal names a failing runner-only test or its flag, rather than an unrelated path.
+pub fn failing_runner_depends_on(failed: &[String], runners: &[String], path: &str) -> bool {
+    failed.iter().any(|test| {
+        runners.contains(test)
+            && (path == test
+                || test
+                    .strip_suffix(".u")
+                    .is_some_and(|stem| path.strip_suffix(".flag") == Some(stem)))
+    })
+}
+
+pub fn false_pass_after_125(previous_125: bool, noop: bool, subject: i32, oracle: i32) -> bool {
+    previous_125 && noop && subject == 0 && oracle != 0
+}
+/// Whether a unit actually stopped reading the path's contents, including a unit-only content line.
+pub fn content_read_dropped(
+    before: &std::collections::BTreeSet<String>,
+    after: &std::collections::BTreeSet<String>,
+    path: &str,
+) -> bool {
+    let unit_only = format!("unit-only:{path}");
+    let reads = |lines: &std::collections::BTreeSet<String>| {
+        lines.contains(path) || lines.contains(&unit_only)
+    };
+    reads(before) && !reads(after)
+}
+
 /// Make the full runner list and require a directory that its unit discovery prunes.
 pub fn listed_policy_runner(script: &str) -> String {
     let full = "\tset -f\n";

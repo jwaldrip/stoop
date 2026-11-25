@@ -863,17 +863,6 @@ fn e3_listings(
         .collect()
 }
 
-fn e3_no_verdict_path(out: &Output) -> Option<String> {
-    stderr(out).lines().find_map(|line| {
-        let rest = line.strip_prefix("stoop: this run has no verdict (exit 125): ")?;
-        let (named, _) = rest.split_once(", and no unit's new proof reads it")?;
-        named
-            .strip_suffix(" changed")
-            .or_else(|| named.strip_suffix(" appeared"))
-            .map(str::to_owned)
-    })
-}
-
 /// The paths that the stored versions of `units` read, by the bundle's table (`stored` is the bundle before the run).
 fn stored_reads(stored: &Value, units: &[String]) -> Vec<String> {
     let table = stored["table"].as_array().cloned().unwrap_or_default();
@@ -1157,6 +1146,7 @@ struct E3Tally {
     gap_sticky: usize,
     gap_stored: usize,
     no_verdict: usize,
+    no_verdict_failing: usize,
 }
 
 /// E3 accepts only w22 and E5, plus retries of the same unchanged runner-only failures. Each category is bounded to a
@@ -1208,6 +1198,7 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
     }
     let mut log: Vec<String> = Vec::new();
     let mut no_verdicts = 0usize;
+    let mut failing_refusals = 0usize;
     let mut divergence: Option<E3Diverged> = None;
     let mut gap_fires = 0usize;
     let mut sticky_retries = 0usize;
@@ -1251,17 +1242,7 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
         let launches = launched(&s);
         s.clear_log();
         let oracle = s.direct(&s.root, &[], &env);
-        let failed: Vec<String> = s
-            .launches()
-            .iter()
-            .flat_map(|launch| {
-                launch
-                    .lines
-                    .iter()
-                    .filter_map(|line| line.strip_prefix("failed=").map(str::to_owned))
-                    .collect::<Vec<_>>()
-            })
-            .collect();
+        let failed = oracle_failed_tests(&s);
         s.clear_log();
         tally.steps += 1;
         let report = |why: &str| {
@@ -1287,6 +1268,12 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
             )
         };
         let subject_code = code(&subject);
+        let noop = ops.iter().all(|op| matches!(op, Step::Noop));
+        if false_pass_after_125(last_125, noop, subject_code, code(&oracle)) {
+            return Err(report(
+                "WRONG VERDICT: an unchanged retry after exit 125 passed",
+            ));
+        }
         if subject_code != 0 || code(&oracle) == 0 || launches.iter().any(String::is_empty) {
             divergence = None;
         } else if let Some(previous) = &mut divergence {
@@ -1307,30 +1294,37 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
             return Err(report(&format!("a launch named {bad}, not a roster unit")));
         }
         if subject_code == 125 {
-            let Some(path) = e3_no_verdict_path(&subject) else {
+            let Some(path) = no_verdict_changed(&subject) else {
                 return Err(report("a status of 125 without the no-verdict line"));
             };
             let after = e3_listings(&s, &world.units);
             let stopped = world.units.iter().any(|unit| {
                 launches.contains(unit)
-                    && after.get(unit).is_some_and(|new| {
-                        // A launched unit that reads the path by stat only now, or that stopped listing it (PR 86 round 3).
-                        let unit_only = format!("unit-only:{path}");
-                        let had_read = before
-                            .get(unit)
-                            .is_some_and(|old| old.contains(&path) || old.contains(&unit_only));
-                        let still_reads = new.contains(&path) || new.contains(&unit_only);
-                        new.contains(&format!("stat:{path}")) || (had_read && !still_reads)
-                    })
+                    && before
+                        .get(unit)
+                        .zip(after.get(unit))
+                        .is_some_and(|(old, new)| content_read_dropped(old, new, &path))
             });
-            if !stopped {
+            let failing_oracle =
+                code(&oracle) != 0 && failing_runner_depends_on(&failed, &world.runners, &path);
+            if failing_oracle {
+                failing_refusals += 1;
+                tally.no_verdict_failing += 1;
+                if failing_refusals * 3 > steps {
+                    return Err(report("too many refusals on a failing oracle"));
+                }
+                println!(
+                    "REFUSAL ON FAILING ORACLE (E3): seed {seed}, step {step}, {path}, failed {failed:?}"
+                );
+            } else if code(&oracle) == 0 && stopped {
+                println!("NO VERDICT ACCEPTED (E3): seed {seed}, step {step}, {path}");
+            } else {
                 return Err(report(&format!(
-                    "the no-verdict line names {path}, which no launched unit stopped reading"
+                    "unaccepted 125: {path} is unrelated to a failing runner and no passing-oracle reader stopped"
                 )));
             }
             no_verdicts += 1;
             tally.no_verdict += 1;
-            println!("NO VERDICT ACCEPTED (E3): seed {seed}, step {step}, {path}");
             if no_verdicts * 3 > steps {
                 return Err(report("too many no-verdicts in one sequence"));
             }
@@ -1467,7 +1461,7 @@ fn r2_e3_flag_readers_model() {
         }
     }
     println!(
-        "E3 sweep: seeds {first}..{}: {} steps, {} covered-file gap steps (w22={}, E5={}), {} sticky retries, {} steps beyond the current reading, {} accepted no-verdicts, {} failing seeds",
+        "E3 sweep: seeds {first}..{}: {} steps, {} covered-file gap steps (w22={}, E5={}), {} sticky retries, {} steps beyond the current reading, {} accepted no-verdicts ({} on failing oracle), {} failing seeds",
         first + seeds - 1,
         tally.steps,
         tally.gap_current,
@@ -1476,6 +1470,7 @@ fn r2_e3_flag_readers_model() {
         tally.gap_sticky,
         tally.gap_stored,
         tally.no_verdict,
+        tally.no_verdict_failing,
         failures.len()
     );
     assert!(
@@ -1500,6 +1495,54 @@ fn e3_reported_seeds_match_the_owner_approved_shapes() {
     }
     assert_eq!((changed_flag.gap_e5, changed_flag.gap_w22), (0, 1));
     assert_eq!(changed_flag.gap_sticky, 1);
+}
+
+#[test]
+fn e3_refusal_requires_an_exact_line_and_a_failing_runner_dependency() {
+    use std::os::unix::process::ExitStatusExt;
+    let output = |message: &str| Output {
+        status: std::process::ExitStatus::from_raw(125 << 8),
+        stdout: Vec::new(),
+        stderr: message.as_bytes().to_vec(),
+    };
+    let exact = "stoop: this run has no verdict (exit 125): tests/m10.flag changed, and no unit's new proof reads it";
+    assert_eq!(
+        no_verdict_changed(&output(exact)).as_deref(),
+        Some("tests/m10.flag")
+    );
+    for bad in [
+        "stoop: this run has no verdict (exit 125)",
+        "stoop: this run has no verdict (exit 125): tests/m10.flag appeared, and no unit's new proof reads it",
+        "stoop: this run has no verdict (exit 125): tests/m10.flag changed, and no unit's new proof reads it extra",
+    ] {
+        assert_eq!(no_verdict_changed(&output(bad)), None);
+    }
+    let failed = vec!["tests/m10.u".to_owned()];
+    let runners = vec!["tests/m10.u".to_owned()];
+    assert!(failing_runner_depends_on(
+        &failed,
+        &runners,
+        "tests/m10.flag"
+    ));
+    assert!(failing_runner_depends_on(&failed, &runners, "tests/m10.u"));
+    assert!(!failing_runner_depends_on(
+        &failed,
+        &runners,
+        "tests/other.flag"
+    ));
+    assert!(!failing_runner_depends_on(&failed, &[], "tests/m10.flag"));
+    assert!(false_pass_after_125(true, true, 0, 1));
+    assert!(!false_pass_after_125(true, true, 1, 1));
+    assert!(!false_pass_after_125(true, false, 0, 1));
+}
+
+#[test]
+fn e3_seed_10077_refuses_a_failing_runner_without_claiming_a_pass() {
+    let mut tally = E3Tally::default();
+    if let Err(why) = run_e3(10077, 15, &mut tally) {
+        panic!("{why}");
+    }
+    assert_eq!(tally.no_verdict_failing, 1);
 }
 
 // Independent delta-review probes. The runner is a disposable fixture in each test.

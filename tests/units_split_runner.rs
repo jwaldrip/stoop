@@ -360,23 +360,21 @@ fn listings(
         })
         .collect()
 }
-
-/// The path that a designed no-verdict line names, when the run printed exactly that line (PR 86 review round 2).
-fn no_verdict_path(out: &std::process::Output) -> Option<String> {
-    stderr(out).lines().find_map(|line| {
-        let rest = line.strip_prefix("stoop: this run has no verdict (exit 125): ")?;
-        let (named, _) = rest.split_once(", and no unit's new proof reads it")?;
-        named
-            .strip_suffix(" changed")
-            .or_else(|| named.strip_suffix(" appeared"))
-            .map(str::to_owned)
-    })
+#[derive(Default)]
+struct RunnerTally {
+    no_verdict: usize,
+    no_verdict_failing: usize,
 }
 
 /// Runs one seeded sequence. Every step's subject verdict must equal the runner's, and its status is never 2. A status of
-/// 125 is accepted only as the designed no-verdict: the exact line, and an affected unit that stopped reading the path in
-/// that step (PR 86 review round 2). Every launched argument is a unit of the roster.
-fn run_world(seed: u64, steps: usize, runner_only: bool) -> Result<(), String> {
+/// 125 requires the exact changed-path line and either a stopped reader with a passing oracle, or a named dependency of a
+/// failing runner-only test. Every launched argument is a unit of the roster.
+fn run_world(
+    seed: u64,
+    steps: usize,
+    runner_only: bool,
+    tally: &mut RunnerTally,
+) -> Result<(), String> {
     let s = Suite::new();
     let mut rng = Rng::new(seed);
     let mut world = World::start(&s, &mut rng);
@@ -395,7 +393,9 @@ fn run_world(seed: u64, steps: usize, runner_only: bool) -> Result<(), String> {
         ));
     }
     let mut log: Vec<String> = Vec::new();
+    let model = if runner_only { "E2" } else { "E1" };
     let mut no_verdicts = 0usize;
+    let mut failing_refusals = 0usize;
     // An unchanged retry after a no-verdict (PR 86 review round 3): half the time, the step after a 125 applies nothing.
     let mut last_125 = false;
     for step in 1..=steps {
@@ -418,9 +418,10 @@ fn run_world(seed: u64, steps: usize, runner_only: bool) -> Result<(), String> {
         let launches = launched(&s);
         s.clear_log();
         let oracle = s.direct(&s.root, &[], &env);
+        let failed = oracle_failed_tests(&s);
         let report = |why: &str| {
             format!(
-                "{why}\nseed {seed}, step {step}\noperations:\n  {}\nsubject exit {}, oracle exit {}, launches {launches:?}\nsubject stderr:\n{}",
+                "{why}\nseed {seed}, step {step}\noperations:\n  {}\nsubject exit {}, oracle exit {}, oracle failed {failed:?}, launches {launches:?}\nsubject stderr:\n{}",
                 log.join("\n  "),
                 code(&subject),
                 code(&oracle),
@@ -428,6 +429,12 @@ fn run_world(seed: u64, steps: usize, runner_only: bool) -> Result<(), String> {
             )
         };
         let subject_code = code(&subject);
+        let noop = ops.iter().all(|op| matches!(op, Op::Noop));
+        if false_pass_after_125(last_125, noop, subject_code, code(&oracle)) {
+            return Err(report(
+                "WRONG VERDICT: an unchanged retry after exit 125 passed",
+            ));
+        }
         last_125 = subject_code == 125;
         if subject_code == 2 {
             return Err(report("a status of 2"));
@@ -435,26 +442,35 @@ fn run_world(seed: u64, steps: usize, runner_only: bool) -> Result<(), String> {
         if subject_code == 125 {
             // The designed no-verdict (PR 86 review round 2): an affected unit stopped reading a changed source, and no
             // new proof reads it. The line must be exact, and this step's own listings must show that stop.
-            let Some(path) = no_verdict_path(&subject) else {
+            let Some(path) = no_verdict_changed(&subject) else {
                 return Err(report("a status of 125 without the no-verdict line"));
             };
             let after = listings(&s, &world.units);
             let stopped = world.units.iter().any(|unit| {
                 launches.contains(unit)
-                    && after.get(unit).is_some_and(|new| {
-                        // A launched unit that reads the path by stat only now, or that stopped listing it (PR 86 round 3).
-                        new.contains(&format!("stat:{path}"))
-                            || (before.get(unit).is_some_and(|old| old.contains(&path))
-                                && !new.contains(&path))
-                    })
+                    && before
+                        .get(unit)
+                        .zip(after.get(unit))
+                        .is_some_and(|(old, new)| content_read_dropped(old, new, &path))
             });
-            if !stopped {
-                return Err(report(&format!(
-                    "the no-verdict line names {path}, which no launched unit stopped reading"
-                )));
+            let failing_oracle =
+                code(&oracle) != 0 && failing_runner_depends_on(&failed, &world.runner_only, &path);
+            if failing_oracle {
+                failing_refusals += 1;
+                tally.no_verdict_failing += 1;
+                if failing_refusals * 3 > steps {
+                    return Err(report("too many refusals on a failing oracle"));
+                }
+                println!(
+                    "REFUSAL ON FAILING ORACLE ({model}): seed {seed}, step {step}, {path}, failed {failed:?}"
+                );
+            } else if code(&oracle) == 0 && stopped {
+                println!("NO VERDICT ACCEPTED ({model}): seed {seed}, step {step}, {path}");
+            } else {
+                return Err(report(&format!("unaccepted 125 for {path}")));
             }
             no_verdicts += 1;
-            println!("NO VERDICT ACCEPTED (x02 shape): seed {seed}, step {step}, {path}");
+            tally.no_verdict += 1;
             if no_verdicts * 3 > steps {
                 return Err(report("too many no-verdicts in one sequence"));
             }
@@ -478,11 +494,20 @@ fn check_range(runner_only: bool) {
     let seeds = count_from_env("STOOP_RUNNER_SEEDS", 4) as u64;
     let steps = count_from_env("STOOP_RUNNER_STEPS", 30);
     let mut failures = Vec::new();
+    let mut tally = RunnerTally::default();
     for seed in first..first + seeds {
-        if let Err(why) = run_world(seed, steps, runner_only) {
+        if let Err(why) = run_world(seed, steps, runner_only, &mut tally) {
             failures.push(why);
         }
     }
+    let model = if runner_only { "E2" } else { "E1" };
+    println!(
+        "{model} sweep: seeds {first}..{}: {} accepted no-verdicts ({} on failing oracle), {} failing seeds",
+        first + seeds - 1,
+        tally.no_verdict,
+        tally.no_verdict_failing,
+        failures.len()
+    );
     assert!(
         failures.is_empty(),
         "{} failing seeds; first:\n{}",
@@ -508,8 +533,63 @@ fn model_runner_only_tests_give_the_full_runs_verdict() {
 #[test]
 fn model_seeds_that_found_issue_84_agree_with_the_runner() {
     for seed in [2059, 2091] {
-        if let Err(why) = run_world(seed, 30, true) {
+        if let Err(why) = run_world(seed, 30, true, &mut RunnerTally::default()) {
             panic!("{why}");
         }
     }
+}
+
+#[test]
+fn bounded_refusal_requires_an_exact_line_and_a_relevant_failure_or_content_drop() {
+    use std::collections::BTreeSet;
+    use std::os::unix::process::ExitStatusExt;
+
+    let output = |line: &str| Output {
+        status: std::process::ExitStatus::from_raw(125 << 8),
+        stdout: Vec::new(),
+        stderr: line.as_bytes().to_vec(),
+    };
+    let line = "stoop: this run has no verdict (exit 125): tests/m10.flag changed, and no unit's new proof reads it";
+    assert_eq!(
+        no_verdict_changed(&output(line)).as_deref(),
+        Some("tests/m10.flag")
+    );
+    for invalid in [
+        "stoop: this run has no verdict (exit 125)",
+        "stoop: this run has no verdict (exit 125): tests/m10.flag appeared, and no unit's new proof reads it",
+        "stoop: this run has no verdict (exit 125): tests/m10.flag changed, and no unit's new proof reads it; extra",
+    ] {
+        assert_eq!(no_verdict_changed(&output(invalid)), None);
+    }
+
+    let failed = vec!["tests/m10.u".to_owned()];
+    let runners = failed.clone();
+    assert!(failing_runner_depends_on(&failed, &runners, "tests/m10.u"));
+    assert!(failing_runner_depends_on(
+        &failed,
+        &runners,
+        "tests/m10.flag"
+    ));
+    assert!(!failing_runner_depends_on(
+        &failed,
+        &runners,
+        "tests/m11.flag"
+    ));
+    assert!(!failing_runner_depends_on(&failed, &[], "tests/m10.flag"));
+
+    let path = "tests/m10.flag";
+    let content = BTreeSet::from([path.to_owned()]);
+    let unit_only = BTreeSet::from([format!("unit-only:{path}")]);
+    let stat = BTreeSet::from([format!("stat:{path}")]);
+    let empty = BTreeSet::new();
+    assert!(content_read_dropped(&content, &stat, path));
+    assert!(content_read_dropped(&unit_only, &empty, path));
+    assert!(!content_read_dropped(&stat, &empty, path));
+    assert!(!content_read_dropped(&stat, &stat, path));
+    assert!(!content_read_dropped(&content, &unit_only, path));
+    assert!(false_pass_after_125(true, true, 0, 1));
+    assert!(!false_pass_after_125(true, true, 1, 1));
+    assert!(!false_pass_after_125(true, false, 0, 1));
+    assert!(!false_pass_after_125(false, true, 0, 1));
+    assert!(!false_pass_after_125(true, true, 0, 0));
 }
