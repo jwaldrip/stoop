@@ -162,6 +162,11 @@ struct SuiteBundleV1 {
     guard: LaunchGuard,
     guard_digest: String,
     roster: Roster,
+    /// The roster that the whole proof was judged with (spec 3.10, PR 86 review round 5). Only a split run's full command
+    /// sets it. Empty when no split run recorded the proof, which makes every roster unit new until the next full run.
+    /// It is omitted when empty, so a bundle that no split run recorded keeps its bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    whole_roster: Vec<String>,
     table: Vec<Input>,
     #[serde(deserialize_with = "unique_map")]
     units: BTreeMap<String, Vec<UnitVersion>>,
@@ -361,6 +366,8 @@ fn valid_bundle(bundle: &SuiteBundleV1, id: &str) -> bool {
         && bundle.suite == id
         && bundle.roster.units.len() <= MAX_UNITS
         && valid_roster(&bundle.roster.units)
+        && bundle.whole_roster.len() <= MAX_UNITS
+        && valid_roster(&bundle.whole_roster)
         && bundle.units.len() <= MAX_UNITS
         && bundle
             .units
@@ -1114,6 +1121,11 @@ pub(crate) fn record(
         guard,
         guard_digest,
         roster,
+        whole_roster: if split {
+            pending.roster.units.clone()
+        } else {
+            Vec::new()
+        },
         table,
         units,
         residue,
@@ -2039,6 +2051,8 @@ pub(crate) struct View {
     pub(crate) units: BTreeMap<String, Vec<Version>>,
     /// The residue, when it is known for `whole`: its count and its first paths.
     pub(crate) residue: Option<(usize, Vec<String>)>,
+    /// The roster that the whole proof was judged with (spec 3.10, PR 86 review round 5). Empty when no split run recorded it.
+    pub(crate) whole_roster: Vec<String>,
 }
 
 impl View {
@@ -2074,6 +2088,7 @@ impl View {
             table: bundle.table,
             units,
             residue,
+            whole_roster: bundle.whole_roster,
         })
     }
 }
@@ -2516,6 +2531,7 @@ mod tests {
             },
             guard_digest: "guard".into(),
             roster: pending.roster,
+            whole_roster: Vec::new(),
             table: Vec::new(),
             units: BTreeMap::new(),
             residue: Residue::default(),
@@ -2527,6 +2543,10 @@ mod tests {
         assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["roster"].get("inputs").is_none());
+        assert!(
+            json.get("whole_roster").is_none(),
+            "a bundle no split run recorded keeps its bytes"
+        );
         let mut bounded = decoded;
         let versions = (0..=MAX_VERSIONS)
             .map(|_| UnitVersion {
@@ -2721,6 +2741,7 @@ mod pass_tests {
             guard: guard(),
             guard_digest: "guard".into(),
             roster: pending.roster,
+            whole_roster: Vec::new(),
             table: Vec::new(),
             units: BTreeMap::new(),
             residue: Residue::default(),
@@ -3804,6 +3825,7 @@ mod cost_tests {
             },
             guard_digest: "guard".into(),
             roster: pending.roster,
+            whole_roster: Vec::new(),
             table,
             units,
             residue: Residue::default(),
@@ -3953,6 +3975,7 @@ mod settle_tests {
             },
             guard_digest: "guard".into(),
             roster: shape.roster,
+            whole_roster: Vec::new(),
             table: vec![input("tests/a.t"), input("tests/gone.t")],
             units: BTreeMap::from([
                 ("tests/a.t".to_owned(), vec![version(0)]),
@@ -4106,6 +4129,7 @@ mod keep_tests {
             guard: guard(),
             guard_digest: "guard".into(),
             roster: pending.roster,
+            whole_roster: Vec::new(),
             table,
             units,
             residue: Residue::default(),

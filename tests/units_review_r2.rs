@@ -2304,3 +2304,23 @@ fn r5_a_head_removed_catalog_directory_is_not_optional() {
 fn r5_e2_head_formerly_ignored_statted_unit_needs_full() {
     r5_statted_unit_control(Path::new(env!("CARGO_BIN_EXE_stoop")), true);
 }
+
+#[test]
+fn r5_a_unit_file_that_gains_an_execute_bit_takes_the_full_form() {
+    use std::os::unix::fs::PermissionsExt;
+    let s = Suite::new();
+    s.executable("t", &ow_script("[ -x \"$ROOT/tests/a.t\" ]"));
+    learned(&s, &[]);
+    fs::set_permissions(s.path("tests/a.t"), fs::Permissions::from_mode(0o755)).unwrap();
+    let (_, run, launches, oracle) = judge("r5-own-execute-bit", &s, &[], true);
+    assert_eq!(
+        oracle, 1,
+        "the runner's policy rejects an executable unit file"
+    );
+    assert_eq!(code(&run), 1, "{}", stderr(&run));
+    assert_eq!(
+        launches,
+        [""],
+        "a changed execute bit is not a content change"
+    );
+}

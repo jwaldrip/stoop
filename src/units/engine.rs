@@ -5,28 +5,6 @@
 //! the full command, which is the switch-off path, with the reason the spec gives. Explain takes the same decision
 //! without the suite lock and prints the same lines (spec 3.12). Nothing here writes, except `settle` and `disagree`,
 //! which run under the suite lock.
-//!
-//! Identity audit for the split decision. A proof records a path's state, not the purpose of the access. In particular,
-//! `f:` and `x:` can be produced by stat alone. The table names the consumer, the inference to examine and its control.
-//!
-//! | Consumer | Evidence actually held | Potential overclaim | Control |
-//! | --- | --- | --- | --- |
-//! | Roster guard | Whole `f:` or `x:` identifies a regular file | File access means roster membership | `r5_e2_a_formerly_ignored_unit_that_the_full_runner_only_statted_needs_full` |
-//! | Completion residue | A catalog path was walked | A listing covers a separate `d` stat | `r5_a_removed_catalog_directory_that_the_full_runner_statted_is_not_optional` |
-//! | Version coverage | A version names a path and identity | A regular-file identity proves a content read | `r3_retry_after_a_stat_only_no_verdict_cannot_be_a_skip` |
-//! | Changed content | A unit read a path by content | The runner uses it only through that unit | `w22_informational_the_documented_covered_file_gap` (accepted) |
-//! | Added name | A later unit reads a new regular file | The full runner uses the name only as data | `r4c_informational_an_appeared_runner_only_test_read_as_data` (accepted) |
-//! | Removed unit | A whole input named its old path | A departed unit's path cannot affect the runner | `r4_departed_unit_path_used_by_the_full_runner_is_not_optional` |
-//! | Whole directory | `d` records directory type, not a listing | A catalog listing also verifies the metadata input | `r5_a_head_removed_catalog_directory_is_not_optional` |
-//! | Whole listing | `dl:` identifies entry names | Equal names verify an entry's type or contents | `rv32_a_new_directory_that_an_affected_unit_names_is_not_excused` |
-//! | Whole absence | `a` records an absent in-root path | A parent listing always notices an appearance | `t1_an_absent_input_that_appears_in_an_unlisted_directory_takes_the_full_form` |
-//! | Whole link | `l:` identifies link text, not the target's contents | A unit or a parent listing vouches for the link | `a_unit_file_replaced_by_a_dangling_link_takes_the_full_form` |
-//! | Whole unreadable | `u` records an unreadable path | A catalog or a unit's later access proves it unchanged | The identity check must refuse a changed `u`. |
-//! | Outside root | The recorded identity covers a present path only | A changed outside input is unit-local | `t1_an_outside_root_input_change_beside_an_own_file_edit_takes_the_full_form` |
-//! | Outside absence | Missing outside paths are not recorded | Absence of an entry means absence is tracked | Documented baseline limitation. |
-//! | Whole output | A version names an output and its current identity | That standalone output proves the whole command's output | E15 checks outputs not named by versions. |
-//! | Listing loss | A regular-file entry or old unit identifies a lost name | Loss cannot matter to runner-only work | `r4_departed_unit_path_used_by_the_full_runner_is_not_optional` |
-//! | 125 and retry | A launch failed to establish an excused read | A stored stat can stand in for the missing read | `r3_retry_after_an_actual_lost_read_cannot_be_a_skip` |
 
 use super::attribution;
 use super::bundle::{self, LaunchGuard, Pending, Settled, Version, View};
@@ -419,6 +397,67 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
             Decision::Full(Some(format!(
                 "{} appeared in an unlisted directory",
                 safe(&input.path)
+            ))),
+            shown,
+            clean,
+        );
+    }
+    // A directory that the full command recorded as metadata (`d`) is read by no unit's run, and a catalog listing does
+    // not cover a metadata read. Its presence and type must hold (PR 86 review round 5, R5a).
+    let dirs: Vec<&Input> = proof
+        .inputs
+        .iter()
+        .filter(|input| input.id == "d" && !Path::new(&input.path).is_absolute())
+        .collect();
+    let now = Current::of(cx.root, &dirs);
+    if let Some(input) = dirs.iter().find(|input| !now.holds(input)) {
+        return verdict(
+            Decision::Full(Some(format!(
+                "{} changed, and the full command read it as a directory",
+                safe(&input.path)
+            ))),
+            shown,
+            clean,
+        );
+    }
+    // A roster unit's own file may change its content, which that unit's run covers. The full command also reads the
+    // execute bit and the file type outside any unit's run, so a change in either takes the full form (round 5).
+    let owns: Vec<&Input> = proof
+        .inputs
+        .iter()
+        .filter(|input| {
+            cx.roster.binary_search(&input.path).is_ok()
+                && (input.id.starts_with("f:") || input.id.starts_with("x:"))
+        })
+        .collect();
+    let now = Current::of(cx.root, &owns);
+    if let Some(input) = owns.iter().find(|input| {
+        !now.id(input).is_some_and(|id| {
+            (id.starts_with("f:") || id.starts_with("x:"))
+                && id.starts_with("x:") == input.id.starts_with("x:")
+        })
+    }) {
+        return verdict(
+            Decision::Full(Some(format!(
+                "{} changed its type or its execute bit",
+                safe(&input.path)
+            ))),
+            shown,
+            clean,
+        );
+    }
+    // A roster unit that the last full run was not judged with is new to the suite. Its file can be one that the runner
+    // only checks by a stat, and a stat records the same identity as a read, so no identity shows that the unit was on
+    // the roster. Only the roster that the whole proof recorded decides it (round 5, R5b).
+    if let Some(unit) = cx
+        .roster
+        .iter()
+        .find(|unit| view.whole_roster.binary_search(unit).is_err())
+    {
+        return verdict(
+            Decision::Full(Some(format!(
+                "{} was not on the roster of the last full run",
+                safe(unit)
             ))),
             shown,
             clean,
@@ -1486,6 +1525,7 @@ mod tests {
                 .map(|(unit, versions)| (unit.to_owned(), versions))
                 .collect(),
             residue: None,
+            whole_roster: Vec::new(),
         };
         (view, current)
     }
@@ -1609,6 +1649,7 @@ mod tests {
         }
         view.whole = proof.digest();
         view.residue = Some((0, Vec::new()));
+        view.whole_roster = vec!["live.t".to_owned()];
         let roster = vec!["live.t".to_owned()];
         let proofs = [proof];
         let cx = Judged {
@@ -1621,6 +1662,138 @@ mod tests {
             judge(&cx, &view).decision,
             Decision::Full(Some(reason)) if reason.contains("units that left the roster read files")
         ));
+    }
+
+    /// A scratch folder with the given files, removed when the test ends.
+    struct TreeDir(std::path::PathBuf);
+
+    impl TreeDir {
+        fn new(name: &str, files: &[(&str, &str)]) -> TreeDir {
+            let root = std::env::temp_dir().join(format!("stoop-r5-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            for (path, body) in files {
+                fs::write(root.join(path), body).unwrap();
+            }
+            TreeDir(root)
+        }
+
+        fn entry(&self, path: &str) -> Input {
+            input(path, &identify(&self.0.join(path), true, false).unwrap())
+        }
+    }
+
+    impl Drop for TreeDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The proof and view of two units, `live.t` and `other.t`, that one full run judged together over `root`. Each unit's
+    /// version reads its own file. The test changes the tree or the view after this.
+    fn two_units_judged(root: &TreeDir, extra: Vec<Input>) -> (Proof, View, Vec<String>) {
+        let live = root.entry("live.t");
+        let other = root.entry("other.t");
+        let mut inputs = vec![live.clone(), other.clone()];
+        inputs.extend(extra);
+        inputs.sort_by(|a, b| a.path.cmp(&b.path));
+        let proof = test_proof(inputs);
+        let guard = whole_guard(&proof);
+        let (mut view, _) = view_of(
+            vec![
+                ("live.t", vec![version(1_000, vec![0])]),
+                ("other.t", vec![version(1_000, vec![1])]),
+            ],
+            vec![live, other],
+        );
+        for versions in view.units.values_mut() {
+            for version in versions {
+                version.guard = guard.clone();
+            }
+        }
+        view.whole = proof.digest();
+        view.residue = Some((0, Vec::new()));
+        view.whole_roster = vec!["live.t".to_owned(), "other.t".to_owned()];
+        (proof, view, vec!["live.t".to_owned(), "other.t".to_owned()])
+    }
+
+    #[test]
+    fn r5_a_directory_the_full_command_read_as_metadata_takes_the_full_form_when_it_changes() {
+        let root = TreeDir::new("metadata", &[("live.t", "live"), ("other.t", "other")]);
+        // The full command stat'd `policy`, which is a directory then. It is gone now.
+        let (proof, view, roster) = two_units_judged(&root, vec![input("policy", "d")]);
+        let guard = whole_guard(&proof);
+        let proofs = [proof];
+        let cx = Judged {
+            root: &root.0,
+            proofs: &proofs,
+            guard,
+            ..judged(&roster, 0)
+        };
+        assert!(
+            matches!(
+                judge(&cx, &view).decision,
+                Decision::Full(Some(reason)) if reason.contains("read it as a directory")
+            ),
+            "a catalog listing does not cover a metadata read"
+        );
+    }
+
+    #[test]
+    fn r5_a_roster_unit_the_last_full_run_was_not_judged_with_takes_the_full_form() {
+        let root = TreeDir::new("roster", &[("live.t", "live"), ("other.t", "other")]);
+        let (proof, mut view, roster) = two_units_judged(&root, Vec::new());
+        // `other.t` was not on the roster of the full run, even though the full command had read its file.
+        view.whole_roster = vec!["live.t".to_owned()];
+        let guard = whole_guard(&proof);
+        let proofs = [proof];
+        let cx = Judged {
+            root: &root.0,
+            proofs: &proofs,
+            guard,
+            ..judged(&roster, 0)
+        };
+        assert!(matches!(
+            judge(&cx, &view).decision,
+            Decision::Full(Some(reason)) if reason.contains("was not on the roster of the last full run")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn r5_an_own_file_that_gains_an_execute_bit_takes_the_full_form() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TreeDir::new("bit", &[("live.t", "live"), ("other.t", "other")]);
+        let (proof, view, roster) = two_units_judged(&root, Vec::new());
+        fs::set_permissions(root.0.join("live.t"), fs::Permissions::from_mode(0o755)).unwrap();
+        let guard = whole_guard(&proof);
+        let proofs = [proof];
+        let cx = Judged {
+            root: &root.0,
+            proofs: &proofs,
+            guard,
+            ..judged(&roster, 0)
+        };
+        assert!(matches!(
+            judge(&cx, &view).decision,
+            Decision::Full(Some(reason)) if reason.contains("its execute bit")
+        ));
+    }
+
+    #[test]
+    fn r5_an_own_file_content_change_stays_a_subset() {
+        let root = TreeDir::new("content", &[("live.t", "live"), ("other.t", "other")]);
+        let (proof, view, roster) = two_units_judged(&root, Vec::new());
+        fs::write(root.0.join("live.t"), "changed").unwrap();
+        let guard = whole_guard(&proof);
+        let proofs = [proof];
+        let cx = Judged {
+            root: &root.0,
+            proofs: &proofs,
+            guard,
+            ..judged(&roster, 0)
+        };
+        assert!(matches!(judge(&cx, &view).decision, Decision::Subset(_)));
     }
 
     #[test]
