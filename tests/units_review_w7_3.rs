@@ -543,9 +543,11 @@ fn w21_a_runner_only_test_a_deleted_unit_read_keeps_the_full_verdict() {
     same_verdict("w21", &second, direct_second);
 }
 
-/// The documented covered-file gap, for comparison with w20 and w21: `c` still reads the runner-only test.
+/// Review round 4 (PR 86): the covered-file gap of round 2 is closed. `c` reads the flag of a runner-only test, and the
+/// runner's own run of `z.u` reads that flag too. A change to the flag takes the full form, so the verdict is the full
+/// command's, and the unit alone does not decide it.
 #[test]
-fn w22_informational_the_documented_covered_file_gap() {
+fn w22_a_flag_that_a_unit_and_a_runner_only_test_both_read_takes_the_full_form() {
     let s = Suite::new();
     s.remove("e2e/x.u");
     let env = [("T_U", "1")];
@@ -554,14 +556,9 @@ fn w22_informational_the_documented_covered_file_gap() {
     s.write("tests/c.flag", "ok\n");
     s.write("tests/c.t", "src/c.src\ntests/z.u\ntests/z.flag\n");
     learned(&s, &env);
-    eprintln!(
-        "REVIEW w22 residue after learning: {}",
-        bundle(&s)["residue"]
-    );
     s.write("tests/z.flag", "fail\n");
     let (_, ran, launches, direct_code) = judge("w22", &s, &env, true);
-    eprintln!(
-        "REVIEW w22 informational: exit={} direct={direct_code} launches={launches:?}",
-        code(&ran)
-    );
+    assert_eq!(direct_code, 1);
+    same_verdict("w22", &ran, direct_code);
+    assert_eq!(launches, [""]);
 }

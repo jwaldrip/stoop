@@ -651,9 +651,10 @@ fn decide_cost() {
         );
         ms
     });
-    // Removing a unit's file changes its directory's listing, which the legacy proof refuses. The engine skips through the
-    // bundle's excuse for that name (E16), and the first skip drops the unit's versions under the lock.
+    // Removing a unit's file changes the roster, so the next run takes the full form once (the roster rule). That run
+    // records the whole proof without the unit, and the skip below is the run after it.
     s.remove("tests/u00000.t");
+    success(&passed(&s, &[], &[SPLIT]));
     let skip_ms = median_ms(|| {
         let started = Instant::now();
         let skip = split(&s, &[]);

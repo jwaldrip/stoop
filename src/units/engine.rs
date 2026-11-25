@@ -3,8 +3,8 @@
 //! roster is an attribution pass that keeps versions (E17), and any other affected set is a subset, one launch per unit
 //! (E18). Both run under the suite lock, which decides again before it launches (`subset`). Every other decision takes
 //! the full command, which is the switch-off path, with the reason the spec gives. Explain takes the same decision
-//! without the suite lock and prints the same lines (spec 3.12). Nothing here writes, except `settle` and `disagree`,
-//! which run under the suite lock.
+//! without the suite lock and prints the same lines (spec 3.12). Nothing here writes, except `disagree`, which runs
+//! under the suite lock.
 
 use super::attribution;
 use super::bundle::{self, LaunchGuard, Pending, Version, View};
@@ -1117,10 +1117,10 @@ mod tests {
         assert_eq!(roster_change(&judged(&roster, 0), &view, &read), None);
     }
 
-    /// A file that a stored proof names is not thereby read by the whole command: the roster rule is about the whole
-    /// proof's own input list only (PR 86 review round 4).
+    /// A unit whose own file the whole proof records only as absent is not read by the whole command (PR 86 review round
+    /// 4): the roster rule needs a regular file or an executable in the whole proof.
     #[test]
-    fn a_stored_read_alone_does_not_make_the_full_command_read_a_unit() {
+    fn a_unit_whose_own_file_the_whole_proof_records_as_absent_is_not_read() {
         let roster = vec!["tests/a.t".to_owned()];
         let (view, _) = view_of(
             vec![("tests/a.t", vec![version(1_000, vec![0])])],

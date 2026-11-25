@@ -1688,7 +1688,7 @@ fn t1_an_outside_root_input_change_beside_an_own_file_edit_takes_the_full_form()
     let flag = flag.display().to_string();
     s.executable(
         "t",
-        &ow_script(&format!("[ -f '{flag}' ] && grep -q fail '{flag}'")),
+        &ow_script(&format!("read -r v < '{flag}' && [ \"$v\" = fail ]")),
     );
     s.write("tests/c.t", &format!("src/c.src\nabs:{flag}\n"));
     learned(&s, &[]);
@@ -1724,6 +1724,7 @@ fn t1_an_absent_input_that_appears_in_an_unlisted_directory_takes_the_full_form(
 fn r5c_a_new_unit_that_the_runner_policy_rejects_takes_the_full_form() {
     let s = Suite::new();
     s.executable("t", &ow_script("[ -f \"$ROOT/tests/d.t\" ]"));
+    s.write("tests/c.t", "src/c.src\ntests/d.t\n");
     learned(&s, &[]);
     assert_eq!(known(&s), Some(0), "{}", residue(&s));
     s.write("tests/d.t", "src/c.src\n");
