@@ -1072,18 +1072,95 @@ fn e3_gap_accepts_only_the_two_owner_approved_shapes() {
     }
 }
 
+struct E3Diverged {
+    origin: usize,
+    failing: std::collections::BTreeSet<String>,
+    changed: std::collections::BTreeSet<String>,
+    shapes: Vec<E3Gap>,
+}
+
+fn e3_changes_runner(step: &Step, test: &str) -> bool {
+    match step {
+        Step::Flag(path, _)
+        | Step::Runner(path)
+        | Step::RunnerDelete(path)
+        | Step::RemoveAndDrop(path)
+        | Step::PublishStaged(path) => path == test,
+        _ => false,
+    }
+}
+
+fn e3_sticky(
+    divergence: &E3Diverged,
+    failed: &[String],
+    runners: &[String],
+    units: &[String],
+    launches: &[String],
+) -> bool {
+    !failed.is_empty()
+        && !launches.iter().any(String::is_empty)
+        && failed.iter().all(|test| {
+            divergence.failing.contains(test)
+                && !divergence.changed.contains(test)
+                && runners.contains(test)
+                && !units.contains(test)
+                && !launches.contains(test)
+        })
+}
+
+#[test]
+fn e3_sticky_retry_requires_the_original_unchanged_runner_only_failures() {
+    let test = "tests/m0.u".to_owned();
+    let mut divergence = E3Diverged {
+        origin: 8,
+        failing: [test.clone(), "tests/m1.u".to_owned()]
+            .into_iter()
+            .collect(),
+        changed: Default::default(),
+        shapes: vec![E3Gap::W22],
+    };
+    let failed = vec![test.clone()];
+    let runners = vec![test.clone()];
+    assert!(e3_sticky(&divergence, &failed, &runners, &[], &[]));
+    assert!(!e3_sticky(&divergence, &[], &runners, &[], &[]));
+    assert!(!e3_sticky(
+        &divergence,
+        &["tests/new.u".to_owned()],
+        &runners,
+        &[],
+        &[]
+    ));
+    assert!(!e3_sticky(&divergence, &failed, &runners, &failed, &[]));
+    assert!(!e3_sticky(&divergence, &failed, &runners, &[], &failed));
+    assert!(!e3_sticky(
+        &divergence,
+        &failed,
+        &runners,
+        &[],
+        &[String::new()]
+    ));
+    assert!(e3_changes_runner(&Step::Flag(test.clone(), "fail"), &test));
+    assert!(e3_changes_runner(&Step::RunnerDelete(test.clone()), &test));
+    assert!(!e3_changes_runner(&Step::Source(0), &test));
+    divergence.changed.insert("tests/m1.u".to_owned());
+    assert!(e3_sticky(&divergence, &failed, &runners, &[], &[]));
+    divergence.changed.insert(test);
+    assert!(!e3_sticky(&divergence, &failed, &runners, &[], &[]));
+}
+
 #[derive(Default)]
 struct E3Tally {
     steps: usize,
     gap_current: usize,
     gap_w22: usize,
     gap_e5: usize,
+    gap_sticky: usize,
     gap_stored: usize,
     no_verdict: usize,
 }
 
-/// E3 accepts only a runner-only failure whose current flag is read by a unit, and either the flag just flipped after a
-/// stored content read (w22), or the runner-only test appeared in this step (E5). Exit 125 keeps its existing bound.
+/// E3 accepts only w22 and E5, plus retries of the same unchanged runner-only failures. Each category is bounded to a
+/// third of a sequence, as are the designed no-verdicts.
 fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
     let s = Suite::new();
     let mut rng = Rng::new(seed);
@@ -1131,6 +1208,9 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
     }
     let mut log: Vec<String> = Vec::new();
     let mut no_verdicts = 0usize;
+    let mut divergence: Option<E3Diverged> = None;
+    let mut gap_fires = 0usize;
+    let mut sticky_retries = 0usize;
     // An unchanged retry after a 125 (PR 86 review round 3): half the time, the step after a 125 applies nothing.
     let mut last_125 = false;
     for step in 1..=steps {
@@ -1207,6 +1287,15 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
             )
         };
         let subject_code = code(&subject);
+        if subject_code != 0 || code(&oracle) == 0 || launches.iter().any(String::is_empty) {
+            divergence = None;
+        } else if let Some(previous) = &mut divergence {
+            for test in &previous.failing {
+                if ops.iter().any(|op| e3_changes_runner(op, test)) {
+                    previous.changed.insert(test.clone());
+                }
+            }
+        }
         last_125 = subject_code == 125;
         if subject_code == 2 {
             return Err(report("a status of 2"));
@@ -1255,6 +1344,22 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
                 "WRONG VERDICT: the subject failed and the runner passed",
             ));
         }
+        if let Some(previous) = divergence.as_ref().filter(|previous| {
+            e3_sticky(previous, &failed, &world.runners, &world.units, &launches)
+        }) {
+            sticky_retries += 1;
+            if sticky_retries * 3 > steps {
+                return Err(report(
+                    "too many sticky covered-file retries in one sequence",
+                ));
+            }
+            tally.gap_sticky += 1;
+            println!(
+                "E3 sticky gap: seed {seed}, step {step}, origin {}, shapes {:?}, failed {failed:?}",
+                previous.origin, previous.shapes
+            );
+            continue;
+        }
         if failed.iter().any(|test| {
             world.units.contains(test)
                 && fs::read_to_string(s.path(test))
@@ -1301,7 +1406,8 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
                 let evidence = E3GapEvidence {
                     runner_only: world.runners.contains(test)
                         && !world.units.contains(test)
-                        && !launches.contains(test),
+                        && !launches.contains(test)
+                        && !launches.iter().any(String::is_empty),
                     appeared_now,
                     flag_flipped,
                     stored_content: previous_flag.is_some_and(|value| {
@@ -1316,10 +1422,20 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
                 };
                 kinds.push(kind);
             }
+            gap_fires += 1;
+            if gap_fires * 3 > steps {
+                return Err(report("too many covered-file exemptions in one sequence"));
+            }
             tally.gap_current += 1;
             tally.gap_w22 += usize::from(kinds.contains(&E3Gap::W22));
             tally.gap_e5 += usize::from(kinds.contains(&E3Gap::E5));
             println!("E3 covered-file gap: seed {seed}, step {step}, shapes {kinds:?}");
+            divergence = Some(E3Diverged {
+                origin: step,
+                failing: failed.iter().cloned().collect(),
+                changed: Default::default(),
+                shapes: kinds,
+            });
             continue;
         }
         if stored_gap {
@@ -1336,7 +1452,7 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
 }
 
 /// E3. Seeds from `STOOP_R2_FIRST` (1) for `STOOP_R2_SEEDS` (4), steps from `STOOP_R2_STEPS` (30). Every failing seed
-/// is reported, and the first one in full.
+/// is reported in full with operations and stderr.
 #[test]
 fn r2_e3_flag_readers_model() {
     let first = count_from_env("STOOP_R2_FIRST", 1) as u64;
@@ -1346,17 +1462,18 @@ fn r2_e3_flag_readers_model() {
     let mut failures = Vec::new();
     for seed in first..first + seeds {
         if let Err(why) = run_e3(seed, steps, &mut tally) {
-            println!("E3 FAILING SEED {seed}");
+            println!("E3 FAILING SEED {seed}:\n{why}");
             failures.push(why);
         }
     }
     println!(
-        "E3 sweep: seeds {first}..{}: {} steps, {} covered-file gap steps (w22={}, E5={}), {} steps beyond the current reading, {} accepted no-verdicts, {} failing seeds",
+        "E3 sweep: seeds {first}..{}: {} steps, {} covered-file gap steps (w22={}, E5={}), {} sticky retries, {} steps beyond the current reading, {} accepted no-verdicts, {} failing seeds",
         first + seeds - 1,
         tally.steps,
         tally.gap_current,
         tally.gap_w22,
         tally.gap_e5,
+        tally.gap_sticky,
         tally.gap_stored,
         tally.no_verdict,
         failures.len()
@@ -1378,10 +1495,11 @@ fn e3_reported_seeds_match_the_owner_approved_shapes() {
     assert_eq!((appeared.gap_e5, appeared.gap_w22), (1, 0));
 
     let mut changed_flag = E3Tally::default();
-    if let Err(why) = run_e3(10037, 8, &mut changed_flag) {
+    if let Err(why) = run_e3(10037, 9, &mut changed_flag) {
         panic!("{why}");
     }
     assert_eq!((changed_flag.gap_e5, changed_flag.gap_w22), (0, 1));
+    assert_eq!(changed_flag.gap_sticky, 1);
 }
 
 // Independent delta-review probes. The runner is a disposable fixture in each test.
