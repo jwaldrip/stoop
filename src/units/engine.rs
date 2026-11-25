@@ -430,9 +430,17 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
                 && (input.id.starts_with("f:") || input.id.starts_with("x:"))
         })
         .collect();
-    let now = Current::of(cx.root, &owns);
+    // A unit's version usually reads its own file, so `current` holds that file's identity already. Only the rest is
+    // identified here.
+    let unseen: Vec<&Input> = owns
+        .iter()
+        .copied()
+        .filter(|input| current.id(input).is_none())
+        .collect();
+    let fresh = Current::of(cx.root, &unseen);
     if let Some(input) = owns.iter().find(|input| {
-        !now.id(input).is_some_and(|id| {
+        let id = current.id(input).or_else(|| fresh.id(input));
+        !id.is_some_and(|id| {
             (id.starts_with("f:") || id.starts_with("x:"))
                 && id.starts_with("x:") == input.id.starts_with("x:")
         })
