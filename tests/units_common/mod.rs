@@ -487,3 +487,42 @@ pub fn code(out: &Output) -> i32 {
 pub fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
+
+/// Make the full runner list and require a directory that its unit discovery prunes.
+pub fn listed_policy_runner(script: &str) -> String {
+    let full = "\tset -f\n";
+    let prune = "-o -path ./slow ";
+    assert_eq!(script.matches(full).count(), 1);
+    assert_eq!(script.matches(prune).count(), 2);
+    script
+        .replace(prune, "-o -path ./slow -o -path ./policy-r6 ")
+        .replace(
+            full,
+            "\tfor item in \"$ROOT\"/policy-r6/zone/*; do :; done\n\t[ -d \"$ROOT/policy-r6/zone\" ] || STATUS=1\n\tset -f\n",
+        )
+}
+
+/// Start with two empty directories, one listed and one serving as a link target.
+pub fn listed_policy_setup(s: &Suite) {
+    fs::create_dir_all(s.path("policy-r6/zone")).unwrap();
+    fs::create_dir_all(s.path("policy-r6/target")).unwrap();
+}
+
+/// Replace the listed directory with an absence, empty directory, regular file or link.
+pub fn listed_policy_replace(s: &Suite, kind: usize) {
+    let path = s.path("policy-r6/zone");
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir(&path).unwrap(),
+        Ok(_) => fs::remove_file(&path).unwrap(),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => panic!("cannot inspect listed directory: {error}"),
+    }
+    match kind {
+        0 => {}
+        1 => fs::create_dir(&path).unwrap(),
+        2 => fs::write(&path, "not a directory\n").unwrap(),
+        3 => std::os::unix::fs::symlink("target", &path).unwrap(),
+        _ => panic!("unknown listed-directory kind {kind}"),
+    }
+    println!("R6 MODEL listed-directory kind={kind}");
+}

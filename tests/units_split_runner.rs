@@ -112,6 +112,7 @@ enum Op {
     RejectNew,
     AddRejected,
     ClearPolicy,
+    ListedDirectory(usize),
     Noop,
 }
 
@@ -177,7 +178,7 @@ impl World {
 
     fn pick(&mut self, rng: &mut Rng, runner_only: bool) -> Op {
         let units = self.units.len();
-        let choice = rng.below(24);
+        let choice = rng.below(25);
         match choice {
             0..=2 => {
                 let kind = ["fail", "ok", "removed"][choice];
@@ -217,6 +218,7 @@ impl World {
                 Op::AddRejected
             }
             22 => Op::ClearPolicy,
+            23 => Op::ListedDirectory(rng.below(4)),
             _ => Op::Noop,
         }
     }
@@ -333,6 +335,7 @@ impl World {
                 self.units.sort();
             }
             Op::ClearPolicy => s.write("policy.src", "none\n"),
+            Op::ListedDirectory(kind) => listed_policy_replace(s, *kind),
             Op::Noop => {}
         }
     }
@@ -377,7 +380,8 @@ fn run_world(seed: u64, steps: usize, runner_only: bool) -> Result<(), String> {
     let s = Suite::new();
     let mut rng = Rng::new(seed);
     let mut world = World::start(&s, &mut rng);
-    s.executable("t", &stat_runner());
+    listed_policy_setup(&s);
+    s.executable("t", &listed_policy_runner(&stat_runner()));
     let env: Vec<(&str, &str)> = if runner_only {
         vec![("T_U", "1")]
     } else {

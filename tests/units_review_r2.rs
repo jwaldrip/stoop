@@ -612,6 +612,7 @@ enum Step {
     StageRunner(String, String),
     StatStaged(String, String),
     PublishStaged(String),
+    ListedDirectory(usize),
     Noop,
 }
 
@@ -668,7 +669,7 @@ impl World {
 
     fn pick(&mut self, rng: &mut Rng) -> Step {
         let units = self.units.len();
-        let choice = rng.below(24);
+        let choice = rng.below(26);
         match choice {
             0..=2 => {
                 let kind = ["fail", "ok", "removed"][choice];
@@ -709,6 +710,7 @@ impl World {
             23 if !self.staged.is_empty() && self.runners.len() < 2 => {
                 Step::PublishStaged(self.staged[rng.below(self.staged.len())].clone())
             }
+            24 => Step::ListedDirectory(rng.below(4)),
             _ => Step::Noop,
         }
     }
@@ -835,6 +837,7 @@ impl World {
                 self.staged.retain(|staged| staged != path);
                 self.runners.push(path.clone());
             }
+            Step::ListedDirectory(kind) => listed_policy_replace(s, *kind),
             Step::Noop => {}
         }
     }
@@ -950,7 +953,8 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
         let body = world.listing(&mut rng, &unit);
         s.write(&unit, &body);
     }
-    s.executable("t", &e3_runner());
+    listed_policy_setup(&s);
+    s.executable("t", &listed_policy_runner(&e3_runner()));
     let cold = split(&s, &[("T_U", "1"), ("FOO", "0")]);
     if code(&cold) != 0 {
         return Err(format!(
@@ -2325,4 +2329,77 @@ fn r5_a_unit_file_that_gains_an_execute_bit_takes_the_full_form() {
         [""],
         "a changed execute bit is not a content change"
     );
+}
+
+#[rustfmt::skip]
+fn r6_directory_fixture(check: &str) -> Suite {
+    let s = Suite::new();
+    s.remove("e2e/x.u");
+    let body = ow_script(check);
+    let old = "-o -path ./slow ";
+    assert_eq!(body.matches(old).count(), 2);
+    s.executable("t", &body.replace(old, "-o -path ./slow -o -path ./policy "));
+    s.write("policy/zone/item", "payload\n");
+    s
+}
+
+#[rustfmt::skip]
+fn r6_directory_id(s: &Suite, prefix: &str) {
+    let proof = bundle(s)["whole"].as_str().unwrap().to_owned();
+    let proofs = s.proofs();
+    assert!(!proofs.is_empty(), "no whole proof for {proof}");
+    assert!(proofs.iter().all(|p| p["inputs"].as_array().unwrap().iter()
+        .any(|input| input["path"] == "policy/zone" && input["id"].as_str().unwrap().starts_with(prefix))),
+        "{proof}: the observed directory must use {prefix:?}");
+    for unit in ["tests/a.t", "tests/b.t", "tests/c.t"] {
+        assert!(!stored_reads(&bundle(s), &[unit.to_owned()]).contains(&"policy/zone".to_owned()),
+            "a unit should not own the full runner's directory check");
+    }
+}
+
+#[rustfmt::skip]
+fn r6_empty_listed_directory_case(binary: &Path, head: bool, change_unit: bool) {
+    // The shell lists this empty directory during the passing full form. None of its launches own that dependency.
+    let s = r6_directory_fixture("for item in \"$ROOT\"/policy/zone/*; do :; done; [ ! -d \"$ROOT/policy/zone\" ]");
+    s.remove("policy/zone/item");
+    s.remove("tests/c.t");
+    success(&r3_control_run(&s, binary));
+    edit(&s, 2);
+    success(&r3_control_run(&s, binary));
+    s.write("tests/c.t", "src/c.src\n");
+    s.write("setup.src", "force a passing whole run for the new roster\n");
+    let full = r3_control_run(&s, binary);
+    success(&full);
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
+    r6_directory_id(&s, "dl:");
+    assert_eq!(known(&s), if head { Some(0) } else { None });
+    fs::remove_dir(s.path("policy/zone")).unwrap();
+    if change_unit { s.write("tests/a.t", "src/shared.src\n\n"); }
+    let mut exits = Vec::new();
+    for attempt in 0..2 {
+        let run = r3_control_run(&s, binary);
+        let launched = launched(&s);
+        let oracle = direct(&s, &TU);
+        assert_eq!(oracle, 1);
+        eprintln!("R6 EMPTY DIR head={head} changed_unit={change_unit} attempt={attempt} exit={} direct={oracle} launches={launched:?} residue={}\n{}", code(&run), residue(&s), stderr(&run));
+        exits.push(code(&run));
+    }
+    assert_eq!(exits, [1, 1], "R6 LISTED EMPTY DIR false verdict: no names does not prove a directory exists");
+}
+
+#[test]
+#[ignore = "requires the pinned comparison binary"]
+fn r6_deleting_an_empty_listed_directory_is_not_an_unchanged_listing() {
+    let path = std::env::var_os("STOOP_REVIEW_BASE_BIN").expect("pinned comparison binary");
+    for change_unit in [false, true] {
+        r6_empty_listed_directory_case(Path::new(&path), false, change_unit);
+    }
+    r6_empty_listed_directory_case(Path::new(env!("CARGO_BIN_EXE_stoop")), true, true);
+}
+
+#[test]
+fn r6_head_deleting_an_empty_listed_directory_takes_the_full_form() {
+    for change_unit in [false, true] {
+        r6_empty_listed_directory_case(Path::new(env!("CARGO_BIN_EXE_stoop")), true, change_unit);
+    }
 }

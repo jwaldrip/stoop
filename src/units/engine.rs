@@ -977,15 +977,14 @@ fn listing_holds(
     list_hash_of_names(&mut candidate) == digest
 }
 
-/// The entry names of a listed directory as `identify` reads them. An absent path lists as no names. `None` when the
-/// path cannot be listed, or is not a directory now.
+/// The entry names of a listed directory as `identify` reads them. `None` when the path is absent, cannot be listed,
+/// or is not a directory now.
 fn listed(dir: &Path) -> Option<Vec<Vec<u8>>> {
     match fs::symlink_metadata(dir) {
         Ok(meta) if meta.is_dir() => fs::read_dir(dir)
             .ok()?
             .map(|entry| Some(entry.ok()?.file_name().as_encoded_bytes().to_vec()))
             .collect(),
-        Err(_) if is_absent(dir) => Some(Vec::new()),
         _ => None,
     }
 }
@@ -1695,6 +1694,113 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn r6_listed_directory_must_exist_for_whole_and_unit_proofs() {
+        let root = TreeDir::new("listed-shapes", &[]);
+        let dir = root.0.join("policy");
+        fs::create_dir(&dir).unwrap();
+        let listing = input("policy", &identify(&dir, true, true).unwrap());
+        let (view, _) = view_of(Vec::new(), vec![listing.clone()]);
+        let cx = Judged {
+            root: &root.0,
+            ..judged(&[], 0)
+        };
+        let check = |holds| {
+            let current = Current::of(&root.0, &[&listing]);
+            assert_eq!(listing_matches(&root.0, &listing), holds);
+            assert_eq!(current.holds(&listing), holds);
+            let input_version = version(1_000, vec![0]);
+            let mut output_version = version(1_000, Vec::new());
+            output_version.outputs.push(0);
+            for version in [&input_version, &output_version] {
+                assert_eq!(
+                    version_reasons(&cx, &view, &current, version).0.is_empty(),
+                    holds
+                );
+            }
+            for output in [false, true] {
+                let mut proof = test_proof(if output {
+                    Vec::new()
+                } else {
+                    vec![listing.clone()]
+                });
+                if output {
+                    proof.outputs.push(listing.clone());
+                }
+                assert_eq!(
+                    listings_change(&cx, &view, &current, &proof, &[]).is_ok(),
+                    holds,
+                    "whole proof output={output}"
+                );
+            }
+        };
+        check(true);
+        fs::remove_dir(&dir).unwrap();
+        check(false);
+        fs::write(&dir, "not a directory").unwrap();
+        check(false);
+        fs::remove_file(&dir).unwrap();
+        #[cfg(unix)]
+        {
+            fs::create_dir(root.0.join("target")).unwrap();
+            std::os::unix::fs::symlink("target", &dir).unwrap();
+            check(false);
+            fs::remove_file(&dir).unwrap();
+        }
+        fs::create_dir(&dir).unwrap();
+        check(true);
+    }
+
+    #[test]
+    fn r6_listing_excuses_require_the_directory_to_exist() {
+        let root = TreeDir::new("listed-excuses", &[]);
+        let dir = root.0.join("policy");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("old.flag"), "old").unwrap();
+        let listing = input("policy", &identify(&dir, true, true).unwrap());
+        let proof = test_proof(vec![root.entry("policy/old.flag")]);
+        let (view, _) = view_of(Vec::new(), Vec::new());
+        let covered = BTreeSet::new();
+        fs::remove_file(dir.join("old.flag")).unwrap();
+        assert!(listing_holds(
+            &root.0,
+            &view,
+            &[],
+            &listing,
+            &proof,
+            &covered
+        ));
+        fs::remove_dir(&dir).unwrap();
+        assert!(!listing_holds(
+            &root.0,
+            &view,
+            &[],
+            &listing,
+            &proof,
+            &covered
+        ));
+        fs::create_dir(&dir).unwrap();
+        assert!(listing_holds(
+            &root.0,
+            &view,
+            &[],
+            &listing,
+            &proof,
+            &covered
+        ));
+        fs::write(dir.join("old.flag"), "old").unwrap();
+        fs::write(dir.join("new.flag"), "new").unwrap();
+        let covered = BTreeSet::from(["policy/new.flag".to_owned()]);
+        assert!(listing_holds(
+            &root.0,
+            &view,
+            &[],
+            &listing,
+            &proof,
+            &covered
+        ));
     }
 
     /// The proof and view of two units, `live.t` and `other.t`, that one full run judged together over `root`. Each unit's

@@ -689,6 +689,7 @@ enum Op {
     RunnerDelete(usize),
     Setup,
     Docs,
+    ListedDirectory(usize),
     Noop,
 }
 
@@ -727,6 +728,8 @@ impl Model {
         }
         s.write("setup.src", "setup\n");
         s.write("docs/readme.md", "docs\n");
+        listed_policy_setup(s);
+        s.executable("t", &listed_policy_runner(include_str!("fixtures/hook/t")));
         model
     }
 
@@ -769,6 +772,7 @@ impl Model {
             15 if !self.runners.is_empty() => Op::RunnerDelete(rng.below(self.runners.len())),
             16 => Op::SelfFail(rng.below(units)),
             17 => Op::SelfPass(rng.below(units)),
+            18 => Op::ListedDirectory(rng.below(4)),
             _ => Op::Noop,
         }
     }
@@ -854,6 +858,7 @@ impl Model {
                 }
                 s.write(&path, &body);
             }
+            Op::ListedDirectory(kind) => listed_policy_replace(s, kind),
             Op::Noop => {}
         }
     }
