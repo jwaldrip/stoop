@@ -364,12 +364,12 @@ fn listings(
 struct RunnerTally {
     no_verdict: usize,
     no_verdict_failing: usize,
-    no_verdict_delayed: usize,
+    no_verdict_no_reader: usize,
 }
 
 /// Runs one seeded sequence. Every step's subject verdict must equal the runner's, and its status is never 2. A status of
-/// 125 requires the exact changed-path line and a current or independently recorded earlier content drop with a passing
-/// oracle, or a named dependency of a failing runner-only test. Every launched argument is a unit of the roster.
+/// 125 requires the exact changed-path line and no content reader with a passing oracle, or a named dependency of a
+/// failing runner-only test. Passing-oracle refusals also need a just-dropped read or a recorded whole input.
 fn run_world(
     seed: u64,
     steps: usize,
@@ -397,10 +397,9 @@ fn run_world(
     let model = if runner_only { "E2" } else { "E1" };
     let mut no_verdicts = 0usize;
     let mut failing_refusals = 0usize;
-    let mut delayed_refusals = 0usize;
-    let mut drops = ContentDrops::default();
-    let initial = listings(&s, &world.units);
-    drops.observe(&ModelListings::new(), &initial, 0, &launched(&s), true);
+    let mut no_reader_refusals = 0usize;
+    let mut whole_inputs = ModelWholeInputs::default();
+    whole_inputs.record(&s, &world.units, &world.runner_only);
     // An unchanged retry after a no-verdict (PR 86 review round 3): half the time, the step after a 125 applies nothing.
     let mut last_125 = false;
     for step in 1..=steps {
@@ -435,13 +434,9 @@ fn run_world(
         };
         let subject_code = code(&subject);
         let after = listings(&s, &world.units);
-        drops.observe(
-            &before,
-            &after,
-            step,
-            &launches,
-            subject_code == 0 && launches.iter().any(String::is_empty),
-        );
+        if subject_code == 0 && launches.iter().any(String::is_empty) {
+            whole_inputs.record(&s, &world.units, &world.runner_only);
+        }
         let noop = ops.iter().all(|op| matches!(op, Op::Noop));
         if false_pass_after_125(last_125, noop, subject_code, code(&oracle)) {
             return Err(report(
@@ -467,6 +462,7 @@ fn run_world(
             });
             let failing_oracle =
                 code(&oracle) != 0 && failing_runner_depends_on(&failed, &world.runner_only, &path);
+            let no_reader = code(&oracle) == 0 && no_content_reader(&s, &after, &path);
             if failing_oracle {
                 failing_refusals += 1;
                 tally.no_verdict_failing += 1;
@@ -476,19 +472,15 @@ fn run_world(
                 println!(
                     "REFUSAL ON FAILING ORACLE ({model}): seed {seed}, step {step}, {path}, failed {failed:?}"
                 );
-            } else if code(&oracle) == 0 && stopped {
+            } else if no_reader && stopped {
                 println!("NO VERDICT ACCEPTED ({model}): seed {seed}, step {step}, {path}");
-            } else if let (0, Some((unit, dropped_at))) =
-                (code(&oracle), drops.delayed(&path, step))
-            {
-                delayed_refusals += 1;
-                tally.no_verdict_delayed += 1;
-                if delayed_refusals * 3 > steps {
-                    return Err(report("too many delayed-drop refusals"));
+            } else if no_reader && whole_inputs.contains(&s, &path) {
+                no_reader_refusals += 1;
+                tally.no_verdict_no_reader += 1;
+                if no_reader_refusals * 3 > steps {
+                    return Err(report("too many no-content-reader refusals"));
                 }
-                println!(
-                    "DELAYED DROP REFUSAL ({model}): seed {seed}, step {step}, {path}, dropped by {unit} at step {dropped_at}"
-                );
+                println!("NO CONTENT READER REFUSAL ({model}): seed {seed}, step {step}, {path}");
             } else {
                 return Err(report(&format!("unaccepted 125 for {path}")));
             }
@@ -525,11 +517,11 @@ fn check_range(runner_only: bool) {
     }
     let model = if runner_only { "E2" } else { "E1" };
     println!(
-        "{model} sweep: seeds {first}..{}: {} accepted no-verdicts ({} on failing oracle, {} delayed drops), {} failing seeds",
+        "{model} sweep: seeds {first}..{}: {} accepted no-verdicts ({} on failing oracle, {} with no content reader), {} failing seeds",
         first + seeds - 1,
         tally.no_verdict,
         tally.no_verdict_failing,
-        tally.no_verdict_delayed,
+        tally.no_verdict_no_reader,
         failures.len()
     );
     assert!(
@@ -564,56 +556,63 @@ fn model_seeds_that_found_issue_84_agree_with_the_runner() {
 }
 
 #[test]
-fn model_seed_10069_accepts_the_recorded_delayed_content_drop() {
-    let mut tally = RunnerTally::default();
-    if let Err(why) = run_world(10069, 8, false, &mut tally) {
-        panic!("{why}");
+fn model_stat_only_refusals_require_no_current_content_reader() {
+    for seed in [10069, 14015] {
+        let mut tally = RunnerTally::default();
+        if let Err(why) = run_world(seed, 8, false, &mut tally) {
+            panic!("{why}");
+        }
+        assert!(tally.no_verdict_no_reader > 0, "seed {seed}");
     }
-    assert!(tally.no_verdict_delayed > 0);
 }
 
 #[test]
-fn delayed_content_drops_clear_on_reread_or_whole_refresh() {
-    use std::collections::{BTreeMap, BTreeSet};
-
+fn no_content_reader_rejects_content_lines_and_implicit_reads() {
+    let s = Suite::new();
     let unit = "tests/a.t".to_owned();
-    let path = "src/s3";
-    let contents = |line: &str| BTreeMap::from([(unit.clone(), BTreeSet::from([line.to_owned()]))]);
-    let read = contents(path);
-    let stat = contents("stat:src/s3");
-    let unit_only = contents("unit-only:src/s3");
-    let empty = BTreeMap::from([(unit.clone(), BTreeSet::new())]);
-    let mut drops = ContentDrops::default();
-    drops.observe(&empty, &read, 0, &[String::new()], true);
-    drops.observe(&read, &stat, 1, std::slice::from_ref(&unit), false);
-    assert_eq!(drops.delayed(path, 1), None);
-    assert_eq!(drops.delayed(path, 2), Some((unit.as_str(), 1)));
-    drops.observe(&stat, &stat, 2, std::slice::from_ref(&unit), false);
-    assert_eq!(drops.delayed(path, 3), Some((unit.as_str(), 1)));
-    drops.observe(&stat, &read, 3, std::slice::from_ref(&unit), false);
-    assert_eq!(drops.delayed(path, 4), None);
-    drops.observe(&read, &unit_only, 4, std::slice::from_ref(&unit), false);
-    drops.observe(&unit_only, &empty, 5, &[], false);
-    assert_eq!(drops.delayed(path, 6), Some((unit.as_str(), 5)));
-    drops.observe(&empty, &empty, 6, &[], true);
-    assert_eq!(drops.delayed(path, 7), None);
-    assert_eq!(drops.delayed("src/never-read", 7), None);
+    let units = vec![unit.clone()];
+    s.write("src/s3", "source\n");
+    s.write(&unit, "stat:src/s3\n");
+    let stat = listings(&s, &units);
+    assert!(no_content_reader(&s, &stat, "src/s3"));
+    assert!(!no_content_reader(&s, &stat, &unit));
+    assert!(!no_content_reader(&s, &stat, "setup.src"));
+    s.write(&unit, "src/s3\n");
+    assert!(!no_content_reader(&s, &listings(&s, &units), "src/s3"));
+    s.write(&unit, "unit-only:src/s3\n");
+    assert!(!no_content_reader(&s, &listings(&s, &units), "src/s3"));
+    s.write(&unit, "stat:src/s3\n");
+    s.write("tests/a.flag", "ok\n");
+    assert!(!no_content_reader(
+        &s,
+        &listings(&s, &units),
+        "tests/a.flag"
+    ));
 }
 
 #[test]
-fn delayed_content_drops_require_an_observed_read() {
-    use std::collections::{BTreeMap, BTreeSet};
+fn model_whole_inputs_require_a_recorded_read_from_the_latest_full_run() {
+    let s = Suite::new();
+    s.write("policy.src", "none\n");
+    s.write("src/s3", "source\n");
+    s.write("tests/a.t", "stat:src/s3\n");
+    s.executable("t", &stat_runner());
+    let units: Vec<String> = ["tests/a.t", "tests/b.t", "tests/c.t"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let cold = split(&s, &[]);
+    assert_eq!(code(&cold), 0, "{}", stderr(&cold));
+    let mut whole = ModelWholeInputs::default();
+    whole.record(&s, &units, &[]);
+    assert!(whole.contains(&s, "src/s3"));
+    assert!(!whole.contains(&s, "src/never-read"));
 
-    let unit = "tests/a.t".to_owned();
-    let empty = BTreeMap::from([(unit.clone(), BTreeSet::new())]);
-    let unit_only = BTreeMap::from([(
-        unit.clone(),
-        BTreeSet::from(["unit-only:src/s3".to_owned()]),
-    )]);
-    let mut drops = ContentDrops::default();
-    drops.observe(&empty, &unit_only, 0, &[String::new()], true);
-    drops.observe(&unit_only, &empty, 1, &[], false);
-    assert_eq!(drops.delayed("src/s3", 2), None);
+    s.write("tests/a.t", "src/c.src\n");
+    let full = split(&s, &[("STOOP_FULL", "1")]);
+    assert_eq!(code(&full), 0, "{}", stderr(&full));
+    whole.record(&s, &units, &[]);
+    assert!(!whole.contains(&s, "src/s3"));
 }
 
 #[test]

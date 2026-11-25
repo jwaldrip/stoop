@@ -925,12 +925,12 @@ struct Tally {
     exemptions: usize,
     no_verdict: usize,
     no_verdict_failing: usize,
-    no_verdict_delayed: usize,
+    no_verdict_no_reader: usize,
 }
 
 /// M1 compares the subject with the direct runner, including runner-only tests under `T_U=1`.
-/// A 125 requires the exact changed-path line and a current or independently recorded earlier content-read drop with a
-/// passing oracle, or the failing runner-only test's own file or flag. Each category is bounded and printed.
+/// A 125 requires the exact changed-path line and a passing oracle with no content reader, or the failing runner-only
+/// test's own file or flag. Passing-oracle refusals also need a just-dropped read or a recorded whole input.
 /// Every acceptance is printed. Status 2 is never accepted, and every launched argument is a roster unit. A no-op after
 /// a passing run launches nothing, unless the engine names the residue as its reason (spec 3.8). Then the full form runs
 /// once and must match the runner. The next no-op must skip, and so must every no-op until a step that is not a no-op.
@@ -951,7 +951,7 @@ fn model_split_runs_give_the_full_runs_verdict() {
         exemptions,
         no_verdict,
         no_verdict_failing,
-        no_verdict_delayed,
+        no_verdict_no_reader,
     } = tally;
     let share = if post_noops == 0 {
         0.0
@@ -959,7 +959,7 @@ fn model_split_runs_give_the_full_runs_verdict() {
         exemptions as f64 * 100.0 / post_noops as f64
     };
     println!(
-        "M1 sweep: seeds {first}..{}: {post_noops} no-ops after a passing run, {exemptions} exempt full runs ({share:.2}%), {no_verdict} accepted no-verdicts ({no_verdict_failing} on failing oracle, {no_verdict_delayed} delayed drops)",
+        "M1 sweep: seeds {first}..{}: {post_noops} no-ops after a passing run, {exemptions} exempt full runs ({share:.2}%), {no_verdict} accepted no-verdicts ({no_verdict_failing} on failing oracle, {no_verdict_no_reader} with no content reader)",
         first + seeds
     );
     if post_noops >= MIN_POST_NOOPS {
@@ -1032,10 +1032,9 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
     let mut operations: Vec<String> = Vec::new();
     let mut no_verdicts = 0usize;
     let mut failing_refusals = 0usize;
-    let mut delayed_refusals = 0usize;
-    let mut drops = ContentDrops::default();
-    let initial = model_listed_lines(&s, &model.roster());
-    drops.observe(&ModelListings::new(), &initial, 0, &launched(&s), true);
+    let mut no_reader_refusals = 0usize;
+    let mut whole_inputs = ModelWholeInputs::default();
+    whole_inputs.record(&s, &model.roster(), &[]);
     let mut last_125 = false;
     for step in 1..=steps {
         // The units and their listed lines before this step's operations, read from the files the model wrote.
@@ -1102,13 +1101,10 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
         };
         let subject_code = code(&subject);
         let after = model_listed_lines(&s, &roster);
-        drops.observe(
-            &before,
-            &after,
-            step,
-            &launches,
-            subject_code == 0 && launches.iter().any(String::is_empty),
-        );
+        if subject_code == 0 && launches.iter().any(String::is_empty) {
+            let runners: Vec<String> = model.runners.iter().map(|id| runner_path(*id)).collect();
+            whole_inputs.record(&s, &roster, &runners);
+        }
         assert!(
             !false_pass_after_125(last_125, noop, subject_code, code(&oracle)),
             "WRONG VERDICT: an unchanged retry after exit 125 passed: {}",
@@ -1139,6 +1135,7 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
             let runners: Vec<String> = model.runners.iter().map(|id| runner_path(*id)).collect();
             let failing_oracle =
                 code(&oracle) != 0 && failing_runner_depends_on(&failed, &runners, &path);
+            let no_reader = code(&oracle) == 0 && no_content_reader(&s, &after, &path);
             if failing_oracle {
                 failing_refusals += 1;
                 tally.no_verdict_failing += 1;
@@ -1150,21 +1147,17 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
                 println!(
                     "REFUSAL ON FAILING ORACLE (M1): seed {seed}, step {step}, {path}, failed {failed:?}"
                 );
-            } else if code(&oracle) == 0 && stopped {
+            } else if no_reader && stopped {
                 println!("NO VERDICT ACCEPTED (M1): seed {seed}, step {step}, {path}");
-            } else if let (0, Some((unit, dropped_at))) =
-                (code(&oracle), drops.delayed(&path, step))
-            {
-                delayed_refusals += 1;
-                tally.no_verdict_delayed += 1;
+            } else if no_reader && whole_inputs.contains(&s, &path) {
+                no_reader_refusals += 1;
+                tally.no_verdict_no_reader += 1;
                 assert!(
-                    delayed_refusals * 3 <= steps,
-                    "too many delayed-drop refusals: {}",
+                    no_reader_refusals * 3 <= steps,
+                    "too many no-content-reader refusals: {}",
                     report()
                 );
-                println!(
-                    "DELAYED DROP REFUSAL (M1): seed {seed}, step {step}, {path}, dropped by {unit} at step {dropped_at}"
-                );
+                println!("NO CONTENT READER REFUSAL (M1): seed {seed}, step {step}, {path}");
             } else {
                 panic!(
                     "unaccepted 125 for {path}, oracle failed {failed:?}: {}",

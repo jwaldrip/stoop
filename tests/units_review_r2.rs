@@ -1147,7 +1147,7 @@ struct E3Tally {
     gap_stored: usize,
     no_verdict: usize,
     no_verdict_failing: usize,
-    no_verdict_delayed: usize,
+    no_verdict_no_reader: usize,
 }
 
 /// E3 accepts only w22 and E5, plus retries of the same unchanged runner-only failures. Each category is bounded to a
@@ -1200,10 +1200,9 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
     let mut log: Vec<String> = Vec::new();
     let mut no_verdicts = 0usize;
     let mut failing_refusals = 0usize;
-    let mut delayed_refusals = 0usize;
-    let mut drops = ContentDrops::default();
-    let initial = e3_listings(&s, &world.units);
-    drops.observe(&ModelListings::new(), &initial, 0, &launched(&s), true);
+    let mut no_reader_refusals = 0usize;
+    let mut whole_inputs = ModelWholeInputs::default();
+    whole_inputs.record(&s, &world.units, &world.runners);
     let mut divergence: Option<E3Diverged> = None;
     let mut gap_fires = 0usize;
     let mut sticky_retries = 0usize;
@@ -1274,13 +1273,9 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
         };
         let subject_code = code(&subject);
         let after = e3_listings(&s, &world.units);
-        drops.observe(
-            &before,
-            &after,
-            step,
-            &launches,
-            subject_code == 0 && launches.iter().any(String::is_empty),
-        );
+        if subject_code == 0 && launches.iter().any(String::is_empty) {
+            whole_inputs.record(&s, &world.units, &world.runners);
+        }
         let noop = ops.iter().all(|op| matches!(op, Step::Noop));
         if false_pass_after_125(last_125, noop, subject_code, code(&oracle)) {
             return Err(report(
@@ -1319,6 +1314,7 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
             });
             let failing_oracle =
                 code(&oracle) != 0 && failing_runner_depends_on(&failed, &world.runners, &path);
+            let no_reader = code(&oracle) == 0 && no_content_reader(&s, &after, &path);
             if failing_oracle {
                 failing_refusals += 1;
                 tally.no_verdict_failing += 1;
@@ -1328,23 +1324,17 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
                 println!(
                     "REFUSAL ON FAILING ORACLE (E3): seed {seed}, step {step}, {path}, failed {failed:?}"
                 );
-            } else if code(&oracle) == 0 && stopped {
+            } else if no_reader && stopped {
                 println!("NO VERDICT ACCEPTED (E3): seed {seed}, step {step}, {path}");
-            } else if let (0, Some((unit, dropped_at))) =
-                (code(&oracle), drops.delayed(&path, step))
-            {
-                delayed_refusals += 1;
-                tally.no_verdict_delayed += 1;
-                if delayed_refusals * 3 > steps {
-                    return Err(report("too many delayed-drop refusals"));
+            } else if no_reader && whole_inputs.contains(&s, &path) {
+                no_reader_refusals += 1;
+                tally.no_verdict_no_reader += 1;
+                if no_reader_refusals * 3 > steps {
+                    return Err(report("too many no-content-reader refusals"));
                 }
-                println!(
-                    "DELAYED DROP REFUSAL (E3): seed {seed}, step {step}, {path}, dropped by {unit} at step {dropped_at}"
-                );
+                println!("NO CONTENT READER REFUSAL (E3): seed {seed}, step {step}, {path}");
             } else {
-                return Err(report(&format!(
-                    "unaccepted 125: {path} is unrelated to a failing runner and no passing-oracle reader stopped"
-                )));
+                return Err(report(&format!("unaccepted 125 for {path}")));
             }
             no_verdicts += 1;
             tally.no_verdict += 1;
@@ -1484,7 +1474,7 @@ fn r2_e3_flag_readers_model() {
         }
     }
     println!(
-        "E3 sweep: seeds {first}..{}: {} steps, {} covered-file gap steps (w22={}, E5={}), {} sticky retries, {} steps beyond the current reading, {} accepted no-verdicts ({} on failing oracle, {} delayed drops), {} failing seeds",
+        "E3 sweep: seeds {first}..{}: {} steps, {} covered-file gap steps (w22={}, E5={}), {} sticky retries, {} steps beyond the current reading, {} accepted no-verdicts ({} on failing oracle, {} with no content reader), {} failing seeds",
         first + seeds - 1,
         tally.steps,
         tally.gap_current,
@@ -1494,7 +1484,7 @@ fn r2_e3_flag_readers_model() {
         tally.gap_stored,
         tally.no_verdict,
         tally.no_verdict_failing,
-        tally.no_verdict_delayed,
+        tally.no_verdict_no_reader,
         failures.len()
     );
     assert!(

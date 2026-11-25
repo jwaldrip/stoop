@@ -540,11 +540,10 @@ pub fn content_read_dropped(
 }
 pub type ModelListings = BTreeMap<String, std::collections::BTreeSet<String>>;
 
-/// Content drops observed independently from the engine's stored proofs.
+/// Paths the model observed the last successful full runner reading.
 #[derive(Default)]
-pub struct ContentDrops {
-    paths: BTreeMap<String, (String, usize)>,
-    unit_reads: BTreeMap<String, std::collections::BTreeSet<String>>,
+pub struct ModelWholeInputs {
+    paths: std::collections::BTreeSet<String>,
 }
 
 fn content_line(line: &str) -> Option<&str> {
@@ -555,66 +554,53 @@ fn content_line(line: &str) -> Option<&str> {
     }
 }
 
-impl ContentDrops {
-    /// Record edits, then forget paths actually reread by launched units or a refreshed whole proof.
-    pub fn observe(
-        &mut self,
-        before: &ModelListings,
-        after: &ModelListings,
-        step: usize,
-        launches: &[String],
-        refreshed: bool,
-    ) {
-        if refreshed {
-            self.paths.clear();
-            self.unit_reads.clear();
-        } else {
-            for (unit, old) in before {
-                for path in old.iter().filter_map(|line| content_line(line)) {
-                    let previously_read = self
-                        .unit_reads
-                        .get(unit)
-                        .is_some_and(|reads| reads.contains(path));
-                    let still_read = after
-                        .get(unit)
-                        .is_some_and(|new| new.iter().any(|line| content_line(line) == Some(path)));
-                    if previously_read && !still_read {
-                        self.paths.insert(path.to_owned(), (unit.clone(), step));
+impl ModelWholeInputs {
+    pub fn record(&mut self, s: &Suite, units: &[String], runners: &[String]) {
+        self.paths.clear();
+        self.paths.insert("t".to_owned());
+        self.paths.insert("setup.src".to_owned());
+        for test in units.iter().chain(runners) {
+            self.paths.insert(test.clone());
+            if let Some((stem, _)) = test.rsplit_once('.') {
+                self.paths.insert(format!("{stem}.flag"));
+            }
+            if let Ok(body) = fs::read_to_string(s.path(test)) {
+                for line in body.lines() {
+                    if line.is_empty() || line == "fail" || line.starts_with("unit-only:") {
+                        continue;
                     }
+                    self.paths
+                        .insert(line.strip_prefix("stat:").unwrap_or(line).to_owned());
                 }
-            }
-        }
-        if launches.iter().any(String::is_empty) {
-            for (unit, lines) in after {
-                let reads = self.unit_reads.entry(unit.clone()).or_default();
-                for path in lines
-                    .iter()
-                    .filter(|line| !line.starts_with("unit-only:"))
-                    .filter_map(|line| content_line(line))
-                {
-                    reads.insert(path.to_owned());
-                    self.paths.remove(path);
-                }
-            }
-        }
-        for unit in launches {
-            if let Some(lines) = after.get(unit) {
-                let reads = lines
-                    .iter()
-                    .filter_map(|line| content_line(line).map(str::to_owned))
-                    .collect::<std::collections::BTreeSet<_>>();
-                for path in &reads {
-                    self.paths.remove(path);
-                }
-                self.unit_reads.insert(unit.clone(), reads);
             }
         }
     }
 
-    pub fn delayed(&self, path: &str, step: usize) -> Option<(&str, usize)> {
-        let (unit, dropped_at) = self.paths.get(path)?;
-        (*dropped_at < step).then_some((unit.as_str(), *dropped_at))
+    pub fn contains(&self, s: &Suite, path: &str) -> bool {
+        self.paths.contains(path)
+            && s.proofs().first().is_some_and(|proof| {
+                proof["inputs"].as_array().is_some_and(|inputs| {
+                    inputs
+                        .iter()
+                        .any(|input| input["path"].as_str() == Some(path))
+                })
+            })
     }
+}
+
+/// Whether no roster unit reads this path by content in the current model state.
+pub fn no_content_reader(s: &Suite, units: &ModelListings, path: &str) -> bool {
+    if !units.is_empty() && matches!(path, "t" | "setup.src") {
+        return false;
+    }
+    units.iter().all(|(unit, lines)| {
+        let own_flag = unit
+            .rsplit_once('.')
+            .is_some_and(|(stem, _)| path.strip_suffix(".flag") == Some(stem));
+        unit != path
+            && !(own_flag && s.path(path).is_file())
+            && !lines.iter().any(|line| content_line(line) == Some(path))
+    })
 }
 
 /// Make the full runner list and require a directory that its unit discovery prunes.
