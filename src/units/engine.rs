@@ -307,6 +307,18 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
     if let Some(reason) = output_missing(cx, view, proof) {
         return verdict(Decision::Full(Some(reason)), shown, clean);
     }
+    // E17 and E18 (spec 3.10, PR 86 review round 2, option B): a changed input that only units which left the roster read
+    // has no reader that a launch of this run could check. The full command decides it, before any launch.
+    if let Some(path) = departed_only_change(cx, view, proof, &affected) {
+        return verdict(
+            Decision::Full(Some(format!(
+                "{} changed and only units that left the roster read it",
+                safe(&path)
+            ))),
+            shown,
+            clean,
+        );
+    }
     // A missing roster member that the full command read can also be used by the runner outside that unit. No listing
     // or deleted-input excuse can establish otherwise, even if another unit still reads all of its other inputs.
     if let Some((unit, _)) = view.units.iter().find(|(unit, versions)| {
@@ -430,18 +442,6 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
             );
         }
         return verdict(Decision::Skip(skip), shown, clean);
-    }
-    // E17 and E18 (spec 3.10, PR 86 review round 2, option B): a changed input that only units which left the roster read
-    // has no reader that a launch of this run could check. The full command decides it, before any launch.
-    if let Some(path) = departed_only_change(cx, view, proof, &affected) {
-        return verdict(
-            Decision::Full(Some(format!(
-                "{} changed and only units that left the roster read it",
-                safe(&path)
-            ))),
-            shown,
-            clean,
-        );
     }
     // A deleted input that a stored version of a roster unit reads takes the full form before any launch (PR 86 review
     // round 3). No launch can vouch for an absence it does not read by content.

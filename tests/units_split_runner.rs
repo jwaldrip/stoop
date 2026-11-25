@@ -21,15 +21,22 @@ fn stderr(out: &Output) -> String {
     text(&out.stderr)
 }
 
-/// The fake runner with one more reading (PR 86 review round 3): a listed line `stat:P` stats `P` and reads no content.
+/// The model runner supports stat-only reads and a full-command policy that requires or rejects a unit path.
 fn stat_runner() -> String {
     let fixture = include_str!("fixtures/hook/t");
     let anchor = "cat \"$ROOT/$line\"";
+    let full = "\tset -f\n";
     assert_eq!(fixture.matches(anchor).count(), 1);
-    fixture.replace(
-        anchor,
-        "case $line in\nstat:*) test -e \"$ROOT/${line#stat:}\" ;;\n*) cat \"$ROOT/$line\" ;;\nesac",
-    )
+    assert_eq!(fixture.matches(full).count(), 1);
+    fixture
+        .replace(
+            anchor,
+            "case $line in\nstat:*) test -e \"$ROOT/${line#stat:}\" ;;\n*) cat \"$ROOT/$line\" ;;\nesac",
+        )
+        .replace(
+            full,
+            "\tif IFS= read -r policy < \"$ROOT/policy.src\"; then\n\t\tcase $policy in\n\t\trequire:*) [ -f \"$ROOT/${policy#require:}\" ] || STATUS=1 ;;\n\t\treject:*) [ ! -f \"$ROOT/${policy#reject:}\" ] || STATUS=1 ;;\n\t\tesac\n\tfi\n\tset -f\n",
+        )
 }
 
 /// The pinned hook under `env`, with the engine on.
@@ -99,6 +106,12 @@ enum Op {
     StatLine(String),
     /// A source file is removed, and each unit that lists it stops listing it in the same step (PR 86 review round 3).
     DropSource(usize),
+    SelfFail(String),
+    SelfPass(String),
+    Require(String),
+    RejectNew,
+    AddRejected,
+    ClearPolicy,
     Noop,
 }
 
@@ -120,7 +133,9 @@ fn sources_line(rng: &mut Rng) -> String {
             picked.push(source);
         }
     }
-    picked.iter().map(|n| format!("src/s{n}\n")).collect()
+    let mut body: String = picked.iter().map(|n| format!("src/s{n}\n")).collect();
+    body.push_str("policy.src\n");
+    body
 }
 
 /// The flag file that the fake runner reads for a test: the same path with `.flag` in place of its extension.
@@ -134,6 +149,7 @@ impl World {
             s.remove(unit);
         }
         s.remove("e2e/x.u");
+        s.write("policy.src", "none\n");
         for n in 0..4 {
             s.write(&format!("src/s{n}"), "source\n");
         }
@@ -161,7 +177,7 @@ impl World {
 
     fn pick(&mut self, rng: &mut Rng, runner_only: bool) -> Op {
         let units = self.units.len();
-        let choice = rng.below(if runner_only { 17 } else { 14 });
+        let choice = rng.below(24);
         match choice {
             0..=2 => {
                 let kind = ["fail", "ok", "removed"][choice];
@@ -187,10 +203,20 @@ impl World {
             11 => Op::Setup,
             12 if units > 0 => Op::StatLine(self.units[rng.below(units)].clone()),
             13 => Op::DropSource(rng.below(4)),
-            14 | 15 if self.runner_only.len() < 3 => Op::AddRunnerOnly(self.fresh("u")),
-            16 if !self.runner_only.is_empty() => {
+            14 | 15 if runner_only && self.runner_only.len() < 3 => {
+                Op::AddRunnerOnly(self.fresh("u"))
+            }
+            16 if runner_only && !self.runner_only.is_empty() => {
                 Op::DeleteRunnerOnly(self.runner_only[rng.below(self.runner_only.len())].clone())
             }
+            17 => Op::SelfFail(self.units[rng.below(units)].clone()),
+            18 => Op::SelfPass(self.units[rng.below(units)].clone()),
+            19 => Op::Require(self.units[rng.below(units)].clone()),
+            20 if !self.units.iter().any(|unit| unit == "tests/policy.t") => Op::RejectNew,
+            21 if units < 9 && !self.units.iter().any(|unit| unit == "tests/policy.t") => {
+                Op::AddRejected
+            }
+            22 => Op::ClearPolicy,
             _ => Op::Noop,
         }
     }
@@ -285,6 +311,28 @@ impl World {
                     s.remove(&source);
                 }
             }
+            Op::SelfFail(path) | Op::SelfPass(path) => {
+                let text = fs::read_to_string(s.path(path)).unwrap();
+                let mut body: String = text
+                    .lines()
+                    .filter(|line| *line != "fail")
+                    .map(|line| format!("{line}\n"))
+                    .collect();
+                if matches!(op, Op::SelfFail(_)) {
+                    body.push_str("fail\n");
+                }
+                s.write(path, &body);
+            }
+            Op::Require(path) => s.write("policy.src", &format!("require:{path}\n")),
+            Op::RejectNew => s.write("policy.src", "reject:tests/policy.t\n"),
+            Op::AddRejected => {
+                let path = "tests/policy.t".to_owned();
+                s.write(&path, &sources_line(rng));
+                self.deleted.retain(|gone| gone != &path);
+                self.units.push(path);
+                self.units.sort();
+            }
+            Op::ClearPolicy => s.write("policy.src", "none\n"),
             Op::Noop => {}
         }
     }

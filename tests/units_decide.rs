@@ -359,7 +359,7 @@ fn t9_an_output_only_the_full_form_writes_is_checked() {
     assert_eq!(s.launches().len(), 1, "the full form launches once");
 }
 
-/// T10 (D10): a new unit has no proof, so the run is not a skip.
+/// T10 (D10): the full command judges a new unit before its proof can be trusted.
 #[test]
 fn t10_a_new_unit_is_not_skipped() {
     let s = Suite::new();
@@ -368,11 +368,10 @@ fn t10_a_new_unit_is_not_skipped() {
     s.clear_log();
     let out = split(&s, &[]);
     success(&out);
-    assert_eq!(decision(&out), "subset", "{}", stderr(&out));
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
     assert_eq!(
-        s.launches().len(),
-        1,
-        "the subset launches the new unit alone"
+        s.launches().first().map(|launch| launch.args.len()),
+        Some(0)
     );
 }
 

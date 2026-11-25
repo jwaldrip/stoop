@@ -233,24 +233,22 @@ fn s5_a_setup_change_runs_full_and_the_next_change_is_a_subset() {
     assert_eq!(launched(&s), ["tests/a.t", "tests/b.t"]);
 }
 
-/// S6: a new unit has no proof, so it runs alone.
+/// S6: a newly added unit has not been judged by the full runner, so the full command runs first.
 #[test]
-fn s6_a_new_unit_runs_alone() {
+fn s6_a_new_unit_takes_the_full_form() {
     let s = Suite::new();
     success(&passed(&s, &[]));
     s.write("tests/d.t", "src/c.src\n");
     s.clear_log();
     let out = split(&s, &[]);
     success(&out);
-    assert_eq!(launched(&s), ["tests/d.t"]);
-    assert_header(&out, "; run 1 (new): tests/d.t");
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
+    assert!(full(&out), "{}", stderr(&out));
 }
 
-/// S7: deleting `c`, then editing `a` and `b` through their own files. Both remaining units are affected, so the whole
-/// roster is affected and the attribution pass runs both, one launch each. The proof of `c` is dropped with the write
-/// (spec 3.10, E17). The next test pins the case where the shared source changes instead.
+/// S7: a removed unit file that the full command read requires the full form, even when the remaining units changed.
 #[test]
-fn s7_deleting_c_then_an_edit_runs_a_and_b() {
+fn s7_deleting_c_then_editing_a_and_b_runs_the_full_form() {
     let s = Suite::new();
     success(&passed(&s, &[]));
     s.remove("tests/c.t");
@@ -259,8 +257,8 @@ fn s7_deleting_c_then_an_edit_runs_a_and_b() {
     s.clear_log();
     let out = split(&s, &[]);
     success(&out);
-    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t"]);
-    assert!(pass_line(&out), "{}", stderr(&out));
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
+    assert!(full(&out), "{}", stderr(&out));
     assert!(
         !stored_units(&s).iter().any(|unit| unit == "tests/c.t"),
         "the proof of a deleted unit was kept: {:?}",
@@ -292,17 +290,17 @@ fn s7_literal_deleting_c_then_an_edit_to_shared_is_global() {
     );
 }
 
-/// S8: renaming `c` to `d` runs `d` alone.
+/// S8: a rename removes a file read by the full command, so the full form judges it.
 #[test]
-fn s8_renaming_c_to_d_runs_d_alone() {
+fn s8_renaming_c_to_d_runs_the_full_form() {
     let s = Suite::new();
     success(&passed(&s, &[]));
     fs::rename(s.path("tests/c.t"), s.path("tests/d.t")).unwrap();
     s.clear_log();
     let out = split(&s, &[]);
     success(&out);
-    assert_eq!(launched(&s), ["tests/d.t"]);
-    assert_header(&out, "; run 1 (new): tests/d.t");
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
+    assert!(full(&out), "{}", stderr(&out));
 }
 
 /// S9: `c.t` lists a file that does not exist yet. Creating it changes only the proof of `c`, so `c` runs alone.
@@ -681,6 +679,8 @@ enum Op {
     Flag(usize, Flag),
     Source(usize),
     Rewrite(usize),
+    SelfFail(usize),
+    SelfPass(usize),
     Add,
     Delete(usize),
     Rename(usize),
@@ -750,7 +750,7 @@ impl Model {
     /// re-added, and runner-only tests come and go, so that a step can carry several operations at once.
     fn pick(&self, rng: &mut Rng) -> Op {
         let units = self.units.len();
-        match rng.below(18) {
+        match rng.below(20) {
             0 => Op::Flag(rng.below(units), Flag::Fail),
             1 => Op::Flag(rng.below(units), Flag::Ok),
             2 => Op::Flag(rng.below(units), Flag::Removed),
@@ -767,6 +767,8 @@ impl Model {
             }
             13 | 14 => Op::Runner,
             15 if !self.runners.is_empty() => Op::RunnerDelete(rng.below(self.runners.len())),
+            16 => Op::SelfFail(rng.below(units)),
+            17 => Op::SelfPass(rng.below(units)),
             _ => Op::Noop,
         }
     }
@@ -838,6 +840,19 @@ impl Model {
             Op::RunnerDelete(k) => {
                 let id = self.runners.remove(k);
                 s.remove(&runner_path(id));
+            }
+            Op::SelfFail(k) | Op::SelfPass(k) => {
+                let path = unit_path(self.units[k]);
+                let text = fs::read_to_string(s.path(&path)).unwrap();
+                let mut body: String = text
+                    .lines()
+                    .filter(|line| *line != "fail")
+                    .map(|line| format!("{line}\n"))
+                    .collect();
+                if matches!(op, Op::SelfFail(_)) {
+                    body.push_str("fail\n");
+                }
+                s.write(&path, &body);
             }
             Op::Noop => {}
         }
@@ -913,7 +928,7 @@ struct Tally {
 /// once and must match the runner. The next no-op must skip, and so must every no-op until a step that is not a no-op.
 /// A sweep fails above `EXEMPTION_LIMIT_PERCENT` exempt no-ops after a passing run. Seeds come from `STOOP_MODEL_FIRST`
 /// (1 by default) for `STOOP_MODEL_SEEDS` (4 by default), and steps from `STOOP_MODEL_STEPS` (30). A step applies one
-/// operation, or two in about three steps in ten, before its run.
+/// to three operations, or repeats unchanged after a no-verdict.
 #[test]
 fn model_split_runs_give_the_full_runs_verdict() {
     let first = count_from_env("STOOP_MODEL_FIRST", 1);
@@ -1017,14 +1032,28 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
     let mut exempted = false;
     let mut operations: Vec<String> = Vec::new();
     let mut no_verdicts = 0usize;
+    let mut last_125 = false;
     for step in 1..=steps {
         // The units and their listed lines before this step's operations, read from the files the model wrote.
         let before_units = model.roster();
         let before = model_listed_lines(&s, &before_units);
-        let count = if rng.below(10) < 3 { 2 } else { 1 };
+        let retry = last_125 && rng.below(2) == 0;
+        let count = if retry {
+            1
+        } else {
+            match rng.below(20) {
+                0..=11 => 1,
+                12..=16 => 2,
+                _ => 3,
+            }
+        };
         let mut ops = Vec::new();
         for _ in 0..count {
-            let op = model.pick(&mut rng);
+            let op = if retry {
+                Op::Noop
+            } else {
+                model.pick(&mut rng)
+            };
             model.apply(&s, &mut rng, op);
             ops.push(op);
         }
@@ -1067,6 +1096,7 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
             )
         };
         let subject_code = code(&subject);
+        last_125 = subject_code == 125;
         assert!(subject_code != 2, "{}", report());
         if subject_code == 125 {
             // The designed no-verdict (PR 86 review round 2), accepted under the bounded rule of the runner models: the exact
@@ -1159,34 +1189,22 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
     }
 }
 
-/// STOP 4 (spec 3.10, E16 as amended): a no-op after a subset that added a unit skips. The subset launched only the new
-/// unit and proved it, so its own version covers it, and the whole proof's listing of `tests` gained only that name. The
-/// no-op is the engine's skip (`no tracked input changed`), not the legacy hit. This is M1 seed 1, step 15.
+/// A no-op after the full form for a new unit skips.
 #[test]
-fn m1_seed1_step15_a_no_op_after_a_subset_that_added_a_unit_skips() {
+fn m1_seed1_step15_a_no_op_after_a_new_unit_skips() {
     let s = Suite::new();
     success(&passed(&s, &[]));
     s.write("tests/d.t", "src/c.src\n");
     s.clear_log();
     let added = split(&s, &[]);
     success(&added);
-    assert_eq!(launched(&s), ["tests/d.t"], "{}", stderr(&added));
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
     s.clear_log();
     let explained = explain(&s, &[]);
     let out = split(&s, &[]);
     success(&out);
     assert!(skipped(&explained), "{}", stderr(&explained));
     assert!(skipped(&out), "{}", stderr(&out));
-    assert!(
-        stderr(&explained).contains("no tracked input changed"),
-        "{}",
-        stderr(&explained)
-    );
-    assert!(
-        stderr(&out).contains("no tracked input changed"),
-        "{}",
-        stderr(&out)
-    );
     assert!(s.launches().is_empty(), "a skip launches nothing");
 }
 
@@ -1352,7 +1370,11 @@ fn a_file_read_only_by_a_removed_units_version_is_a_change() {
     s.clear_log();
     let out = split(&s, &[]);
     success(&out);
-    assert!(stderr(&out).contains("(tests changed)"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("tests/d.t was removed after the full command read it"),
+        "{}",
+        stderr(&out)
+    );
     assert_eq!(launched(&s), [""]);
 }
 
@@ -1372,7 +1394,11 @@ fn an_added_unit_removed_again_takes_one_full_run_then_skips() {
     let out = split(&s, &[]);
     success(&out);
     assert!(full(&out), "{}", stderr(&out));
-    assert!(stderr(&out).contains("(tests changed)"), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("tests/d.t was removed after the full command read it"),
+        "{}",
+        stderr(&out)
+    );
     s.clear_log();
     let explained = explain(&s, &[]);
     let next = split(&s, &[]);
@@ -1382,7 +1408,7 @@ fn an_added_unit_removed_again_takes_one_full_run_then_skips() {
     assert!(s.launches().is_empty(), "a skip launches nothing");
 }
 
-/// STOP 4, reviewer r25: a new top-level unit that fails has no proof, so it is affected and runs alone. A skip would hide it.
+/// STOP 4: the full runner judges a new top-level unit, including its failure.
 #[test]
 fn a_new_top_level_unit_that_fails_is_not_a_skip() {
     let s = Suite::new();
@@ -1393,10 +1419,10 @@ fn a_new_top_level_unit_that_fails_is_not_a_skip() {
     let out = split(&s, &[]);
     assert!(!skipped(&out), "{}", stderr(&out));
     assert_eq!(code(&out), 1, "{}", stderr(&out));
-    assert_eq!(launched(&s), ["z.t"]);
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
 }
 
-/// STOP 4, reviewer r25b: a failing unit in a new top-level directory is affected and runs alone.
+/// STOP 4: the full runner judges a new unit in a top-level directory.
 #[test]
 fn a_new_unit_in_a_new_top_level_directory_that_fails_is_not_a_skip() {
     let s = Suite::new();
@@ -1407,7 +1433,7 @@ fn a_new_unit_in_a_new_top_level_directory_that_fails_is_not_a_skip() {
     let out = split(&s, &[]);
     assert!(!skipped(&out), "{}", stderr(&out));
     assert_eq!(code(&out), 1, "{}", stderr(&out));
-    assert_eq!(launched(&s), ["extra/z.t"]);
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
 }
 
 /// STOP 4, reviewer r27: a unit file replaced by a directory that holds a failing unit. The path still exists, so E11 takes
@@ -1454,9 +1480,7 @@ fn a_unit_deleted_before_it_had_a_proof_takes_one_full_run_then_skips() {
     assert!(s.launches().is_empty(), "a skip launches nothing");
 }
 
-/// A unit deleted after it had a proof takes one full run, then skips. Its reads were the last readers of files that the
-/// full command reads, so the skip that would drop its versions takes the full form instead, which measures the residue
-/// again without the deleted unit. The run after it skips.
+/// A unit deleted after the full command read it takes one full run, then skips.
 #[test]
 fn a_unit_deleted_after_it_had_a_proof_takes_one_full_run_then_skips() {
     let s = Suite::new();
@@ -1467,7 +1491,7 @@ fn a_unit_deleted_after_it_had_a_proof_takes_one_full_run_then_skips() {
     success(&out);
     assert!(full(&out), "{}", stderr(&out));
     assert!(
-        stderr(&out).contains("the units that left the roster read files that no unit reads now"),
+        stderr(&out).contains("tests/c.t was removed after the full command read it"),
         "{}",
         stderr(&out)
     );

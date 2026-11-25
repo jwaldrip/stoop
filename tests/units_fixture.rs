@@ -15,7 +15,7 @@
 //! | --- | --- |
 //! | no test word (no argument, or only words starting with `-`) | Runs every `*.t` under the root except `slow/`, plus every `*.u` when `T_U=1`, in `LC_ALL=C` sort order, listed by `find`, `sed` and `sort`. With `T_LINT=1` it first executes `<root>/lint`. |
 //! | test words | Words starting with `-` are logged only. Every other word is a test path relative to the cwd, run in order. Before the first test it runs `find /dev/null -prune`, `sed -n q` and `LC_ALL=C sort` on empty input: the programs the no-argument form runs to list its roster. So a unit launch traces every program the full form runs (purity). `T_LINT` (in the full form) and `T_IGNORE` and `T_STAT_UNIT` (in a unit launch) are the exceptions; none of these launches produce unit proofs. |
-//! | running test P | With `T_WRITE_AT=P` (IF) and `T_WRITE` set, `written` goes to `T_WRITE` right before `cat P`. Then `cat P`. Then `cat <root>/<line>` for each non-empty line of P. Then `cat <root>/setup.src`. With `T_WRITE_EACH=1`, `written` goes to `${P%.*}.out` after those reads. Then the FIFO hold, if `T_FIFO` is set. Then the test fails if `${P%.*}.flag` contains `fail`, or, in the test-word form, if `T_FAIL_ALONE=P` (IF). Logs `ran=P`, and `failed=P` on failure. A missing P fails the test. |
+//! | running test P | With `T_WRITE_AT=P` (IF) and `T_WRITE` set, `written` goes to `T_WRITE` right before `cat P`. Then `cat P`. A line exactly equal to `fail` fails the test; each other non-empty line is read with `cat <root>/<line>`. Then `cat <root>/setup.src`. With `T_WRITE_EACH=1`, `written` goes to `${P%.*}.out` after those reads. Then the FIFO hold, if `T_FIFO` is set. Then the test fails if `${P%.*}.flag` contains `fail`, or, in the test-word form, if `T_FAIL_ALONE=P` (IF). Logs `ran=P`, and `failed=P` on failure. A missing P fails the test. |
 //! | `T_IGNORE=1` | With test words: reads nothing and exits 0. It exits before the purity programs run (see the test-words row). A plain `T_WRITE` still writes first. The no-argument form is unaffected. |
 //! | `T_STAT_UNIT=1` | With test words: `test -e P` instead of running it. Logs `statted=P`. |
 //! | `T_FIFO=<path>`, `T_FIFO_AT=<P>` | One `read < $T_FIFO` per invocation, after the first test that reads its files (or after the test logged as `T_FIFO_AT` has read its files). Then it appends P to `<path>.passed`, the marker that a release waits for. |
@@ -85,6 +85,17 @@ fn f1_no_arguments_runs_every_t_except_slow_in_c_order() {
             "tests/c.t"
         ]
     );
+}
+
+#[test]
+fn a_fail_line_fails_both_the_full_and_single_unit_forms() {
+    let s = Suite::new();
+    s.write("tests/a.t", "src/shared.src\nfail\n");
+    let full = s.direct(&s.root, &[], &[]);
+    assert_eq!(code(&full), 1, "{}", text(&full.stderr));
+    s.clear_log();
+    let single = s.direct(&s.root, &["tests/a.t"], &[]);
+    assert_eq!(code(&single), 1, "{}", text(&single.stderr));
 }
 
 /// A non-C UTF-8 locale this platform has, if any. `C.UTF-8` collates by code point, the same

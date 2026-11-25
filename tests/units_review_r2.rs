@@ -471,10 +471,9 @@ fn r2_e17_departed_only_reader_of_a_failing_flag_takes_the_full_form() {
     full_form("e17", &ran, &launches, direct_code, "tests/z.flag");
 }
 
-/// A departed unit that shares a changed source with a live unit leaves the live unit's new proof to read it, so the
-/// run stays a subset.
+/// A departed unit's own file can matter to the runner even if a live unit shares its changed source.
 #[test]
-fn r2_a_departed_reader_shared_with_a_live_unit_stays_a_subset() {
+fn r2_a_departed_reader_shared_with_a_live_unit_takes_the_full_form() {
     let s = zsuite();
     s.write("tests/a.t", "src/shared.src\nsrc/both.src\n");
     s.write(
@@ -486,18 +485,30 @@ fn r2_a_departed_reader_shared_with_a_live_unit_stays_a_subset() {
     s.write("src/both.src", "changed\n");
     let (_, ran, launches, direct_code) = judge("shared-live", &s, &TU, true);
     same_verdict("shared-live", &ran, direct_code);
-    assert_eq!(launches, ["tests/a.t"], "{}", stderr(&ran));
+    assert_eq!(
+        launches.first().map(String::as_str),
+        Some(""),
+        "{}",
+        stderr(&ran)
+    );
+    assert!(stderr(&ran).contains("tests/c.t was removed after the full command read it"));
 }
 
-/// A departed unit whose inputs did not change does not take the full form: the change is to a live unit alone.
+/// A departed unit's own file still takes the full form when its other inputs are unchanged.
 #[test]
-fn r2_an_unchanged_input_of_a_departed_reader_stays_a_subset() {
+fn r2_an_unchanged_input_of_a_departed_reader_takes_the_full_form() {
     let s = zlearned();
     s.remove("tests/c.t");
     s.write("tests/a.t", "src/shared.src\n\n");
     let (_, ran, launches, direct_code) = judge("unchanged", &s, &TU, true);
     same_verdict("unchanged", &ran, direct_code);
-    assert_eq!(launches, ["tests/a.t"], "{}", stderr(&ran));
+    assert_eq!(
+        launches.first().map(String::as_str),
+        Some(""),
+        "{}",
+        stderr(&ran)
+    );
+    assert!(stderr(&ran).contains("tests/c.t was removed after the full command read it"));
 }
 
 /// The D19 shape with the switch off (PR 86 review round 2, switch-off parity): a cold run, then a changed run that
@@ -596,6 +607,8 @@ enum Step {
     /// A runner-only test's flag is removed, and each unit that lists it stops listing it in the same step (PR 86 review
     /// round 3).
     RemoveAndDrop(String),
+    SelfFail(String),
+    SelfPass(String),
     Noop,
 }
 
@@ -651,7 +664,7 @@ impl World {
 
     fn pick(&mut self, rng: &mut Rng) -> Step {
         let units = self.units.len();
-        let choice = rng.below(19);
+        let choice = rng.below(21);
         match choice {
             0..=2 => {
                 let kind = ["fail", "ok", "removed"][choice];
@@ -679,6 +692,8 @@ impl World {
             }
             17 => Step::Env(rng.below(3)),
             18 => Step::Forced,
+            19 => Step::SelfFail(self.units[rng.below(units)].clone()),
+            20 => Step::SelfPass(self.units[rng.below(units)].clone()),
             _ => Step::Noop,
         }
     }
@@ -768,6 +783,18 @@ impl World {
                 if s.path(&flag).exists() {
                     s.remove(&flag);
                 }
+            }
+            Step::SelfFail(path) | Step::SelfPass(path) => {
+                let text = fs::read_to_string(s.path(path)).unwrap();
+                let mut body: String = text
+                    .lines()
+                    .filter(|line| *line != "fail")
+                    .map(|line| format!("{line}\n"))
+                    .collect();
+                if matches!(step, Step::SelfFail(_)) {
+                    body.push_str("fail\n");
+                }
+                s.write(path, &body);
             }
             Step::Noop => {}
         }
@@ -1002,6 +1029,15 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
         if subject_code != 0 {
             return Err(report(
                 "WRONG VERDICT: the subject failed and the runner passed",
+            ));
+        }
+        if failed.iter().any(|test| {
+            world.units.contains(test)
+                && fs::read_to_string(s.path(test))
+                    .is_ok_and(|body| body.lines().any(|line| line == "fail"))
+        }) {
+            return Err(report(
+                "WRONG VERDICT: a unit with a failing own file passed",
             ));
         }
         let listed_now = |flag: &str| {
@@ -1411,6 +1447,180 @@ fn r4_script(missing_fails: bool, held: bool) -> String {
     body
 }
 
+fn r4_version_id(stored: &Value, unit: &str, path: &str) -> String {
+    let version = &stored["units"][unit][0];
+    let mut index = 0;
+    for step in version["inputs"].as_array().unwrap() {
+        index += step.as_u64().unwrap() as usize;
+        let input = &stored["table"][index];
+        if input["path"] == path {
+            return input["id"].as_str().unwrap().to_owned();
+        }
+    }
+    panic!("the proof of {unit} has no {path}");
+}
+
+#[test]
+fn r4_kill_after_the_stat_proof_is_durable_and_before_finish() {
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+    let s = zsuite();
+    s.executable("t", &r4_script(false, true));
+    s.write("tests/a.t", "src/shared.src\ntests/z.u\ntests/z.flag\n");
+    s.write("tests/c.t", "src/c.src\n");
+    let fifo = s.fifo();
+    let gate = s.outside.join("hold-trigger");
+    // Keep every environment value equal across cold, warmed, interrupted, retry and oracle runs.
+    let env = with(
+        &TU,
+        &[
+            ("T_FIFO", fifo.to_str().unwrap()),
+            ("T_FIFO_AT", "tests/b.t"),
+            ("R4_HOLD_GATE", gate.to_str().unwrap()),
+        ],
+    );
+    learned(&s, &env);
+    assert_eq!(known(&s), Some(0), "{}", residue(&s));
+    let before = bundle(&s);
+    s.write(
+        "tests/a.t",
+        "src/shared.src\ntests/z.u\nstat:tests/z.flag\n",
+    );
+    s.write("tests/b.t", "src/shared.src\n\n");
+    s.write("tests/z.flag", "fail\n");
+    fs::write(&gate, "hold").unwrap();
+    s.clear_log();
+    let mut command = s.stoop(&s.root);
+    command
+        .args(["run", "--root"])
+        .arg(&s.root)
+        .args(["--", "./t", HOOK]);
+    command.env(SPLIT.0, SPLIT.1).envs(env.iter().copied());
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = spawning(|| command.spawn()).unwrap();
+    let writer = meet(&fifo);
+    let held_launches = launched(&s);
+    let at_hold = bundle(&s);
+    child.kill().unwrap();
+    assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    drop(writer);
+    fs::remove_file(&gate).unwrap();
+    assert_eq!(
+        held_launches,
+        ["tests/a.t", "tests/b.t"],
+        "the hold must be in the subset, not the full form or completion"
+    );
+    assert_eq!(
+        at_hold["whole"], before["whole"],
+        "the whole proof was replaced before the hold"
+    );
+    let old_flag = r4_version_id(&before, "tests/a.t", "tests/z.flag");
+    let new_flag = r4_version_id(&at_hold, "tests/a.t", "tests/z.flag");
+    assert!(
+        new_flag.starts_with("f:") && new_flag != old_flag,
+        "the stat-only version was not yet durable: old={old_flag}, new={new_flag}"
+    );
+    assert_ne!(
+        r4_version_id(&at_hold, "tests/a.t", "tests/a.t"),
+        r4_version_id(&before, "tests/a.t", "tests/a.t")
+    );
+    assert_eq!(
+        r4_version_id(&at_hold, "tests/b.t", "tests/b.t"),
+        r4_version_id(&before, "tests/b.t", "tests/b.t"),
+        "the second launch was already recorded"
+    );
+    eprintln!(
+        "R4 KILL AT DURABLE A: launches={held_launches:?} a.flag={new_flag} residue={}",
+        at_hold["residue"]
+    );
+    let (_, retry, run, oracle) = judge("r4-kill-retry", &s, &env, true);
+    assert_eq!(oracle, 1);
+    assert_eq!(
+        code(&retry),
+        1,
+        "R4 KILL WRONG VERDICT: exit={} direct={oracle} launches={run:?}\n{}",
+        code(&retry),
+        stderr(&retry)
+    );
+    assert_eq!(run, [""]);
+    assert_eq!(at_hold["residue"]["state"], "none");
+    let (_, retry, run, oracle) = judge("r4-kill-retry-again", &s, &env, true);
+    assert_eq!(
+        (code(&retry), oracle, run.as_slice()),
+        (1, 1, [String::new()].as_slice())
+    );
+}
+
+#[test]
+fn r4_failed_due_write_still_carries_content_proof_to_the_next_write() {
+    use std::process::Stdio;
+    let s = zsuite();
+    s.executable("t", &r4_script(false, true));
+    s.write("tests/a.t", "src/shared.src\ntests/z.u\ntests/z.flag\n");
+    s.write("tests/c.t", "src/c.src\n");
+    let fifo = s.fifo();
+    let gate = s.outside.join("hold-trigger");
+    let env = with(
+        &TU,
+        &[
+            ("T_FIFO", fifo.to_str().unwrap()),
+            ("R4_HOLD_GATE", gate.to_str().unwrap()),
+        ],
+    );
+    learned(&s, &env);
+    assert_eq!(known(&s), Some(0));
+    let path = s.bundle_path().unwrap();
+    let backup = path.with_extension("probe-backup");
+    let before = bundle(&s);
+    let old_flag = r4_version_id(&before, "tests/a.t", "tests/z.flag");
+    s.write("tests/z.flag", "still ok, different bytes\n");
+    s.write("tests/b.t", "src/shared.src\n\n");
+    fs::write(&gate, "hold").unwrap();
+    s.clear_log();
+    let mut command = s.stoop(&s.root);
+    command
+        .args(["run", "--root"])
+        .arg(&s.root)
+        .args(["--", "./t", HOOK]);
+    command.env(SPLIT.0, SPLIT.1).envs(env.iter().copied());
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let child = spawning(|| command.spawn()).unwrap();
+    let first = meet(&fifo);
+    assert_eq!(launched(&s), ["tests/a.t"]);
+    fs::rename(&path, &backup).unwrap();
+    // A cannot rename an encoded bundle over this directory. The suite's scratch folder still works for B.
+    fs::create_dir(&path).unwrap();
+    release(first);
+    let second = meet(&fifo);
+    assert_eq!(launched(&s), ["tests/a.t", "tests/b.t"]);
+    assert!(
+        path.is_dir(),
+        "unexpected successful bundle replace while A was recording"
+    );
+    fs::remove_dir(&path).unwrap();
+    fs::rename(&backup, &path).unwrap();
+    release(second);
+    let run = finish(child);
+    fs::remove_file(&gate).unwrap();
+    let oracle = direct(&s, &env);
+    let flag = r4_version_id(&bundle(&s), "tests/a.t", "tests/z.flag");
+    assert_ne!(flag, old_flag, "B's write did not carry A's held proof");
+    eprintln!(
+        "R4 DUE WRITE: exit={} direct={oracle}, A flag updated at B's write\n{}",
+        code(&run),
+        stderr(&run)
+    );
+    assert_eq!(oracle, 0);
+    assert_eq!(
+        code(&run),
+        0,
+        "R4 DUE WRITE false no-verdict:\n{}",
+        stderr(&run)
+    );
+    let (_, retry, _, oracle) = judge("r4-due-write-retry", &s, &env, true);
+    assert_eq!((code(&retry), oracle), (0, 0));
+}
+
 /// The fixture runner with two more line forms. `abs:P` reads the absolute path P by content, and a `fail` line fails
 /// the unit that lists it. The full form also runs `check`, a shell condition, before its tests, and fails when it holds.
 /// That is a runner-only check of a path outside any unit (PR 86 review round 4, B11 and D2).
@@ -1603,13 +1813,14 @@ fn r4_retry_after_each_input_refusal_and_round_trip_switch() {
         }
         let (_, initial, run, oracle) = judge(mode, &s, &TU, true);
         assert_eq!(oracle, 1);
-        // A changed runner-only input takes the full form at once, and that run fails with the direct command.
-        assert_eq!(
-            (code(&initial), run.as_slice()),
-            (1, [String::new()].as_slice()),
-            "{mode}: {}",
-            stderr(&initial)
-        );
+        if mode == "removed" {
+            assert_eq!(code(&initial), 1);
+            assert_eq!(run, [""]);
+        } else {
+            assert_eq!(code(&initial), 125, "{mode}: {}", stderr(&initial));
+            assert_eq!(run, ["tests/c.t"]);
+            assert!(stderr(&initial).contains("tests/z.flag"));
+        }
         for off in [false, false, true, false] {
             s.clear_log();
             let run = if off { s.hook(&TU) } else { split(&s, &TU) };
@@ -1663,12 +1874,9 @@ fn r4_retry_while_fallback_store_unavailable_and_after_unlock() {
             assert_eq!((code, launches.as_slice()), (1, [String::new()].as_slice()));
         }
         let (_, refusal, run, oracle) = judge("r4-restored-refusal", &s, &TU, true);
-        assert_eq!(
-            (code(&refusal), run.as_slice(), oracle),
-            (1, [String::new()].as_slice(), 1),
-            "{}",
-            stderr(&refusal)
-        );
+        no_verdict_names(&refusal, "tests/z.flag");
+        assert_eq!(run, ["tests/c.t"]);
+        assert_eq!(oracle, 1);
         let (_, retry, run, oracle) = judge("r4-restored-retry", &s, &TU, true);
         assert_eq!(
             (code(&retry), oracle, run.as_slice()),
@@ -1699,6 +1907,11 @@ fn t1_an_outside_root_input_change_beside_an_own_file_edit_takes_the_full_form()
     assert_eq!(oracle, 1);
     assert_eq!(code(&run), 1, "{}", stderr(&run));
     assert_eq!(launches, [""]);
+    let (_, retry, launches, oracle) = judge("t1-b11-retry", &s, &[], true);
+    assert_eq!(
+        (code(&retry), oracle, launches.as_slice()),
+        (1, 1, [String::new()].as_slice())
+    );
 }
 
 /// Review round 4, D2 (derived). A path in a dot directory, which the catalog walk does not list, appears. A unit reads it
@@ -1716,6 +1929,11 @@ fn t1_an_absent_input_that_appears_in_an_unlisted_directory_takes_the_full_form(
     assert_eq!(oracle, 1);
     assert_eq!(code(&run), 1, "{}", stderr(&run));
     assert_eq!(launches, [""]);
+    let (_, retry, launches, oracle) = judge("t1-d2-retry", &s, &[], true);
+    assert_eq!(
+        (code(&retry), oracle, launches.as_slice()),
+        (1, 1, [String::new()].as_slice())
+    );
 }
 
 /// Review round 4, E2 (derived). A new unit that the runner's own policy rejects. The new unit passes alone, so a subset
@@ -1732,19 +1950,31 @@ fn r5c_a_new_unit_that_the_runner_policy_rejects_takes_the_full_form() {
     assert_eq!(oracle, 1);
     assert_eq!(code(&run), 1, "{}", stderr(&run));
     assert_eq!(launches, [""]);
+    let (_, retry, launches, oracle) = judge("r5c-retry", &s, &[], true);
+    assert_eq!(
+        (code(&retry), oracle, launches.as_slice()),
+        (1, 1, [String::new()].as_slice())
+    );
 }
 
-/// Review round 4, E5 (derived). A runner-only flag that a unit reads changes beside an edit to a unit's own file. The
-/// unit's own proof does not cover the runner's read of the flag, so the run takes the full form.
+/// The accepted covered-file gap also applies when a runner-only test appears: a unit reads the file by content, but
+/// the runner executes it separately and fails on its existing flag. The traces cannot distinguish that from unit data.
 #[test]
-fn r4c_a_runner_only_flag_that_a_unit_reads_is_never_excused() {
-    let s = zlearned();
+fn r4c_informational_an_appeared_runner_only_test_read_as_data() {
+    let s = zsuite();
+    s.remove("tests/z.u");
     s.write("tests/z.flag", "fail\n");
+    learned(&s, &TU);
+    assert_eq!(known(&s), Some(0), "{}", residue(&s));
+    s.write("tests/z.u", "src/c.src\n");
     s.write("tests/a.t", "src/shared.src\n\n");
-    let (_, run, launches, oracle) = judge("r4c", &s, &TU, true);
+    let (_, run, launches, oracle) = judge("r4c-appeared", &s, &TU, true);
     assert_eq!(oracle, 1);
-    assert_eq!(code(&run), 1, "{}", stderr(&run));
-    assert_eq!(launches, [""]);
+    assert_eq!(code(&run), 0, "{}", stderr(&run));
+    assert_eq!(launches, ["tests/a.t", "tests/c.t"]);
+    let (_, retry, launches, oracle) = judge("r4c-appeared-retry", &s, &TU, true);
+    assert_eq!((code(&retry), oracle), (0, 1), "{}", stderr(&retry));
+    assert!(launches.is_empty(), "{launches:?}");
 }
 
 /// Benefit kept (owner-accepted): own-file content edits accumulate between full runs, and the next unchanged run skips.

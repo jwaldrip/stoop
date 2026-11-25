@@ -69,7 +69,12 @@ run_test() {
 	cat "$1"
 	while IFS= read -r line || [ -n "$line" ]; do
 		if [ -n "$line" ]; then
-			cat "$ROOT/$line"
+			if [ "$line" = fail ]; then
+				note "failed=$1"
+				STATUS=1
+			else
+				cat "$ROOT/$line"
+			fi
 		fi
 	done < "$1"
 	cat "$ROOT/setup.src"
