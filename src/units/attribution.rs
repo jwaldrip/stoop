@@ -180,6 +180,8 @@ pub(super) struct Ran {
     pub(super) breaches: Vec<Breach>,
     /// The units whose new proof this run stored, with the keys their launches read by content (spec 3.10, rv34, rv38).
     pub(super) proven: BTreeMap<String, BTreeSet<String>>,
+    /// Gap paths that a newly held proof observed only by stat.
+    pub(super) stat_gaps: BTreeSet<String>,
     /// The excused names that no new proof of this run reads by content (spec 3.10, rv34).
     pub(super) unread: Vec<Unread>,
     /// The changed inputs of the whole proof that no kept version and no new proof of this run reads by content (spec
@@ -220,6 +222,7 @@ pub(super) fn launch_each(
         stopped: None,
         breaches: Vec::new(),
         proven: BTreeMap::new(),
+        stat_gaps: BTreeSet::new(),
         unread: Vec::new(),
         uncovered: Vec::new(),
         failed: None,
@@ -311,6 +314,15 @@ pub(super) fn launch_each(
                                 pass.record(&launch.unit, &kept.inputs, &kept.outputs, now());
                             // A failed write keeps the proof in memory, and the end of the pass writes it (spec 3.11).
                             if matches!(stored, Stored::Stored | Stored::WriteFailed) {
+                                ran.stat_gaps.extend(
+                                    kept.inputs
+                                        .iter()
+                                        .filter(|input| {
+                                            gaps.contains(&input.path)
+                                                && !observed.content.contains(&input.path)
+                                        })
+                                        .map(|input| input.path.clone()),
+                                );
                                 ran.proven.insert(unit.clone(), observed.content.clone());
                             }
                             match stored {
@@ -440,6 +452,12 @@ pub(super) fn finish(
             .iter()
             .any(|unit| ran.proven.contains_key(unit))
     });
+    // A different successful unit can also store a stat of an unread name while its excusing unit fails. Its proof
+    // would otherwise make that name look covered on the next run, even though the excuser's old proof remains.
+    let stat_unread = ran
+        .unread
+        .iter()
+        .any(|unread| ran.stat_gaps.contains(&unread.path));
     // Likewise, only a version stored by this run can turn an uncovered content input into a stat-only input.
     let stored_uncovered = pass.held().iter().any(|(unit, inputs, _)| {
         ran.proven.contains_key(unit)
@@ -451,6 +469,7 @@ pub(super) fn finish(
         || ran.unlaunched
         || !ran.breaches.is_empty()
         || replaced_unread
+        || stat_unread
         || stored_uncovered;
     pass.settle_residue(&lookup.proofs, pending.listings(), unknown);
     let id = pending.suite();

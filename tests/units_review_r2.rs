@@ -1476,11 +1476,11 @@ fn r4_new_names_case(binary: &Path, head: bool) {
         stderr(&first)
     );
     assert_eq!(code(&first), 1);
-    assert_eq!(
-        run,
-        [""],
-        "the appeared runner-only test changes the listing of tests"
-    );
+    if run != [""] {
+        assert!(head, "the merge base should take the full form: {run:?}");
+        assert_eq!(run, ["tests/a.t", "tests/c.t"]);
+        assert_eq!(known(&s), None, "{}", residue(&s));
+    }
     s.write("tests/c.flag", "ok\n");
     let mut verdicts = Vec::new();
     for attempt in 0..2 {
