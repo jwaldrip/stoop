@@ -2037,6 +2037,46 @@ fn r5c_a_new_unit_that_the_runner_policy_rejects_takes_the_full_form() {
     );
 }
 
+/// The runner counts its catalog without probing the future unit by name. Its old proof has no input for d.t, and the
+/// new unit passes alone, but adding it violates the full runner's policy.
+#[test]
+fn r4_e2_an_unseen_new_unit_rejected_by_runner_policy_takes_the_full_form() {
+    let s = Suite::new();
+    s.executable(
+        "t",
+        &ow_script("set -- \"$ROOT\"/tests/*.t; [ \"$#\" -gt 3 ]"),
+    );
+    learned(&s, &[]);
+    assert_eq!(known(&s), Some(0), "{}", residue(&s));
+    let proofs = s.proofs();
+    assert!(
+        !proofs.is_empty()
+            && proofs.iter().all(|proof| {
+                proof["inputs"].as_array().is_some_and(|inputs| {
+                    inputs
+                        .iter()
+                        .all(|input| input["path"].as_str() != Some("tests/d.t"))
+                })
+            }),
+        "the full proof already named the future unit"
+    );
+    s.write("tests/d.t", "src/c.src\n");
+    let (_, run, launches, oracle) = judge("r4-e2-unseen", &s, &[], true);
+    assert_eq!(
+        (code(&run), oracle, launches.as_slice()),
+        (1, 1, [String::new()].as_slice()),
+        "{}",
+        stderr(&run)
+    );
+    let (_, retry, launches, oracle) = judge("r4-e2-unseen-retry", &s, &[], true);
+    assert_eq!(
+        (code(&retry), oracle, launches.as_slice()),
+        (1, 1, [String::new()].as_slice()),
+        "{}",
+        stderr(&retry)
+    );
+}
+
 /// The accepted covered-file gap also applies when a runner-only test appears: a unit reads the file by content, but
 /// the runner executes it separately and fails on its existing flag. The traces cannot distinguish that from unit data.
 #[test]
