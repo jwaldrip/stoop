@@ -906,17 +906,184 @@ fn stored_reads(stored: &Value, units: &[String]) -> Vec<String> {
     out
 }
 
+/// A stat and a content read share an identity. Check the unit's recorded own-file bytes and its runner line too.
+fn e3_stored_content_flag(
+    stored: &Value,
+    s: &Suite,
+    units: &[String],
+    flag: &str,
+    previous: &str,
+) -> bool {
+    let Some(table) = stored["table"].as_array() else {
+        return false;
+    };
+    let flag_hash = blake3::hash(previous.as_bytes()).to_hex().to_string();
+    for unit in units {
+        let Ok(body) = fs::read_to_string(s.path(unit)) else {
+            continue;
+        };
+        if !body
+            .lines()
+            .any(|line| line == flag || line.strip_prefix("unit-only:") == Some(flag))
+        {
+            continue;
+        }
+        let unit_hash = blake3::hash(body.as_bytes()).to_hex().to_string();
+        let Some(versions) = stored["units"][unit.as_str()].as_array() else {
+            continue;
+        };
+        for version in versions {
+            let Some(inputs) = version["inputs"].as_array() else {
+                continue;
+            };
+            let mut index = 0u64;
+            let mut has_unit = false;
+            let mut has_flag = false;
+            for (at, delta) in inputs.iter().enumerate() {
+                let Some(delta) = delta.as_u64() else {
+                    break;
+                };
+                index = if at == 0 { delta } else { index + delta };
+                let Some(entry) = table.get(index as usize) else {
+                    break;
+                };
+                let id = entry["id"].as_str().unwrap_or_default();
+                let Some(hash) = id.strip_prefix("f:").or_else(|| id.strip_prefix("x:")) else {
+                    continue;
+                };
+                let path = entry["path"].as_str().unwrap_or_default();
+                has_unit |= path == unit && hash == unit_hash;
+                has_flag |= path == flag && hash == flag_hash;
+            }
+            if has_unit && has_flag {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[test]
+fn e3_stored_content_requires_a_content_line_and_matching_proof() {
+    let s = Suite::new();
+    let flag = "tests/z.flag";
+    let units = vec!["tests/a.t".to_owned()];
+    let content = "ok\n";
+    s.write(flag, content);
+    let stat_body = format!("stat:{flag}\n");
+    s.write("tests/a.t", &stat_body);
+    let mut stored = serde_json::json!({
+        "table": [
+            {"path": "tests/a.t", "id": format!("f:{}", blake3::hash(stat_body.as_bytes()))},
+            {"path": flag, "id": format!("f:{}", blake3::hash(content.as_bytes()))}
+        ],
+        "units": {"tests/a.t": [{"inputs": [0, 1]}]}
+    });
+    assert!(!e3_stored_content_flag(&stored, &s, &units, flag, content));
+    let read_body = format!("{flag}\n");
+    s.write("tests/a.t", &read_body);
+    stored["table"][0]["id"] = Value::String(format!("f:{}", blake3::hash(read_body.as_bytes())));
+    assert!(e3_stored_content_flag(&stored, &s, &units, flag, content));
+    assert!(!e3_stored_content_flag(
+        &stored,
+        &s,
+        &units,
+        flag,
+        "different\n"
+    ));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum E3Gap {
+    W22,
+    E5,
+}
+
+#[derive(Clone, Copy, Default)]
+struct E3GapEvidence {
+    runner_only: bool,
+    appeared_now: bool,
+    flag_flipped: bool,
+    stored_content: bool,
+    current_content: bool,
+}
+
+fn e3_gap(evidence: E3GapEvidence) -> Option<E3Gap> {
+    if !evidence.runner_only || !evidence.current_content {
+        return None;
+    }
+    if evidence.appeared_now {
+        Some(E3Gap::E5)
+    } else if evidence.flag_flipped && evidence.stored_content {
+        Some(E3Gap::W22)
+    } else {
+        None
+    }
+}
+
+#[test]
+fn e3_gap_accepts_only_the_two_owner_approved_shapes() {
+    let w22 = E3GapEvidence {
+        runner_only: true,
+        flag_flipped: true,
+        stored_content: true,
+        current_content: true,
+        ..E3GapEvidence::default()
+    };
+    let e5 = E3GapEvidence {
+        runner_only: true,
+        appeared_now: true,
+        current_content: true,
+        ..E3GapEvidence::default()
+    };
+    assert_eq!(e3_gap(w22), Some(E3Gap::W22));
+    assert_eq!(e3_gap(e5), Some(E3Gap::E5));
+    for rejected in [
+        E3GapEvidence {
+            runner_only: false,
+            ..w22
+        },
+        E3GapEvidence {
+            current_content: false,
+            ..w22
+        },
+        E3GapEvidence {
+            flag_flipped: false,
+            ..w22
+        },
+        E3GapEvidence {
+            stored_content: false,
+            ..w22
+        },
+        E3GapEvidence {
+            runner_only: false,
+            ..e5
+        },
+        E3GapEvidence {
+            current_content: false,
+            ..e5
+        },
+        E3GapEvidence {
+            appeared_now: false,
+            ..e5
+        },
+    ] {
+        assert_eq!(e3_gap(rejected), None);
+    }
+}
+
 #[derive(Default)]
 struct E3Tally {
     steps: usize,
     gap_current: usize,
+    gap_w22: usize,
+    gap_e5: usize,
     gap_stored: usize,
     no_verdict: usize,
 }
 
-/// One E3 sequence. The documented covered-file gap permits a pass only when each failed test's flag is listed by a
-/// current unit. A flag read only by a stale version is a wrong verdict. Exit 125 is accepted only with the exact
-/// no-verdict line and a launched unit that stopped listing the named path in this step.
+/// E3 accepts only a runner-only failure whose current flag is read by a unit, and either the flag just flipped after a
+/// stored content read (w22), or the runner-only test appeared in this step (E5). Exit 125 keeps its existing bound.
 fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
     let s = Suite::new();
     let mut rng = Rng::new(seed);
@@ -968,6 +1135,16 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
     let mut last_125 = false;
     for step in 1..=steps {
         let before = e3_listings(&s, &world.units);
+        let before_flags: std::collections::BTreeMap<String, Option<String>> = world
+            .runners
+            .iter()
+            .map(|runner| {
+                (
+                    runner.clone(),
+                    fs::read_to_string(s.path(&flag_of(runner))).ok(),
+                )
+            })
+            .collect();
         let forced_noop = last_125 && rng.below(2) == 0;
         let count = if forced_noop { 1 } else { 1 + rng.below(3) };
         let mut ops = Vec::new();
@@ -1106,10 +1283,43 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
                 listed_now(&flag) || reads.contains(&flag)
             });
         if current {
+            let mut kinds = Vec::new();
+            for test in &failed {
+                let flag = flag_of(test);
+                let previous_flag = before_flags.get(test).and_then(|value| value.as_deref());
+                let appeared_now = !before_flags.contains_key(test)
+                    && ops.iter().any(|op| match op {
+                        Step::Runner(path) | Step::PublishStaged(path) => path == test,
+                        _ => false,
+                    });
+                let flag_flipped = ops
+                    .iter()
+                    .any(|op| matches!(op, Step::Flag(path, _) if path == test))
+                    && previous_flag.is_some_and(|value| !value.contains("fail"))
+                    && !fs::read_to_string(s.path(&flag))
+                        .is_ok_and(|value| !value.contains("fail"));
+                let evidence = E3GapEvidence {
+                    runner_only: world.runners.contains(test)
+                        && !world.units.contains(test)
+                        && !launches.contains(test),
+                    appeared_now,
+                    flag_flipped,
+                    stored_content: previous_flag.is_some_and(|value| {
+                        e3_stored_content_flag(&stored, &s, &world.units, &flag, value)
+                    }),
+                    current_content: listed_now(&flag),
+                };
+                let Some(kind) = e3_gap(evidence) else {
+                    return Err(report(
+                        "WRONG VERDICT: the covered-file mismatch is outside w22 and E5",
+                    ));
+                };
+                kinds.push(kind);
+            }
             tally.gap_current += 1;
-            println!(
-                "E3 covered-file gap (a current unit lists the flag): seed {seed}, step {step}"
-            );
+            tally.gap_w22 += usize::from(kinds.contains(&E3Gap::W22));
+            tally.gap_e5 += usize::from(kinds.contains(&E3Gap::E5));
+            println!("E3 covered-file gap: seed {seed}, step {step}, shapes {kinds:?}");
             continue;
         }
         if stored_gap {
@@ -1141,10 +1351,12 @@ fn r2_e3_flag_readers_model() {
         }
     }
     println!(
-        "E3 sweep: seeds {first}..{}: {} steps, {} covered-file gap steps, {} steps beyond the current reading, {} accepted no-verdicts, {} failing seeds",
+        "E3 sweep: seeds {first}..{}: {} steps, {} covered-file gap steps (w22={}, E5={}), {} steps beyond the current reading, {} accepted no-verdicts, {} failing seeds",
         first + seeds - 1,
         tally.steps,
         tally.gap_current,
+        tally.gap_w22,
+        tally.gap_e5,
         tally.gap_stored,
         tally.no_verdict,
         failures.len()
@@ -1155,6 +1367,21 @@ fn r2_e3_flag_readers_model() {
         failures.len(),
         failures.first().cloned().unwrap_or_default()
     );
+}
+
+#[test]
+fn e3_reported_seeds_match_the_owner_approved_shapes() {
+    let mut appeared = E3Tally::default();
+    if let Err(why) = run_e3(14039, 5, &mut appeared) {
+        panic!("{why}");
+    }
+    assert_eq!((appeared.gap_e5, appeared.gap_w22), (1, 0));
+
+    let mut changed_flag = E3Tally::default();
+    if let Err(why) = run_e3(10037, 8, &mut changed_flag) {
+        panic!("{why}");
+    }
+    assert_eq!((changed_flag.gap_e5, changed_flag.gap_w22), (0, 1));
 }
 
 // Independent delta-review probes. The runner is a disposable fixture in each test.
