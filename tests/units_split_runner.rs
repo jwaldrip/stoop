@@ -616,6 +616,52 @@ fn model_whole_inputs_require_a_recorded_read_from_the_latest_full_run() {
 }
 
 #[test]
+fn model_whole_inputs_select_the_bundle_proof_instead_of_the_first_stored_proof() {
+    let s = Suite::new();
+    s.write("policy.src", "none\n");
+    s.write("src/s3", "source\n");
+    s.write("tests/a.t", "stat:src/s3\n");
+    s.executable("t", &stat_runner());
+    let units: Vec<String> = ["tests/a.t", "tests/b.t", "tests/c.t"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    let cold = split(&s, &[]);
+    assert_eq!(code(&cold), 0, "{}", stderr(&cold));
+
+    let proof_files: Vec<_> = std::fs::read_dir(s.path(".stoop/proofs"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    assert_eq!(proof_files.len(), 1);
+    let proof_file = &proof_files[0];
+    let mut stored: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(proof_file).unwrap()).unwrap();
+    let proofs = stored["proofs"].as_array_mut().unwrap();
+    assert_eq!(proofs.len(), 1);
+    let mut other = proofs[0].clone();
+    let inputs = other["inputs"].as_array_mut().unwrap();
+    let input = inputs
+        .iter()
+        .find(|input| input["path"] == "src/s3")
+        .unwrap()
+        .clone();
+    inputs.retain(|input| input["path"] != "src/s3");
+    let mut ghost = input;
+    ghost["path"] = "src/ghost".into();
+    inputs.push(ghost);
+    proofs.insert(0, other);
+    std::fs::write(proof_file, serde_json::to_vec(&stored).unwrap()).unwrap();
+
+    // The model's current candidates include both paths, but only s3 is in the active proof.
+    s.write("tests/a.t", "stat:src/s3\nsrc/ghost\n");
+    let mut whole = ModelWholeInputs::default();
+    whole.record(&s, &units, &[]);
+    assert!(whole.contains(&s, "src/s3"));
+    assert!(!whole.contains(&s, "src/ghost"));
+}
+
+#[test]
 fn bounded_refusal_requires_an_exact_line_and_a_relevant_failure_or_content_drop() {
     use std::collections::BTreeSet;
     use std::os::unix::process::ExitStatusExt;

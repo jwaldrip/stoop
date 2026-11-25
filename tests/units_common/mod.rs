@@ -553,6 +553,84 @@ fn content_line(line: &str) -> Option<&str> {
         Some(line.strip_prefix("unit-only:").unwrap_or(line))
     }
 }
+// Match the serialized fields and their order in Proof::digest. The bundle names the last full
+// proof by digest; neither the first proof file nor the first proof in it is necessarily that proof.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ModelOidBasis {
+    text: String,
+    eol: String,
+    filter: String,
+    ident: String,
+    working_tree_encoding: String,
+    export_subst: String,
+    crlf: String,
+    autocrlf: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ModelProofInput {
+    path: String,
+    id: String,
+    #[serde(default)]
+    oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oid_basis: Option<ModelOidBasis>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ModelProvenance {
+    os: String,
+    arch: String,
+    tracer: String,
+    version: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct ModelStoredProof {
+    inputs: Vec<ModelProofInput>,
+    #[serde(default)]
+    outputs: Vec<ModelProofInput>,
+    #[serde(default)]
+    removed: Vec<String>,
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    probes: BTreeMap<String, String>,
+    #[serde(default)]
+    env_excluded: Vec<String>,
+    #[serde(default)]
+    ignore: Option<Vec<String>>,
+    #[serde(default)]
+    priors: Option<Vec<ModelProofInput>>,
+    #[serde(default)]
+    unplannable: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    provenance: Option<ModelProvenance>,
+}
+
+fn model_proof_digest(value: &Value) -> String {
+    let proof: ModelStoredProof =
+        serde_json::from_value(value.clone()).expect("a stored proof must match the model");
+    let bytes = serde_json::to_vec(&(
+        &proof.inputs,
+        &proof.outputs,
+        &proof.removed,
+        &proof.env,
+        &proof.probes,
+        &proof.env_excluded,
+        &proof.ignore,
+        &proof.priors,
+        &proof.unplannable,
+        &proof.cwd,
+        &proof.scope,
+        &proof.provenance,
+    ))
+    .expect("model proof fields serialize");
+    format!("p-{}", &blake3::hash(&bytes).to_hex()[..32])
+}
 
 impl ModelWholeInputs {
     pub fn record(&mut self, s: &Suite, units: &[String], runners: &[String]) {
@@ -578,13 +656,18 @@ impl ModelWholeInputs {
 
     pub fn contains(&self, s: &Suite, path: &str) -> bool {
         self.paths.contains(path)
-            && s.proofs().first().is_some_and(|proof| {
-                proof["inputs"].as_array().is_some_and(|inputs| {
-                    inputs
-                        .iter()
-                        .any(|input| input["path"].as_str() == Some(path))
+            && s.bundle()
+                .and_then(|bundle| bundle["whole"].as_str().map(str::to_owned))
+                .is_some_and(|whole| {
+                    s.proofs().iter().any(|proof| {
+                        model_proof_digest(proof) == whole
+                            && proof["inputs"].as_array().is_some_and(|inputs| {
+                                inputs
+                                    .iter()
+                                    .any(|input| input["path"].as_str() == Some(path))
+                            })
+                    })
                 })
-            })
     }
 }
 
