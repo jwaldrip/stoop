@@ -325,6 +325,36 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
             clean,
         );
     }
+    // An outside-root input may also drive the full runner outside any unit. Unlike root-relative unit data, there is
+    // no tracked directory listing to expose a change there, so the whole proof must still hold for that input.
+    if let Some(input) = proof
+        .inputs
+        .iter()
+        .filter(|input| Path::new(&input.path).is_absolute())
+        .find(|input| {
+            let held = if let Some(id) = current.id(input) {
+                id == input.id
+            } else {
+                identify(
+                    &from_key(cx.root, &input.path),
+                    false,
+                    input.id.starts_with("dl:"),
+                )
+                .as_deref()
+                    == Some(input.id.as_str())
+            };
+            !held
+        })
+    {
+        return verdict(
+            Decision::Full(Some(format!(
+                "{} changed outside the repository",
+                safe(&input.path)
+            ))),
+            shown,
+            clean,
+        );
+    }
     // E16 to E18 each need every listing that the whole proof holds to be as it was (see `listings_change`).
     let excused = match listings_change(cx, view, &current, proof, &affected) {
         Ok(excused) => excused,
