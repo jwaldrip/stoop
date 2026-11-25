@@ -1259,13 +1259,18 @@ fn a_top_level_unit_added_since_the_full_run_is_covered_by_its_own_proof() {
     assert!(s.launches().is_empty(), "a skip launches nothing");
 }
 
-/// STOP 4 guard: an added unit whose proof has expired is affected, so it launches. The excuse never reaches it.
+/// A unit whose proof has expired is affected when a covered flag change makes the engine judge the suite.
 #[test]
 fn an_added_unit_whose_proof_expired_is_affected_not_excused() {
     let s = Suite::new();
     success(&passed(&s, &[]));
     s.write("tests/d.t", "src/c.src\n");
     success(&split(&s, &[]));
+    s.write("tests/a.flag", "ok\n");
+    s.clear_log();
+    let changed = split(&s, &[]);
+    success(&changed);
+    assert_eq!(launched(&s), ["tests/a.t"], "{}", stderr(&changed));
     let path = s.bundle_path().expect("a suite bundle");
     let mut bundle = s.bundle().expect("a suite bundle");
     for (unit, versions) in bundle["units"].as_object_mut().unwrap().iter_mut() {
