@@ -1938,15 +1938,48 @@ fn r4_retry_while_fallback_store_unavailable_and_after_unlock() {
 #[test]
 fn t1_an_outside_root_input_change_beside_an_own_file_edit_takes_the_full_form() {
     let s = Suite::new();
-    let flag = s.outside.join("x.flag");
-    fs::write(&flag, "ok\n").unwrap();
-    let flag = flag.display().to_string();
+    struct OutsideFile(std::path::PathBuf);
+    impl Drop for OutsideFile {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let home = fs::canonicalize(std::env::var_os("HOME").expect("HOME")).unwrap();
+    assert!(
+        !home.starts_with("/tmp") && !home.starts_with("/var/tmp") && !home.starts_with("/run")
+    );
+    let path = home.join(format!(".stoop-r4-b11-{}.flag", std::process::id()));
+    File::options()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .unwrap();
+    let file = OutsideFile(path);
+    fs::write(&file.0, "ok\n").unwrap();
+    let flag = file.0.display().to_string();
     s.executable(
         "t",
         &ow_script(&format!("read -r v < '{flag}' && [ \"$v\" = fail ]")),
     );
     s.write("tests/c.t", &format!("src/c.src\nabs:{flag}\n"));
     learned(&s, &[]);
+    assert!(
+        s.proofs().iter().any(|proof| {
+            proof["inputs"].as_array().is_some_and(|inputs| {
+                inputs.iter().any(|input| {
+                    input["path"] == flag
+                        && input["id"]
+                            .as_str()
+                            .is_some_and(|id| id.starts_with("f:") || id.starts_with("x:"))
+                })
+            })
+        }),
+        "the whole proof did not record the outside input"
+    );
+    assert!(
+        stored_reads(&bundle(&s), &["tests/c.t".to_owned()]).contains(&flag),
+        "unit c did not record the outside input"
+    );
     assert_eq!(known(&s), Some(0), "{}", residue(&s));
     fs::write(&flag, "fail\n").unwrap();
     s.write("tests/a.t", "src/shared.src\n\n");

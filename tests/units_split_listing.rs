@@ -25,7 +25,7 @@ const NOTE_FILE: &str = "note \"changed_inputs_file=$(flat \"${STOOP_CHANGED_INP
 
 /// The fixture runner with four review knobs, inserted at its two fixed anchors:
 /// - `T_LS_DIR` with `T_LS_AT=P`: test P lists `$ROOT/$T_LS_DIR`, so the listing is one of its reads.
-/// - `T_READ_ABS` with `T_READ_ABS_AT=P`: test P reads that absolute path by content.
+/// - `T_READ_ABS` with `T_READ_ABS_AT=P`: unit P reads that absolute path by content when launched alone.
 /// - `T_BIG_AT=P` with `T_BIG_DIR`: test P reads every file under that directory by content.
 ///
 /// Every launch also logs whether `STOOP_CHANGED_INPUTS` is set (`changed_inputs_set`, empty when unset) and the text of
@@ -40,7 +40,7 @@ fn review_runner() -> String {
     let knobs = concat!(
         "\tcat \"$ROOT/setup.src\"\n",
         "\tif [ -n \"${T_LS_DIR:-}\" ] && [ \"${T_LS_AT:-}\" = \"$1\" ]; then ls \"$ROOT/$T_LS_DIR\" > /dev/null; fi\n",
-        "\tif [ -n \"${T_READ_ABS:-}\" ] && [ \"${T_READ_ABS_AT:-}\" = \"$1\" ]; then cat \"$T_READ_ABS\" > /dev/null; fi\n",
+        "\tif [ \"$TESTS\" = 1 ] && [ -n \"${T_READ_ABS:-}\" ] && [ \"${T_READ_ABS_AT:-}\" = \"$1\" ]; then cat \"$T_READ_ABS\" > /dev/null; fi\n",
         "\tif [ -n \"${T_BIG_AT:-}\" ] && [ \"$T_BIG_AT\" = \"$1\" ] && [ -d \"${T_BIG_DIR:-/nonexistent}\" ]; then find \"$T_BIG_DIR\" -type f -exec cat {} + > /dev/null; fi\n",
         "\tif [ -n \"${T_STAT_REL:-}\" ] && [ \"${T_STAT_AT:-}\" = \"$1\" ]; then test -e \"$ROOT/$T_STAT_REL\"; fi\n",
     );

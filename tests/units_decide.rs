@@ -650,10 +650,14 @@ fn decide_cost() {
         );
         ms
     });
-    // Removing a unit's file changes the roster, so the next run takes the full form once (the roster rule). That run
-    // records the whole proof without the unit, and the skip below is the run after it.
+    // A removed unit now takes the full form. Relearn after the removal, then add a unit-only flag so that the whole
+    // proof is stale but the affected unit has a current proof. The next no-op exercises an engine skip, not a legacy hit.
     s.remove("tests/u00000.t");
     success(&passed(&s, &[], &[SPLIT]));
+    s.write("tests/a.flag", "ok\n");
+    let changed = split(&s, &[]);
+    success(&changed);
+    assert_eq!(decision(&changed), "subset", "{}", stderr(&changed));
     let skip_ms = median_ms(|| {
         let started = Instant::now();
         let skip = split(&s, &[]);
