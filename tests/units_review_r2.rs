@@ -1229,10 +1229,12 @@ fn r3_off_record_then_on_checks_the_dropped_content() {
     assert_eq!(residue(&s)["state"], "provisional");
     assert_eq!(known(&s), Some(0));
     s.write("tests/z.flag", "fail\n");
-    let (_, run, _, oracle) = judge("r3-off-on-stale", &s, &TU, true);
+    let (_, run, launches, oracle) = judge("r3-off-on-stale", &s, &TU, true);
     assert_eq!(oracle, 1);
     same_verdict("r3-off-on-stale", &run, oracle);
-    no_verdict_names(&run, "tests/z.flag");
+    // A switch-off record stores no roster (PR 86 review round 5), so this first switch-on decision is the full form. The
+    // full form runs the runner's check of the flag, where a subset would stop at a 125.
+    assert_eq!(launches, [""], "{}", stderr(&run));
     let (_, retry, launches, oracle) = judge("r3-off-on-retry", &s, &TU, true);
     same_verdict("r3-off-on-retry", &retry, oracle);
     assert_eq!(launches, [""]);
