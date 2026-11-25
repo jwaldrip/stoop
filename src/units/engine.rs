@@ -1832,6 +1832,26 @@ mod tests {
     }
 
     #[test]
+    fn r6_a_roster_file_not_read_by_the_whole_command_takes_the_full_form() {
+        let root = TreeDir::new("unread-roster", &[("live.t", "live"), ("other.t", "other")]);
+        let (mut proof, mut view, roster) = two_units_judged(&root, Vec::new());
+        proof.inputs.retain(|input| input.path != "other.t");
+        view.whole = proof.digest();
+        let guard = whole_guard(&proof);
+        let proofs = [proof];
+        let cx = Judged {
+            root: &root.0,
+            proofs: &proofs,
+            guard,
+            ..judged(&roster, 0)
+        };
+        assert!(matches!(
+            judge(&cx, &view).decision,
+            Decision::Full(Some(reason)) if reason.contains("other.t has not been read by the full command")
+        ));
+    }
+
+    #[test]
     fn r5_a_directory_the_full_command_read_as_metadata_takes_the_full_form_when_it_changes() {
         let root = TreeDir::new("metadata", &[("live.t", "live"), ("other.t", "other")]);
         // The full command stat'd `policy`, which is a directory then. It is gone now.
