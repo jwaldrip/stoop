@@ -390,6 +390,27 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
             clean,
         );
     }
+    // A unit the last full command did not read has not been judged by that command. Its own successful launch cannot
+    // account for runner policy that rejects the new unit, even when an old unit recorded the path as absent.
+    if let Some(unit) = cx.roster.iter().find(|unit| {
+        !proof
+            .inputs
+            .binary_search_by(|input| input.path.as_str().cmp(unit.as_str()))
+            .ok()
+            .is_some_and(|index| {
+                let id = &proof.inputs[index].id;
+                id.starts_with("f:") || id.starts_with("x:")
+            })
+    }) {
+        return verdict(
+            Decision::Full(Some(format!(
+                "{} has not been read by the full command",
+                safe(unit)
+            ))),
+            shown,
+            clean,
+        );
+    }
     // E16 to E18 each need every listing that the whole proof holds to be as it was (see `listings_change`).
     let excused = match listings_change(cx, view, &current, proof, &affected) {
         Ok(excused) => excused,
