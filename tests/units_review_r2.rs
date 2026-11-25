@@ -863,6 +863,36 @@ fn e3_listings(
         .collect()
 }
 
+/// An appeared runner-only test must be read by content by a unit launched in this step.
+fn e3_launched_content_path(listings: &ModelListings, launches: &[String], path: &str) -> bool {
+    let unit_only = format!("unit-only:{path}");
+    launches.iter().any(|unit| {
+        listings
+            .get(unit)
+            .is_some_and(|lines| lines.contains(path) || lines.contains(&unit_only))
+    })
+}
+
+#[test]
+fn r7_e5_requires_a_launched_unit_to_read_the_appeared_test() {
+    let mut listings = ModelListings::new();
+    listings.insert(
+        "tests/a.t".into(),
+        ["tests/z.u".into()].into_iter().collect(),
+    );
+    listings.insert(
+        "tests/c.t".into(),
+        ["stat:tests/z.u".into()].into_iter().collect(),
+    );
+    let launches = vec!["tests/c.t".to_owned()];
+    assert!(!e3_launched_content_path(&listings, &launches, "tests/z.u"));
+    listings
+        .get_mut("tests/c.t")
+        .unwrap()
+        .insert("unit-only:tests/z.u".into());
+    assert!(e3_launched_content_path(&listings, &launches, "tests/z.u"));
+}
+
 /// The paths that the stored versions of `units` read, by the bundle's table (`stored` is the bundle before the run).
 fn stored_reads(stored: &Value, units: &[String]) -> Vec<String> {
     let table = stored["table"].as_array().cloned().unwrap_or_default();
@@ -995,6 +1025,7 @@ struct E3GapEvidence {
     flag_flipped: bool,
     stored_content: bool,
     current_content: bool,
+    appeared_test_content: bool,
 }
 
 fn e3_gap(evidence: E3GapEvidence) -> Option<E3Gap> {
@@ -1002,7 +1033,7 @@ fn e3_gap(evidence: E3GapEvidence) -> Option<E3Gap> {
         return None;
     }
     if evidence.appeared_now {
-        Some(E3Gap::E5)
+        evidence.appeared_test_content.then_some(E3Gap::E5)
     } else if evidence.flag_flipped && evidence.stored_content {
         Some(E3Gap::W22)
     } else {
@@ -1023,6 +1054,7 @@ fn e3_gap_accepts_only_the_two_owner_approved_shapes() {
         runner_only: true,
         appeared_now: true,
         current_content: true,
+        appeared_test_content: true,
         ..E3GapEvidence::default()
     };
     assert_eq!(e3_gap(w22), Some(E3Gap::W22));
@@ -1053,6 +1085,10 @@ fn e3_gap_accepts_only_the_two_owner_approved_shapes() {
             ..e5
         },
         E3GapEvidence {
+            appeared_test_content: false,
+            ..e5
+        },
+        E3GapEvidence {
             appeared_now: false,
             ..e5
         },
@@ -1079,14 +1115,20 @@ fn e3_changes_runner(step: &Step, test: &str) -> bool {
     }
 }
 
+fn e3_changes_full_policy(step: &Step) -> bool {
+    matches!(step, Step::ListedDirectory(_))
+}
+
 fn e3_sticky(
     divergence: &E3Diverged,
     failed: &[String],
+    policy_failures: &[String],
     runners: &[String],
     units: &[String],
     launches: &[String],
 ) -> bool {
     !failed.is_empty()
+        && policy_failures.is_empty()
         && !launches.iter().any(String::is_empty)
         && failed.iter().all(|test| {
             divergence.failing.contains(test)
@@ -1110,20 +1152,44 @@ fn e3_sticky_retry_requires_the_original_unchanged_runner_only_failures() {
     };
     let failed = vec![test.clone()];
     let runners = vec![test.clone()];
-    assert!(e3_sticky(&divergence, &failed, &runners, &[], &[]));
-    assert!(!e3_sticky(&divergence, &[], &runners, &[], &[]));
+    assert!(e3_sticky(&divergence, &failed, &[], &runners, &[], &[]));
+    assert!(!e3_sticky(&divergence, &[], &[], &runners, &[], &[]));
     assert!(!e3_sticky(
         &divergence,
         &["tests/new.u".to_owned()],
+        &[],
         &runners,
         &[],
         &[]
     ));
-    assert!(!e3_sticky(&divergence, &failed, &runners, &failed, &[]));
-    assert!(!e3_sticky(&divergence, &failed, &runners, &[], &failed));
     assert!(!e3_sticky(
         &divergence,
         &failed,
+        &["policy-r6/zone".to_owned()],
+        &runners,
+        &[],
+        &[]
+    ));
+    assert!(!e3_sticky(
+        &divergence,
+        &failed,
+        &[],
+        &runners,
+        &failed,
+        &[]
+    ));
+    assert!(!e3_sticky(
+        &divergence,
+        &failed,
+        &[],
+        &runners,
+        &[],
+        &failed
+    ));
+    assert!(!e3_sticky(
+        &divergence,
+        &failed,
+        &[],
         &runners,
         &[],
         &[String::new()]
@@ -1132,9 +1198,9 @@ fn e3_sticky_retry_requires_the_original_unchanged_runner_only_failures() {
     assert!(e3_changes_runner(&Step::RunnerDelete(test.clone()), &test));
     assert!(!e3_changes_runner(&Step::Source(0), &test));
     divergence.changed.insert("tests/m1.u".to_owned());
-    assert!(e3_sticky(&divergence, &failed, &runners, &[], &[]));
+    assert!(e3_sticky(&divergence, &failed, &[], &runners, &[], &[]));
     divergence.changed.insert(test);
-    assert!(!e3_sticky(&divergence, &failed, &runners, &[], &[]));
+    assert!(!e3_sticky(&divergence, &failed, &[], &runners, &[], &[]));
 }
 
 #[derive(Default)]
@@ -1247,6 +1313,7 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
         s.clear_log();
         let oracle = s.direct(&s.root, &[], &env);
         let failed = oracle_failed_tests(&s);
+        let policy_failures = oracle_policy_failures(&s);
         s.clear_log();
         tally.steps += 1;
         let report = |why: &str| {
@@ -1263,7 +1330,7 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
                 })
                 .collect();
             format!(
-                "{why}\nseed {seed}, step {step}\noperations:\n  {}\nfiles now:\n  {}\nsubject exit {}, oracle exit {}, oracle failed {failed:?}, launches {launches:?}\nsubject stderr:\n{}",
+                "{why}\nseed {seed}, step {step}\noperations:\n  {}\nfiles now:\n  {}\nsubject exit {}, oracle exit {}, oracle failed {failed:?}, policy failures {policy_failures:?}, launches {launches:?}\nsubject stderr:\n{}",
                 log.join("\n  "),
                 files.join("\n  "),
                 code(&subject),
@@ -1282,7 +1349,17 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
                 "WRONG VERDICT: an unchanged retry after exit 125 passed",
             ));
         }
-        if subject_code != 0 || code(&oracle) == 0 || launches.iter().any(String::is_empty) {
+        let changed_full_policy = divergence.is_some() && ops.iter().any(e3_changes_full_policy);
+        if changed_full_policy && subject_code == 0 && !launches.iter().any(String::is_empty) {
+            return Err(report(
+                "WRONG VERDICT: a full-run policy change requires a fresh full run after a gap",
+            ));
+        }
+        if subject_code != 0
+            || code(&oracle) == 0
+            || launches.iter().any(String::is_empty)
+            || changed_full_policy
+        {
             divergence = None;
         } else if let Some(previous) = &mut divergence {
             for test in &previous.failing {
@@ -1351,8 +1428,20 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
                 "WRONG VERDICT: the subject failed and the runner passed",
             ));
         }
+        if !policy_failures.is_empty() {
+            return Err(report(
+                "WRONG VERDICT: the full runner has an independent policy failure",
+            ));
+        }
         if let Some(previous) = divergence.as_ref().filter(|previous| {
-            e3_sticky(previous, &failed, &world.runners, &world.units, &launches)
+            e3_sticky(
+                previous,
+                &failed,
+                &policy_failures,
+                &world.runners,
+                &world.units,
+                &launches,
+            )
         }) {
             sticky_retries += 1;
             if sticky_retries * 3 > steps {
@@ -1421,6 +1510,7 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
                         e3_stored_content_flag(&stored, &s, &world.units, &flag, value)
                     }),
                     current_content: listed_now(&flag),
+                    appeared_test_content: e3_launched_content_path(&after, &launches, test),
                 };
                 let Some(kind) = e3_gap(evidence) else {
                     return Err(report(
@@ -2804,4 +2894,124 @@ fn r6_head_deleting_an_empty_listed_directory_takes_the_full_form() {
     for change_unit in [false, true] {
         r6_empty_listed_directory_case(Path::new(env!("CARGO_BIN_EXE_stoop")), true, change_unit);
     }
+}
+
+fn r7_oracle(s: &Suite, env: &[(&str, &str)]) -> (i32, Vec<String>, Vec<String>) {
+    s.clear_log();
+    let out = s.direct(&s.root, &[], env);
+    let failures = oracle_failed_tests(s);
+    let policy_failures = oracle_policy_failures(s);
+    s.clear_log();
+    (code(&out), failures, policy_failures)
+}
+
+fn r7_policy_fixture() -> Suite {
+    let s = zsuite();
+    listed_policy_setup(&s);
+    s.executable("t", &listed_policy_runner(&e3_runner()));
+    learned(&s, &TU);
+    assert_eq!(known(&s), Some(0), "{}", residue(&s));
+    assert!(s.proofs().iter().any(|p| p["inputs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i["path"] == "policy-r6/zone" && i["id"].as_str().unwrap().starts_with("dl:"))));
+    s
+}
+
+#[test]
+#[rustfmt::skip]
+fn r7_sticky_classifier_cannot_see_an_independent_full_policy_failure() {
+    let s = r7_policy_fixture();
+    let stored = bundle(&s);
+    let world_units: Vec<String> = ROSTER.iter().map(|unit| (*unit).to_owned()).collect();
+    let runners = vec!["tests/z.u".to_owned()];
+    assert!(e3_stored_content_flag(&stored, &s, &world_units, "tests/z.flag", "ok\n"));
+    s.write("tests/z.flag", "fail\n");
+    let (_, first, launches, oracle) = judge("r7-first-accepted-w22", &s, &TU, true);
+    assert_eq!((code(&first), oracle), (0, 1));
+    assert_eq!(launches, ["tests/c.t"]);
+    let (before, failed, policy) = r7_oracle(&s, &TU);
+    assert_eq!((before, failed.as_slice()), (1, runners.as_slice()));
+    assert!(policy.is_empty());
+    assert_eq!(r7_oracle(&s, &[("T_U", "0")]), (0, Vec::new(), Vec::new()));
+    let event = Step::ListedDirectory(0);
+    let mut divergence = E3Diverged {
+        origin: 1,
+        failing: failed.iter().cloned().collect(),
+        changed: Default::default(),
+        shapes: vec![E3Gap::W22],
+    };
+    assert!(e3_sticky(&divergence, &failed, &policy, &runners, &world_units, &[]));
+    for test in &divergence.failing {
+        if e3_changes_runner(&event, test) { divergence.changed.insert(test.clone()); }
+    }
+    assert!(divergence.changed.is_empty());
+    assert!(e3_changes_full_policy(&event));
+    listed_policy_replace(&s, 0);
+    let (direct, failed, policy) = r7_oracle(&s, &TU);
+    assert_eq!((direct, failed.as_slice()), (1, runners.as_slice()));
+    assert_eq!(policy, ["policy-r6/zone"]);
+    assert_eq!(r7_oracle(&s, &[("T_U", "0")]), (1, Vec::new(), policy.clone()));
+    let (_, outcome, actual, direct) = judge("r7-sticky-after-distinct-policy-failure", &s, &TU, true);
+    assert_eq!(direct, 1);
+    let mutant = std::env::var_os("STOOP_R7_LISTED_MUTANT").is_some();
+    if mutant {
+        assert_eq!(code(&outcome), 0, "expected the actual stale skip in the negative control");
+        assert!(actual.is_empty());
+    } else {
+        assert_eq!(code(&outcome), 1, "{}", stderr(&outcome));
+        assert_eq!(actual, [""]);
+    }
+    let proposed_launches: &[String] = if mutant { &actual } else { &[] };
+    let accepted = e3_sticky(&divergence, &failed, &policy, &runners, &world_units, proposed_launches);
+    eprintln!("R7 STICKY mutant={mutant} subject={} direct={direct} independent_policy_exit=1 failed={failed:?} policy={policy:?} classifier_accepts_skip={accepted}", code(&outcome));
+    assert!(!accepted, "an independent full-run policy failure must reject the sticky exemption");
+}
+
+#[test]
+#[rustfmt::skip]
+fn r7_e5_classifier_credits_a_flag_read_without_a_read_of_the_test() {
+    let s = zsuite();
+    s.remove("tests/z.u");
+    s.remove("tests/z.flag");
+    s.executable("t", &e3_runner());
+    s.write("tests/c.t", "src/c.src\nunit-only:tests/z.u\nunit-only:tests/z.flag\n");
+    learned(&s, &TU);
+    assert_eq!(known(&s), Some(0));
+    let world_units: Vec<String> = ROSTER.iter().map(|unit| (*unit).to_owned()).collect();
+    let admitted = "tests/z.u";
+    let flag = "tests/z.flag";
+    assert!(!s.path(admitted).exists());
+    assert!(!s.path(flag).exists());
+    assert_eq!(r4_version_id(&bundle(&s), "tests/c.t", admitted), "a");
+    s.write("tests/c.t", "src/c.src\nstat:tests/z.u\nunit-only:tests/z.flag\n");
+    s.write(admitted, "src/c.src\n");
+    s.write(flag, "fail\n");
+    let runners = vec![admitted.to_owned()];
+    let (direct, failed, policy) = r7_oracle(&s, &TU);
+    assert_eq!((direct, failed.as_slice()), (1, runners.as_slice()));
+    assert!(policy.is_empty());
+    let (_, outcome, launches, oracle) = judge("r7-e5-stats-test-and-reads-flag", &s, &TU, true);
+    assert_eq!(oracle, 1);
+    assert_eq!(launches, ["tests/c.t"]);
+    let mutant = std::env::var_os("STOOP_R7_E5_MUTANT").is_some();
+    if mutant {
+        assert_eq!(code(&outcome), 0, "expected false pass when the test path's refusal is suppressed");
+    } else {
+        assert_eq!(code(&outcome), 125, "{}", stderr(&outcome));
+        assert!(stderr(&outcome).contains("tests/z.u appeared"), "{}", stderr(&outcome));
+    }
+    let after = e3_listings(&s, &world_units);
+    assert!(no_content_reader(&s, &after, admitted));
+    assert!(!no_content_reader(&s, &after, flag));
+    let shape = e3_gap(E3GapEvidence {
+        runner_only: runners.contains(&admitted.to_owned()) && !world_units.contains(&admitted.to_owned()) && !launches.contains(&admitted.to_owned()),
+        appeared_now: true,
+        current_content: !no_content_reader(&s, &after, flag),
+        appeared_test_content: e3_launched_content_path(&after, &launches, admitted),
+        ..E3GapEvidence::default()
+    });
+    eprintln!("R7 E5 mutant={mutant} subject={} direct=1 test_content_reader=false flag_content_reader=true classifier={shape:?}", code(&outcome));
+    assert_eq!(shape, None, "a flag read without a content read of the appeared test must not receive E5");
 }

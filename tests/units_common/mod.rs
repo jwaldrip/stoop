@@ -512,6 +512,20 @@ pub fn oracle_failed_tests(s: &Suite) -> Vec<String> {
         .collect()
 }
 
+/// Full-run policy failures recorded separately from failed tests.
+pub fn oracle_policy_failures(s: &Suite) -> Vec<String> {
+    s.launches()
+        .iter()
+        .flat_map(|launch| {
+            launch
+                .lines
+                .iter()
+                .filter_map(|line| line.strip_prefix("failed-policy=").map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
 /// The refusal names a failing runner-only test or its flag, rather than an unrelated path.
 pub fn failing_runner_depends_on(failed: &[String], runners: &[String], path: &str) -> bool {
     failed.iter().any(|test| {
@@ -696,7 +710,7 @@ pub fn listed_policy_runner(script: &str) -> String {
         .replace(prune, "-o -path ./slow -o -path ./policy-r6 ")
         .replace(
             full,
-            "\tfor item in \"$ROOT\"/policy-r6/zone/*; do :; done\n\t[ -d \"$ROOT/policy-r6/zone\" ] || STATUS=1\n\tset -f\n",
+            "\tfor item in \"$ROOT\"/policy-r6/zone/*; do :; done\n\tif [ ! -d \"$ROOT/policy-r6/zone\" ]; then note 'failed-policy=policy-r6/zone'; STATUS=1; fi\n\tset -f\n",
         )
 }
 
