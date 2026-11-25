@@ -307,6 +307,24 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
     if let Some(reason) = output_missing(cx, view, proof) {
         return verdict(Decision::Full(Some(reason)), shown, clean);
     }
+    // A missing roster member that the full command read can also be used by the runner outside that unit. No listing
+    // or deleted-input excuse can establish otherwise, even if another unit still reads all of its other inputs.
+    if let Some((unit, _)) = view.units.iter().find(|(unit, versions)| {
+        !versions.is_empty()
+            && cx.roster.binary_search(unit).is_err()
+            && proof.inputs.iter().any(|input| {
+                input.path == **unit && (input.id.starts_with("f:") || input.id.starts_with("x:"))
+            })
+    }) {
+        return verdict(
+            Decision::Full(Some(format!(
+                "{} was removed after the full command read it",
+                safe(unit)
+            ))),
+            shown,
+            clean,
+        );
+    }
     // E16 to E18 each need every listing that the whole proof holds to be as it was (see `listings_change`).
     let excused = match listings_change(cx, view, &current, proof, &affected) {
         Ok(excused) => excused,
