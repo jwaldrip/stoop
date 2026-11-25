@@ -1352,14 +1352,13 @@ fn a_unit_the_whole_proof_never_read_is_excused_by_its_bundle() {
     agree(&s, &[], "skip");
 }
 
-/// A removed directory of units is a change: its parent's listing loses a name that is not a file, and no proof
-/// excuses that name (E16).
+/// A removed directory is a change: its parent's listing loses a name that no proof excuses (E16).
 #[test]
 fn a_removed_directory_is_a_change() {
     let s = Suite::new();
-    s.write("tests/sub/d.t", "src/c.src\n");
+    s.write("docs/sub/note.txt", "read me\n");
     success(&passed(&s, &[], &[SPLIT]));
-    fs::remove_dir_all(s.path("tests/sub")).unwrap();
+    fs::remove_dir_all(s.path("docs/sub")).unwrap();
     let explained = explain(&s, &[]);
     s.clear_log();
     let ran = split(&s, &[]);
@@ -1370,7 +1369,7 @@ fn a_removed_directory_is_a_change() {
         stderr(&explained)
     );
     assert_eq!(decision(&ran), "full", "run: {}", stderr(&ran));
-    assert!(stderr(&ran).contains("(tests changed)"), "{}", stderr(&ran));
+    assert!(stderr(&ran).contains("(docs changed)"), "{}", stderr(&ran));
     assert_eq!(s.launches().len(), 1, "the full form launches once");
 }
 
@@ -1391,17 +1390,22 @@ fn a_rename_of_a_unit_to_a_non_unit_name_is_a_change() {
         stderr(&explained)
     );
     assert_eq!(decision(&ran), "full", "run: {}", stderr(&ran));
-    assert!(stderr(&ran).contains("(tests changed)"), "{}", stderr(&ran));
+    assert!(
+        stderr(&ran).contains("tests/c.t was removed after the full command read it"),
+        "{}",
+        stderr(&ran)
+    );
     assert_eq!(s.launches().len(), 1, "the full form launches once");
 }
 
-/// An added name is never excused as a lost one, even when a unit leaves the same directory in the same change.
+/// An added name is never excused as a lost one, even when a recorded file leaves the same directory.
 #[test]
 fn an_added_name_is_never_excused_as_lost() {
     let s = Suite::new();
+    s.write("tests/a.flag", "ok\n");
     success(&passed(&s, &[], &[SPLIT]));
     s.write("tests/new.txt", "x\n");
-    s.remove("tests/c.t");
+    s.remove("tests/a.flag");
     let explained = explain(&s, &[]);
     s.clear_log();
     let ran = split(&s, &[]);
@@ -1458,7 +1462,7 @@ fn a_new_unit_in_a_new_top_level_directory_is_not_a_skip() {
         stderr(&explained)
     );
     let out = split(&s, &[]);
-    assert_eq!(decision(&out), "subset", "{}", stderr(&out));
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
     assert_eq!(code(&out), 1, "{}", stderr(&out));
 }
 
@@ -1477,7 +1481,7 @@ fn a_new_unit_at_the_top_level_is_not_a_skip() {
     let direct = s.direct(&s.root, &[], &[]);
     assert_eq!(code(&direct), 1, "{}", stderr(&direct));
     let out = split(&s, &[]);
-    assert_eq!(decision(&out), "subset", "{}", stderr(&out));
+    assert_eq!(decision(&out), "full", "{}", stderr(&out));
     assert_eq!(code(&out), 1, "{}", stderr(&out));
 }
 

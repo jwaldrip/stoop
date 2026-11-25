@@ -580,7 +580,7 @@ fn e3_runner() -> String {
     fixture
         .replace(
             stat,
-            "case $line in\nstat:*) test -e \"$ROOT/${line#stat:}\" ;;\n*) cat \"$ROOT/$line\" ;;\nesac",
+            "case $line in\nunit-only:*) if [ \"$TESTS\" = 1 ]; then cat \"$ROOT/${line#unit-only:}\"; fi ;;\nstat:*) test -e \"$ROOT/${line#stat:}\" ;;\n*) cat \"$ROOT/$line\" ;;\nesac",
         )
         .replace(
             flag,
@@ -609,6 +609,9 @@ enum Step {
     RemoveAndDrop(String),
     SelfFail(String),
     SelfPass(String),
+    StageRunner(String, String),
+    StatStaged(String, String),
+    PublishStaged(String),
     Noop,
 }
 
@@ -616,6 +619,7 @@ struct World {
     units: Vec<String>,
     runners: Vec<String>,
     deleted: Vec<String>,
+    staged: Vec<String>,
     next: usize,
     revision: usize,
     foo: usize,
@@ -664,7 +668,7 @@ impl World {
 
     fn pick(&mut self, rng: &mut Rng) -> Step {
         let units = self.units.len();
-        let choice = rng.below(21);
+        let choice = rng.below(24);
         match choice {
             0..=2 => {
                 let kind = ["fail", "ok", "removed"][choice];
@@ -694,6 +698,17 @@ impl World {
             18 => Step::Forced,
             19 => Step::SelfFail(self.units[rng.below(units)].clone()),
             20 => Step::SelfPass(self.units[rng.below(units)].clone()),
+            21 if self.staged.len() < 2 => {
+                let unit = self.units[rng.below(units)].clone();
+                Step::StageRunner(unit, self.fresh("u"))
+            }
+            22 if !self.staged.is_empty() => Step::StatStaged(
+                self.units[rng.below(units)].clone(),
+                self.staged[rng.below(self.staged.len())].clone(),
+            ),
+            23 if !self.staged.is_empty() && self.runners.len() < 2 => {
+                Step::PublishStaged(self.staged[rng.below(self.staged.len())].clone())
+            }
             _ => Step::Noop,
         }
     }
@@ -796,6 +811,30 @@ impl World {
                 }
                 s.write(path, &body);
             }
+            Step::StageRunner(unit, path) => {
+                let body = fs::read_to_string(s.path(unit)).unwrap();
+                s.write(
+                    unit,
+                    &format!("{body}unit-only:{path}\nunit-only:{}\n", flag_of(path)),
+                );
+                self.staged.push(path.clone());
+            }
+            Step::StatStaged(unit, path) => {
+                let body = fs::read_to_string(s.path(unit)).unwrap();
+                s.write(
+                    unit,
+                    &format!("{body}stat:{path}\nstat:{}\n", flag_of(path)),
+                );
+            }
+            Step::PublishStaged(path) => {
+                s.write(path, &World::sources(rng));
+                s.write(
+                    &flag_of(path),
+                    if rng.below(2) == 0 { "ok\n" } else { "fail\n" },
+                );
+                self.staged.retain(|staged| staged != path);
+                self.runners.push(path.clone());
+            }
             Step::Noop => {}
         }
     }
@@ -889,6 +928,7 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
         units: Vec::new(),
         runners: Vec::new(),
         deleted: Vec::new(),
+        staged: Vec::new(),
         next: 0,
         revision: 0,
         foo: 0,
@@ -1005,9 +1045,12 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
                 launches.contains(unit)
                     && after.get(unit).is_some_and(|new| {
                         // A launched unit that reads the path by stat only now, or that stopped listing it (PR 86 round 3).
-                        new.contains(&format!("stat:{path}"))
-                            || (before.get(unit).is_some_and(|old| old.contains(&path))
-                                && !new.contains(&path))
+                        let unit_only = format!("unit-only:{path}");
+                        let had_read = before
+                            .get(unit)
+                            .is_some_and(|old| old.contains(&path) || old.contains(&unit_only));
+                        let still_reads = new.contains(&path) || new.contains(&unit_only);
+                        new.contains(&format!("stat:{path}")) || (had_read && !still_reads)
                     })
             });
             if !stopped {
@@ -1043,7 +1086,11 @@ fn run_e3(seed: u64, steps: usize, tally: &mut E3Tally) -> Result<(), String> {
         let listed_now = |flag: &str| {
             world.units.iter().any(|unit| {
                 fs::read_to_string(s.path(unit))
-                    .map(|body| body.lines().any(|line| line == flag))
+                    .map(|body| {
+                        body.lines().any(|line| {
+                            line == flag || line.strip_prefix("unit-only:") == Some(flag)
+                        })
+                    })
                     .unwrap_or(false)
             })
         };
