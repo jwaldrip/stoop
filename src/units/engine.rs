@@ -1877,6 +1877,13 @@ mod tests {
     fn r5_a_roster_unit_the_last_full_run_was_not_judged_with_takes_the_full_form() {
         let root = TreeDir::new("roster", &[("live.t", "live"), ("other.t", "other")]);
         let (proof, mut view, roster) = two_units_judged(&root, Vec::new());
+        let recorded = proof
+            .inputs
+            .iter()
+            .find(|input| input.path == "other.t")
+            .unwrap();
+        assert!(recorded.id.starts_with("f:"));
+        assert!(view.whole_roster.iter().any(|unit| unit == "other.t"));
         // `other.t` was not on the roster of the full run, even though the full command had read its file.
         view.whole_roster = vec!["live.t".to_owned()];
         let guard = whole_guard(&proof);
