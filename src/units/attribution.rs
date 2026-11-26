@@ -1211,15 +1211,17 @@ mod tests {
 
     #[test]
     fn a_grouped_final_stop_does_not_mask_a_missing_member() {
-        let mut ran = Ran::default();
-        ran.stopped = Some((
-            0,
-            Violation::ReadUnit {
-                reader: "tests/a.t (+1 more)".to_owned(),
-                unit: "tests/c.t".to_owned(),
-            },
-        ));
-        ran.unverified = Some("tests/b.t".to_owned());
+        let ran = Ran {
+            stopped: Some((
+                0,
+                Violation::ReadUnit {
+                    reader: "tests/a.t (+1 more)".to_owned(),
+                    unit: "tests/c.t".to_owned(),
+                },
+            )),
+            unverified: Some("tests/b.t".to_owned()),
+            ..Ran::default()
+        };
         let stopped_early = matches!(&ran.stopped, Some((index, _)) if index + 1 < 1);
         assert!(!stopped_early);
         assert_eq!(
