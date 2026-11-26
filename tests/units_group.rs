@@ -7,7 +7,8 @@
 mod units_common;
 
 use std::fs;
-use std::process::Output;
+use std::os::unix::process::ExitStatusExt;
+use std::process::{Child, Output, Stdio};
 use units_common::*;
 
 const A: &str = "tests/a.t";
@@ -42,6 +43,18 @@ fn warm(s: &Suite, extra: &[(&str, &str)]) {
 fn edit_shared(s: &Suite) {
     s.write("src/shared.src", "shared changed\n");
 }
+fn held_group(s: &Suite, extra: &[(&str, &str)]) -> Child {
+    let mut command = s.stoop(&s.root);
+    command
+        .args(["run", "--root"])
+        .arg(&s.root)
+        .args(["--", "./t", HOOK])
+        .envs(GROUP)
+        .envs(extra.iter().copied())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    spawning(|| command.spawn()).unwrap()
+}
 
 #[test]
 fn s2_an_edit_to_shared_runs_a_and_b_in_one_launch() {
@@ -61,6 +74,7 @@ fn s2_an_edit_to_shared_runs_a_and_b_in_one_launch() {
     for field in ["inputs", "outputs", "created", "guard"] {
         assert_eq!(a[field], b[field], "{field}");
     }
+    // Table compaction can change c's serialized indexes without replacing its version.
     assert_eq!(
         bundle["units"][C][0]["created"],
         before["units"][C][0]["created"]
@@ -159,6 +173,82 @@ fn s25_a_failing_group_launch_leaves_every_member_affected() {
     assert_eq!(after["units"][A], before["units"][A]);
     assert_eq!(after["units"][B], before["units"][B]);
     fs::remove_file(toggle).unwrap();
+    s.clear_log();
+    success(&run(&s, &extra));
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+}
+#[test]
+fn s14_a_kill_during_the_group_launch_leaves_both_affected() {
+    let s = Suite::new();
+    let fifo = s.fifo();
+    let gate = s.outside.join("hold");
+    let extra = [
+        ("T_FIFO", fifo.to_str().unwrap()),
+        ("T_FIFO_AT", B),
+        ("T_FIFO_IF", gate.to_str().unwrap()),
+    ];
+    warm(&s, &extra);
+    let before = s.bundle_bytes().unwrap();
+    edit_shared(&s);
+    fs::write(&gate, "hold").unwrap();
+    let mut child = held_group(&s, &extra);
+    let writer = meet(&fifo);
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+    child.kill().unwrap();
+    assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGKILL));
+    drop(writer);
+    fs::remove_file(&gate).unwrap();
+    assert_eq!(s.bundle_bytes().unwrap(), before);
+    let prediction = explain_words(&s, &["./t", HOOK], &extra);
+    let explained = all_output(&prediction);
+    assert!(
+        explained.contains("stoop: affected tests/a.t: src/shared.src changed"),
+        "{explained}"
+    );
+    assert!(
+        explained.contains("stoop: affected tests/b.t: src/shared.src changed"),
+        "{explained}"
+    );
+    s.clear_log();
+    success(&run(&s, &extra));
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+}
+
+#[test]
+fn s17_an_edit_during_the_group_launch_leaves_both_affected() {
+    let s = Suite::new();
+    let fifo = s.fifo();
+    let gate = s.outside.join("hold");
+    let extra = [
+        ("T_FIFO", fifo.to_str().unwrap()),
+        ("T_FIFO_AT", B),
+        ("T_FIFO_IF", gate.to_str().unwrap()),
+    ];
+    warm(&s, &extra);
+    let before = s.bundle().unwrap();
+    edit_shared(&s);
+    s.age("src/shared.src");
+    fs::write(&gate, "hold").unwrap();
+    let child = held_group(&s, &extra);
+    let writer = meet(&fifo);
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+    s.write("src/shared.src", "shared changed while running\n");
+    release(writer);
+    let out = finish(child);
+    fs::remove_file(&gate).unwrap();
+    let stderr = text(&out.stderr);
+    assert_eq!(code(&out), 125, "{stderr}");
+    assert!(
+        stderr.contains("stoop: not recorded for tests/a.t (+1 more): src/shared.src changed while the command ran"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("stoop: this run has no verdict (exit 125): src/shared.src changed, and no unit's new proof reads it"),
+        "{stderr}"
+    );
+    let after = s.bundle().unwrap();
+    assert_eq!(after["units"][A], before["units"][A]);
+    assert_eq!(after["units"][B], before["units"][B]);
     s.clear_log();
     success(&run(&s, &extra));
     assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);

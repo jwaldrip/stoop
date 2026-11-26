@@ -34,7 +34,8 @@ flat() {
 
 # The FIFO hold: one read per invocation, after the first test, or after the test named by T_FIFO_AT.
 hold() {
-	if [ -n "${T_FIFO:-}" ] && [ -z "$HELD" ]; then
+	if [ -n "${T_FIFO:-}" ] && [ -z "$HELD" ] \
+		&& { [ -z "${T_FIFO_IF:-}" ] || [ -e "$T_FIFO_IF" ]; }; then
 		if [ -z "${T_FIFO_AT:-}" ] || [ "$T_FIFO_AT" = "$1" ]; then
 			HELD=1
 			read -r _ < "$T_FIFO" || true
