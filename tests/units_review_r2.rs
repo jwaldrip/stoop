@@ -951,6 +951,7 @@ fn e3_stored_content_flag(
         let Some(versions) = stored["units"][unit.as_str()].as_array() else {
             continue;
         };
+        // Grouped members retain their inexact versions as proofs, subject to the same content checks.
         for version in versions {
             let Some(inputs) = version["inputs"].as_array() else {
                 continue;
@@ -1235,6 +1236,7 @@ struct E3Tally {
     no_verdict: usize,
     no_verdict_failing: usize,
     no_verdict_no_reader: usize,
+    group: ModelGroupTally,
 }
 
 /// Runs one E3 sequence. `STOOP_R8_RECREATE_EMPTY` requests the identical directory recreation at seed 10037, step 9.
@@ -1255,6 +1257,7 @@ fn run_e3_recreating(
     tally: &mut E3Tally,
     recreate: bool,
 ) -> Result<(), String> {
+    let grouped = model_group_enabled();
     let s = Suite::new();
     let mut rng = Rng::new(seed);
     for unit in ["tests/a.t", "tests/b.t", "tests/c.t"] {
@@ -1292,7 +1295,11 @@ fn run_e3_recreating(
     }
     listed_policy_setup(&s);
     s.executable("t", &listed_policy_runner(&e3_runner()));
-    let cold = split(&s, &[("T_U", "1"), ("FOO", "0")]);
+    let cold_env = model_subject_env(&[("T_U", "1"), ("FOO", "0")], grouped);
+    let cold = split(&s, &cold_env);
+    if grouped {
+        tally.group.record(&s, &launched(&s));
+    }
     if code(&cold) != 0 {
         return Err(format!(
             "seed {seed}: the cold run failed: {}",
@@ -1353,7 +1360,7 @@ fn run_e3_recreating(
         log.push(format!("step {step}: {ops:?}"));
         let foo_value = world.foo.to_string();
         let env: Vec<(&str, &str)> = vec![("T_U", "1"), ("FOO", foo_value.as_str())];
-        let mut subject_env = env.clone();
+        let mut subject_env = model_subject_env(&env, grouped);
         if world.forced {
             subject_env.push(("STOOP_FULL", "1"));
         }
@@ -1361,6 +1368,10 @@ fn run_e3_recreating(
         s.clear_log();
         let subject = split(&s, &subject_env);
         let launches = launched(&s);
+        if grouped {
+            tally.group.record(&s, &launches);
+        }
+        let launched_units = model_launch_units(&launches, grouped);
         s.clear_log();
         let oracle = s.direct(&s.root, &[], &env);
         let failed = oracle_failed_tests(&s);
@@ -1424,7 +1435,7 @@ fn run_e3_recreating(
         if subject_code == 2 {
             return Err(report("a status of 2"));
         }
-        if let Some(bad) = launches
+        if let Some(bad) = launched_units
             .iter()
             .find(|launch| !launch.is_empty() && !world.units.contains(launch))
         {
@@ -1435,7 +1446,7 @@ fn run_e3_recreating(
                 return Err(report("a status of 125 without the no-verdict line"));
             };
             let stopped = world.units.iter().any(|unit| {
-                launches.contains(unit)
+                launched_units.contains(unit)
                     && before
                         .get(unit)
                         .zip(after.get(unit))
@@ -1492,7 +1503,7 @@ fn run_e3_recreating(
                 &policy_failures,
                 &world.runners,
                 &world.units,
-                &launches,
+                &launched_units,
             )
         }) {
             sticky_retries += 1;
@@ -1554,7 +1565,7 @@ fn run_e3_recreating(
                 let evidence = E3GapEvidence {
                     runner_only: world.runners.contains(test)
                         && !world.units.contains(test)
-                        && !launches.contains(test)
+                        && !launched_units.contains(test)
                         && !launches.iter().any(String::is_empty),
                     appeared_now,
                     flag_flipped,
@@ -1562,10 +1573,10 @@ fn run_e3_recreating(
                         e3_stored_content_flag(&stored, &s, &world.units, &flag, value)
                     }),
                     launched_stored_content: previous_flag.is_some_and(|value| {
-                        e3_stored_content_flag(&stored, &s, &launches, &flag, value)
+                        e3_stored_content_flag(&stored, &s, &launched_units, &flag, value)
                     }),
                     current_content: listed_now(&flag),
-                    appeared_test_content: e3_launched_content_path(&after, &launches, test),
+                    appeared_test_content: e3_launched_content_path(&after, &launched_units, test),
                 };
                 let Some(kind) = e3_gap(evidence) else {
                     return Err(report(
@@ -1618,8 +1629,9 @@ fn r2_e3_flag_readers_model() {
             failures.push(why);
         }
     }
+    let group_summary = tally.group.summary(model_group_enabled());
     println!(
-        "E3 sweep: seeds {first}..{}: {} steps, {} covered-file gap steps (w22={}, E5={}), {} sticky retries, {} steps beyond the current reading, {} accepted no-verdicts ({} on failing oracle, {} with no content reader), {} failing seeds",
+        "E3 sweep: seeds {first}..{}: {} steps, {} covered-file gap steps (w22={}, E5={}), {} sticky retries, {} steps beyond the current reading, {} accepted no-verdicts ({} on failing oracle, {} with no content reader), {} failing seeds{group_summary}",
         first + seeds - 1,
         tally.steps,
         tally.gap_current,

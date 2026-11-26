@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
@@ -24,6 +24,111 @@ pub const HOOK: &str = "{changed:**/*.t|!slow/**}";
 pub const ROSTER: [&str; 3] = ["tests/a.t", "tests/b.t", "tests/c.t"];
 
 const RUNNER: &str = include_str!("../fixtures/hook/t");
+
+/// Group only the seeded model subjects when explicitly requested.
+pub fn model_group_enabled() -> bool {
+    std::env::var("STOOP_MODEL_GROUP").is_ok_and(|value| value == "1")
+}
+
+pub fn model_subject_env<'a>(env: &[(&'a str, &'a str)], grouped: bool) -> Vec<(&'a str, &'a str)> {
+    let mut subject_env = env.to_vec();
+    if grouped {
+        subject_env.push(("STOOP_SPLIT_GROUP", "1"));
+    }
+    subject_env
+}
+
+/// Keep the empty full-run record while separating grouped unit arguments.
+pub fn model_launch_units(launches: &[String], grouped: bool) -> Vec<String> {
+    if grouped {
+        launches
+            .iter()
+            .flat_map(|launch| launch.split(' ').map(str::to_owned))
+            .collect()
+    } else {
+        launches.to_vec()
+    }
+}
+
+#[derive(Default)]
+pub struct ModelGroupTally {
+    grouped_launches: usize,
+    inexact_versions_written: usize,
+    root: Option<PathBuf>,
+    versions: BTreeMap<String, Vec<Value>>,
+}
+
+/// Resolve delta-encoded table indices before comparing versions, since table compaction can renumber them.
+fn model_version(version: &Value, table: &[Value]) -> Value {
+    let mut version = version.clone();
+    for field in ["inputs", "outputs"] {
+        let mut index = 0usize;
+        let mut inputs: Vec<Value> = version[field]
+            .as_array()
+            .expect("version indices")
+            .iter()
+            .map(|delta| {
+                index += delta.as_u64().expect("version index") as usize;
+                table.get(index).expect("version table entry").clone()
+            })
+            .collect();
+        inputs.sort_by_key(Value::to_string);
+        version[field] = Value::Array(inputs);
+    }
+    version
+}
+
+impl ModelGroupTally {
+    /// Count grouped launches and newly observed inexact member versions, not unchanged versions seen again.
+    pub fn record(&mut self, s: &Suite, launches: &[String]) {
+        if self.root.as_ref() != Some(&s.root) {
+            self.root = Some(s.root.clone());
+            self.versions.clear();
+        }
+        let groups: Vec<Vec<&str>> = launches
+            .iter()
+            .map(|launch| launch.split(' ').collect())
+            .filter(|members: &Vec<&str>| members.len() > 1)
+            .collect();
+        self.grouped_launches += groups.len();
+        let members: BTreeSet<&str> = groups.into_iter().flatten().collect();
+        let versions = s.bundle().map_or_else(BTreeMap::new, |bundle| {
+            let table = bundle["table"].as_array().expect("bundle table");
+            bundle["units"]
+                .as_object()
+                .expect("bundle units")
+                .iter()
+                .map(|(unit, versions)| {
+                    let inexact = versions
+                        .as_array()
+                        .expect("unit versions")
+                        .iter()
+                        .filter(|version| version["exact"].as_bool() == Some(false))
+                        .map(|version| model_version(version, table))
+                        .collect();
+                    (unit.clone(), inexact)
+                })
+                .collect()
+        });
+        for (unit, inexact) in &versions {
+            if members.contains(unit.as_str()) && self.versions.get(unit) != Some(inexact) {
+                self.inexact_versions_written += inexact.len();
+            }
+        }
+        self.versions = versions;
+    }
+
+    pub fn summary(&self, grouped: bool) -> String {
+        if grouped {
+            format!(
+                ", grouped launches: {}, inexact versions written (observed lower bound): {}",
+                self.grouped_launches, self.inexact_versions_written
+            )
+        } else {
+            String::new()
+        }
+    }
+}
 
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 

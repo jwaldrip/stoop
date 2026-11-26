@@ -11,6 +11,16 @@ use crate::trace::Trace;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
+/// The name a launch goes by in a violation or a line: its unit, or the first member and how many more it has (spec 5.1,
+/// C12).
+pub(crate) fn launch_name(members: &[String]) -> String {
+    match members {
+        [] => String::new(),
+        [only] => only.clone(),
+        [first, rest @ ..] => format!("{first} (+{} more)", rest.len()),
+    }
+}
+
 /// The units of a suite, as a set for membership. Roster order is the caller's concern.
 pub(crate) struct Roster {
     names: HashSet<String>,
@@ -84,24 +94,29 @@ impl Violation {
     }
 }
 
-/// Every key that the launches of one run have written so far, each with the first unit whose launch wrote it.
+/// Every key that the launches of one run have written so far, each with the members of the first launch that wrote it.
 #[derive(Default)]
 pub(crate) struct Written {
-    keys: BTreeMap<String, String>,
+    keys: BTreeMap<String, Vec<String>>,
 }
 
 impl Written {
-    pub(crate) fn add(&mut self, keys: &BTreeSet<String>, unit: &str) {
+    pub(crate) fn add(&mut self, keys: &BTreeSet<String>, members: &[String]) {
         for key in keys {
             self.keys
                 .entry(key.clone())
-                .or_insert_with(|| unit.to_owned());
+                .or_insert_with(|| members.to_vec());
         }
     }
 
-    /// The unit whose launch wrote `key` first in this run, if one did.
-    pub(crate) fn writer(&self, key: &str) -> Option<&str> {
-        self.keys.get(key).map(String::as_str)
+    /// The name of the launch that wrote `key` first in this run, if one did.
+    pub(crate) fn writer(&self, key: &str) -> Option<String> {
+        self.members(key).map(launch_name)
+    }
+
+    /// The members of the launch that wrote `key` first in this run, if one did.
+    fn members(&self, key: &str) -> Option<&[String]> {
+        self.keys.get(key).map(Vec::as_slice)
     }
 }
 
@@ -149,7 +164,10 @@ pub(crate) fn read_unit(
     members: &[String],
     content: &BTreeSet<String>,
 ) -> Option<Violation> {
-    let reader = members.first()?;
+    if members.is_empty() {
+        return None;
+    }
+    let reader = launch_name(members);
     content
         .iter()
         .find(|key| roster.contains(key.as_str()) && !members.contains(*key))
@@ -167,7 +185,10 @@ pub(crate) fn wrote(
     writes: &BTreeSet<String>,
     named: &Named,
 ) -> Option<Violation> {
-    let writer = members.first()?;
+    if members.is_empty() {
+        return None;
+    }
+    let writer = launch_name(members);
     if let Some(unit) = writes.iter().find(|key| roster.contains(key.as_str())) {
         return Some(Violation::WroteUnit {
             writer: writer.clone(),
@@ -215,13 +236,17 @@ pub(crate) fn read_written(
     written: &Written,
     members: &[String],
 ) -> Option<Violation> {
-    let reader = members.first()?;
+    if members.is_empty() {
+        return None;
+    }
+    let reader = launch_name(members);
     inputs.iter().find_map(|input| {
-        let writer = written
-            .writer(&input.path)
-            .filter(|writer| !members.iter().any(|member| member.as_str() == *writer))?;
+        let writers = written.members(&input.path)?;
+        if writers.iter().any(|writer| members.contains(writer)) {
+            return None;
+        }
         Some(Violation::WroteInput {
-            writer: writer.to_owned(),
+            writer: launch_name(writers),
             path: input.path.clone(),
             reader: reader.clone(),
         })

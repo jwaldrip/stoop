@@ -398,6 +398,21 @@ struct Stat {
     id: (u64, u64),
 }
 
+/// The longest path that a launch's list file can take under `store` for `suite` (spec 6): the scratch folder's name with
+/// 20 digits each for its pid and its counter, and the longest list name. Explain and the run both count a list path at
+/// this length, so the fit check agrees with the launch.
+pub(crate) fn scratch_path_max(store: &Path, suite: &str) -> usize {
+    let digits = "0".repeat(20);
+    let folder = format!(".{suite}-{digits}-{digits}.scratch");
+    store
+        .join("units")
+        .join("v1")
+        .join(folder)
+        .join("changed-root")
+        .as_os_str()
+        .len()
+}
+
 /// The suite directory `<store>/units/v1`. Every name below it is opened, renamed and removed
 /// relative to this descriptor without following links, so a link in the suite path refuses the
 /// access instead of leading it outside the store. The configured store directory itself may be a

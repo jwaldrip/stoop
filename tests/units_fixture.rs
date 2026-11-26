@@ -19,17 +19,21 @@
 //! | `T_IGNORE=1` | With test words: reads nothing and exits 0. It exits before the purity programs run (see the test-words row). A plain `T_WRITE` still writes first. The no-argument form is unaffected. |
 //! | `T_STAT_UNIT=1` | With test words: `test -e P` instead of running it. Logs `statted=P`. |
 //! | `T_FIFO=<path>`, `T_FIFO_AT=<P>` | One `read < $T_FIFO` per invocation, after the first test that reads its files (or after the test logged as `T_FIFO_AT` has read its files). Then it appends P to `<path>.passed`, the marker that a release waits for. |
+//! | `T_FIFO_IF=<path>` | The FIFO hold runs only while this outside-root path exists. The other FIFO settings stay unchanged across warmup and the held run. |
 //! | `T_IF=<path>` | The toggle for the rows marked (IF). |
 //! | `T_WRITE=<path>` (IF) | Writes `written` to that path, relative to the cwd, once per invocation before any test. With `T_WRITE_AT` set it writes only in that test's invocation: see the next row. |
 //! | `T_WRITE_AT=<P>` (IF) | Narrows `T_WRITE` to the invocation that runs test P, written right before P's reads. P must exist and be run, not statted by `T_STAT_UNIT`. The path rules depend on the form. In the no-argument form the write runs after the runner has moved to the root, so a relative `T_WRITE` path is root-relative, as `T_WRITE_FULL` is, and P is spelled as the roster lists it: root-relative, for example `tests/b.t`. In the test-word form the write stays relative to the cwd, and P is spelled as the test word is: relative to the cwd, for example `../tests/b.t` from `docs`. |
-//! | `T_WRITE_EACH=1` | Each test P writes `written` to `${P%.*}.out` after its reads, in every invocation that runs it. Not (IF). |
+//! | `T_WRITE_EACH=1` | Each test P writes `written` to `${P%.*}.out` after its reads, in every invocation that runs it. With `T_OUTPUT_DIR`, it writes to `<root>/$T_OUTPUT_DIR/${P##*/}.out` instead. Not (IF). |
 //! | `T_WRITE_FULL=<path>` | The no-argument form writes `written` to the path after it moves to the root and before its first test, so a relative path is root-relative. Not (IF). |
 //! | `T_READ_OTHER=<path>` (IF) | Reads that path once per invocation, relative to the cwd. A FIFO is read one line, then its `<path>.passed` marker is written, as `T_FIFO` does. |
 //! | `T_STAT_OTHER=<path>` (IF) | Runs `test -e <path>` once per invocation, relative to the cwd, and logs `stat_other=<path>`. The answer does not change the exit status. |
 //! | `T_FAIL_FULL=1` (IF) | The no-argument form exits 1 after its tests. |
 //! | `T_FAIL_ALONE=<P>` (IF) | In the test-word form, test P fails after it has run. Its reads and the other tests are unchanged. |
+//! | `T_SKIP_TEST=<P>` (IF) | In the test-word form, logs `skipped=P` and does not read P. |
+//! | `T_GROUP_READ=<path>` (IF) | With at least two test words, reads the root-relative path once. |
+//! | `T_GATE=<path>` | In the no-argument form, fails if the root-relative path contains `fail`. |
 //! | `T_LS_ROOT=1` / `T_STAT_ROOT=1` | `ls -a <root>` (logs `ls_root`) / `test -d <root>` (logs `stat_root`), once per invocation. |
-//! | `LOG=<path>` (outside the root) | Per invocation it logs `launch`, then `arg=<w>` for each argument, then `changed=`, `units=`, `changed_file=`, `changed_inputs=`, `changed_inputs_file=` (newlines inside a value logged as `\|`), then the per-test lines. |
+//! | `LOG=<path>` (outside the root) | Per invocation it logs `launch`, then `arg=<w>` for each argument, then `changed=`, `units=`, `changed_file=`, `changed_inputs=`, `changed_inputs_file=` (newlines inside a value logged as `\|`), `changed_set=`, `units_set=`, then the per-test lines. |
 //! | exit | 1 if any test failed, or if `T_FAIL_FULL` (IF) fails the no-argument form after its tests; else 0. |
 //!
 //! `T_RECORDS` comes in W8 and writes to `$STOOP_RESULT_FILE`.
@@ -47,6 +51,71 @@ use std::process::Stdio;
 use units_common::*;
 
 // The runner, run directly: order, arguments, the environment log, and each knob.
+#[test]
+fn grouped_test_output_and_hold_controls_are_independent() {
+    let s = Suite::new();
+    fs::create_dir(s.path(".outputs")).unwrap();
+    let output = [("T_WRITE_EACH", "1"), ("T_OUTPUT_DIR", ".outputs")];
+    let out = s.direct(&s.root, &["tests/a.t"], &output);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert_eq!(
+        fs::read_to_string(s.path(".outputs/a.t.out")).unwrap(),
+        "written\n"
+    );
+    assert!(!s.path("tests/a.out").exists());
+
+    let fifo = s.fifo();
+    let gate = s.outside.join("hold");
+    let hold = [
+        ("T_FIFO", fifo.to_str().unwrap()),
+        ("T_FIFO_AT", "tests/a.t"),
+        ("T_FIFO_IF", gate.to_str().unwrap()),
+    ];
+    assert_eq!(code(&s.direct(&s.root, &["tests/a.t"], &hold)), 0);
+    fs::write(&gate, "hold").unwrap();
+    let child = s.direct_child(&s.root, &["tests/a.t"], &hold, Stdio::null());
+    release(meet(&fifo));
+    let out = finish(child);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+}
+
+#[test]
+fn group_knobs_are_scoped_to_the_requested_launches() {
+    let s = Suite::new();
+    s.write("gate", "fail\n");
+    let gate = [("T_GATE", "gate"), ("T_GROUP_READ", "gate")];
+    assert_eq!(code(&s.direct(&s.root, &[], &gate)), 1);
+    s.clear_log();
+    assert_eq!(code(&s.direct(&s.root, &["tests/a.t"], &gate)), 0);
+    assert!(!s.launches()[0]
+        .lines
+        .iter()
+        .any(|line| line == "group_read=gate"));
+    s.clear_log();
+    assert_eq!(
+        code(&s.direct(&s.root, &["tests/a.t", "tests/b.t"], &gate)),
+        0
+    );
+    assert!(s.launches()[0]
+        .lines
+        .iter()
+        .any(|line| line == "group_read=gate"));
+
+    let toggle = s.outside.join("toggle");
+    let toggle = toggle.to_str().unwrap();
+    let skip = [("T_SKIP_TEST", "tests/b.t"), ("T_IF", toggle)];
+    s.clear_log();
+    assert_eq!(code(&s.direct(&s.root, &["tests/b.t"], &skip)), 0);
+    assert_eq!(s.launches()[0].ran(), ["tests/b.t"]);
+    fs::write(toggle, "on").unwrap();
+    s.clear_log();
+    assert_eq!(code(&s.direct(&s.root, &["tests/b.t"], &skip)), 0);
+    assert!(s.launches()[0].ran().is_empty());
+    assert!(s.launches()[0]
+        .lines
+        .iter()
+        .any(|line| line == "skipped=tests/b.t"));
+}
 
 #[test]
 fn f1_no_arguments_runs_every_t_except_slow_in_c_order() {

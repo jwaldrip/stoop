@@ -9,16 +9,17 @@
 use super::attribution;
 use super::bundle::{self, LaunchGuard, Pending, Settled, Version, View};
 use super::config::Config;
-use super::hook::safe;
+use super::expand;
+use super::hook::{safe, Base, FileMode, Hook};
 use super::residue;
 use crate::ignore::Ignore;
 use crate::input::{identify, list_hash_of_names, par_map, Input};
 use crate::pathutil::from_key;
 use crate::proof::{now, Proof};
-use crate::run::{Lookup, RunCx};
+use crate::run::{Lookup, RunCx, HOOK_ENV};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::ffi::OsStr;
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use std::{fs, io};
 
@@ -91,6 +92,8 @@ pub(crate) struct Plan {
     /// The whole proof's content inputs that changed and that no kept version reads, in path order (spec 3.10, PR 86
     /// review round 2). A new proof of this run must read each by content, or the run has no verdict.
     pub(crate) uncovered: Vec<String>,
+    /// Whether the subset runs as one grouped launch of all its affected units (spec 5.1).
+    pub(crate) grouped: bool,
 }
 
 /// One affected unit (spec 3.9): its reason, which the header and explain name, and the inputs that changed for its
@@ -142,7 +145,7 @@ pub(crate) fn decide(
     let Some(view) = bundle::view(store, pending, key) else {
         return plain();
     };
-    let judged = Judged::new(cx, pending, &lookup.proofs, max_age);
+    let judged = Judged::new(cx, pending, &lookup.proofs, max_age).grouping(cx, store);
     let verdict = judge(&judged, &view);
     if forced {
         return Verdict {
@@ -181,6 +184,8 @@ pub(super) struct Judged<'a> {
     guard: String,
     max_age: u64,
     now: u64,
+    /// The grouped launch of this decision, when grouping is on and the hook takes it (spec 5.1).
+    group: Option<Group>,
 }
 
 impl<'a> Judged<'a> {
@@ -198,8 +203,76 @@ impl<'a> Judged<'a> {
             guard: guard_now(cx),
             max_age,
             now: now(),
+            group: None,
         }
     }
+
+    /// The grouped form of this decision, when `STOOP_SPLIT_GROUP` is on and the hook takes that form (spec 5.1). `store`
+    /// names the list paths that the fit check counts.
+    pub(super) fn grouping(mut self, cx: &RunCx<'_>, store: &Path) -> Judged<'a> {
+        if !grouped() {
+            return self;
+        }
+        let Some(hook) = cx.hook.as_ref() else {
+            return self;
+        };
+        if !expand::groups(hook) {
+            return self;
+        }
+        self.group = Some(Group {
+            hook: hook.clone(),
+            cwd: cx.cwd.clone(),
+            env: std::env::vars_os()
+                .filter(|(name, _)| {
+                    !HOOK_ENV
+                        .iter()
+                        .any(|var| name.as_os_str() == OsStr::new(var))
+                })
+                .collect(),
+            stand_in: bundle::scratch_path_max(store, self.suite),
+            arg_max: expand::arg_max(),
+        });
+        self
+    }
+}
+
+/// What a decision needs to check that a grouped launch fits the command line (spec 6): the hook, the cwd, the environment
+/// the launch inherits without the five hook variables it replaces, the length a list path takes, and the argument limit.
+struct Group {
+    hook: Hook,
+    cwd: PathBuf,
+    env: Vec<(OsString, OsString)>,
+    stand_in: usize,
+    arg_max: usize,
+}
+
+impl Group {
+    /// Whether the grouped launch of `affected` fits the command line (spec 6): its argv, and its environment with each list
+    /// path at the stand-in length.
+    fn fits(&self, root: &Path, affected: &[Affected]) -> bool {
+        let members: Vec<String> = affected
+            .iter()
+            .map(|affected| affected.unit.clone())
+            .collect();
+        let stand_in = self.stand_in;
+        let list = |_: FileMode, _: Base| Some(OsString::from("x".repeat(stand_in)));
+        let Some(many) = expand::launch_many(&self.hook, &members, root, &self.cwd, &list) else {
+            return false;
+        };
+        let inputs = expand::inputs_text(
+            root,
+            &self.cwd,
+            affected.iter().flat_map(|affected| affected.changed.iter()),
+        );
+        let mut env = self.env.clone();
+        env.extend(expand::exports(&many.value, &inputs, stand_in));
+        expand::fits(&many.argv, &env, self.arg_max)
+    }
+}
+
+/// Whether grouped launches are on (spec 5.1): the engine is on, and `STOOP_SPLIT_GROUP` holds a true value.
+fn grouped() -> bool {
+    switch() == Some(true) && std::env::var_os("STOOP_SPLIT_GROUP").is_some_and(|value| on(&value))
 }
 
 /// The guard digest the run would record now (spec 3.6). It is built as `attribution::pass` builds its guard, so a
@@ -525,14 +598,33 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
         );
     }
     // E17 and E18: the affected units launch one at a time. Units that are all affected make the attribution pass.
+    // A subset of two or more units runs as one grouped launch when grouping is on and that launch fits the command line
+    // (spec 5.1, 6). A launch that does not fit takes the full form, and the reason says so.
     let whole = affected.len() == cx.roster.len();
     let uncovered = uncovered_changes(cx, view, &current, proof);
+    let as_group = !whole && affected.len() >= 2 && cx.group.is_some();
+    if as_group
+        && !cx
+            .group
+            .as_ref()
+            .is_some_and(|group| group.fits(cx.root, &affected))
+    {
+        return verdict(
+            Decision::Full(Some(format!(
+                "the {} affected units do not fit on the command line",
+                affected.len()
+            ))),
+            shown,
+            clean,
+        );
+    }
     let plan = Plan {
         units: cx.roster.len(),
         inputs: skipped(cx, view).inputs,
         affected,
         excused,
         uncovered,
+        grouped: as_group,
     };
     verdict(
         if whole {
@@ -1592,6 +1684,7 @@ mod tests {
             guard: "g".to_owned(),
             max_age,
             now: 1_000,
+            group: None,
         }
     }
 

@@ -53,7 +53,7 @@ pub(crate) fn execute(
     };
     let ignore = attribution::ignore_for(cx, store);
     let guard = attribution::guard_of(cx, &ignore);
-    let judged = Judged::new(cx, pending, &lookup.proofs, max_age);
+    let judged = Judged::new(cx, pending, &lookup.proofs, max_age).grouping(cx, store);
     match bundle::keep(store, pending, key, guard, |view| {
         engine::judge_units(&judged, view)
     }) {
@@ -128,12 +128,13 @@ pub(crate) fn learn(
     for (unit, inputs, outputs) in pass.held_owned() {
         named.store(&unit, &paths(&inputs), &paths(&outputs));
     }
+    let launches: Vec<Vec<String>> = units.iter().map(|unit| vec![unit.clone()]).collect();
     let ran = attribution::launch_each(
         cx,
         hook,
         &ignore,
         &mut pass,
-        &units,
+        &launches,
         &roster,
         &mut named,
         &[],
@@ -210,8 +211,7 @@ fn launch(frame: &Frame<'_, '_>, mut pass: Pass, plan: &Plan) -> Outcome {
     let cx = frame.cx;
     let quiet = cx.o.quiet;
     let units = frame.pending.units();
-    let planned = plan.affected.len();
-    if planned == units.len() {
+    if plan.affected.len() == units.len() {
         pass.set_phase("attribution");
         say(
             quiet,
@@ -230,6 +230,13 @@ fn launch(frame: &Frame<'_, '_>, mut pass: Pass, plan: &Plan) -> Outcome {
         .iter()
         .map(|affected| affected.unit.clone())
         .collect();
+    // A grouped plan runs its units in one launch (spec 5.1). Every other plan runs one launch per unit.
+    let launches: Vec<Vec<String>> = if plan.grouped {
+        vec![launched.clone()]
+    } else {
+        launched.iter().map(|unit| vec![unit.clone()]).collect()
+    };
+    let planned = launches.len();
     // Only exact versions name an owner. Inexact paths of skipped units remain protected by the 125 checks below.
     let mut named = Named::default();
     for (unit, inputs, outputs) in pass.held_owned() {
@@ -237,7 +244,7 @@ fn launch(frame: &Frame<'_, '_>, mut pass: Pass, plan: &Plan) -> Outcome {
     }
     let skipped = skipped_units(&pass, units, &launched);
     // An attribution pass names no changed input: each of its launches sees an empty STOOP_CHANGED_INPUTS (spec 3.11).
-    let changed: HashMap<String, Vec<String>> = if planned == units.len() {
+    let changed: HashMap<String, Vec<String>> = if plan.affected.len() == units.len() {
         HashMap::new()
     } else {
         plan.affected
@@ -258,7 +265,7 @@ fn launch(frame: &Frame<'_, '_>, mut pass: Pass, plan: &Plan) -> Outcome {
         frame.hook,
         frame.ignore,
         &mut pass,
-        &launched,
+        &launches,
         &roster,
         &mut named,
         &skipped,
@@ -319,6 +326,21 @@ pub(crate) fn decision_line(cx: &RunCx<'_>, key: &str, plan: &Plan, whole: bool)
     let Some(hook) = cx.hook.as_ref() else {
         return format!("stoop: would run {key}");
     };
+    if plan.grouped {
+        let members: Vec<String> = plan
+            .affected
+            .iter()
+            .map(|affected| affected.unit.clone())
+            .collect();
+        let argv = expand::launch_many(hook, &members, cx.root, cx.cwd, &|_, _| {
+            Some(OsString::from("<list>"))
+        })
+        .map_or_else(String::new, |many| render(&many.argv));
+        return format!(
+            "stoop: would run {key} ({launches} of {} units affected): argv {argv}",
+            plan.units
+        );
+    }
     let first = plan
         .affected
         .first()
@@ -395,6 +417,7 @@ mod tests {
             affected,
             excused: Vec::new(),
             uncovered: Vec::new(),
+            grouped: false,
         });
         assert!(
             line.starts_with(
