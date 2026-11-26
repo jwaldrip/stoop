@@ -287,6 +287,10 @@ fn g_h3_a_group_changing_a_skipped_listing_has_no_verdict() {
 
 fn premise_violation(s: &Suite, extra: &[(&str, &str)]) {
     s.write("gate", "ok\n");
+    // Every unit must execute grep too; otherwise the full form's gate check is residue.
+    for flag in ["tests/a.flag", "tests/b.flag", "tests/c.flag"] {
+        s.write(flag, "ok\n");
+    }
     s.write(A, "src/shared.src\ngate\n");
     warm(s, extra);
     make_group(s, extra);
@@ -413,12 +417,40 @@ fn g_v4_an_appeared_flag_is_excused_and_read_by_the_group() {
 #[test]
 fn g_v7_an_outside_root_change_takes_the_full_form() {
     let s = Suite::new();
-    let outside = s.outside.join("input");
-    fs::write(&outside, "old\n").unwrap();
-    let extra = [("T_READ_OTHER", outside.to_str().unwrap())];
+    struct Outside(std::path::PathBuf);
+    impl Drop for Outside {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    // /tmp is ignored outside the root. Runner and Cargo test temp directories are not.
+    let dir = std::env::var_os("RUNNER_TEMP")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_TARGET_TMPDIR")));
+    fs::create_dir_all(&dir).unwrap();
+    let dir = fs::canonicalize(dir).unwrap();
+    assert!(!dir.starts_with("/tmp") && !dir.starts_with("/var/tmp") && !dir.starts_with("/run"));
+    let outside = Outside(dir.join(format!("stoop-v7-{}", std::process::id())));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&outside.0)
+        .unwrap();
+    fs::write(&outside.0, "old\n").unwrap();
+    let extra = [("T_READ_OTHER", outside.0.to_str().unwrap())];
     warm(&s, &extra);
+    assert!(
+        s.proofs()
+            .iter()
+            .any(|proof| proof["inputs"].as_array().is_some_and(|inputs| {
+                inputs
+                    .iter()
+                    .any(|input| input["path"].as_str() == outside.0.to_str())
+            })),
+        "the whole proof must track the external input"
+    );
     make_group(&s, &extra);
-    fs::write(&outside, "outside changed\n").unwrap();
+    fs::write(&outside.0, "outside changed\n").unwrap();
     let out = run(&s, &extra);
     success(&out);
     assert_full(&s, &out, "changed outside the repository");
@@ -906,6 +938,7 @@ exec "$ROOT/t" "$@"
 // Record the original argv, then adapt option and list forms to the fixture runner.
 const ARGV_413: &str = r#"#!/bin/sh
 ROOT=$(cd "$(dirname "$0")" && pwd -P) || exit 2
+cat "$ROOT/.stoop.toml" >/dev/null
 printf 'launch\n' >> "$LOG.argv"
 entries=
 add() {
