@@ -114,8 +114,8 @@ fn s24_a_member_the_launch_did_not_read_disables_and_has_no_verdict() {
     warm(&s, &extra);
     let before = s.bundle().unwrap();
     let id = before["suite"].as_str().unwrap();
-    s.remove("tests/a.out");
-    s.remove("tests/b.out");
+    // Removing an output would change the listing of `tests/`, which the whole proof holds, so it takes the full form.
+    edit_shared(&s);
     fs::write(toggle, "on").unwrap();
     let out = run(&s, &extra);
     assert_eq!(
