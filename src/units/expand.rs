@@ -6,12 +6,11 @@
 //! code needs no placeholder: its words stay as written, and the variables are exported for each unit.
 
 use super::hook::{Base, FileMode, Hook, Join, Placeholder, PlaceholderName};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Component, Path, PathBuf};
 
 /// One unit's launch: its argv, and the value `STOOP_CHANGED` and `STOOP_UNITS` hold for it.
 pub(crate) struct Launch {
-    pub unit: String,
     pub argv: Vec<OsString>,
     pub value: OsString,
 }
@@ -207,7 +206,6 @@ pub(crate) fn launch(
     lists: &dyn Fn(FileMode, Base) -> Option<OsString>,
 ) -> Option<Launch> {
     Some(Launch {
-        unit: unit.to_owned(),
         argv: argv_with(hook, unit, root, cwd, lists)?,
         value: render(root, cwd, unit, Base::Cwd),
     })
@@ -394,9 +392,8 @@ mod tests {
         let units = vec!["tests/a.t".to_string(), "tests/b.t".to_string()];
         let launches = launches(&hook, &units, Path::new("/r"), Path::new("/r/tests")).unwrap();
         assert_eq!(launches.len(), 2);
-        assert_eq!(launches[0].unit, "tests/a.t");
         assert_eq!(launches[0].value, OsString::from("a.t"));
-        assert_eq!(launches[1].unit, "tests/b.t");
+        assert_eq!(launches[1].argv[0], "t");
         assert_eq!(launches[1].value, OsString::from("b.t"));
         assert_eq!(
             launches[1].argv,

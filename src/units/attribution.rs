@@ -9,7 +9,7 @@ use super::config::Config;
 use super::engine::Excused;
 use super::expand;
 use super::hook::{safe, Base, FileMode, Hook};
-use super::independence::{Named, Roster, Violation, Written};
+use super::independence::{launch_name, Named, Roster, Violation, Written};
 use super::launch::{self, Observed, SkippedUnit, Verdict};
 use super::policy;
 use super::residue;
@@ -69,12 +69,13 @@ pub(crate) fn pass(
     );
     let real_root = std::fs::canonicalize(cx.root).unwrap_or_else(|_| cx.root.clone());
     let roster = Roster::new(units);
+    let launches: Vec<Vec<String>> = units.iter().map(|unit| vec![unit.clone()]).collect();
     let ran = launch_each(
         cx,
         hook,
         &ignore,
         &mut bundle_pass,
-        units,
+        &launches,
         &roster,
         &mut Named::default(),
         &[],
@@ -189,21 +190,23 @@ pub(super) struct Ran {
     pub(super) uncovered: Vec<String>,
     /// The first unit whose launch failed, in launch order. A learning run names it as the disagreement (spec 3.10).
     pub(super) failed: Option<String>,
+    /// The first launch that exited 0 without reading one of its members, when that launch was grouped (spec 3.7, C5).
+    pub(super) unverified: Option<String>,
 }
 
-/// The launches of a pass or a subset, one traced launch per unit in `units` order (spec 3.3, 3.7, 3.11). Each launch
-/// is judged, and its proof replaces the unit's version when it holds. `named` holds the paths exact versions give,
-/// and `skipped` the units that are not launched, so a launch that breaks one of them is seen. `changed` gives each
-/// launched unit its changed inputs, which the launch exports as `STOOP_CHANGED_INPUTS` (spec 3.11).
-/// `gaps` names the changed inputs and the appeared names that no kept version covers. A proof that stats one of them is
-/// written with the residue unknown (`Pass::unsettle`, spec 3.8).
+/// The launches of a pass or a subset, one traced launch per entry of `launches`, in order (spec 3.3, 3.7, 3.11). An
+/// entry holds one unit, or the members of a grouped launch (spec 5.1). Each launch is judged, and its proof replaces the
+/// version of each member when it holds. `named` holds the paths exact versions give, and `skipped` the units that are not
+/// launched, so a launch that breaks one of them is seen. `changed` gives each launched unit its changed inputs, which the
+/// launch exports as `STOOP_CHANGED_INPUTS` (spec 3.11). `gaps` names the changed inputs and the appeared names that no
+/// kept version covers. A proof that stats one of them is written with the residue unknown (`Pass::unsettle`, spec 3.8).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn launch_each(
     cx: &RunCx<'_>,
     hook: &Hook,
     ignore: &Ignore,
     pass: &mut Pass,
-    units: &[String],
+    launches: &[Vec<String>],
     roster: &Roster,
     named: &mut Named,
     skipped: &[SkippedUnit],
@@ -226,64 +229,67 @@ pub(super) fn launch_each(
         unread: Vec::new(),
         uncovered: Vec::new(),
         failed: None,
+        unverified: None,
     };
     let mut listing_breach: Option<Breach> = None;
-    for (index, unit) in units.iter().enumerate() {
-        let unit_name = safe(unit);
+    for (index, members) in launches.iter().enumerate() {
+        let name = safe(&launch_name(members));
+        let grouped = members.len() > 1;
         // The launch's list files live in its own folder, which is removed when this iteration ends.
         let mut folder = match pass.scratch() {
             Ok(folder) => folder,
             Err(error) => {
-                not_launched(quiet, &unit_name, &error);
+                not_launched(quiet, &name, &error);
                 ran.unlaunched = true;
                 continue;
             }
         };
-        let inputs = changed_inputs(cx, changed.get(unit));
-        let lists = match Lists::write(&mut folder, cx.root, cx.cwd, unit, &forms, &inputs) {
+        let inputs = expand::inputs_text(
+            cx.root,
+            cx.cwd,
+            members
+                .iter()
+                .flat_map(|unit| changed.get(unit).into_iter().flatten()),
+        );
+        let lists = match Lists::write(&mut folder, cx.root, cx.cwd, members, &forms, &inputs) {
             Ok(lists) => lists,
             Err(error) => {
-                not_launched(quiet, &unit_name, &error);
+                not_launched(quiet, &name, &error);
                 ran.unlaunched = true;
                 continue;
             }
         };
-        let Some(launch) = expand::launch(hook, unit, cx.root, cx.cwd, &|mode, base| {
+        let Some((argv, value)) = launch_of(hook, members, cx.root, cx.cwd, &|mode, base| {
             lists.get(mode, base)
         }) else {
-            let why = "its arguments cannot be expanded";
-            not_launched(quiet, &unit_name, &why);
+            not_launched(quiet, &name, &"its arguments cannot be expanded");
             ran.unlaunched = true;
             continue;
         };
-        std::env::set_var("STOOP_CHANGED", &launch.value);
-        std::env::set_var("STOOP_UNITS", &launch.value);
-        std::env::set_var("STOOP_CHANGED_FILE", &lists.changed);
-        // Above 64 KiB the variable is unset, and the list file carries the list (spec 3.11, rv31). The kernel refuses one
-        // environment string over 128 KiB, so a longer export would stop the launch from starting.
-        if inputs.len() <= CHANGED_INPUTS_ENV_MAX {
-            std::env::set_var("STOOP_CHANGED_INPUTS", &inputs);
-        } else {
-            std::env::remove_var("STOOP_CHANGED_INPUTS");
-        }
-        std::env::set_var("STOOP_CHANGED_INPUTS_FILE", &lists.inputs);
+        export(&lists, &value, &inputs);
         // The root listing before the launch, which the root guard compares with the one after it (spec 3.5).
         let root_before = launch::root_names(cx.root);
         let unit_status =
-            match run::launch_traced(cx, &launch.argv, ignore, real_root, false, false, false) {
-                // A trace that fails before the command starts has run nothing. The unit runs once
-                // untraced and keeps no proof. It is never retried traced, because that could run it
-                // a second time.
+            match run::launch_traced(cx, &argv, ignore, real_root, false, false, false) {
+                // A grouped launch too large for the kernel runs nothing. A plain run would report the spawn failure as a
+                // verdict (spec 6, C7).
+                Err(error) if grouped && too_big(&error) => {
+                    not_launched(quiet, &name, &error);
+                    ran.unlaunched = true;
+                    continue;
+                }
+                // A trace that fails before the command starts has run nothing. The unit runs once untraced and keeps no
+                // proof. It is never retried traced, because that could run it a second time.
                 Err(error) => {
                     say(
                         quiet,
                         format!(
-                            "stoop: not traced ({}); running {unit_name} without a proof",
+                            "stoop: not traced ({}); running {name} without a proof",
                             safe(&error.to_string())
                         ),
                     );
                     ran.ran += 1;
-                    run::plain(&launch.argv, &[])
+                    run::plain(&argv, &[])
                 }
                 Ok(trace) => {
                     ran.ran += 1;
@@ -293,7 +299,7 @@ pub(super) fn launch_each(
                         real_root,
                         ignore,
                         roster,
-                        members: std::slice::from_ref(unit),
+                        members,
                         written: &written,
                         named,
                         root_before: &root_before,
@@ -301,55 +307,64 @@ pub(super) fn launch_each(
                     match launch::judge(&context, &trace, &observed) {
                         Verdict::Proven(kept) => {
                             // A stat of a gap path covers it by identity alone. Until the run settles, nothing marks the
-                            // residue unknown, so a kill now would leave a known residue beside this proof. Mark it
-                            // unknown before the write that stores the proof (spec 3.8, PR 86 review round 3).
-                            if kept.inputs.iter().any(|input| {
+                            // residue unknown, so a kill now would leave a known residue beside this proof. Mark it unknown
+                            // before the write that stores the proof (spec 3.8, PR 86 review round 3).
+                            let gap_stat = |input: &Input| {
                                 gaps.contains(&input.path)
                                     && !observed.content.contains(&input.path)
-                            }) {
+                            };
+                            if kept.inputs.iter().any(gap_stat) {
                                 pass.unsettle();
                             }
-                            let (old_inputs, old_outputs) = pass.held_of(unit);
-                            let stored = pass.record(
-                                std::slice::from_ref(&launch.unit),
-                                &kept.inputs,
-                                &kept.outputs,
-                                now(),
-                            );
+                            let olds: Vec<(Vec<Input>, Vec<Input>)> =
+                                members.iter().map(|unit| pass.held_of(unit)).collect();
+                            let stored = pass.record(members, &kept.inputs, &kept.outputs, now());
                             // A failed write keeps the proof in memory, and the end of the pass writes it (spec 3.11).
                             if matches!(stored, Stored::Stored | Stored::WriteFailed) {
                                 ran.stat_gaps.extend(
                                     kept.inputs
                                         .iter()
-                                        .filter(|input| {
-                                            gaps.contains(&input.path)
-                                                && !observed.content.contains(&input.path)
-                                        })
+                                        .filter(|input| gap_stat(input))
                                         .map(|input| input.path.clone()),
                                 );
-                                ran.proven.insert(unit.clone(), observed.content.clone());
+                                for unit in members {
+                                    ran.proven.insert(unit.clone(), observed.content.clone());
+                                }
                             }
                             match stored {
                                 Stored::OverBudget => ran.over_budget += 1,
                                 Stored::Stored | Stored::WriteFailed => {
-                                    named.forget(unit, &paths(&old_inputs), &paths(&old_outputs));
-                                    named.store(unit, &paths(&kept.inputs), &paths(&kept.outputs));
+                                    for (unit, (old_inputs, old_outputs)) in
+                                        members.iter().zip(&olds)
+                                    {
+                                        named.forget(unit, &paths(old_inputs), &paths(old_outputs));
+                                        named.store(
+                                            unit,
+                                            &paths(&kept.inputs),
+                                            &paths(&kept.outputs),
+                                        );
+                                    }
                                 }
                             }
                         }
                         Verdict::Failed => {}
                         Verdict::Unrecorded(why) => say(
                             quiet,
-                            format!("stoop: not recorded for {unit_name}: {}", safe(&why)),
+                            format!("stoop: not recorded for {name}: {}", safe(&why)),
                         ),
                         Verdict::Coupled(violation) => {
-                            if let Violation::NeverRan { .. } = violation {
+                            if let Violation::NeverRan { unit } = &violation {
                                 say(
                                     quiet,
                                     format!(
-                                        "stoop: no proof for {unit_name}: the launch never read it"
+                                        "stoop: no proof for {}: the launch never read it",
+                                        safe(unit)
                                     ),
                                 );
+                                // A grouped launch is the last one, so a member it never read gives the run no verdict (C5).
+                                if grouped {
+                                    ran.unverified = Some(unit.clone());
+                                }
                             }
                             ran.stopped = Some((index, violation));
                         }
@@ -358,21 +373,21 @@ pub(super) fn launch_each(
                     if listing_breach.is_none() {
                         listing_breach = launch::listing(skipped, cx.root, real_root, &trace).map(
                             |(skip, key, dir)| Breach {
-                                writer: unit.clone(),
+                                writer: launch_name(members),
                                 key,
                                 dir: Some(dir),
                                 skipped: skip,
                             },
                         );
                     }
-                    written.add(&observed.writes, unit);
+                    written.add(&observed.writes, members);
                     trace.status
                 }
             };
         // The first nonzero status in roster order. A failing unit never stops the pass (spec 3.9).
         ran.status = keep(ran.status, unit_status);
         if unit_status != 0 && ran.failed.is_none() {
-            ran.failed = Some(unit.clone());
+            ran.failed = members.first().cloned();
         }
         if ran.stopped.is_some() {
             break;
@@ -384,51 +399,62 @@ pub(super) fn launch_each(
     ran
 }
 
+/// The argv and the unit value of one launch of `members`: a single unit's launch, or the grouped launch of several (spec
+/// 4.12, 5.2).
+fn launch_of(
+    hook: &Hook,
+    members: &[String],
+    root: &Path,
+    cwd: &Path,
+    lists: &dyn Fn(FileMode, Base) -> Option<OsString>,
+) -> Option<(Vec<OsString>, OsString)> {
+    match members {
+        [unit] => {
+            expand::launch(hook, unit, root, cwd, lists).map(|launch| (launch.argv, launch.value))
+        }
+        _ => {
+            expand::launch_many(hook, members, root, cwd, lists).map(|many| (many.argv, many.value))
+        }
+    }
+}
+
+/// Exports one launch's variables (spec 3.11, 5.3): the list paths, and the value and the changed inputs unless they are
+/// over the list bound, in which case the variable is unset and the list file carries the list.
+fn export(lists: &Lists, value: &OsStr, inputs: &OsStr) {
+    std::env::set_var("STOOP_CHANGED_FILE", &lists.changed);
+    std::env::set_var("STOOP_CHANGED_INPUTS_FILE", &lists.inputs);
+    for name in ["STOOP_CHANGED", "STOOP_UNITS"] {
+        if expand::listed(value.len()) {
+            std::env::set_var(name, value);
+        } else {
+            std::env::remove_var(name);
+        }
+    }
+    if expand::listed(inputs.len()) {
+        std::env::set_var("STOOP_CHANGED_INPUTS", inputs);
+    } else {
+        std::env::remove_var("STOOP_CHANGED_INPUTS");
+    }
+}
+
+/// Whether a spawn failed because its arguments are too large: E2BIG, which is 7 on Linux and on macOS (spec C7).
+fn too_big(error: &io::Error) -> bool {
+    error.raw_os_error() == Some(7)
+}
+
 /// The first skipped unit whose input, output or own file this run wrote, in roster order (spec 3.7). The writer is the
 /// first launch that wrote the path.
 fn file_breach(skipped: &[SkippedUnit], written: &Written) -> Option<Breach> {
     skipped.iter().find_map(|skip| {
         skip.paths.iter().find_map(|path| {
             written.writer(path).map(|writer| Breach {
-                writer: writer.to_owned(),
+                writer,
                 key: path.clone(),
                 dir: None,
                 skipped: skip.unit.clone(),
             })
         })
     })
-}
-
-/// The largest changed-inputs list that `STOOP_CHANGED_INPUTS` exports whole, in bytes (spec 3.11, rv31). Above it the
-/// variable is unset and the list file carries the list.
-const CHANGED_INPUTS_ENV_MAX: usize = 64 * 1024;
-
-/// The changed inputs of one launch, as `STOOP_CHANGED_INPUTS` holds them (spec 3.11): the cwd-relative paths of the
-/// changed keys inside the root, sorted, one per line. A pass has none, so its text is empty.
-fn changed_inputs(cx: &RunCx<'_>, keys: Option<&Vec<String>>) -> OsString {
-    let mut paths: Vec<OsString> = keys
-        .into_iter()
-        .flatten()
-        .filter(|key| !key.starts_with('/'))
-        .map(|key| {
-            let path = expand::render(cx.root, cx.cwd, key, Base::Cwd);
-            if path.is_empty() {
-                OsString::from(".")
-            } else {
-                path
-            }
-        })
-        .collect();
-    paths.sort();
-    paths.dedup();
-    let mut text = OsString::new();
-    for (index, path) in paths.iter().enumerate() {
-        if index > 0 {
-            text.push("\n");
-        }
-        text.push(path);
-    }
-    text
 }
 
 /// Settles a run's launches once they end (spec 3.6 to 3.8, 3.11, 3.12): the residue of the whole command, the state
@@ -444,6 +470,7 @@ pub(super) fn finish(
     let stopped_early = matches!(&ran.stopped, Some((index, _)) if index + 1 < planned);
     let no_verdict = ran.unlaunched
         || stopped_early
+        || ran.unverified.is_some()
         || !ran.breaches.is_empty()
         || !ran.unread.is_empty()
         || !ran.uncovered.is_empty();
@@ -519,6 +546,15 @@ pub(super) fn finish(
                 format!(
                     "stoop: this run has no verdict (exit 125): only {} of {planned} launches ran",
                     ran.ran
+                ),
+            );
+        }
+        if let Some(unit) = &ran.unverified {
+            say(
+                quiet,
+                format!(
+                    "stoop: this run has no verdict (exit 125): {} did not run in its launch",
+                    safe(unit)
                 ),
             );
         }
@@ -877,18 +913,18 @@ impl Lists {
         folder: &mut Scratch,
         root: &Path,
         cwd: &Path,
-        unit: &str,
+        members: &[String],
         forms: &[(FileMode, Base)],
         inputs: &OsStr,
     ) -> io::Result<Lists> {
-        let changed = write_form(folder, root, cwd, unit, FileMode::File, Base::Cwd)?;
+        let changed = write_form(folder, root, cwd, members, FileMode::File, Base::Cwd)?;
         let mut others: Vec<(FileMode, Base, OsString)> = Vec::new();
         for &(mode, base) in forms {
             let named = (mode, base) == (FileMode::File, Base::Cwd);
             if named || others.iter().any(|(m, b, _)| *m == mode && *b == base) {
                 continue;
             }
-            let path = write_form(folder, root, cwd, unit, mode, base)?;
+            let path = write_form(folder, root, cwd, members, mode, base)?;
             others.push((mode, base, path));
         }
         let inputs = folder
@@ -913,16 +949,20 @@ impl Lists {
     }
 }
 
-/// Writes one unit's list in a form into the launch's folder, and returns its path.
+/// Writes one list in a form into the launch's folder, and returns its path. The list holds one entry for each member, in
+/// roster order (spec 4.12).
 fn write_form(
     folder: &mut Scratch,
     root: &Path,
     cwd: &Path,
-    unit: &str,
+    members: &[String],
     mode: FileMode,
     base: Base,
 ) -> io::Result<OsString> {
-    let bytes = expand::list_bytes(root, cwd, unit, mode, base);
+    let mut bytes = Vec::new();
+    for unit in members {
+        bytes.extend(expand::list_bytes(root, cwd, unit, mode, base));
+    }
     Ok(folder
         .write(expand::list_name(mode, base), &bytes)?
         .into_os_string())
