@@ -600,6 +600,11 @@ fn a_launch_that_cannot_be_traced_runs_untraced_once() {
     );
     let err = text(&out.stderr);
     assert!(err.contains("running tests/b.t without a proof"), "{err}");
+    assert_eq!(code(&out), 125, "{err}");
+    assert!(
+        err.contains("the launch of tests/b.t could not be traced, so it has no member evidence"),
+        "{err}"
+    );
     one_per_unit(&s.launches(), &ROSTER);
     let bundle = bundle(&s);
     assert!(bundle["units"]["tests/a.t"][0].is_object(), "{bundle}");

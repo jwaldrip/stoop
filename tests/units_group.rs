@@ -1078,7 +1078,7 @@ pid_t fork(void) {
     );
 }
 #[test]
-fn known_gap_c5_ungrouped_last_launch_coupling_masks_missing_evidence() {
+fn singleton_last_launch_coupling_cannot_mask_missing_evidence() {
     let s = Suite::new();
     fs::create_dir(s.path(".outputs")).unwrap();
     let gate = s.outside.join("review-gate");
@@ -1116,9 +1116,13 @@ fi
     assert!(stderr.contains("tests/b.t read tests/c.t"), "{stderr}");
     let direct = s.direct(&s.root, &[], &env);
     assert_eq!(code(&direct), 1, "{}", text(&direct.stderr));
-    // Pre-existing dark per-unit C5 gap, tracked in jwaldrip/stoop#91.
+    // The coupling diagnostic stays. The verdict does not: tests/b.t never read its own file (issue #91).
+    assert!(
+        stderr.contains("tests/b.t did not run in its launch"),
+        "{stderr}"
+    );
     assert_eq!(s.bundle().unwrap()["state"]["code"], "read_unit");
-    assert_eq!(code(&out), 0, "{stderr}");
+    assert_eq!(code(&out), 125, "{stderr}");
 }
 
 #[test]
