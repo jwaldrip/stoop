@@ -898,6 +898,258 @@ IFS=$old
 set +f
 exec "$ROOT/t" "$@"
 "#;
+// Record the original argv, then adapt option and list forms to the fixture runner.
+const ARGV_413: &str = r#"#!/bin/sh
+ROOT=$(cd "$(dirname "$0")" && pwd -P) || exit 2
+printf 'launch\n' >> "$LOG.argv"
+entries=
+add() {
+	old_ifs=$IFS
+	IFS=',
+ '
+	set -f
+	for part in $1; do
+		case "$part" in
+			tests/*.t|tests/*.u) entries="$entries$part
+" ;;
+		esac
+	done
+	set +f
+	IFS=$old_ifs
+}
+for word in "$@"; do
+	printf 'arg=%s\n' "$word" >> "$LOG.argv"
+	case "$word" in
+		@*) add "$(cat "${word#@}")" ;;
+		--files=*) add "${word#--files=}" ;;
+		-f=*) add "${word#-f=}" ;;
+		-f?*) add "${word#-f}" ;;
+		*) add "$word" ;;
+	esac
+done
+old=$IFS
+IFS='
+'
+set -f
+set -- $entries
+IFS=$old
+set +f
+exec "$ROOT/t" "$@"
+"#;
+
+#[test]
+fn a10n_the_4_13_rows_run_end_to_end() {
+    struct Row {
+        words: &'static [&'static str],
+        expected: &'static [&'static str],
+        many: bool,
+        mixed: bool,
+    }
+    let rows = [
+        Row {
+            words: &["./argv", "--files", "{changed}"],
+            expected: &["launch", "arg=--files", "arg=tests/a.t", "arg=tests/b.t"],
+            many: false,
+            mixed: false,
+        },
+        Row {
+            words: &["./argv", "--files={changed}"],
+            expected: &["launch", "arg=--files=tests/a.t", "arg=--files=tests/b.t"],
+            many: false,
+            mixed: false,
+        },
+        Row {
+            words: &["./argv", "-f", "{changed}"],
+            expected: &["launch", "arg=-f", "arg=tests/a.t", "arg=tests/b.t"],
+            many: false,
+            mixed: false,
+        },
+        Row {
+            words: &["./argv", "-f={changed}"],
+            expected: &["launch", "arg=-f=tests/a.t", "arg=-f=tests/b.t"],
+            many: false,
+            mixed: false,
+        },
+        Row {
+            words: &["./argv", "-f{changed}"],
+            expected: &["launch", "arg=-ftests/a.t", "arg=-ftests/b.t"],
+            many: false,
+            mixed: false,
+        },
+        Row {
+            words: &["./argv", "-f", "{changed:each}"],
+            expected: &[
+                "launch",
+                "arg=-f",
+                "arg=tests/a.t",
+                "arg=-f",
+                "arg=tests/b.t",
+            ],
+            many: false,
+            mixed: false,
+        },
+        Row {
+            words: &["./argv", "--files={changed:comma}"],
+            expected: &["launch", "arg=--files=tests/a.t,tests/b.t"],
+            many: false,
+            mixed: false,
+        },
+        Row {
+            words: &["./argv", "--files=base,{changed:comma}"],
+            expected: &["launch", "arg=--files=base,tests/a.t,tests/b.t"],
+            many: false,
+            mixed: false,
+        },
+        Row {
+            words: &["./argv", "--files", "base", "--files", "{changed}"],
+            expected: &[
+                "launch",
+                "arg=--files",
+                "arg=base",
+                "arg=--files",
+                "arg=tests/a.t",
+                "arg=tests/b.t",
+            ],
+            many: false,
+            mixed: false,
+        },
+        Row {
+            words: &["./argv", "--files", "base", "more", "{changed}"],
+            expected: &[
+                "launch",
+                "arg=--files",
+                "arg=base",
+                "arg=more",
+                "arg=tests/a.t",
+                "arg=tests/b.t",
+            ],
+            many: true,
+            mixed: false,
+        },
+        Row {
+            words: &["./argv", "-v", "--", "{changed}"],
+            expected: &[
+                "launch",
+                "arg=-v",
+                "arg=--",
+                "arg=tests/a.t",
+                "arg=tests/b.t",
+            ],
+            many: false,
+            mixed: false,
+        },
+        Row {
+            words: &["./argv", "{changed:**/*.t}"],
+            expected: &["launch", "arg=tests/a.t", "arg=tests/b.t"],
+            many: false,
+            mixed: false,
+        },
+        Row {
+            words: &["./argv", "--files", "{changed:**/*.t|**/*.u}"],
+            expected: &["launch", "arg=--files", "arg=tests/a.t", "arg=tests/b.u"],
+            many: false,
+            mixed: true,
+        },
+        Row {
+            words: &["./argv", "{unit:**/*.t}"],
+            expected: &["launch", "arg=tests/a.t", "launch", "arg=tests/b.t"],
+            many: false,
+            mixed: false,
+        },
+        Row {
+            words: &["./argv", "@{changed:file}"],
+            expected: &["launch", "arg=@<list>"],
+            many: false,
+            mixed: false,
+        },
+        Row {
+            words: &["./npm", "test", "--", "--files", "{changed}"],
+            expected: &[
+                "launch",
+                "arg=test",
+                "arg=--",
+                "arg=--files",
+                "arg=tests/a.t",
+                "arg=tests/b.t",
+            ],
+            many: false,
+            mixed: false,
+        },
+        Row {
+            words: &["./argv", "--files", "$STOOP_CHANGED"],
+            expected: &["launch", "arg=--files", "arg=tests/a.t", "arg=tests/b.t"],
+            many: false,
+            mixed: false,
+        },
+    ];
+    for row in rows {
+        let s = Suite::new();
+        s.remove("slow/s.t");
+        s.remove("e2e/x.u");
+        if row.mixed {
+            s.remove(B);
+            s.write("tests/b.u", "src/shared.src\n");
+        }
+        s.executable("argv", ARGV_413);
+        s.executable("npm", ARGV_413);
+        let options = if row.many {
+            "options = [{ names = [\"--files\"], values = \"many\" }]\n"
+        } else {
+            ""
+        };
+        s.config(&format!(
+            "[[units.suite]]\nid = \"args\"\nmatch = {}\nunits = [\"tests/*.t\", \"tests/*.u\"]\n{options}",
+            serde_json::to_string(row.words).unwrap()
+        ));
+        let mut env = GROUP.to_vec();
+        if row.mixed {
+            env.push(("T_U", "1"));
+        }
+        let warm = s.run(&s.root, &[], row.words, &env);
+        success(&warm);
+        let log = s.log.with_extension("argv");
+        fs::remove_file(&log).unwrap();
+        s.clear_log();
+        edit_shared(&s);
+        let out = s.run(&s.root, &[], row.words, &env);
+        success(&out);
+        let raw = fs::read_to_string(&log).unwrap();
+        let actual: Vec<_> = raw
+            .lines()
+            .map(|line| {
+                if line.starts_with("arg=@") {
+                    "arg=@<list>"
+                } else {
+                    line
+                }
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            row.expected,
+            "{:?}: {}",
+            row.words,
+            text(&out.stderr)
+        );
+        let expected_units = if row.mixed {
+            vec![A, "tests/b.u"]
+        } else {
+            vec![A, B]
+        };
+        let ran: Vec<_> = s
+            .launches()
+            .iter()
+            .flat_map(|launch| {
+                launch
+                    .ran()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(ran, expected_units, "{:?}", row.words);
+    }
+}
 
 /// `stoop explain` with `words` as the hook, under `env`. Its decision may print on either stream.
 fn explain_words(s: &Suite, words: &[&str], env: &[(&str, &str)]) -> Output {
