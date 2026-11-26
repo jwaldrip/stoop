@@ -559,9 +559,8 @@ pub(super) fn judge_units(cx: &Judged<'_>, view: &View) -> Result<Plan, Box<Verd
     }
 }
 
-/// Completion (spec 3.10, W7-3), judged under the suite lock after a recorded full run. The run learns when the residue
-/// it left is unknown or not empty, and then launches each roster unit with no valid version, in roster order. It
-/// declines when the suite is disabled or the residue is known and empty, so no learning is needed.
+/// Completion after a recorded full run learns every unit without a valid exact version, in roster order.
+/// It declines when the suite is disabled or the residue is known and empty.
 pub(super) fn learn(cx: &Judged<'_>, view: &View) -> Result<Vec<String>, &'static str> {
     if view.disabled.is_some() {
         return Err("the suite is disabled");
@@ -576,16 +575,39 @@ pub(super) fn learn(cx: &Judged<'_>, view: &View) -> Result<Vec<String>, &'stati
         return Err("the residue is known and empty");
     }
     let current = Current::of(cx.root, &checked(cx, view));
-    Ok(analyse(cx, view, &current)
+    let mut units: Vec<String> = analyse(cx, view, &current)
         .into_iter()
         .map(|affected| affected.unit)
-        .collect())
+        .collect();
+    let mut inexact = inexact_only(cx, view, &current).peekable();
+    if inexact.peek().is_some() {
+        units.extend(inexact.cloned());
+        units.sort_unstable();
+    }
+    Ok(units)
 }
 
-/// Whether every roster unit holds a valid version now, which lets the residue be confirmed (spec 3.8, point iii).
+/// Whether every roster unit holds a valid exact version, which lets the residue be confirmed.
 pub(super) fn holds(cx: &Judged<'_>, view: &View) -> bool {
     let current = Current::of(cx.root, &checked(cx, view));
-    analyse(cx, view, &current).is_empty()
+    analyse(cx, view, &current).is_empty() && inexact_only(cx, view, &current).next().is_none()
+}
+
+/// Units with a valid inexact version, but no valid exact version, in roster order.
+fn inexact_only<'a>(
+    cx: &'a Judged<'_>,
+    view: &'a View,
+    current: &'a Current,
+) -> impl Iterator<Item = &'a String> + 'a {
+    cx.roster.iter().filter(|unit| {
+        view.units.get(*unit).is_some_and(|versions| {
+            let valid =
+                |version: &Version| version_reasons(cx, view, current, version).0.is_empty();
+            versions.iter().any(|version| !version.exact)
+                && !versions.iter().filter(|version| version.exact).any(valid)
+                && versions.iter().filter(|version| !version.exact).any(valid)
+        })
+    })
 }
 
 /// Whether the versions of the units that left the roster hold the last reader of a path that the roster's units no
@@ -1359,20 +1381,34 @@ pub(crate) fn learn_line(
     // residue for that same proof (`record`, PR 86 review round 2). Completion then learns each unit without a valid
     // version, whatever the residue was before the run. Explain cannot tell the same-proof case before the run, so it
     // names those units here.
-    let lacking = match bundle::view(store, pending, key) {
-        None => pending.units().len(),
+    let (lacking, has_inexact) = match bundle::view(store, pending, key) {
+        None => (pending.units().len(), false),
         Some(view) => {
             if view.disabled.is_some() {
                 return None;
             }
             let current = Current::of(cx.root, &checked(&judged, &view));
-            analyse(&judged, &view, &current).len()
+            let inexact = inexact_only(&judged, &view, &current).count();
+            (
+                analyse(&judged, &view, &current).len() + inexact,
+                inexact > 0,
+            )
         }
     };
+    learning_line(lacking, has_inexact)
+}
+
+fn learning_line(lacking: usize, has_inexact: bool) -> Option<String> {
     (lacking > 0).then(|| {
-        format!(
-            "stoop: if the full command passes, would launch {lacking} units without a current proof, one launch each"
-        )
+        if has_inexact {
+            format!(
+                "stoop: if the full command passes, would launch {lacking} units without a current exact proof, one launch each"
+            )
+        } else {
+            format!(
+                "stoop: if the full command passes, would launch {lacking} units without a current proof, one launch each"
+            )
+        }
     })
 }
 
@@ -1540,6 +1576,7 @@ mod tests {
     fn version(created: u64, inputs: Vec<u32>) -> Version {
         Version {
             created,
+            exact: true,
             guard: "g".to_owned(),
             inputs,
             outputs: Vec::new(),
@@ -1555,6 +1592,129 @@ mod tests {
             guard: "g".to_owned(),
             max_age,
             now: 1_000,
+        }
+    }
+
+    fn inexact_version(inputs: Vec<u32>) -> Version {
+        let mut version = version(1_000, inputs);
+        version.exact = false;
+        version
+    }
+
+    fn identity_matrix_view() -> (View, Current, Vec<String>) {
+        let entries = [
+            ("tests/a.t", "f:a"),
+            ("tests/b.t", "x:b"),
+            ("dir", "d"),
+            ("listed", "dl:one"),
+            ("absent", "a"),
+            ("/outside-root", "f:outside"),
+            ("link", "l:target"),
+            ("unreadable", "u"),
+            ("output", "f:out"),
+        ];
+        let table: Vec<Input> = entries.iter().map(|(path, id)| input(path, id)).collect();
+        let mut values = HashMap::new();
+        for entry in &table {
+            let mut slots = [None, None];
+            slots[usize::from(entry.id.starts_with("dl:"))] = Some(entry.id.clone());
+            values.insert(entry.path.clone(), slots);
+        }
+        let group = || {
+            let mut version = inexact_version((0..8).collect());
+            version.outputs = vec![8];
+            version
+        };
+        let roster = vec!["tests/a.t".to_owned(), "tests/b.t".to_owned()];
+        let (view, _) = view_of(
+            vec![("tests/a.t", vec![group()]), ("tests/b.t", vec![group()])],
+            table,
+        );
+        (view, Current(values), roster)
+    }
+
+    #[test]
+    fn an_inexact_version_holds_while_every_input_of_its_launch_holds() {
+        let (view, current, roster) = identity_matrix_view();
+        let cx = judged(&roster, 0);
+        assert!(analyse(&cx, &view, &current).is_empty());
+        assert_eq!(
+            inexact_only(&cx, &view, &current)
+                .cloned()
+                .collect::<Vec<_>>(),
+            roster
+        );
+    }
+
+    #[test]
+    fn an_inexact_version_is_affected_by_an_input_only_another_member_read() {
+        let (view, mut current, roster) = identity_matrix_view();
+        let cx = judged(&roster, 0);
+        for entry in &view.table {
+            let slot = usize::from(entry.id.starts_with("dl:"));
+            current.0.get_mut(&entry.path).unwrap()[slot] = None;
+            let affected: Vec<String> = analyse(&cx, &view, &current)
+                .into_iter()
+                .map(|unit| unit.unit)
+                .collect();
+            assert_eq!(affected, roster, "changed identity {}", entry.path);
+            current.0.get_mut(&entry.path).unwrap()[slot] = Some(entry.id.clone());
+        }
+    }
+
+    #[test]
+    fn a_valid_exact_version_avoids_reproof_but_a_stale_one_does_not() {
+        let table = vec![input("tests/a.t", "f:1")];
+        let mut stale = version(1_000, vec![0]);
+        stale.guard = "old".to_owned();
+        let (mut view, current) = view_of(
+            vec![("tests/a.t", vec![inexact_version(vec![0]), stale])],
+            table,
+        );
+        let roster = vec!["tests/a.t".to_owned()];
+        let cx = judged(&roster, 0);
+        assert_eq!(inexact_only(&cx, &view, &current).count(), 1);
+        view.units
+            .get_mut("tests/a.t")
+            .unwrap()
+            .push(version(1_000, vec![0]));
+        assert_eq!(inexact_only(&cx, &view, &current).count(), 0);
+    }
+
+    #[test]
+    fn the_learn_line_names_inexact_units_with_the_exact_proof_wording() {
+        assert_eq!(
+            learning_line(2, true).as_deref(),
+            Some("stoop: if the full command passes, would launch 2 units without a current exact proof, one launch each")
+        );
+        assert_eq!(
+            learning_line(2, false).as_deref(),
+            Some("stoop: if the full command passes, would launch 2 units without a current proof, one launch each")
+        );
+        assert_eq!(learning_line(0, true), None);
+    }
+
+    #[test]
+    fn a_valid_inexact_version_still_covers_a_listing_name() {
+        let table = vec![input("tests/a.t", "f:1"), input("tests/b.flag", "x:2")];
+        let (view, current) = view_of(
+            vec![("tests/a.t", vec![inexact_version(vec![0, 1])])],
+            table,
+        );
+        let roster = vec!["tests/a.t".to_owned()];
+        let covered = covered_reads(&judged(&roster, 0), &view, &current, &BTreeSet::new());
+        assert!(covered.contains("tests/b.flag"));
+    }
+
+    #[test]
+    fn listing_coverage_uses_the_same_identity_kinds_for_inexact_versions() {
+        let (view, current, roster) = identity_matrix_view();
+        let covered = covered_reads(&judged(&roster, 0), &view, &current, &BTreeSet::new());
+        for path in ["tests/a.t", "tests/b.t", "/outside-root"] {
+            assert!(covered.contains(path), "{path}");
+        }
+        for path in ["dir", "listed", "absent", "link", "unreadable", "output"] {
+            assert!(!covered.contains(path), "{path}");
         }
     }
 
@@ -1693,6 +1853,139 @@ mod tests {
     impl Drop for TreeDir {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn an_inexact_kept_version_covers_a_changed_whole_input() {
+        let root = TreeDir::new("inexact-kept", &[("shared", "new")]);
+        let (mut view, _) = view_of(
+            vec![("a.t", vec![inexact_version(vec![0])])],
+            vec![root.entry("shared")],
+        );
+        let roster = vec!["a.t".to_owned()];
+        let cx = Judged {
+            root: &root.0,
+            ..judged(&roster, 0)
+        };
+        let proof = test_proof(vec![input("shared", "f:old")]);
+        let current = Current::of(&root.0, &[&view.table[0]]);
+        assert!(uncovered_changes(&cx, &view, &current, &proof).is_empty());
+        view.units.clear();
+        assert_eq!(uncovered_changes(&cx, &view, &current, &proof), ["shared"]);
+    }
+
+    #[test]
+    fn an_inexact_version_still_marks_a_deleted_input_as_read() {
+        let root = TreeDir::new("inexact-absent", &[]);
+        let (view, _) = view_of(
+            vec![("a.t", vec![inexact_version(vec![0])])],
+            vec![input("missing", "f:old")],
+        );
+        let roster = vec!["a.t".to_owned()];
+        let cx = Judged {
+            root: &root.0,
+            ..judged(&roster, 0)
+        };
+        let proof = test_proof(vec![input("missing", "f:old")]);
+        assert_eq!(
+            absent_reader_change(&cx, &view, &proof).as_deref(),
+            Some("missing")
+        );
+    }
+
+    #[test]
+    fn an_inexact_live_reader_still_covers_a_departed_readers_path() {
+        let root = TreeDir::new("inexact-departed", &[("shared", "new")]);
+        let table = vec![input("shared", "f:old")];
+        let (mut view, _) = view_of(
+            vec![
+                ("a.t", vec![inexact_version(vec![0])]),
+                ("gone.t", vec![version(1_000, vec![0])]),
+            ],
+            table,
+        );
+        let roster = vec!["a.t".to_owned()];
+        let cx = Judged {
+            root: &root.0,
+            ..judged(&roster, 0)
+        };
+        let proof = test_proof(vec![input("shared", "f:old")]);
+        let affected = vec![Affected {
+            unit: "a.t".to_owned(),
+            why: "changed".to_owned(),
+            changed: Vec::new(),
+        }];
+        assert!(!units_that_left_held_a_reader(&cx, &view));
+        assert_eq!(departed_only_change(&cx, &view, &proof, &affected), None);
+        view.units.remove("a.t");
+        assert!(units_that_left_held_a_reader(&cx, &view));
+        assert_eq!(
+            departed_only_change(&cx, &view, &proof, &affected).as_deref(),
+            Some("shared")
+        );
+    }
+
+    #[test]
+    fn inexact_versions_still_participate_in_the_global_input_guard() {
+        let root = TreeDir::new("inexact-global", &[("shared", "new")]);
+        let (view, _) = view_of(
+            vec![
+                ("a.t", vec![inexact_version(vec![0])]),
+                ("b.t", vec![inexact_version(vec![0])]),
+            ],
+            vec![input("shared", "f:old")],
+        );
+        let roster = vec!["a.t".to_owned(), "b.t".to_owned()];
+        let cx = Judged {
+            root: &root.0,
+            ..judged(&roster, 0)
+        };
+        let proof = test_proof(vec![input("shared", "f:old")]);
+        let current = Current::of(&root.0, &[&view.table[0]]);
+        assert_eq!(
+            global_change(&cx, &view, &proof, &current).as_deref(),
+            Some("shared")
+        );
+    }
+
+    #[test]
+    fn an_inexact_version_still_attributes_its_output_to_the_unit() {
+        let root = TreeDir::new("inexact-output", &[]);
+        let mut group = inexact_version(Vec::new());
+        group.outputs.push(0);
+        let (mut view, _) = view_of(vec![("a.t", vec![group])], vec![input("output", "f:old")]);
+        let roster = vec!["a.t".to_owned()];
+        let cx = Judged {
+            root: &root.0,
+            ..judged(&roster, 0)
+        };
+        let mut proof = test_proof(Vec::new());
+        proof.outputs.push(input("output", "f:old"));
+        assert_eq!(output_missing(&cx, &view, &proof), None);
+        view.units.clear();
+        assert_eq!(
+            output_missing(&cx, &view, &proof).as_deref(),
+            Some("output output is missing")
+        );
+    }
+
+    #[test]
+    fn an_inexact_affected_version_supplies_listing_excuses() {
+        let (view, _, _) = identity_matrix_view();
+        let affected = vec![Affected {
+            unit: "tests/a.t".to_owned(),
+            why: "changed".to_owned(),
+            changed: Vec::new(),
+        }];
+        let reads = rerun_reads(&view, &affected, &BTreeSet::new());
+        for entry in &view.table[..8] {
+            assert_eq!(
+                reads.get(&entry.path).unwrap(),
+                &["tests/a.t"],
+                "{}",
+                entry.path
+            );
         }
     }
 

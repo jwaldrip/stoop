@@ -1153,8 +1153,8 @@ pub(crate) fn record(
 }
 
 /// Stores the residue of a whole proof's inputs (spec 3.8, points i and ii). It is measured only when every roster unit
-/// holds a version, and it is kept while it is already known for `digest`. It is stored provisional: W6 compares paths
-/// and cannot confirm them (C4, C5). A residue that would take the bundle past its bound is not kept.
+/// holds an exact version, and it is kept while it is already known for `digest`. It is stored provisional: W6 compares
+/// paths and cannot confirm them (C4, C5). A residue that would take the bundle past its bound is not kept.
 fn store_residue(bundle: &mut SuiteBundleV1, whole: &[Input], digest: &str, listings: &[String]) {
     if residue_known(&bundle.residue, digest) {
         return;
@@ -1163,7 +1163,7 @@ fn store_residue(bundle: &mut SuiteBundleV1, whole: &[Input], digest: &str, list
         bundle
             .units
             .get(unit)
-            .is_some_and(|versions| !versions.is_empty())
+            .is_some_and(|versions| versions.iter().any(|version| version.exact))
     });
     let next = if complete {
         let covered = covered_paths(bundle);
@@ -1242,13 +1242,14 @@ fn losses(removed: &BTreeMap<String, bool>, now: &BTreeMap<String, bool>) -> Vec
     lost
 }
 
-/// The paths of the inputs of every unit version the bundle holds: what the units' own runs read (spec 3.8).
+/// The paths read by exact unit versions: what the units' own runs read (spec 3.8).
 fn covered_paths(bundle: &SuiteBundleV1) -> BTreeSet<&str> {
     let len = bundle.table.len();
     bundle
         .units
         .values()
         .flatten()
+        .filter(|version| version.exact)
         .filter_map(|version| undelta(&version.inputs, len))
         .flatten()
         .map(|index| bundle.table[index as usize].path.as_str())
@@ -1430,20 +1431,21 @@ impl Pass {
         Scratch::create(&self.area, &self.bundle.suite)
     }
 
-    /// Keeps one unit's proof as its only version, in place of the version the unit held (spec 3.11). The bundle is
-    /// written when a write is due (see `FLUSH_INTERVAL`). A proof that the budget or the bundle's bounds refuse is not
-    /// kept: the unit keeps the version it held, and the table keeps no entry of the refused proof.
+    /// Replaces every member's version as one record. A singleton is exact; a shared launch is inexact.
+    /// A refused record restores every member and the table before any write is made.
     pub(crate) fn record(
         &mut self,
-        unit: &str,
+        members: &[String],
         inputs: &[Input],
         outputs: &[Input],
         created: u64,
     ) -> Stored {
+        let Some((last, others)) = members.split_last() else {
+            return Stored::WriteFailed;
+        };
         let mark = self.bundle.table.len();
-        // A kept pass compacts the table, which renumbers every version. A refused proof restores the state the record
-        // began with, so the state is taken before anything changes (spec 3.11).
-        let snapshot = self.keep.then(|| {
+        // Kept passes compact the table. A multi-member refusal must also restore every member in a clear pass.
+        let snapshot = (self.keep || !others.is_empty()).then(|| {
             (
                 self.bundle.units.clone(),
                 self.bundle.table.clone(),
@@ -1457,7 +1459,7 @@ impl Pass {
         let outputs = self.indices(outputs);
         let version = UnitVersion {
             created,
-            exact: true,
+            exact: members.len() == 1,
             source: ResultSource::Exit,
             guard: self.bundle.guard_digest.clone(),
             inputs: delta(&inputs),
@@ -1465,23 +1467,30 @@ impl Pass {
         };
         let removed = bundle_readers(
             &self.bundle.table,
-            self.bundle.units.get(unit).into_iter().flatten(),
+            members
+                .iter()
+                .flat_map(|unit| self.bundle.units.get(unit).into_iter().flatten()),
         );
-        let previous = self.bundle.units.insert(unit.to_owned(), vec![version]);
+        for member in others {
+            self.bundle
+                .units
+                .insert(member.clone(), vec![version.clone()]);
+        }
+        let previous = self.bundle.units.insert(last.clone(), vec![version]);
         if self.keep {
             self.compact_table();
         }
         self.note_losses(&removed);
         let Ok(bytes) = serde_json::to_vec(&self.bundle) else {
-            self.refuse(unit, previous, mark, snapshot);
+            self.refuse(last, previous, mark, snapshot);
             return Stored::WriteFailed;
         };
         if bytes.len() as u64 > self.budget {
-            self.refuse(unit, previous, mark, snapshot);
+            self.refuse(last, previous, mark, snapshot);
             return Stored::OverBudget;
         }
         if !valid_bundle(&self.bundle, &self.bundle.suite) {
-            self.refuse(unit, previous, mark, snapshot);
+            self.refuse(last, previous, mark, snapshot);
             return Stored::WriteFailed;
         }
         self.dirty = true;
@@ -1619,8 +1628,11 @@ impl Pass {
         changed
     }
 
-    /// The entries that a unit's stored versions name, as inputs and as outputs, in table order (spec 3.9).
-    fn entries(&self, versions: &[UnitVersion]) -> (Vec<Input>, Vec<Input>) {
+    /// The entries that the supplied versions name, as inputs and outputs, in table order.
+    fn entries<'a>(
+        &self,
+        versions: impl IntoIterator<Item = &'a UnitVersion>,
+    ) -> (Vec<Input>, Vec<Input>) {
         let len = self.bundle.table.len();
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
@@ -1653,6 +1665,30 @@ impl Pass {
                 (unit.clone(), inputs, outputs)
             })
             .collect()
+    }
+
+    /// Only exact versions identify a particular unit as the owner of a path.
+    pub(crate) fn held_owned(&self) -> Vec<(String, Vec<Input>, Vec<Input>)> {
+        self.bundle
+            .units
+            .iter()
+            .filter_map(|(unit, versions)| {
+                let mut exact = versions.iter().filter(|version| version.exact).peekable();
+                exact.peek()?;
+                let (inputs, outputs) = self.entries(exact);
+                Some((unit.clone(), inputs, outputs))
+            })
+            .collect()
+    }
+
+    /// The sorted unit names that hold at least one exact version.
+    pub(crate) fn held_exact(&self) -> impl Iterator<Item = &str> {
+        self.bundle.units.iter().filter_map(|(unit, versions)| {
+            versions
+                .iter()
+                .any(|version| version.exact)
+                .then_some(unit.as_str())
+        })
     }
 
     /// Names the state a stopped run stores: `attribution` for a run that launches every unit, `subset` for one that
@@ -2033,6 +2069,7 @@ pub(crate) fn known_residue(store: &Path, id: &str, key: &str) -> Option<(usize,
 /// and outputs, in table order.
 pub(crate) struct Version {
     pub(crate) created: u64,
+    pub(crate) exact: bool,
     pub(crate) guard: String,
     pub(crate) inputs: Vec<u32>,
     pub(crate) outputs: Vec<u32>,
@@ -2070,6 +2107,7 @@ impl View {
                 .map(|version| {
                     Some(Version {
                         created: version.created,
+                        exact: version.exact,
                         inputs: undelta(&version.inputs, len)?,
                         outputs: undelta(&version.outputs, len)?,
                         guard: version.guard,
@@ -2781,6 +2819,153 @@ mod pass_tests {
     }
 
     #[test]
+    fn a_residue_is_never_measured_from_an_inexact_version() {
+        let mut bundle = bundle_for(pending_for(&["tests/a.t", "tests/b.t"]), "key");
+        bundle.table = vec![input("src/a"), input("src/b")];
+        let exact = version(delta(&[0]));
+        let mut inexact = version(delta(&[1]));
+        inexact.exact = false;
+        bundle.units.insert("tests/a.t".into(), vec![exact]);
+        bundle.units.insert("tests/b.t".into(), vec![inexact]);
+
+        let whole = vec![input("src/a"), input("src/b")];
+        store_residue(&mut bundle, &whole, "p-1", &[]);
+        assert!(
+            matches!(bundle.residue.state, ResidueState::None),
+            "a roster member with only an inexact proof cannot complete the residue"
+        );
+
+        bundle.units.get_mut("tests/b.t").unwrap()[0].exact = true;
+        store_residue(&mut bundle, &whole, "p-1", &[]);
+        assert!(matches!(bundle.residue.state, ResidueState::Provisional));
+        assert_eq!(bundle.residue.count, 0);
+    }
+
+    #[test]
+    fn confirm_counts_only_exact_versions() {
+        let roster = ["tests/a.t", "tests/b.t"];
+        let pending = pending_for(&roster);
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.table = vec![input("src/exact"), input("src/inexact")];
+        let mut inexact = version(delta(&[1]));
+        inexact.exact = false;
+        bundle
+            .units
+            .insert("tests/a.t".into(), vec![version(delta(&[0]))]);
+        bundle.units.insert("tests/b.t".into(), vec![inexact]);
+        let dir = seed("confirm-exact-only", &bundle);
+        let outcome = confirm(
+            &dir,
+            &pending,
+            "key",
+            "p-1",
+            &[input("src/exact"), input("src/inexact")],
+            |_| true,
+        );
+        assert!(matches!(outcome, Settled::Written));
+        let residue = stored(&dir, pending.suite()).residue;
+        assert!(matches!(residue.state, ResidueState::Confirmed));
+        assert_eq!(residue.count, 1);
+        assert_eq!(residue.paths, ["src/inexact"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn with_inexact_engine_fixture(
+        name: &str,
+        check: impl FnOnce(&super::super::engine::Judged<'_>, &View, &Path),
+    ) {
+        use super::super::engine::Judged;
+        use crate::run::{Opts, RunCx};
+
+        let dir = store(name);
+        let root = dir.join("root");
+        fs::create_dir_all(root.join("tests")).unwrap();
+        for name in ["a.t", "b.t", "c.t", "shared"] {
+            fs::write(root.join("tests").join(name), name).unwrap();
+        }
+        let opts = Opts::default();
+        let rel_cwd = String::new();
+        let scope = None;
+        let store = crate::proof::Store::new(dir.join("proofs"));
+        let hook = None;
+        let full_reason = None;
+        let salt = None;
+        let cx = RunCx {
+            o: &opts,
+            cwd: &root,
+            root: &root,
+            rel_cwd: &rel_cwd,
+            scope: &scope,
+            store: &store,
+            hook: &hook,
+            full_reason: &full_reason,
+            max_age: 0,
+            bypass: false,
+            explain: false,
+            observe_runners: true,
+            env_now: BTreeMap::new(),
+            env_excluded: Vec::new(),
+            salt: &salt,
+            remote: None,
+        };
+        let ignore = crate::ignore::Ignore::new(
+            &opts.ignore,
+            Some(&root.join(".stoopignore")),
+            &opts.transient,
+        );
+        let guard = super::super::attribution::guard_of(&cx, &ignore).digest();
+        let roster = ["tests/a.t", "tests/b.t", "tests/c.t"];
+        let pending = pending_for(&roster);
+        let proof = whole_proof(&[]);
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.whole = Some(proof.digest());
+        bundle.table = ["tests/a.t", "tests/b.t", "tests/shared", "tests/c.t"]
+            .iter()
+            .map(|path| Input {
+                path: (*path).into(),
+                id: crate::input::identify(&root.join(path), true, false).unwrap(),
+                oid: None,
+                oid_basis: None,
+            })
+            .collect();
+        let mut grouped = version(delta(&[0, 1, 2]));
+        grouped.exact = false;
+        grouped.guard = guard.clone();
+        let mut single = version(delta(&[3]));
+        single.guard = guard;
+        bundle.units.insert(roster[0].into(), vec![grouped.clone()]);
+        bundle.units.insert(roster[1].into(), vec![grouped]);
+        bundle.units.insert(roster[2].into(), vec![single]);
+        let view = View::of(bundle).unwrap();
+        let proofs = [proof];
+        let judged = Judged::new(&cx, &pending, &proofs, 0);
+        check(&judged, &view, &root);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn learn_relaunches_units_whose_valid_proofs_are_all_inexact() {
+        with_inexact_engine_fixture("learn-inexact", |judged, view, root| {
+            assert_eq!(
+                super::super::engine::learn(judged, view).unwrap(),
+                ["tests/a.t", "tests/b.t"]
+            );
+            fs::write(root.join("tests/c.t"), "changed").unwrap();
+            assert_eq!(
+                super::super::engine::learn(judged, view).unwrap(),
+                ["tests/a.t", "tests/b.t", "tests/c.t"]
+            );
+        });
+    }
+
+    #[test]
+    fn holds_is_false_while_a_unit_holds_only_an_inexact_proof() {
+        with_inexact_engine_fixture("holds-inexact", |judged, view, _| {
+            assert!(!super::super::engine::holds(judged, view));
+        });
+    }
+
+    #[test]
     fn delta_round_trips_and_decoding_refuses_out_of_range_and_unordered_indices() {
         let indices = [0, 3, 4, 10];
         let stored = delta(&indices);
@@ -2824,19 +3009,19 @@ mod pass_tests {
         let setup = input("setup.src");
         let stored = |outcome: Stored| matches!(outcome, Stored::Stored);
         assert!(stored(pass.record(
-            "tests/a.t",
+            &["tests/a.t".to_owned()],
             &[shared.clone(), setup.clone(), shared.clone()],
             &[],
             1
         )));
         assert!(stored(pass.record(
-            "tests/b.t",
+            &["tests/b.t".to_owned()],
             std::slice::from_ref(&setup),
             &[],
             2
         )));
         assert!(stored(pass.record(
-            "tests/a.t",
+            &["tests/a.t".to_owned()],
             std::slice::from_ref(&setup),
             &[],
             3
@@ -2863,7 +3048,12 @@ mod pass_tests {
         let mut pass = pass_of(start(&dir, &pending_for(&roster), "key", guard()));
         pass.budget = before.len() as u64;
         assert!(matches!(
-            pass.record("tests/a.t", &[input("src/shared.src")], &[], 1),
+            pass.record(
+                &["tests/a.t".to_owned()],
+                &[input("src/shared.src")],
+                &[],
+                1
+            ),
             Stored::OverBudget
         ));
         assert!(
@@ -3035,7 +3225,12 @@ mod pass_tests {
         let mut pass = pass_of(start(&dir, &pending_of(&units), "key", guard()));
         for unit in &units {
             assert!(matches!(
-                pass.record(unit, &[input("src/shared.src")], &[], 1),
+                pass.record(
+                    std::slice::from_ref(unit),
+                    &[input("src/shared.src")],
+                    &[],
+                    1
+                ),
                 Stored::Stored
             ));
         }
@@ -3054,7 +3249,12 @@ mod pass_tests {
         let dir = seed("final-flush", &bundle_for(pending_of(&units), "key"));
         let mut pass = pass_of(start(&dir, &pending_of(&units), "key", guard()));
         for unit in &units {
-            pass.record(unit, &[input("src/shared.src")], &[], 1);
+            pass.record(
+                std::slice::from_ref(unit),
+                &[input("src/shared.src")],
+                &[],
+                1,
+            );
         }
         drop(pass);
         let area = Area::open(&dir, false).unwrap().unwrap();
@@ -3074,8 +3274,18 @@ mod pass_tests {
         let id = pending_of(&units).suite;
         let dir = seed("killed", &bundle_for(pending_of(&units), "key"));
         let mut pass = pass_of(start(&dir, &pending_of(&units), "key", guard()));
-        pass.record(&units[0], &[input("src/shared.src")], &[], 1);
-        pass.record(&units[1], &[input("src/shared.src")], &[], 1);
+        pass.record(
+            std::slice::from_ref(&units[0]),
+            &[input("src/shared.src")],
+            &[],
+            1,
+        );
+        pass.record(
+            std::slice::from_ref(&units[1]),
+            &[input("src/shared.src")],
+            &[],
+            1,
+        );
         // A kill ends the process without running the pass's end, so nothing more is written.
         std::mem::forget(pass);
         let area = Area::open(&dir, false).unwrap().unwrap();
@@ -3171,12 +3381,22 @@ mod pass_tests {
         let dir = seed("due-write", &bundle_for(pending_of(&units), "key"));
         let mut pass = pass_of(start(&dir, &pending_of(&units), "key", guard()));
         assert!(matches!(
-            pass.record(&units[0], &[input("src/shared.src")], &[], 1),
+            pass.record(
+                std::slice::from_ref(&units[0]),
+                &[input("src/shared.src")],
+                &[],
+                1
+            ),
             Stored::Stored
         ));
         std::thread::sleep(FLUSH_INTERVAL);
         assert!(matches!(
-            pass.record(&units[1], &[input("src/shared.src")], &[], 1),
+            pass.record(
+                std::slice::from_ref(&units[1]),
+                &[input("src/shared.src")],
+                &[],
+                1
+            ),
             Stored::Stored
         ));
         std::mem::forget(pass);
@@ -3201,7 +3421,12 @@ mod pass_tests {
         let suite_dir = dir.join("units/v1");
         let mut pass = pass_of(start(&dir, &pending_of(&units), "key", guard()));
         assert!(matches!(
-            pass.record(&units[0], &[input("src/shared.src")], &[], 1),
+            pass.record(
+                std::slice::from_ref(&units[0]),
+                &[input("src/shared.src")],
+                &[],
+                1
+            ),
             Stored::Stored
         ));
         std::thread::sleep(FLUSH_INTERVAL);
@@ -3209,7 +3434,12 @@ mod pass_tests {
             // The due write cannot create its temporary entry, so it fails.
             let _mode = ModeGuard::set(&suite_dir, 0o500);
             assert!(matches!(
-                pass.record(&units[1], &[input("src/shared.src")], &[], 1),
+                pass.record(
+                    std::slice::from_ref(&units[1]),
+                    &[input("src/shared.src")],
+                    &[],
+                    1
+                ),
                 Stored::WriteFailed
             ));
         }
@@ -3502,8 +3732,8 @@ mod pass_tests {
         let pending = pending_for(&roster);
         let id = pending.suite().to_owned();
         let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
-        let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
-        let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
+        let _ = pass.record(&["tests/a.t".to_owned()], &[input("src/shared")], &[], 1);
+        let _ = pass.record(&["tests/b.t".to_owned()], &[input("src/shared")], &[], 1);
         pass.settle_residue(&[proof], &[], false);
         drop(pass);
         let stored_residue = stored(&dir, &id).residue;
@@ -3526,8 +3756,8 @@ mod pass_tests {
         let pending = pending_for(&roster);
         let id = pending.suite().to_owned();
         let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
-        let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
-        let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
+        let _ = pass.record(&["tests/a.t".to_owned()], &[input("src/shared")], &[], 1);
+        let _ = pass.record(&["tests/b.t".to_owned()], &[input("src/shared")], &[], 1);
         pass.settle_residue(&[proof], &[], true);
         drop(pass);
         let stored_residue = stored(&dir, &id).residue;
@@ -3548,7 +3778,7 @@ mod pass_tests {
         let pending = pending_for(&roster);
         let id = pending.suite().to_owned();
         let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
-        let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
+        let _ = pass.record(&["tests/a.t".to_owned()], &[input("src/shared")], &[], 1);
         pass.settle_residue(&[proof], &[], false);
         drop(pass);
         let stored_residue = stored(&dir, &id).residue;
@@ -3727,8 +3957,8 @@ mod pass_tests {
         let pending = pending_for(&roster);
         let id = pending.suite().to_owned();
         let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
-        let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
-        let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
+        let _ = pass.record(&["tests/a.t".to_owned()], &[input("src/shared")], &[], 1);
+        let _ = pass.record(&["tests/b.t".to_owned()], &[input("src/shared")], &[], 1);
         pass.settle_residue(&[other], &[], false);
         drop(pass);
         let stored_residue = stored(&dir, &id).residue;
@@ -3751,8 +3981,8 @@ mod pass_tests {
         let pending = pending_for(&roster);
         let id = pending.suite().to_owned();
         let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
-        let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
-        let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
+        let _ = pass.record(&["tests/a.t".to_owned()], &[input("src/shared")], &[], 1);
+        let _ = pass.record(&["tests/b.t".to_owned()], &[input("src/shared")], &[], 1);
         pass.settle_residue(&[other, measured], &[], false);
         drop(pass);
         let stored_residue = stored(&dir, &id).residue;
@@ -4160,6 +4390,207 @@ mod keep_tests {
         entries.iter().map(|entry| entry.path.clone()).collect()
     }
 
+    fn record_group(
+        pass: &mut Pass,
+        members: &[String],
+        inputs: &[Input],
+        outputs: &[Input],
+    ) -> Stored {
+        pass.record(members, inputs, outputs, 2)
+    }
+
+    fn group_fixture(name: &str, first_reads: &str, second_reads: &str) -> (PathBuf, Pass) {
+        let units = ["tests/a.t", "tests/b.t"];
+        let mut held = BTreeMap::new();
+        held.insert("tests/a.t".to_owned(), vec![version(vec![0])]);
+        held.insert("tests/b.t".to_owned(), vec![version(vec![1])]);
+        let table = vec![input(first_reads), input(second_reads)];
+        let mut bundle = bundle_for(pending_for(&units), "key", table, held);
+        bundle.residue = Residue {
+            state: ResidueState::Confirmed,
+            paths: Vec::new(),
+            count: 0,
+            whole: Some("p-1".into()),
+        };
+        let dir = seed(name, &bundle);
+        let pass = kept(&dir, &pending_for(&units));
+        (dir, pass)
+    }
+
+    fn group_members() -> [String; 2] {
+        ["tests/a.t".to_owned(), "tests/b.t".to_owned()]
+    }
+
+    #[test]
+    fn owned_entries_name_only_exact_versions() {
+        let (dir, mut pass) = group_fixture("owned-entries", "src/old-a", "src/old-b");
+        let mut directory = input("shared-dir");
+        directory.id = "d".into();
+        let mut listing = input("shared-listing");
+        listing.id = "dl:listing".into();
+        assert!(matches!(
+            record_group(
+                &mut pass,
+                &group_members(),
+                &[input("src/group"), directory, listing],
+                &[input("out/group")],
+            ),
+            Stored::Stored
+        ));
+        assert_eq!(pass.held().len(), 2);
+        assert!(pass.held_owned().is_empty());
+
+        assert!(matches!(
+            pass.record(
+                &["tests/a.t".to_owned()],
+                &[input("src/owned")],
+                &[input("out/owned")],
+                3,
+            ),
+            Stored::Stored
+        ));
+        let inexact = pass.bundle.units["tests/b.t"][0].clone();
+        pass.bundle
+            .units
+            .get_mut("tests/a.t")
+            .unwrap()
+            .push(inexact);
+        let owned = pass.held_owned();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].0, "tests/a.t");
+        assert_eq!(paths(&owned[0].1), ["src/owned"]);
+        assert_eq!(paths(&owned[0].2), ["out/owned"]);
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_two_member_record_stores_identical_inexact_versions_in_one_write() {
+        let (dir, mut pass) = group_fixture("group-write", "src/old-a", "src/old-b");
+        let group_input = input("src/group");
+        let output = input("out/group");
+        assert!(matches!(
+            record_group(&mut pass, &group_members(), &[group_input], &[output]),
+            Stored::Stored
+        ));
+        assert_eq!(pass.writes, 1, "the group is stored in one write");
+        let a = &pass.bundle.units["tests/a.t"][0];
+        let b = &pass.bundle.units["tests/b.t"][0];
+        assert!(!a.exact && !b.exact, "a grouped version is inexact");
+        assert_eq!(
+            serde_json::to_vec(a).unwrap(),
+            serde_json::to_vec(b).unwrap()
+        );
+        let file = dir.join("units/v1").join(bundle_name(&pass.bundle.suite));
+        let disk: SuiteBundleV1 = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
+        assert_eq!(disk.units.len(), 2);
+        assert!(!disk.units["tests/a.t"][0].exact && !disk.units["tests/b.t"][0].exact);
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_refused_two_member_record_keeps_every_member_s_old_version() {
+        let (dir, mut pass) = group_fixture("group-refused", "src/old-a", "src/old-b");
+        let before = serde_json::to_vec(&pass.bundle).unwrap();
+        let file = dir.join("units/v1").join(bundle_name(&pass.bundle.suite));
+        let disk_before = fs::read(&file).unwrap();
+        pass.budget = 1;
+        assert!(matches!(
+            record_group(&mut pass, &group_members(), &[input("src/group")], &[]),
+            Stored::OverBudget
+        ));
+        assert_eq!(serde_json::to_vec(&pass.bundle).unwrap(), before);
+        assert_eq!(fs::read(&file).unwrap(), disk_before);
+        assert!(!pass.residue_lost);
+        assert!(pass.lost_paths.is_empty());
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_refused_group_in_a_clear_pass_restores_prior_members_and_table() {
+        let units = ["tests/a.t", "tests/b.t"];
+        let dir = seed(
+            "group-refused-clear",
+            &bundle_for(pending_for(&units), "key", Vec::new(), BTreeMap::new()),
+        );
+        let pending = pending_for(&units);
+        let mut pass = match start(&dir, &pending, "key", guard()) {
+            Start::Pass(pass) => pass,
+            _ => panic!("the clear pass did not start"),
+        };
+        assert!(matches!(
+            pass.record(&["tests/a.t".to_owned()], &[input("src/old")], &[], 1),
+            Stored::Stored
+        ));
+        let before = serde_json::to_vec(&pass.bundle).unwrap();
+        pass.budget = 1;
+        assert!(matches!(
+            record_group(&mut pass, &group_members(), &[input("src/group")], &[]),
+            Stored::OverBudget
+        ));
+        assert_eq!(serde_json::to_vec(&pass.bundle).unwrap(), before);
+        assert_eq!(paths(&pass.held_of("tests/a.t").0), ["src/old"]);
+        assert!(pass.held_of("tests/b.t").0.is_empty());
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_two_member_record_loses_no_reader_another_member_keeps() {
+        let (dir, mut pass) = group_fixture("group-keeps-reader", "src/shared", "src/shared");
+        assert!(matches!(
+            record_group(&mut pass, &group_members(), &[input("src/shared")], &[]),
+            Stored::Stored
+        ));
+        assert!(!pass.residue_lost);
+        assert!(pass.lost_paths.is_empty());
+        assert!(matches!(pass.bundle.residue.state, ResidueState::Confirmed));
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn assert_group_loses_last_reader(name: &str, first: &str, second: &str) {
+        let (dir, mut pass) = group_fixture(name, first, second);
+        assert!(matches!(
+            record_group(&mut pass, &group_members(), &[input("src/group")], &[]),
+            Stored::Stored
+        ));
+        assert!(pass.residue_lost);
+        assert!(pass.lost_paths.contains("src/last-reader"));
+        assert!(matches!(pass.bundle.residue.state, ResidueState::None));
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_two_member_record_marks_a_path_lost_when_its_last_reader_is_a_replaced_member() {
+        assert_group_loses_last_reader("group-lost-first", "src/last-reader", "src/other");
+    }
+
+    #[test]
+    fn a_two_member_record_loses_the_second_members_last_reader() {
+        assert_group_loses_last_reader("group-lost-second", "src/other", "src/last-reader");
+    }
+
+    #[test]
+    fn a_one_member_record_writes_the_bytes_it_wrote_before() {
+        let (dir, mut pass) = group_fixture("single-record-bytes", "src/old-a", "src/old-b");
+        assert!(matches!(
+            pass.record(&["tests/a.t".to_owned()], &[input("src/old-a")], &[], 2),
+            Stored::Stored
+        ));
+        let version = &pass.bundle.units["tests/a.t"][0];
+        let expected = format!(
+            "{{\"created\":2,\"exact\":true,\"source\":{{\"kind\":\"exit\"}},\"guard\":\"{}\",\"inputs\":[0],\"outputs\":[]}}",
+            pass.bundle.guard_digest
+        );
+        assert_eq!(serde_json::to_string(version).unwrap(), expected);
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn a_path_whose_last_content_reader_turns_stat_only_is_lost() {
         let content = BTreeMap::from([("src/a.src".to_owned(), true)]);
@@ -4201,11 +4632,25 @@ mod keep_tests {
     }
 
     #[test]
+    fn an_inexact_version_still_counts_as_a_reader_for_loss_bookkeeping() {
+        let table = vec![input("src/shared.src")];
+        let exact = version(vec![0]);
+        let mut inexact = version(vec![0]);
+        inexact.exact = false;
+        let removed = bundle_readers(&table, std::iter::once(&exact));
+        let now = bundle_readers(&table, std::iter::once(&inexact));
+        assert!(!lost_reader(&removed, &now));
+    }
+
+    #[test]
     fn only_content_ids_read_content() {
         assert!(content_id("f:1"));
         assert!(content_id("x:1"));
         assert!(content_id("dl:1"));
         assert!(content_id("a"));
+        assert!(content_id("l:target"));
+        assert!(content_id("u"));
+        assert!(!content_id("d"));
         assert!(!content_id("s:1"));
         assert!(!content_id("stat:1"));
     }
@@ -4250,7 +4695,7 @@ mod keep_tests {
         );
         let mut pass = kept(&dir, &pending_for(&units));
         assert!(matches!(
-            pass.record("tests/a.t", &[input("src/c.src")], &[], 2),
+            pass.record(&["tests/a.t".to_owned()], &[input("src/c.src")], &[], 2),
             Stored::Stored
         ));
         assert_eq!(paths(&pass.held_of("tests/a.t").0), ["src/c.src"]);
@@ -4276,7 +4721,7 @@ mod keep_tests {
         let mut pass = kept(&dir, &pending_for(&units));
         pass.budget = 1;
         assert!(matches!(
-            pass.record("tests/a.t", &[input("src/c.src")], &[], 2),
+            pass.record(&["tests/a.t".to_owned()], &[input("src/c.src")], &[], 2),
             Stored::OverBudget
         ));
         assert_eq!(paths(&pass.held_of("tests/a.t").0), ["src/a.src"]);
@@ -4313,7 +4758,7 @@ mod keep_tests {
         let pending = pending_for(&units);
         let mut pass = kept(&dir, &pending);
         assert!(matches!(
-            pass.record("tests/c.t", &[input("src/c.src")], &[], 2),
+            pass.record(&["tests/c.t".to_owned()], &[input("src/c.src")], &[], 2),
             Stored::Stored
         ));
         assert!(
@@ -4369,11 +4814,16 @@ mod keep_tests {
         let mut pass = kept(&dir, &pending_for(&units));
         // m5 stops reading the grep binary, and m6 reads it again later in the same pass.
         assert!(matches!(
-            pass.record("tests/m5.t", &[], &[], 2),
+            pass.record(&["tests/m5.t".to_owned()], &[], &[], 2),
             Stored::Stored
         ));
         assert!(matches!(
-            pass.record("tests/m6.t", &[input("/usr/bin/grep")], &[], 3),
+            pass.record(
+                &["tests/m6.t".to_owned()],
+                &[input("/usr/bin/grep")],
+                &[],
+                3
+            ),
             Stored::Stored
         ));
         pass.settle_residue(&[proof], &[], false);
@@ -4424,7 +4874,7 @@ mod keep_tests {
         let dir = seed("stat-reread", &bundle);
         let mut pass = kept(&dir, &pending_for(&units));
         assert!(matches!(
-            pass.record("tests/m5.t", &[], &[], 2),
+            pass.record(&["tests/m5.t".to_owned()], &[], &[], 2),
             Stored::Stored
         ));
         let stat = Input {
@@ -4434,7 +4884,7 @@ mod keep_tests {
             oid_basis: None,
         };
         assert!(matches!(
-            pass.record("tests/m6.t", &[stat], &[], 3),
+            pass.record(&["tests/m6.t".to_owned()], &[stat], &[], 3),
             Stored::Stored
         ));
         pass.settle_residue(&[proof], &[], false);
@@ -4458,7 +4908,7 @@ mod keep_tests {
         let dir = seed("last-write", &bundle);
         let mut pass = kept(&dir, &pending_for(&units));
         assert!(matches!(
-            pass.record("tests/m5.t", &[], &[], 2),
+            pass.record(&["tests/m5.t".to_owned()], &[], &[], 2),
             Stored::Stored
         ));
         pass.settle_residue(&[proof], &[], false);
@@ -4504,7 +4954,7 @@ mod keep_tests {
         let dir = seed("still-read", &bundle);
         let mut pass = kept(&dir, &pending_for(&units));
         assert!(matches!(
-            pass.record("tests/m5.t", &[], &[], 2),
+            pass.record(&["tests/m5.t".to_owned()], &[], &[], 2),
             Stored::Stored
         ));
         assert!(

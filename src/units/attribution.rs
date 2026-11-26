@@ -192,7 +192,7 @@ pub(super) struct Ran {
 }
 
 /// The launches of a pass or a subset, one traced launch per unit in `units` order (spec 3.3, 3.7, 3.11). Each launch
-/// is judged, and its proof replaces the unit's version when it holds. `named` holds the names the bundle's versions give,
+/// is judged, and its proof replaces the unit's version when it holds. `named` holds the paths exact versions give,
 /// and `skipped` the units that are not launched, so a launch that breaks one of them is seen. `changed` gives each
 /// launched unit its changed inputs, which the launch exports as `STOOP_CHANGED_INPUTS` (spec 3.11).
 /// `gaps` names the changed inputs and the appeared names that no kept version covers. A proof that stats one of them is
@@ -310,8 +310,12 @@ pub(super) fn launch_each(
                                 pass.unsettle();
                             }
                             let (old_inputs, old_outputs) = pass.held_of(unit);
-                            let stored =
-                                pass.record(&launch.unit, &kept.inputs, &kept.outputs, now());
+                            let stored = pass.record(
+                                std::slice::from_ref(&launch.unit),
+                                &kept.inputs,
+                                &kept.outputs,
+                                now(),
+                            );
                             // A failed write keeps the proof in memory, and the end of the pass writes it (spec 3.11).
                             if matches!(stored, Stored::Stored | Stored::WriteFailed) {
                                 ran.stat_gaps.extend(

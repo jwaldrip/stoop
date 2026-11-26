@@ -1274,6 +1274,55 @@ fn d20_a_falsy_switch_is_the_same_as_unset() {
     }
 }
 
+/// D21: the engine without a grouped-proof producer preserves the base's output and stores.
+#[test]
+#[ignore = "requires STOOP_BASE_BIN and a Linux tracer"]
+fn d21_split_on_without_grouping_matches_the_base() {
+    let pair = Pair::new("split-on");
+    pair.write("t", include_str!("fixtures/hook/t"));
+    for root in &pair.roots {
+        fs::set_permissions(root.join("t"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    pair.write("tests/a.t", "src/shared.src\n");
+    pair.write("tests/b.t", "src/shared.src\n");
+    pair.write("tests/c.t", "src/c.src\n");
+    pair.write("src/shared.src", "shared\n");
+    pair.write("src/c.src", "c\n");
+    pair.write("setup.src", "setup\n");
+
+    let hook = "{changed:**/*.t|!slow/**}";
+    let run = ["run", "--root", ".", "--key", "d21", "--", "./t", hook];
+    let explain = ["explain", "--root", ".", "--key", "d21", "--", "./t", hook];
+    let env = [("STOOP_SPLIT", "1")];
+    let step = |label: &str| {
+        pair.step(&format!("D21 {label} explain"), "", &explain, &env);
+        let output = pair.step(&format!("D21 {label} run"), "", &run, &env);
+        pair.compare_store(".stoop");
+        output
+    };
+
+    contains(&step("cold"), "attribution pass after the full run");
+    pair.write("src/shared.src", "shared changed\n");
+    contains(
+        &step("shared edit"),
+        "run 2 (src/shared.src changed): tests/a.t, tests/b.t",
+    );
+    pair.write("tests/c.t", "src/c.src\n\n");
+    contains(&step("own edit"), "run 1 (tests/c.t changed): tests/c.t");
+    pair.write("setup.src", "setup changed\n");
+    contains(
+        &step("setup edit"),
+        "setup.src changed and every unit reads it",
+    );
+    pair.write("tests/d.t", "src/c.src\n");
+    step("new unit");
+    pair.remove("tests/d.t");
+    step("deleted unit");
+    pair.write("tests/a.flag", "ok\n");
+    step("flag appears");
+    step("no-op");
+}
+
 #[test]
 #[ignore = "requires STOOP_BASE_BIN and a Linux tracer"]
 fn legacy_paths_match_the_base() {
