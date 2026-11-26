@@ -189,7 +189,7 @@ fn a_member_writing_another_members_output_is_still_disabled() {
     ];
     warm(&s, &env);
     inject_union(&s);
-    fs::write(marker, "go").unwrap();
+    fs::write(&marker, "go").unwrap();
     s.write("src/shared.src", "changed\n");
     s.write("src/c.src", "changed\n");
     s.clear_log();
