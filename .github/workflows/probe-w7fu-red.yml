@@ -1,0 +1,22 @@
+name: W7 follow-ups red probe
+
+on:
+  push:
+    branches: [probe/w7fu-red]
+
+permissions:
+  contents: read
+
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the three reviewer regressions
+        if: always()
+        run: cargo test --test units_review_r2 r9x_ -- --nocapture --test-threads=1
+      - name: Run the percent diagnostic regression
+        if: always()
+        run: cargo test --test units_evidence an_untraced_launch_escapes_its_percent_once -- --nocapture --test-threads=1
