@@ -746,6 +746,57 @@ fn s10_a_grouped_launch_names_only_units_and_their_changed_inputs() {
 }
 
 #[test]
+fn a_group_exports_the_union_of_members_changed_inputs() {
+    let s = Suite::new();
+    s.write(A, "src/a.src\n");
+    s.write(B, "src/b.src\n");
+    s.write("src/a.src", "a\n");
+    s.write("src/b.src", "b\n");
+    warm(&s, &[]);
+    s.write("src/a.src", "changed a\n");
+    s.write("src/b.src", "changed b\n");
+    s.clear_log();
+    let out = run(&s, &[]);
+    success(&out);
+    let calls = s.launches();
+    assert_eq!(calls.len(), 1, "{}", text(&out.stderr));
+    assert_eq!(calls[0].args, [A, B]);
+    assert_eq!(calls[0].env("changed_inputs"), "src/a.src|src/b.src");
+}
+
+#[test]
+fn shell_environment_code_keeps_one_launch_per_unit() {
+    let s = Suite::new();
+    let words = ["sh", "-c", "./t ${STOOP_CHANGED:+\"$STOOP_CHANGED\"}", "sh"];
+    s.config(
+        "[[units.suite]]\nid = \"shell\"\nmatch = ['sh', '-c', './t ${STOOP_CHANGED:+\"$STOOP_CHANGED\"}', 'sh']\nunits = ['tests/**/*.t']\n",
+    );
+    success(&s.run(&s.root, &[], &words, &GROUP));
+    edit_shared(&s);
+    s.clear_log();
+    let out = s.run(&s.root, &[], &words, &GROUP);
+    success(&out);
+    assert_eq!(launched(&s), [A, B], "{}", text(&out.stderr));
+}
+
+#[test]
+fn the_whole_roster_affected_keeps_one_launch_per_unit() {
+    let s = Suite::new();
+    warm(&s, &[]);
+    edit_shared(&s);
+    s.write("src/c.src", "changed c\n");
+    s.clear_log();
+    let out = run(&s, &[]);
+    success(&out);
+    assert!(
+        text(&out.stderr).contains("attribution pass: 3 units, one launch each"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(launched(&s), [A, B, C], "{}", text(&out.stderr));
+}
+
+#[test]
 fn s24_a_member_the_launch_did_not_read_disables_and_has_no_verdict() {
     let s = Suite::new();
     let toggle = s.outside.join("toggle");
@@ -777,6 +828,7 @@ fn s24_a_member_the_launch_did_not_read_disables_and_has_no_verdict() {
         ),
         "{stderr}"
     );
+    assert!(!stderr.contains("only 1 of 2 launches ran"), "{stderr}");
     let after = s.bundle().unwrap();
     assert_eq!(after["units"][A], before["units"][A]);
     assert_eq!(after["units"][B], before["units"][B]);
