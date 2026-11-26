@@ -55,6 +55,306 @@ fn held_group(s: &Suite, extra: &[(&str, &str)]) -> Child {
         .stderr(Stdio::piped());
     spawning(|| command.spawn()).unwrap()
 }
+fn make_group(s: &Suite, extra: &[(&str, &str)]) {
+    edit_shared(s);
+    let out = run(s, extra);
+    success(&out);
+    assert_eq!(
+        launched(s),
+        ["tests/a.t tests/b.t"],
+        "{}",
+        text(&out.stderr)
+    );
+    s.clear_log();
+}
+
+fn assert_full(s: &Suite, out: &Output, reason: &str) {
+    assert_eq!(launched(s).first().map(String::as_str), Some(""));
+    assert!(text(&out.stderr).contains(reason), "{}", text(&out.stderr));
+}
+#[test]
+fn g_v1_a_file_one_member_read_reruns_the_group() {
+    let s = Suite::new();
+    s.write("src/private.src", "private\n");
+    s.write(A, "src/shared.src\nsrc/private.src\n");
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    s.write("src/private.src", "private changed\n");
+    let out = run(&s, &[]);
+    success(&out);
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &[])));
+}
+
+#[test]
+fn g_v3_a_stat_only_read_reruns_the_group() {
+    let s = Suite::new();
+    let runner = include_str!("fixtures/hook/t");
+    let anchor = "cat \"$ROOT/$line\"";
+    assert_eq!(runner.matches(anchor).count(), 1);
+    s.executable(
+        "t",
+        &runner.replace(
+            anchor,
+            "case $line in\nstat:*) test -e \"$ROOT/${line#stat:}\" ;;\n*) cat \"$ROOT/$line\" ;;\nesac",
+        ),
+    );
+    s.write("src/stat.src", "old\n");
+    s.write(A, "src/shared.src\nstat:src/stat.src\n");
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    s.write("src/stat.src", "changed size\n");
+    let out = run(&s, &[]);
+    success(&out);
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &[])));
+}
+
+#[test]
+fn g_v4_an_appeared_flag_is_excused_and_read_by_the_group() {
+    let s = Suite::new();
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    s.write("tests/a.flag", "ok\n");
+    let out = run(&s, &[]);
+    success(&out);
+    assert_eq!(
+        launched(&s),
+        ["tests/a.t tests/b.t"],
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &[])));
+}
+
+#[test]
+fn g_v7_an_outside_root_change_takes_the_full_form() {
+    let s = Suite::new();
+    let outside = s.outside.join("input");
+    fs::write(&outside, "old\n").unwrap();
+    let extra = [("T_READ_OTHER", outside.to_str().unwrap())];
+    warm(&s, &extra);
+    make_group(&s, &extra);
+    fs::write(&outside, "outside changed\n").unwrap();
+    let out = run(&s, &extra);
+    success(&out);
+    assert_full(&s, &out, "changed outside the repository");
+    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &extra)));
+}
+
+#[test]
+fn g_u1_a_changed_shared_source_is_covered_by_the_group() {
+    let s = Suite::new();
+    warm(&s, &[]);
+    edit_shared(&s);
+    let out = run(&s, &[]);
+    success(&out);
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &[])));
+    for unit in [A, B] {
+        assert_eq!(s.bundle().unwrap()["units"][unit][0]["exact"], false);
+    }
+}
+
+#[test]
+fn g_u2_another_member_covers_a_dropped_read() {
+    let s = Suite::new();
+    s.write("src/extra.src", "old\n");
+    s.write(A, "src/shared.src\nsrc/extra.src\n");
+    s.write(B, "src/shared.src\nsrc/extra.src\n");
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    s.write(A, "src/shared.src\n");
+    s.write("src/extra.src", "changed\n");
+    let out = run(&s, &[]);
+    success(&out);
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &[])));
+}
+
+fn dropped_private_read(s: &Suite) -> Output {
+    s.write("src/private.src", "old\n");
+    s.write(A, "src/shared.src\nsrc/private.src\n");
+    warm(s, &[]);
+    make_group(s, &[]);
+    s.write(A, "src/shared.src\n");
+    s.write("src/private.src", "changed\n");
+    run(s, &[])
+}
+
+#[test]
+fn g_u3_a_sole_reader_dropping_its_read_has_no_verdict() {
+    let s = Suite::new();
+    let out = dropped_private_read(&s);
+    let stderr = text(&out.stderr);
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+    assert_eq!(code(&out), 125, "{stderr}");
+    assert!(
+        stderr.contains("stoop: this run has no verdict (exit 125): src/private.src changed, and no unit's new proof reads it"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn g_t1_an_unchanged_retry_after_a_grouped_125_takes_the_full_form() {
+    let s = Suite::new();
+    let first = dropped_private_read(&s);
+    assert_eq!(code(&first), 125, "{}", text(&first.stderr));
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+    s.clear_log();
+    let retry = run(&s, &[]);
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
+    assert_eq!(code(&retry), code(&s.direct(&s.root, &[], &[])));
+}
+
+#[test]
+fn g_d1_a_removed_member_takes_the_full_form() {
+    let s = Suite::new();
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    s.remove(A);
+    let out = run(&s, &[]);
+    success(&out);
+    assert_full(
+        &s,
+        &out,
+        "tests/a.t was removed after the full command read it",
+    );
+    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &[])));
+}
+
+#[test]
+fn g_d2_a_removed_private_input_takes_the_full_form() {
+    let s = Suite::new();
+    s.write("src/private.src", "private\n");
+    s.write(A, "src/shared.src\nsrc/private.src\n");
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    s.remove("src/private.src");
+    let out = run(&s, &[]);
+    assert_full(
+        &s,
+        &out,
+        "src/private.src was removed, and a unit's stored proof reads it",
+    );
+    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &[])));
+}
+
+#[test]
+fn g_d3_the_full_run_after_a_removal_reproves_the_group() {
+    let s = Suite::new();
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    s.remove(A);
+    let out = run(&s, &[]);
+    success(&out);
+    assert_full(
+        &s,
+        &out,
+        "tests/a.t was removed after the full command read it",
+    );
+    assert!(launched(&s).iter().any(|call| call == B));
+    let bundle = s.bundle().unwrap();
+    assert_eq!(bundle["units"][B][0]["exact"], true, "{bundle}");
+    assert_eq!(bundle["residue"]["state"], "confirmed", "{bundle}");
+}
+
+#[test]
+fn g_r1_a_reset_residue_waits_for_the_next_full_run() {
+    let s = Suite::new();
+    s.write("src/private.src", "private\n");
+    s.write(A, "src/shared.src\nsrc/private.src\n");
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    s.write(A, "src/shared.src\n");
+    let out = run(&s, &[]);
+    success(&out);
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+    assert_eq!(s.bundle().unwrap()["residue"]["state"], "none");
+    s.clear_log();
+    let next = run(&s, &[]);
+    success(&next);
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
+    let bundle = s.bundle().unwrap();
+    assert_eq!(bundle["residue"]["state"], "confirmed", "{bundle}");
+    for unit in [A, B] {
+        assert_eq!(bundle["units"][unit][0]["exact"], true, "{unit}: {bundle}");
+    }
+}
+
+#[test]
+fn g_r3_explain_counts_inexact_units_for_completion() {
+    let s = Suite::new();
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    s.write("tests/d.t", "src/c.src\n");
+    let out = explain_words(&s, &["./t", HOOK], &GROUP);
+    assert!(s.launches().is_empty());
+    let message = all_output(&out);
+    assert!(
+        message.contains("would launch 3 units without a current exact proof, one launch each"),
+        "{message}"
+    );
+    let run = run(&s, &[]);
+    success(&run);
+    assert_eq!(launched(&s), ["", A, B, "tests/d.t"]);
+}
+
+#[test]
+fn g_a1_a_failing_forced_full_run_with_inexact_proofs_disables() {
+    let s = Suite::new();
+    let gate = s.outside.join("fail-full");
+    let extra = [("T_IF", gate.to_str().unwrap()), ("T_FAIL_FULL", "1")];
+    warm(&s, &extra);
+    make_group(&s, &extra);
+    fs::write(&gate, "fail").unwrap();
+    let forced = [
+        ("T_IF", gate.to_str().unwrap()),
+        ("T_FAIL_FULL", "1"),
+        ("STOOP_FULL", "1"),
+    ];
+    let out = run(&s, &forced);
+    assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
+    let bundle = s.bundle().unwrap();
+    assert_eq!(bundle["state"]["status"], "disabled", "{bundle}");
+    assert_eq!(bundle["state"]["code"], "disagreement", "{bundle}");
+    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &extra)));
+}
+
+#[test]
+fn g_k1_inexact_proofs_stay_valid_with_grouping_off() {
+    let s = Suite::new();
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    let no_group = [("STOOP_SPLIT", "1")];
+    success(&s.hook(&no_group));
+    assert!(s.launches().is_empty());
+    s.write(A, "src/shared.src\n\n");
+    let out = s.hook(&no_group);
+    success(&out);
+    assert_eq!(launched(&s), [A, B], "{}", text(&out.stderr));
+    for unit in [A, B] {
+        assert_eq!(s.bundle().unwrap()["units"][unit][0]["exact"], true);
+    }
+}
+
+#[test]
+fn g_o1_a_new_unit_beside_a_grouped_edit_takes_the_full_form() {
+    let s = Suite::new();
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    s.write(A, "src/shared.src\n\n");
+    s.write("tests/d.t", "src/c.src\n");
+    let out = run(&s, &[]);
+    success(&out);
+    assert_full(
+        &s,
+        &out,
+        "tests/d.t was not on the roster of the last full run",
+    );
+    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &[])));
+}
 
 #[test]
 fn s2_an_edit_to_shared_runs_a_and_b_in_one_launch() {
@@ -199,7 +499,8 @@ fn s14_a_kill_during_the_group_launch_leaves_both_affected() {
     drop(writer);
     fs::remove_file(&gate).unwrap();
     assert_eq!(s.bundle_bytes().unwrap(), before);
-    let prediction = explain_words(&s, &["./t", HOOK], &extra);
+    let env: Vec<_> = GROUP.into_iter().chain(extra.iter().copied()).collect();
+    let prediction = explain_words(&s, &["./t", HOOK], &env);
     let explained = all_output(&prediction);
     assert!(
         explained.contains("stoop: affected tests/a.t: src/shared.src changed"),
