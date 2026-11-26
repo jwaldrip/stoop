@@ -767,9 +767,14 @@ fn a_group_exports_the_union_of_members_changed_inputs() {
 #[test]
 fn shell_environment_code_keeps_one_launch_per_unit() {
     let s = Suite::new();
-    let words = ["sh", "-c", "./t ${STOOP_CHANGED:+\"$STOOP_CHANGED\"}", "sh"];
+    let words = [
+        "sh",
+        "-c",
+        "cat .stoop.toml >/dev/null; ./t ${STOOP_CHANGED:+\"$STOOP_CHANGED\"}",
+        "sh",
+    ];
     s.config(
-        "[[units.suite]]\nid = \"shell\"\nmatch = ['sh', '-c', './t ${STOOP_CHANGED:+\"$STOOP_CHANGED\"}', 'sh']\nunits = ['tests/**/*.t']\n",
+        "[[units.suite]]\nid = \"shell\"\nmatch = ['sh', '-c', 'cat .stoop.toml >/dev/null; ./t ${STOOP_CHANGED:+\"$STOOP_CHANGED\"}', 'sh']\nunits = ['tests/**/*.t']\n",
     );
     success(&s.run(&s.root, &[], &words, &GROUP));
     edit_shared(&s);
@@ -829,6 +834,41 @@ fn s24_a_member_the_launch_did_not_read_disables_and_has_no_verdict() {
         "{stderr}"
     );
     assert!(!stderr.contains("only 1 of 2 launches ran"), "{stderr}");
+    let after = s.bundle().unwrap();
+    assert_eq!(after["units"][A], before["units"][A]);
+    assert_eq!(after["units"][B], before["units"][B]);
+}
+
+#[test]
+fn a_missing_group_member_alone_has_no_verdict() {
+    let s = Suite::new();
+    fs::create_dir(s.path(".outputs")).unwrap();
+    let toggle = s.outside.join("toggle");
+    let toggle = toggle.to_str().unwrap();
+    let extra = [
+        ("T_WRITE_EACH", "1"),
+        ("T_OUTPUT_DIR", ".outputs"),
+        ("T_SKIP_TEST", B),
+        ("T_IF", toggle),
+    ];
+    warm(&s, &extra);
+    let before = s.bundle().unwrap();
+    s.remove(".outputs/a.t.out");
+    s.remove(".outputs/b.t.out");
+    fs::write(toggle, "on").unwrap();
+    let out = run(&s, &extra);
+    let stderr = text(&out.stderr);
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"], "{stderr}");
+    assert_eq!(code(&out), 125, "{stderr}");
+    assert!(
+        stderr.contains("tests/b.t did not run in its launch"),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("only 1 of 2 launches ran"), "{stderr}");
+    assert!(
+        !stderr.contains("changed, and no unit's new proof reads it"),
+        "{stderr}"
+    );
     let after = s.bundle().unwrap();
     assert_eq!(after["units"][A], before["units"][A]);
     assert_eq!(after["units"][B], before["units"][B]);
