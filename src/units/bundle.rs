@@ -1628,8 +1628,11 @@ impl Pass {
         changed
     }
 
-    /// The entries that a unit's stored versions name, as inputs and as outputs, in table order (spec 3.9).
-    fn entries(&self, versions: &[UnitVersion]) -> (Vec<Input>, Vec<Input>) {
+    /// The entries that the supplied versions name, as inputs and outputs, in table order.
+    fn entries<'a>(
+        &self,
+        versions: impl IntoIterator<Item = &'a UnitVersion>,
+    ) -> (Vec<Input>, Vec<Input>) {
         let len = self.bundle.table.len();
         let mut inputs = Vec::new();
         let mut outputs = Vec::new();
@@ -1660,6 +1663,20 @@ impl Pass {
             .map(|(unit, versions)| {
                 let (inputs, outputs) = self.entries(versions);
                 (unit.clone(), inputs, outputs)
+            })
+            .collect()
+    }
+
+    /// Only exact versions identify a particular unit as the owner of a path.
+    pub(crate) fn held_owned(&self) -> Vec<(String, Vec<Input>, Vec<Input>)> {
+        self.bundle
+            .units
+            .iter()
+            .filter_map(|(unit, versions)| {
+                let mut exact = versions.iter().filter(|version| version.exact).peekable();
+                exact.peek()?;
+                let (inputs, outputs) = self.entries(exact);
+                Some((unit.clone(), inputs, outputs))
             })
             .collect()
     }
@@ -4402,6 +4419,49 @@ mod keep_tests {
 
     fn group_members() -> [String; 2] {
         ["tests/a.t".to_owned(), "tests/b.t".to_owned()]
+    }
+
+    #[test]
+    fn owned_entries_name_only_exact_versions() {
+        let (dir, mut pass) = group_fixture("owned-entries", "src/old-a", "src/old-b");
+        let mut directory = input("shared-dir");
+        directory.id = "d".into();
+        let mut listing = input("shared-listing");
+        listing.id = "dl:listing".into();
+        assert!(matches!(
+            record_group(
+                &mut pass,
+                &group_members(),
+                &[input("src/group"), directory, listing],
+                &[input("out/group")],
+            ),
+            Stored::Stored
+        ));
+        assert_eq!(pass.held().len(), 2);
+        assert!(pass.held_owned().is_empty());
+
+        assert!(matches!(
+            pass.record(
+                &["tests/a.t".to_owned()],
+                &[input("src/owned")],
+                &[input("out/owned")],
+                3,
+            ),
+            Stored::Stored
+        ));
+        let inexact = pass.bundle.units["tests/b.t"][0].clone();
+        pass.bundle
+            .units
+            .get_mut("tests/a.t")
+            .unwrap()
+            .push(inexact);
+        let owned = pass.held_owned();
+        assert_eq!(owned.len(), 1);
+        assert_eq!(owned[0].0, "tests/a.t");
+        assert_eq!(paths(&owned[0].1), ["src/owned"]);
+        assert_eq!(paths(&owned[0].2), ["out/owned"]);
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

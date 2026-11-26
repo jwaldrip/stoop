@@ -125,7 +125,7 @@ pub(crate) fn learn(
     let real_root = std::fs::canonicalize(cx.root).unwrap_or_else(|_| cx.root.clone());
     let roster = Roster::new(pending.units());
     let mut named = Named::default();
-    for (unit, inputs, outputs) in pass.held() {
+    for (unit, inputs, outputs) in pass.held_owned() {
         named.store(&unit, &paths(&inputs), &paths(&outputs));
     }
     let ran = attribution::launch_each(
@@ -230,10 +230,9 @@ fn launch(frame: &Frame<'_, '_>, mut pass: Pass, plan: &Plan) -> Outcome {
         .iter()
         .map(|affected| affected.unit.clone())
         .collect();
-    // Every unit's stored entries name a path, so a launch that writes one of them is seen, including the entries of a
-    // unit that is launched later (spec 3.8, 3.11).
+    // Only exact versions name an owner. Inexact paths of skipped units remain protected by the 125 checks below.
     let mut named = Named::default();
-    for (unit, inputs, outputs) in pass.held() {
+    for (unit, inputs, outputs) in pass.held_owned() {
         named.store(&unit, &paths(&inputs), &paths(&outputs));
     }
     let skipped = skipped_units(&pass, units, &launched);

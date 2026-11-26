@@ -192,7 +192,7 @@ pub(super) struct Ran {
 }
 
 /// The launches of a pass or a subset, one traced launch per unit in `units` order (spec 3.3, 3.7, 3.11). Each launch
-/// is judged, and its proof replaces the unit's version when it holds. `named` holds the names the bundle's versions give,
+/// is judged, and its proof replaces the unit's version when it holds. `named` holds the paths exact versions give,
 /// and `skipped` the units that are not launched, so a launch that breaks one of them is seen. `changed` gives each
 /// launched unit its changed inputs, which the launch exports as `STOOP_CHANGED_INPUTS` (spec 3.11).
 /// `gaps` names the changed inputs and the appeared names that no kept version covers. A proof that stats one of them is
