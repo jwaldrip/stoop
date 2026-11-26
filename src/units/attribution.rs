@@ -197,6 +197,9 @@ pub(super) struct Ran {
     grouped_untraced: bool,
     /// The bundle refused the proof of a grouped launch.
     grouped_over_budget: bool,
+    /// The first singleton launch that could not be traced and exited 0. It has no member evidence, so the run has no
+    /// verdict (decision A, spec 3.7).
+    untraced_success: Option<String>,
 }
 
 /// The launches of a pass or a subset, one traced launch per entry of `launches`, in order (spec 3.3, 3.7, 3.11). An
@@ -275,18 +278,23 @@ pub(super) fn launch_each(
                         ),
                     );
                     ran.ran += 1;
-                    run::plain(&argv, &[])
+                    let status = run::plain(&argv, &[]);
+                    record_untraced(&mut ran, status, &name);
+                    status
                 }
                 Ok(trace) => {
                     ran.ran += 1;
                     let observed = Observed::of(&trace, cx.root, real_root, ignore);
-                    // Check grouped evidence independently of judge's diagnostic precedence: a coupling can be found
-                    // before NeverRan, but it must not turn a successful launch that skipped a member into a verdict.
-                    if grouped && observed.status == 0 {
-                        ran.unverified = members
-                            .iter()
-                            .find(|unit| !observed.content.contains(*unit))
-                            .cloned();
+                    // A launch that exits 0 must have read the own file of each member, whatever judge reports first (spec
+                    // 3.7, C5). A coupling diagnostic can come before NeverRan, and it must not turn that into a verdict.
+                    if let Some(unit) = unverified_member(
+                        grouped,
+                        index + 1 == launches.len(),
+                        observed.status,
+                        members,
+                        &observed.content,
+                    ) {
+                        ran.unverified = Some(unit);
                     }
                     let context = launch::Context {
                         root: cx.root,
@@ -442,9 +450,9 @@ fn file_breach(skipped: &[SkippedUnit], written: &Written) -> Option<Breach> {
     })
 }
 
-/// A grouped trace error never falls through to an untraced launch, regardless of its error kind. The singleton path
-/// retains its existing fallback. Linux execvp failures inside the traced child return status 127 rather than an error;
-/// the command-line fit check is the defense for E2BIG on that path.
+/// A grouped trace error never falls through to an untraced launch, regardless of its error kind. A singleton keeps its
+/// untraced fallback, whose exit 0 is no verdict (`record_untraced`). Linux execvp failures inside the traced child
+/// return status 127 rather than an error; the command-line fit check is the defense for E2BIG on that path.
 fn grouped_trace_failure(
     ran: &mut Ran,
     grouped: bool,
@@ -460,6 +468,37 @@ fn grouped_trace_failure(
     true
 }
 
+/// The member that a launch leaves without its own file read, when the launch exits 0 and that exit would otherwise be
+/// the run's verdict (spec 3.7, C5). A grouped launch always checks. A singleton checks only when it is the last launch:
+/// a singleton that stops the pass earlier already has no verdict, and its message stays as it was. A stat is not a
+/// read, so `content` holds content reads only.
+fn unverified_member(
+    grouped: bool,
+    last: bool,
+    status: i32,
+    members: &[String],
+    content: &BTreeSet<String>,
+) -> Option<String> {
+    if status != 0 || !(grouped || last) {
+        return None;
+    }
+    members
+        .iter()
+        .find(|unit| !content.contains(*unit))
+        .cloned()
+}
+
+/// A singleton launch that could not be traced has no member evidence, so an exit 0 from its plain run is no verdict
+/// (decision A). A nonzero status is the launch's own verdict and stands as it is. The rule applies wherever the launches
+/// decide the run's exit: a subset run, and an attribution pass that `pass` starts, whose exit is its launches' status
+/// (run.rs). Completion after a full run is different: `subset::learn` keeps the full command's status and never calls
+/// `finish`, so its untraced launches record no proof and leave the exit as it is.
+fn record_untraced(ran: &mut Ran, status: i32, name: &str) {
+    if status == 0 && ran.untraced_success.is_none() {
+        ran.untraced_success = Some(name.to_owned());
+    }
+}
+
 /// Records a proof-budget refusal without giving a grouped launch a successful verdict.
 fn budget_refused(ran: &mut Ran, grouped: bool) {
     ran.over_budget += 1;
@@ -470,6 +509,7 @@ fn no_verdict(ran: &Ran, stopped_early: bool) -> bool {
     ran.unlaunched
         || stopped_early
         || ran.unverified.is_some()
+        || ran.untraced_success.is_some()
         || ran.grouped_over_budget
         || !ran.breaches.is_empty()
         || !ran.unread.is_empty()
@@ -581,6 +621,15 @@ pub(super) fn finish(
                 quiet,
                 format!(
                     "stoop: this run has no verdict (exit 125): {} did not run in its launch",
+                    safe(unit)
+                ),
+            );
+        }
+        if let Some(unit) = &ran.untraced_success {
+            say(
+                quiet,
+                format!(
+                    "stoop: this run has no verdict (exit 125): the launch of {} could not be traced, so it has no member evidence",
                     safe(unit)
                 ),
             );
@@ -1005,7 +1054,7 @@ mod tests {
     use super::super::launch::{self, Observed, Verdict};
     use super::{
         budget_refused, disabling, exit_status, grouped_trace_failure, no_verdict, not_launched,
-        Disabling, Ran,
+        record_untraced, unverified_member, Disabling, Ran,
     };
     use crate::ignore::Ignore;
     use crate::trace::{Touch, Trace};
@@ -1269,7 +1318,7 @@ mod tests {
     }
 
     #[test]
-    fn singleton_tracer_errors_keep_the_existing_plain_fallback() {
+    fn singleton_tracer_errors_keep_the_plain_fallback_but_not_its_success() {
         let mut ran = Ran::default();
         assert!(!grouped_trace_failure(
             &mut ran,
@@ -1281,6 +1330,95 @@ mod tests {
         assert!(!ran.unlaunched);
         assert!(!ran.grouped_untraced);
         assert!(!no_verdict(&ran, false));
+        // The plain run exits 0 with no member evidence, so the run has no verdict (decision A).
+        record_untraced(&mut ran, 0, "a");
+        assert!(no_verdict(&ran, false));
+    }
+
+    #[test]
+    fn an_untraced_launch_that_exits_zero_is_no_verdict_and_exits_125() {
+        let mut ran = Ran::default();
+        record_untraced(&mut ran, 0, "tests/a.t");
+        assert_eq!(exit_status(ran.status, no_verdict(&ran, false)), 125);
+    }
+
+    #[test]
+    fn an_untraced_launch_that_fails_keeps_its_status_and_no_untraced_mark() {
+        let mut ran = Ran::default();
+        record_untraced(&mut ran, 1, "tests/a.t");
+        assert!(ran.untraced_success.is_none());
+        ran.status = 1;
+        assert_eq!(exit_status(ran.status, no_verdict(&ran, false)), 1);
+    }
+
+    #[test]
+    fn a_later_failure_keeps_its_status_over_an_untraced_success() {
+        let mut ran = Ran::default();
+        record_untraced(&mut ran, 0, "tests/a.t");
+        ran.status = 2;
+        assert_eq!(exit_status(ran.status, no_verdict(&ran, false)), 2);
+    }
+
+    #[test]
+    fn a_last_singleton_without_its_own_read_on_exit_zero_is_unverified() {
+        let members = ["tests/a.t".to_owned()];
+        assert_eq!(
+            unverified_member(false, true, 0, &members, &BTreeSet::new()),
+            Some("tests/a.t".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_last_singleton_with_its_own_read_on_exit_zero_is_verified() {
+        let members = ["tests/a.t".to_owned()];
+        let content = BTreeSet::from(["tests/a.t".to_owned()]);
+        assert_eq!(unverified_member(false, true, 0, &members, &content), None);
+    }
+
+    #[test]
+    fn a_non_last_singleton_without_its_own_read_is_left_to_its_stop() {
+        let members = ["tests/a.t".to_owned()];
+        assert_eq!(
+            unverified_member(false, false, 0, &members, &BTreeSet::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_grouped_launch_names_its_first_member_without_a_read_wherever_it_is() {
+        let members = ["tests/a.t".to_owned(), "tests/b.t".to_owned()];
+        let content = BTreeSet::from(["tests/a.t".to_owned()]);
+        assert_eq!(
+            unverified_member(true, false, 0, &members, &content),
+            Some("tests/b.t".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_nonzero_launch_is_never_unverified() {
+        let members = ["tests/a.t".to_owned()];
+        assert_eq!(
+            unverified_member(false, true, 1, &members, &BTreeSet::new()),
+            None
+        );
+        assert_eq!(
+            unverified_member(true, true, 2, &members, &BTreeSet::new()),
+            None
+        );
+    }
+
+    #[test]
+    fn a_stat_of_the_own_file_is_not_a_read_for_the_last_singleton() {
+        let (dir, real) = tree("stat-last");
+        let observed_trace = trace(&[(dir.join("tests/a.t"), STAT)]);
+        let ignore = Ignore::new(&[], None, &[]);
+        let observed = Observed::of(&observed_trace, &dir, &real, &ignore);
+        let members = ["tests/a.t".to_owned()];
+        assert_eq!(
+            unverified_member(false, true, 0, &members, &observed.content),
+            Some("tests/a.t".to_owned())
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
