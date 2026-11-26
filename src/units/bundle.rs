@@ -4588,6 +4588,9 @@ mod keep_tests {
         assert!(content_id("x:1"));
         assert!(content_id("dl:1"));
         assert!(content_id("a"));
+        assert!(content_id("l:target"));
+        assert!(content_id("u"));
+        assert!(!content_id("d"));
         assert!(!content_id("s:1"));
         assert!(!content_id("stat:1"));
     }

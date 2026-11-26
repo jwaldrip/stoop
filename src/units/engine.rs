@@ -1707,6 +1707,18 @@ mod tests {
     }
 
     #[test]
+    fn listing_coverage_uses_the_same_identity_kinds_for_inexact_versions() {
+        let (view, current, roster) = identity_matrix_view();
+        let covered = covered_reads(&judged(&roster, 0), &view, &current, &BTreeSet::new());
+        for path in ["tests/a.t", "tests/b.t", "/outside-root"] {
+            assert!(covered.contains(path), "{path}");
+        }
+        for path in ["dir", "listed", "absent", "link", "unreadable", "output"] {
+            assert!(!covered.contains(path), "{path}");
+        }
+    }
+
+    #[test]
     fn a_file_a_valid_roster_version_reads_is_covered() {
         let table = vec![input("tests/a.t", "f:1"), input("tests/a.flag", "f:2")];
         let (view, current) = view_of(vec![("tests/a.t", vec![version(1_000, vec![0, 1])])], table);
