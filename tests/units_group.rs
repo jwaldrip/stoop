@@ -1173,10 +1173,16 @@ fn a10n_the_4_13_rows_run_end_to_end() {
                 }
             })
             .collect();
+        assert!(
+            !actual.windows(2).any(|lines| lines == ["launch", "launch"]),
+            "A10N_FIXTURE_RESIDUE {:?}: {actual:?}; {}",
+            row.words,
+            text(&out.stderr)
+        );
         assert_eq!(
             actual,
             row.expected,
-            "{:?}: {}",
+            "A10N_GROUPED_ARGV {:?}: {}",
             row.words,
             text(&out.stderr)
         );

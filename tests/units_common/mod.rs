@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
@@ -54,31 +54,74 @@ pub fn model_launch_units(launches: &[String], grouped: bool) -> Vec<String> {
 pub struct ModelGroupTally {
     grouped_launches: usize,
     inexact_versions_written: usize,
+    root: Option<PathBuf>,
+    versions: BTreeMap<String, Vec<Value>>,
+}
+
+/// Resolve delta-encoded table indices before comparing versions, since table compaction can renumber them.
+fn model_version(version: &Value, table: &[Value]) -> Value {
+    let mut version = version.clone();
+    for field in ["inputs", "outputs"] {
+        let mut index = 0usize;
+        let mut inputs: Vec<Value> = version[field]
+            .as_array()
+            .expect("version indices")
+            .iter()
+            .map(|delta| {
+                index += delta.as_u64().expect("version index") as usize;
+                table.get(index).expect("version table entry").clone()
+            })
+            .collect();
+        inputs.sort_by_key(Value::to_string);
+        version[field] = Value::Array(inputs);
+    }
+    version
 }
 
 impl ModelGroupTally {
-    /// Count grouped launch records and inexact versions observed after this subject run.
+    /// Count grouped launches and newly observed inexact member versions, not unchanged versions seen again.
     pub fn record(&mut self, s: &Suite, launches: &[String]) {
-        self.grouped_launches += launches
+        if self.root.as_ref() != Some(&s.root) {
+            self.root = Some(s.root.clone());
+            self.versions.clear();
+        }
+        let groups: Vec<Vec<&str>> = launches
             .iter()
-            .filter(|launch| launch.split(' ').count() > 1)
-            .count();
-        self.inexact_versions_written += s.bundle().map_or(0, |bundle| {
-            bundle["units"].as_object().map_or(0, |units| {
-                units
-                    .values()
-                    .filter_map(Value::as_array)
-                    .flat_map(|versions| versions.iter())
-                    .filter(|version| version["exact"].as_bool() == Some(false))
-                    .count()
-            })
+            .map(|launch| launch.split(' ').collect())
+            .filter(|members: &Vec<&str>| members.len() > 1)
+            .collect();
+        self.grouped_launches += groups.len();
+        let members: BTreeSet<&str> = groups.into_iter().flatten().collect();
+        let versions = s.bundle().map_or_else(BTreeMap::new, |bundle| {
+            let table = bundle["table"].as_array().expect("bundle table");
+            bundle["units"]
+                .as_object()
+                .expect("bundle units")
+                .iter()
+                .map(|(unit, versions)| {
+                    let inexact = versions
+                        .as_array()
+                        .expect("unit versions")
+                        .iter()
+                        .filter(|version| version["exact"].as_bool() == Some(false))
+                        .map(|version| model_version(version, table))
+                        .collect();
+                    (unit.clone(), inexact)
+                })
+                .collect()
         });
+        for (unit, inexact) in &versions {
+            if members.contains(unit.as_str()) && self.versions.get(unit) != Some(inexact) {
+                self.inexact_versions_written += inexact.len();
+            }
+        }
+        self.versions = versions;
     }
 
     pub fn summary(&self, grouped: bool) -> String {
         if grouped {
             format!(
-                ", grouped launches: {}, inexact versions written: {}",
+                ", grouped launches: {}, inexact versions written (observed lower bound): {}",
                 self.grouped_launches, self.inexact_versions_written
             )
         } else {
