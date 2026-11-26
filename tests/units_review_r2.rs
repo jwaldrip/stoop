@@ -3355,3 +3355,223 @@ fn r9_sticky_listing_requires_the_same_empty_directory() {
         "a directory that did not exist before the step must end the sticky retry"
     );
 }
+
+#[test]
+fn r9x_identical_flag_rewrite_keeps_a_sticky_retry() {
+    let s = r7_policy_fixture();
+    let units: Vec<String> = ROSTER.iter().map(|unit| (*unit).to_owned()).collect();
+    let runners = vec!["tests/z.u".to_owned()];
+    let flag = "tests/z.flag";
+    s.write(flag, "fail\n");
+    let (_, origin, origin_launches, origin_oracle) = judge("r9x-flag-w22", &s, &TU, true);
+    assert_eq!(
+        (code(&origin), origin_oracle),
+        (0, 1),
+        "{}",
+        stderr(&origin)
+    );
+    assert_eq!(origin_launches, ["tests/c.t"]);
+    let mut divergence = E3Diverged {
+        origin: 1,
+        failing: runners.iter().cloned().collect(),
+        changed: Default::default(),
+        shapes: vec![E3Gap::W22],
+    };
+    let stored = bundle(&s);
+    let previous = fs::read_to_string(s.path(flag)).unwrap();
+    let op = Step::Flag("tests/z.u".to_owned(), "fail");
+    s.write(flag, "fail\n");
+    assert_eq!(fs::read_to_string(s.path(flag)).unwrap(), previous);
+    if e3_changes_runner(&op, "tests/z.u") {
+        divergence.changed.insert("tests/z.u".to_owned());
+    }
+    let (_, retry, launches, oracle) = judge("r9x-flag-retry", &s, &TU, true);
+    let (status, failed, policy) = r7_oracle(&s, &TU);
+    let sticky = e3_sticky(&divergence, &failed, &policy, &runners, &units, &launches);
+    let after = e3_listings(&s, &units);
+    let evidence = E3GapEvidence {
+        runner_only: !launches
+            .iter()
+            .any(|launch| launch == "tests/z.u" || launch.is_empty()),
+        flag_flipped: !previous.contains("fail"),
+        stored_content: e3_stored_content_flag(&stored, &s, &units, flag, &previous),
+        launched_stored_content: e3_stored_content_flag(&stored, &s, &launches, flag, &previous),
+        current_content: !no_content_reader(&s, &after, flag),
+        appeared_test_content: e3_launched_content_path(&after, &launches, "tests/z.u"),
+        ..E3GapEvidence::default()
+    };
+    let shape = e3_gap(evidence);
+    assert_eq!(
+        (code(&retry), oracle, status),
+        (0, 1, 1),
+        "{}",
+        stderr(&retry)
+    );
+    assert!(
+        launches.is_empty(),
+        "identical bytes are no change to the engine"
+    );
+    assert_eq!(failed, runners);
+    assert!(policy.is_empty());
+    assert!(sticky, "an identical flag rewrite keeps the sticky retry");
+    assert_eq!(shape, None, "the unchanged flag is not a fresh origin");
+}
+
+#[test]
+fn r9x_a_held_reader_version_after_a_round_trip_is_rejected() {
+    let s = r7_policy_fixture();
+    let units: Vec<String> = ROSTER.iter().map(|unit| (*unit).to_owned()).collect();
+    let flag = "tests/z.flag";
+    let failure = "tests/z.u";
+    s.write(flag, "fail\n");
+    let (_, first, first_launches, first_oracle) = judge("r9x-trip-first", &s, &TU, true);
+    assert_eq!((code(&first), first_oracle), (0, 1), "{}", stderr(&first));
+    assert_eq!(first_launches, ["tests/c.t"]);
+    s.write(flag, "ok\n");
+    let (_, back, back_launches, back_oracle) = judge("r9x-trip-back", &s, &TU, true);
+    assert_eq!((code(&back), back_oracle), (0, 0), "{}", stderr(&back));
+    assert!(
+        back_launches.is_empty(),
+        "the whole proof holds again, so nothing launches"
+    );
+    let stored = bundle(&s);
+    let versions = stored["units"]["tests/c.t"].as_array().map(Vec::len);
+    let previous = fs::read_to_string(s.path(flag)).unwrap();
+    s.write(flag, "fail\n");
+    let (_, again, launches, oracle) = judge("r9x-trip-again", &s, &TU, true);
+    let (status, failed, policy) = r7_oracle(&s, &TU);
+    let after = e3_listings(&s, &units);
+    let evidence = E3GapEvidence {
+        runner_only: !launches
+            .iter()
+            .any(|launch| launch == failure || launch.is_empty()),
+        flag_flipped: !previous.contains("fail"),
+        stored_content: e3_stored_content_flag(&stored, &s, &units, flag, &previous),
+        launched_stored_content: e3_stored_content_flag(&stored, &s, &launches, flag, &previous),
+        current_content: !no_content_reader(&s, &after, flag),
+        appeared_test_content: e3_launched_content_path(&after, &launches, failure),
+        ..E3GapEvidence::default()
+    };
+    let held_current = e3_stored_content_flag(&stored, &s, &units, flag, "fail\n");
+    let shape = e3_gap(evidence);
+    assert_eq!(
+        (code(&again), oracle, status),
+        (0, 1, 1),
+        "{}",
+        stderr(&again)
+    );
+    assert_eq!(failed, [failure]);
+    assert!(policy.is_empty());
+    assert_eq!(versions, Some(1));
+    assert!(
+        launches.is_empty(),
+        "c's held version read the current flag"
+    );
+    assert!(
+        held_current,
+        "c's held version recorded the flag at its current content"
+    );
+    assert!(evidence.runner_only && evidence.flag_flipped && evidence.current_content);
+    assert_eq!(
+        shape,
+        Some(E3Gap::W22),
+        "the current held reader establishes the gap"
+    );
+}
+
+#[test]
+fn r9x_a_second_w22_during_a_sticky_retry_is_rejected() {
+    let s = zsuite();
+    s.write("tests/y.u", "src/c.src\n");
+    s.write("tests/y.flag", "ok\n");
+    s.write(
+        "tests/c.t",
+        "src/c.src\ntests/z.u\ntests/z.flag\ntests/y.u\ntests/y.flag\n",
+    );
+    listed_policy_setup(&s);
+    s.executable("t", &listed_policy_runner(&e3_runner()));
+    learned(&s, &TU);
+    assert_eq!(known(&s), Some(0), "{}", residue(&s));
+    let units: Vec<String> = ROSTER.iter().map(|unit| (*unit).to_owned()).collect();
+    let runners = vec!["tests/y.u".to_owned(), "tests/z.u".to_owned()];
+    let classify =
+        |stored: &Value, launches: &[String], test: &str, previous: &str, flipped: bool| {
+            let flag = flag_of(test);
+            let after = e3_listings(&s, &units);
+            E3GapEvidence {
+                runner_only: !launches
+                    .iter()
+                    .any(|launch| launch == test || launch.is_empty()),
+                flag_flipped: flipped && !previous.contains("fail"),
+                stored_content: e3_stored_content_flag(stored, &s, &units, &flag, previous),
+                launched_stored_content: e3_stored_content_flag(
+                    stored, &s, launches, &flag, previous,
+                ),
+                current_content: !no_content_reader(&s, &after, &flag),
+                appeared_test_content: e3_launched_content_path(&after, launches, test),
+                ..E3GapEvidence::default()
+            }
+        };
+    let stored = bundle(&s);
+    s.write("tests/z.flag", "fail\n");
+    let (_, origin, origin_launches, origin_oracle) = judge("r9x-second-origin", &s, &TU, true);
+    assert_eq!(
+        (code(&origin), origin_oracle),
+        (0, 1),
+        "{}",
+        stderr(&origin)
+    );
+    assert_eq!(origin_launches, ["tests/c.t"]);
+    assert_eq!(
+        e3_gap(classify(
+            &stored,
+            &origin_launches,
+            "tests/z.u",
+            "ok\n",
+            true
+        )),
+        Some(E3Gap::W22)
+    );
+    let mut divergence = E3Diverged {
+        origin: 1,
+        failing: ["tests/z.u".to_owned()].into_iter().collect(),
+        changed: Default::default(),
+        shapes: vec![E3Gap::W22],
+    };
+    let stored = bundle(&s);
+    let op = Step::Flag("tests/y.u".to_owned(), "fail");
+    s.write("tests/y.flag", "fail\n");
+    for test in divergence.failing.clone() {
+        if e3_changes_runner(&op, &test) {
+            divergence.changed.insert(test);
+        }
+    }
+    let (_, second, launches, oracle) = judge("r9x-second-w22", &s, &TU, true);
+    let (status, failed, policy) = r7_oracle(&s, &TU);
+    let sticky = e3_sticky(&divergence, &failed, &policy, &runners, &units, &launches);
+    let y = e3_gap(classify(&stored, &launches, "tests/y.u", "ok\n", true));
+    let z = e3_gap(classify(&stored, &launches, "tests/z.u", "fail\n", false));
+    let z_alone = e3_sticky(
+        &divergence,
+        &["tests/z.u".to_owned()],
+        &policy,
+        &runners,
+        &units,
+        &launches,
+    );
+    assert_eq!(
+        (code(&second), oracle, status),
+        (0, 1, 1),
+        "{}",
+        stderr(&second)
+    );
+    assert_eq!(launches, ["tests/c.t"]);
+    assert_eq!(failed, runners);
+    assert!(policy.is_empty());
+    assert_eq!(y, Some(E3Gap::W22), "y is a fresh W22");
+    assert!(z_alone, "z alone is still the sticky retry");
+    assert!(
+        sticky || (y.is_some() && z.is_some()),
+        "classify both failures independently"
+    );
+}
