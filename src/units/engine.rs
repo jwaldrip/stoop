@@ -1845,6 +1845,139 @@ mod tests {
     }
 
     #[test]
+    fn an_inexact_kept_version_covers_a_changed_whole_input() {
+        let root = TreeDir::new("inexact-kept", &[("shared", "new")]);
+        let (mut view, _) = view_of(
+            vec![("a.t", vec![inexact_version(vec![0])])],
+            vec![root.entry("shared")],
+        );
+        let roster = vec!["a.t".to_owned()];
+        let cx = Judged {
+            root: &root.0,
+            ..judged(&roster, 0)
+        };
+        let proof = test_proof(vec![input("shared", "f:old")]);
+        let current = Current::of(&root.0, &[&view.table[0]]);
+        assert!(uncovered_changes(&cx, &view, &current, &proof).is_empty());
+        view.units.clear();
+        assert_eq!(uncovered_changes(&cx, &view, &current, &proof), ["shared"]);
+    }
+
+    #[test]
+    fn an_inexact_version_still_marks_a_deleted_input_as_read() {
+        let root = TreeDir::new("inexact-absent", &[]);
+        let (view, _) = view_of(
+            vec![("a.t", vec![inexact_version(vec![0])])],
+            vec![input("missing", "f:old")],
+        );
+        let roster = vec!["a.t".to_owned()];
+        let cx = Judged {
+            root: &root.0,
+            ..judged(&roster, 0)
+        };
+        let proof = test_proof(vec![input("missing", "f:old")]);
+        assert_eq!(
+            absent_reader_change(&cx, &view, &proof).as_deref(),
+            Some("missing")
+        );
+    }
+
+    #[test]
+    fn an_inexact_live_reader_still_covers_a_departed_readers_path() {
+        let root = TreeDir::new("inexact-departed", &[("shared", "new")]);
+        let table = vec![input("shared", "f:old")];
+        let (mut view, _) = view_of(
+            vec![
+                ("a.t", vec![inexact_version(vec![0])]),
+                ("gone.t", vec![version(1_000, vec![0])]),
+            ],
+            table,
+        );
+        let roster = vec!["a.t".to_owned()];
+        let cx = Judged {
+            root: &root.0,
+            ..judged(&roster, 0)
+        };
+        let proof = test_proof(vec![input("shared", "f:old")]);
+        let affected = vec![Affected {
+            unit: "a.t".to_owned(),
+            why: "changed".to_owned(),
+            changed: Vec::new(),
+        }];
+        assert!(!units_that_left_held_a_reader(&cx, &view));
+        assert_eq!(departed_only_change(&cx, &view, &proof, &affected), None);
+        view.units.remove("a.t");
+        assert!(units_that_left_held_a_reader(&cx, &view));
+        assert_eq!(
+            departed_only_change(&cx, &view, &proof, &affected).as_deref(),
+            Some("shared")
+        );
+    }
+
+    #[test]
+    fn inexact_versions_still_participate_in_the_global_input_guard() {
+        let root = TreeDir::new("inexact-global", &[("shared", "new")]);
+        let (view, _) = view_of(
+            vec![
+                ("a.t", vec![inexact_version(vec![0])]),
+                ("b.t", vec![inexact_version(vec![0])]),
+            ],
+            vec![input("shared", "f:old")],
+        );
+        let roster = vec!["a.t".to_owned(), "b.t".to_owned()];
+        let cx = Judged {
+            root: &root.0,
+            ..judged(&roster, 0)
+        };
+        let proof = test_proof(vec![input("shared", "f:old")]);
+        let current = Current::of(&root.0, &[&view.table[0]]);
+        assert_eq!(
+            global_change(&cx, &view, &proof, &current).as_deref(),
+            Some("shared")
+        );
+    }
+
+    #[test]
+    fn an_inexact_version_still_attributes_its_output_to_the_unit() {
+        let root = TreeDir::new("inexact-output", &[]);
+        let mut group = inexact_version(Vec::new());
+        group.outputs.push(0);
+        let (mut view, _) = view_of(vec![("a.t", vec![group])], vec![input("output", "f:old")]);
+        let roster = vec!["a.t".to_owned()];
+        let cx = Judged {
+            root: &root.0,
+            ..judged(&roster, 0)
+        };
+        let mut proof = test_proof(Vec::new());
+        proof.outputs.push(input("output", "f:old"));
+        assert_eq!(output_missing(&cx, &view, &proof), None);
+        view.units.clear();
+        assert_eq!(
+            output_missing(&cx, &view, &proof).as_deref(),
+            Some("output output is missing")
+        );
+    }
+
+    #[test]
+    fn an_inexact_affected_version_supplies_listing_excuses() {
+        let (view, _, _) = identity_matrix_view();
+        let affected = vec![Affected {
+            unit: "tests/a.t".to_owned(),
+            why: "changed".to_owned(),
+            changed: Vec::new(),
+        }];
+        let reads = rerun_reads(&view, &affected, &BTreeSet::new());
+        for entry in &view.table[..8] {
+            assert_eq!(
+                reads.get(&entry.path).unwrap(),
+                &["tests/a.t"],
+                "{}",
+                entry.path
+            );
+        }
+    }
+
+    #[test]
     fn r6_listed_directory_must_exist_for_whole_and_unit_proofs() {
         let root = TreeDir::new("listed-shapes", &[]);
         let dir = root.0.join("policy");

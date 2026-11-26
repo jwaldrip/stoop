@@ -4572,6 +4572,17 @@ mod keep_tests {
     }
 
     #[test]
+    fn an_inexact_version_still_counts_as_a_reader_for_loss_bookkeeping() {
+        let table = vec![input("src/shared.src")];
+        let exact = version(vec![0]);
+        let mut inexact = version(vec![0]);
+        inexact.exact = false;
+        let removed = bundle_readers(&table, std::iter::once(&exact));
+        let now = bundle_readers(&table, std::iter::once(&inexact));
+        assert!(!lost_reader(&removed, &now));
+    }
+
+    #[test]
     fn only_content_ids_read_content() {
         assert!(content_id("f:1"));
         assert!(content_id("x:1"));
