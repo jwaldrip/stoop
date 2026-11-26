@@ -136,15 +136,18 @@ fn a_skipped_inexact_member_is_protected_without_false_disabling() {
     assert_eq!(code(&failed), 1, "{}", text(&failed.stderr));
     s.write(B, "src/shared.src\n");
     s.write("src/shared.src", "shared\n");
+    // Keep the whole proof invalid while b's grouped proof becomes valid again.
+    s.write("src/c.src", "c changed\n");
     s.clear_log();
     let out = s.hook(&ENV);
     let calls = launched(&s);
     assert_eq!(code(&out), 125, "{}", text(&out.stderr));
-    assert_eq!(calls, [A]);
+    assert_eq!(calls, [A, C]);
     assert!(text(&out.stderr).contains("which skipped unit tests/b.t reads"));
     let bundle = s.bundle().unwrap();
     assert_ready(&bundle);
     assert_eq!(bundle["residue"]["state"], "none");
+    assert_eq!(direct(&s, &ENV), 0);
     s.clear_log();
     let retry = s.hook(&ENV);
     assert_eq!(code(&retry), 0, "{}", text(&retry.stderr));
