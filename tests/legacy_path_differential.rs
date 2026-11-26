@@ -1323,6 +1323,42 @@ fn d21_split_on_without_grouping_matches_the_base() {
     step("no-op");
 }
 
+/// D22: grouping on without the engine switch keeps the base's output and stores, for every step of the D21 sequence.
+#[test]
+#[ignore = "requires STOOP_BASE_BIN and a Linux tracer"]
+fn d22_grouping_without_the_switch_matches_the_base() {
+    let pair = Pair::new("group-only");
+    pair.write("t", include_str!("fixtures/hook/t"));
+    for root in &pair.roots {
+        fs::set_permissions(root.join("t"), fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    pair.write("tests/a.t", "src/shared.src\n");
+    pair.write("tests/b.t", "src/shared.src\n");
+    pair.write("tests/c.t", "src/c.src\n");
+    pair.write("src/shared.src", "shared\n");
+    pair.write("src/c.src", "c\n");
+    pair.write("setup.src", "setup\n");
+
+    let hook = "{changed:**/*.t|!slow/**}";
+    let run = ["run", "--root", ".", "--key", "d22", "--", "./t", hook];
+    let explain = ["explain", "--root", ".", "--key", "d22", "--", "./t", hook];
+    let env = [("STOOP_SPLIT_GROUP", "1")];
+    let step = |label: &str| {
+        pair.step(&format!("D22 {label} explain"), "", &explain, &env);
+        pair.step(&format!("D22 {label} run"), "", &run, &env);
+        pair.compare_store(".stoop");
+    };
+
+    step("cold");
+    pair.write("src/shared.src", "shared changed\n");
+    step("shared edit");
+    pair.write("tests/c.t", "src/c.src\n\n");
+    step("own edit");
+    pair.write("setup.src", "setup changed\n");
+    step("setup edit");
+    step("no-op");
+}
+
 #[test]
 #[ignore = "requires STOOP_BASE_BIN and a Linux tracer"]
 fn legacy_paths_match_the_base() {

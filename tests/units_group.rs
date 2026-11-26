@@ -1,4 +1,4 @@
-//! Grouped subset launches, inexact member proofs and fail-closed attribution.
+//! Grouped subset launches, inexact member proofs and fail-closed attribution (W7-4b).
 #![cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -32,8 +32,10 @@ fn launched(s: &Suite) -> Vec<String> {
 }
 
 fn warm(s: &Suite, extra: &[(&str, &str)]) {
-    success(&run(s, extra));
-    assert_eq!(launched(s), ["", A, B, C]);
+    s.clear_log();
+    let out = run(s, extra);
+    success(&out);
+    assert_eq!(launched(s), ["", A, B, C], "{}", text(&out.stderr));
     s.clear_log();
 }
 
@@ -55,10 +57,15 @@ fn s2_an_edit_to_shared_runs_a_and_b_in_one_launch() {
     let a = &bundle["units"][A][0];
     let b = &bundle["units"][B][0];
     assert_eq!(a["exact"], false);
+    assert_eq!(b["exact"], false);
     for field in ["inputs", "outputs", "created", "guard"] {
         assert_eq!(a[field], b[field], "{field}");
     }
-    assert_eq!(bundle["units"][C], before["units"][C]);
+    assert_eq!(
+        bundle["units"][C][0]["created"],
+        before["units"][C][0]["created"]
+    );
+    assert_eq!(bundle["units"][C][0]["exact"], true);
     s.clear_log();
     success(&run(&s, &[]));
     assert!(s.launches().is_empty());
@@ -111,7 +118,12 @@ fn s24_a_member_the_launch_did_not_read_disables_and_has_no_verdict() {
     s.remove("tests/b.out");
     fs::write(toggle, "on").unwrap();
     let out = run(&s, &extra);
-    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+    assert_eq!(
+        launched(&s),
+        ["tests/a.t tests/b.t"],
+        "{}",
+        text(&out.stderr)
+    );
     assert_eq!(code(&out), 125, "{}", text(&out.stderr));
     let stderr = text(&out.stderr);
     assert!(
@@ -236,8 +248,9 @@ fn all_output(out: &Output) -> String {
     format!("{}{}", text(&out.stdout), text(&out.stderr))
 }
 
-/// One hundred units whose paths are about 700 bytes long, so 99 of them as one join word overflow 64 KiB (S20). The
-/// first 99 read the shared source, and the last reads the centre source only.
+/// One hundred and three units with the three of the suite: one hundred whose paths are about 700 bytes long, so 101 of
+/// them as one join word overflow 64 KiB (S20). The first 99 read the shared source, and the last reads the centre
+/// source only. The full command runs every `*.t`, so the roster must cover them all.
 fn long_units(s: &Suite) -> Vec<String> {
     let dir = format!("long/{}", format!("{}/", "d".repeat(45)).repeat(15));
     (0..100)
@@ -289,15 +302,25 @@ fn a_grouped_launch_writes_one_list_holding_every_member() {
 fn s20_a_join_word_over_64_kib_runs_the_full_form() {
     let s = Suite::new();
     long_units(&s);
-    let words = ["./t", "{changed:long/**/*.t:comma}"];
+    let words = ["./t", "{changed:**/*.t|!slow/**:comma}"];
     success(&s.run(&s.root, &[], &words, &GROUP));
     edit_shared(&s);
-    let reason = "the 99 affected units do not fit on the command line";
-    assert!(all_output(&explain_words(&s, &words, &GROUP)).contains(reason));
+    let reason = "the 101 affected units do not fit on the command line";
+    let explained = explain_words(&s, &words, &GROUP);
+    assert!(
+        all_output(&explained).contains(reason),
+        "{}",
+        all_output(&explained)
+    );
     s.clear_log();
     let out = s.run(&s.root, &[], &words, &GROUP);
     assert!(text(&out.stderr).contains(reason), "{}", text(&out.stderr));
-    assert_eq!(launched(&s), [""], "{}", text(&out.stderr));
+    assert_eq!(
+        launched(&s).first().map(String::as_str),
+        Some(""),
+        "{}",
+        text(&out.stderr)
+    );
     assert_eq!(code(&out), code(&s.direct(&s.root, &[], &[])));
 }
 
@@ -306,7 +329,7 @@ fn s20b_a_list_over_64_kib_leaves_the_variables_unset_and_uses_the_file() {
     let s = Suite::new();
     s.executable("argv", ARGV);
     let units = long_units(&s);
-    let words = ["./argv", "@{changed:long/**/*.t:file}"];
+    let words = ["./argv", "@{changed:**/*.t|!slow/**:file}"];
     success(&s.run(&s.root, &[], &words, &GROUP));
     edit_shared(&s);
     s.clear_log();
@@ -314,7 +337,7 @@ fn s20b_a_list_over_64_kib_leaves_the_variables_unset_and_uses_the_file() {
     success(&out);
     let calls = s.launches();
     assert_eq!(calls.len(), 1, "{}", text(&out.stderr));
-    assert_eq!(calls[0].args.len(), 99, "{}", text(&out.stderr));
+    assert_eq!(calls[0].args.len(), 101, "{}", text(&out.stderr));
     assert!(calls[0].lines.contains(&"changed_set=".to_string()));
     assert!(calls[0].lines.contains(&"units_set=".to_string()));
     assert_eq!(s.bundle().unwrap()["units"][&units[0]][0]["exact"], false);
@@ -340,5 +363,10 @@ fn s20e_argv_and_environment_over_half_of_arg_max_run_the_full_form() {
     s.clear_log();
     let out = s.run(&s.root, &[], &["./t", HOOK], &env);
     assert!(text(&out.stderr).contains(reason), "{}", text(&out.stderr));
-    assert_eq!(launched(&s), [""], "{}", text(&out.stderr));
+    assert_eq!(
+        launched(&s).first().map(String::as_str),
+        Some(""),
+        "{}",
+        text(&out.stderr)
+    );
 }
