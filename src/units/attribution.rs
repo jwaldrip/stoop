@@ -310,8 +310,12 @@ pub(super) fn launch_each(
                                 pass.unsettle();
                             }
                             let (old_inputs, old_outputs) = pass.held_of(unit);
-                            let stored =
-                                pass.record(&launch.unit, &kept.inputs, &kept.outputs, now());
+                            let stored = pass.record(
+                                std::slice::from_ref(&launch.unit),
+                                &kept.inputs,
+                                &kept.outputs,
+                                now(),
+                            );
                             // A failed write keeps the proof in memory, and the end of the pass writes it (spec 3.11).
                             if matches!(stored, Stored::Stored | Stored::WriteFailed) {
                                 ran.stat_gaps.extend(
