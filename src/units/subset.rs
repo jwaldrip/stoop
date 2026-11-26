@@ -171,8 +171,10 @@ pub(crate) fn learn(
         }
         disabled = true;
     }
-    let held: BTreeSet<String> = pass.held().into_iter().map(|(unit, _, _)| unit).collect();
-    let complete = pending.units().iter().all(|unit| held.contains(unit));
+    // `keep` pruned departed units, so both sequences are in roster order.
+    let complete = pass
+        .held_exact()
+        .eq(pending.units().iter().map(String::as_str));
     drop(pass);
     // Every roster unit holds a proof, so the residue is measured exactly (spec 3.8, point iii). A busy lock, or a bundle
     // that no longer holds, leaves the residue in the state it had.

@@ -1153,8 +1153,8 @@ pub(crate) fn record(
 }
 
 /// Stores the residue of a whole proof's inputs (spec 3.8, points i and ii). It is measured only when every roster unit
-/// holds a version, and it is kept while it is already known for `digest`. It is stored provisional: W6 compares paths
-/// and cannot confirm them (C4, C5). A residue that would take the bundle past its bound is not kept.
+/// holds an exact version, and it is kept while it is already known for `digest`. It is stored provisional: W6 compares
+/// paths and cannot confirm them (C4, C5). A residue that would take the bundle past its bound is not kept.
 fn store_residue(bundle: &mut SuiteBundleV1, whole: &[Input], digest: &str, listings: &[String]) {
     if residue_known(&bundle.residue, digest) {
         return;
@@ -1163,7 +1163,7 @@ fn store_residue(bundle: &mut SuiteBundleV1, whole: &[Input], digest: &str, list
         bundle
             .units
             .get(unit)
-            .is_some_and(|versions| !versions.is_empty())
+            .is_some_and(|versions| versions.iter().any(|version| version.exact))
     });
     let next = if complete {
         let covered = covered_paths(bundle);
@@ -1242,13 +1242,14 @@ fn losses(removed: &BTreeMap<String, bool>, now: &BTreeMap<String, bool>) -> Vec
     lost
 }
 
-/// The paths of the inputs of every unit version the bundle holds: what the units' own runs read (spec 3.8).
+/// The paths read by exact unit versions: what the units' own runs read (spec 3.8).
 fn covered_paths(bundle: &SuiteBundleV1) -> BTreeSet<&str> {
     let len = bundle.table.len();
     bundle
         .units
         .values()
         .flatten()
+        .filter(|version| version.exact)
         .filter_map(|version| undelta(&version.inputs, len))
         .flatten()
         .map(|index| bundle.table[index as usize].path.as_str())
@@ -1655,6 +1656,16 @@ impl Pass {
             .collect()
     }
 
+    /// The sorted unit names that hold at least one exact version.
+    pub(crate) fn held_exact(&self) -> impl Iterator<Item = &str> {
+        self.bundle.units.iter().filter_map(|(unit, versions)| {
+            versions
+                .iter()
+                .any(|version| version.exact)
+                .then_some(unit.as_str())
+        })
+    }
+
     /// Names the state a stopped run stores: `attribution` for a run that launches every unit, `subset` for one that
     /// launches some (spec 3.6).
     pub(crate) fn set_phase(&mut self, phase: &'static str) {
@@ -2033,6 +2044,7 @@ pub(crate) fn known_residue(store: &Path, id: &str, key: &str) -> Option<(usize,
 /// and outputs, in table order.
 pub(crate) struct Version {
     pub(crate) created: u64,
+    pub(crate) exact: bool,
     pub(crate) guard: String,
     pub(crate) inputs: Vec<u32>,
     pub(crate) outputs: Vec<u32>,
@@ -2070,6 +2082,7 @@ impl View {
                 .map(|version| {
                     Some(Version {
                         created: version.created,
+                        exact: version.exact,
                         inputs: undelta(&version.inputs, len)?,
                         outputs: undelta(&version.outputs, len)?,
                         guard: version.guard,
