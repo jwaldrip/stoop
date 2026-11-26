@@ -383,9 +383,14 @@ fn g_v3_a_stat_only_read_reruns_the_group() {
     make_group(&s, &[]);
     s.write("src/stat.src", "changed size\n");
     let out = run(&s, &[]);
-    success(&out);
+    let stderr = text(&out.stderr);
+    assert_eq!(code(&out), 125, "{stderr}");
     assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
-    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &[])));
+    assert!(
+        stderr.contains("src/stat.src changed, and no unit's new proof reads it"),
+        "{stderr}"
+    );
+    assert_eq!(code(&s.direct(&s.root, &[], &[])), 0);
 }
 
 #[test]
