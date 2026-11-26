@@ -417,6 +417,17 @@ fn g_v4_an_appeared_flag_is_excused_and_read_by_the_group() {
 #[test]
 fn g_v7_an_outside_root_change_takes_the_full_form() {
     let s = Suite::new();
+    // If every unit reads the input, the earlier global-change rule supplies the full reason.
+    let runner = include_str!("fixtures/hook/t");
+    let anchor = "if [ -n \"${T_READ_OTHER:-}\" ] && armed; then";
+    assert_eq!(runner.matches(anchor).count(), 1);
+    s.executable(
+        "t",
+        &runner.replace(
+            anchor,
+            "if [ -n \"${T_READ_OTHER:-}\" ] && armed && { [ \"$TESTS\" = 0 ] || [ \"$COUNT\" -ge 2 ] || [ \"${1:-}\" = tests/a.t ]; }; then",
+        ),
+    );
     struct Outside(std::path::PathBuf);
     impl Drop for Outside {
         fn drop(&mut self) {
