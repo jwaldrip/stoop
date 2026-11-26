@@ -28,8 +28,11 @@
 //! | `T_STAT_OTHER=<path>` (IF) | Runs `test -e <path>` once per invocation, relative to the cwd, and logs `stat_other=<path>`. The answer does not change the exit status. |
 //! | `T_FAIL_FULL=1` (IF) | The no-argument form exits 1 after its tests. |
 //! | `T_FAIL_ALONE=<P>` (IF) | In the test-word form, test P fails after it has run. Its reads and the other tests are unchanged. |
+//! | `T_SKIP_TEST=<P>` (IF) | In the test-word form, logs `skipped=P` and does not read P. |
+//! | `T_GROUP_READ=<path>` (IF) | With at least two test words, reads the root-relative path once. |
+//! | `T_GATE=<path>` | In the no-argument form, fails if the root-relative path contains `fail`. |
 //! | `T_LS_ROOT=1` / `T_STAT_ROOT=1` | `ls -a <root>` (logs `ls_root`) / `test -d <root>` (logs `stat_root`), once per invocation. |
-//! | `LOG=<path>` (outside the root) | Per invocation it logs `launch`, then `arg=<w>` for each argument, then `changed=`, `units=`, `changed_file=`, `changed_inputs=`, `changed_inputs_file=` (newlines inside a value logged as `\|`), then the per-test lines. |
+//! | `LOG=<path>` (outside the root) | Per invocation it logs `launch`, then `arg=<w>` for each argument, then `changed=`, `units=`, `changed_file=`, `changed_inputs=`, `changed_inputs_file=` (newlines inside a value logged as `\|`), `changed_set=`, `units_set=`, then the per-test lines. |
 //! | exit | 1 if any test failed, or if `T_FAIL_FULL` (IF) fails the no-argument form after its tests; else 0. |
 //!
 //! `T_RECORDS` comes in W8 and writes to `$STOOP_RESULT_FILE`.
@@ -47,6 +50,44 @@ use std::process::Stdio;
 use units_common::*;
 
 // The runner, run directly: order, arguments, the environment log, and each knob.
+
+#[test]
+fn group_knobs_are_scoped_to_the_requested_launches() {
+    let s = Suite::new();
+    s.write("gate", "fail\n");
+    let gate = [("T_GATE", "gate"), ("T_GROUP_READ", "gate")];
+    assert_eq!(code(&s.direct(&s.root, &[], &gate)), 1);
+    s.clear_log();
+    assert_eq!(code(&s.direct(&s.root, &["tests/a.t"], &gate)), 0);
+    assert!(!s.launches()[0]
+        .lines
+        .iter()
+        .any(|line| line == "group_read=gate"));
+    s.clear_log();
+    assert_eq!(
+        code(&s.direct(&s.root, &["tests/a.t", "tests/b.t"], &gate)),
+        0
+    );
+    assert!(s.launches()[0]
+        .lines
+        .iter()
+        .any(|line| line == "group_read=gate"));
+
+    let toggle = s.outside.join("toggle");
+    let toggle = toggle.to_str().unwrap();
+    let skip = [("T_SKIP_TEST", "tests/b.t"), ("T_IF", toggle)];
+    s.clear_log();
+    assert_eq!(code(&s.direct(&s.root, &["tests/b.t"], &skip)), 0);
+    assert_eq!(s.launches()[0].ran(), ["tests/b.t"]);
+    fs::write(toggle, "on").unwrap();
+    s.clear_log();
+    assert_eq!(code(&s.direct(&s.root, &["tests/b.t"], &skip)), 0);
+    assert!(s.launches()[0].ran().is_empty());
+    assert!(s.launches()[0]
+        .lines
+        .iter()
+        .any(|line| line == "skipped=tests/b.t"));
+}
 
 #[test]
 fn f1_no_arguments_runs_every_t_except_slow_in_c_order() {

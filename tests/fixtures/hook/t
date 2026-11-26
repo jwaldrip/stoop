@@ -13,10 +13,11 @@ ROOT=$(cd "$(dirname "$0")" && pwd -P) || exit 2
 STATUS=0
 HELD=
 TESTS=0
+COUNT=0
 for word in "$@"; do
 	case $word in
 		-*) ;;
-		*) TESTS=1 ;;
+		*) TESTS=1; COUNT=$((COUNT + 1)) ;;
 	esac
 done
 
@@ -49,6 +50,10 @@ armed() {
 }
 
 run_test() {
+	if [ "$TESTS" = 1 ] && [ -n "${T_SKIP_TEST:-}" ] && [ "$1" = "$T_SKIP_TEST" ] && armed; then
+		note "skipped=$1"
+		return
+	fi
 	if [ "$TESTS" = 1 ] && [ "${T_STAT_UNIT:-}" = 1 ]; then
 		note "statted=$1"
 		if [ ! -e "$1" ]; then
@@ -110,6 +115,8 @@ note "units=$(flat "${STOOP_UNITS:-}")"
 note "changed_file=$(flat "${STOOP_CHANGED_FILE:-}")"
 note "changed_inputs=$(flat "${STOOP_CHANGED_INPUTS:-}")"
 note "changed_inputs_file=$(flat "${STOOP_CHANGED_INPUTS_FILE:-}")"
+note "changed_set=${STOOP_CHANGED+1}"
+note "units_set=${STOOP_UNITS+1}"
 
 if [ -n "${T_WRITE:-}" ] && [ -z "${T_WRITE_AT:-}" ] && armed; then
 	printf 'written\n' > "$T_WRITE"
@@ -141,6 +148,10 @@ if [ -n "${T_STAT_OTHER:-}" ] && armed; then
 	test -e "$T_STAT_OTHER"
 	note "stat_other=$T_STAT_OTHER"
 fi
+if [ "$COUNT" -ge 2 ] && [ -n "${T_GROUP_READ:-}" ] && armed; then
+	cat "$ROOT/$T_GROUP_READ" > /dev/null
+	note "group_read=$T_GROUP_READ"
+fi
 
 if [ "$TESTS" = 0 ]; then
 	cd "$ROOT" || exit 2
@@ -153,6 +164,9 @@ if [ "$TESTS" = 0 ]; then
 	done
 	set +f
 	if [ "${T_FAIL_FULL:-}" = 1 ] && armed; then
+		STATUS=1
+	fi
+	if [ -n "${T_GATE:-}" ] && grep -q fail "$ROOT/$T_GATE"; then
 		STATUS=1
 	fi
 else
