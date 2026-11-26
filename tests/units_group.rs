@@ -194,3 +194,151 @@ fn g_h2_a_group_writing_a_skipped_units_input_disables() {
         "{stderr}"
     );
 }
+
+/// The argument wrapper of these tests: an argument that starts with `@` names a list file, and each line of the file
+/// becomes an argument. The runner gets the rest as they are, so a launch's words show what the hook gave it.
+const ARGV: &str = r#"#!/bin/sh
+ROOT=$(cd "$(dirname "$0")" && pwd -P) || exit 2
+list=
+for word in "$@"; do
+	case $word in
+		@*) list="$list$(cat "${word#@}")
+" ;;
+		*) list="$list$word
+" ;;
+	esac
+done
+old=$IFS
+IFS='
+'
+set -f
+set -- $list
+IFS=$old
+set +f
+exec "$ROOT/t" "$@"
+"#;
+
+/// `stoop explain` with `words` as the hook, under `env`. Its decision may print on either stream.
+fn explain_words(s: &Suite, words: &[&str], env: &[(&str, &str)]) -> Output {
+    let mut command = s.stoop(&s.root);
+    command
+        .args(["explain", "--root"])
+        .arg(&s.root)
+        .arg("--")
+        .args(words);
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    spawning(|| command.output()).unwrap()
+}
+
+fn all_output(out: &Output) -> String {
+    format!("{}{}", text(&out.stdout), text(&out.stderr))
+}
+
+/// One hundred units whose paths are about 700 bytes long, so 99 of them as one join word overflow 64 KiB (S20). The
+/// first 99 read the shared source, and the last reads the centre source only.
+fn long_units(s: &Suite) -> Vec<String> {
+    let dir = format!("long/{}", format!("{}/", "d".repeat(45)).repeat(15));
+    (0..100)
+        .map(|n| {
+            let unit = format!("{dir}u{n:03}.t");
+            let source = if n == 99 {
+                "src/c.src"
+            } else {
+                "src/shared.src"
+            };
+            s.write(&unit, &format!("{source}\n"));
+            unit
+        })
+        .collect()
+}
+
+#[test]
+fn explain_names_the_grouped_argv() {
+    let s = Suite::new();
+    success(&s.run(&s.root, &[], &["./t", HOOK], &GROUP));
+    edit_shared(&s);
+    let out = explain_words(&s, &["./t", HOOK], &GROUP);
+    assert!(
+        all_output(&out).contains("(2 of 3 units affected): argv ./t tests/a.t tests/b.t"),
+        "{}",
+        all_output(&out)
+    );
+}
+
+#[test]
+fn a_grouped_launch_writes_one_list_holding_every_member() {
+    let s = Suite::new();
+    s.executable("argv", ARGV);
+    let words = ["./argv", "@{changed:**/*.t|!slow/**:file}"];
+    success(&s.run(&s.root, &[], &words, &GROUP));
+    edit_shared(&s);
+    s.clear_log();
+    let out = s.run(&s.root, &[], &words, &GROUP);
+    success(&out);
+    assert_eq!(
+        launched(&s),
+        ["tests/a.t tests/b.t"],
+        "{}",
+        text(&out.stderr)
+    );
+}
+
+#[test]
+fn s20_a_join_word_over_64_kib_runs_the_full_form() {
+    let s = Suite::new();
+    long_units(&s);
+    let words = ["./t", "{changed:long/**/*.t:comma}"];
+    success(&s.run(&s.root, &[], &words, &GROUP));
+    edit_shared(&s);
+    let reason = "the 99 affected units do not fit on the command line";
+    assert!(all_output(&explain_words(&s, &words, &GROUP)).contains(reason));
+    s.clear_log();
+    let out = s.run(&s.root, &[], &words, &GROUP);
+    assert!(text(&out.stderr).contains(reason), "{}", text(&out.stderr));
+    assert_eq!(launched(&s), [""], "{}", text(&out.stderr));
+    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &[])));
+}
+
+#[test]
+fn s20b_a_list_over_64_kib_leaves_the_variables_unset_and_uses_the_file() {
+    let s = Suite::new();
+    s.executable("argv", ARGV);
+    let units = long_units(&s);
+    let words = ["./argv", "@{changed:long/**/*.t:file}"];
+    success(&s.run(&s.root, &[], &words, &GROUP));
+    edit_shared(&s);
+    s.clear_log();
+    let out = s.run(&s.root, &[], &words, &GROUP);
+    success(&out);
+    let calls = s.launches();
+    assert_eq!(calls.len(), 1, "{}", text(&out.stderr));
+    assert_eq!(calls[0].args.len(), 99, "{}", text(&out.stderr));
+    assert!(calls[0].lines.contains(&"changed_set=".to_string()));
+    assert!(calls[0].lines.contains(&"units_set=".to_string()));
+    assert_eq!(s.bundle().unwrap()["units"][&units[0]][0]["exact"], false);
+}
+
+#[test]
+fn s20e_argv_and_environment_over_half_of_arg_max_run_the_full_form() {
+    let s = Suite::new();
+    // SAFETY: sysconf reads no pointers.
+    let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize;
+    let value = "b".repeat(100 * 1024);
+    let names: Vec<String> = (0..arg_max / 2 / value.len() + 1)
+        .map(|n| format!("STOOP_TEST_BALLAST_{n}"))
+        .collect();
+    let mut env: Vec<(&str, &str)> = GROUP.to_vec();
+    for name in &names {
+        env.push((name.as_str(), value.as_str()));
+    }
+    let reason = "the 2 affected units do not fit on the command line";
+    success(&s.run(&s.root, &[], &["./t", HOOK], &env));
+    edit_shared(&s);
+    assert!(all_output(&explain_words(&s, &["./t", HOOK], &env)).contains(reason));
+    s.clear_log();
+    let out = s.run(&s.root, &[], &["./t", HOOK], &env);
+    assert!(text(&out.stderr).contains(reason), "{}", text(&out.stderr));
+    assert_eq!(launched(&s), [""], "{}", text(&out.stderr));
+}
