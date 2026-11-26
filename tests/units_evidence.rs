@@ -2,6 +2,11 @@
 //! evidence at all (W7-4c, issue #91). Each test is one row of the class table in the pull request: the branch the
 //! launch takes, its position among the launches, the evidence its own unit leaves, its exit status and whether it was
 //! traced. Linux only, as the tracer and the fork shim are.
+//!
+//! Every run of a row uses the same environment. The environment is an input of the whole command, so a variable that
+//! only the subject run sets would turn it into a full run. The knobs below are inert until their gate exists, so the
+//! learning run that comes first does not act on them: `T_IF` guards the skip and the failure knobs, `RVW_GATE` guards
+//! the seams and the stat knob, and `RVW_DROP_GATE` acts only while `RVW_GATE` exists.
 #![cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -49,14 +54,17 @@ pid_t fork(void) {
 /// The fixture runner with five seams. `RVW_ACTION` acts in the launch of `tests/b.t` alone, and only while `RVW_GATE`
 /// exists: `read_c` reads `tests/c.t`, `write_own` writes `tests/b.t`, `write_input` writes `src/shared.src` (an input
 /// of `tests/a.t`), `write_output` writes `.outputs/a.t.out` (an output of `tests/a.t`), and `fail` exits 1.
-/// `RVW_DROP_GATE` removes the gate in the launch of `tests/a.t`, after that launch's trace was refused, so the next
+/// `RVW_DROP_GATE` removes `RVW_GATE` in the launch of `tests/a.t`, after that launch's trace was refused, so the next
 /// launch is traced. `RVW_FULL_FAIL` fails `tests/b.t` in the full form only. `RVW_CREATE_GATE` creates the gate as
-/// the full form ends, so the learning launches that follow it are untraced.
+/// the full form ends, so the learning launches that follow it are untraced. The stat knob acts only while
+/// `RVW_GATE` exists.
 fn runner() -> String {
     let runner = include_str!("fixtures/hook/t");
     assert_eq!(runner.matches("STATUS=0\n").count(), 1);
     assert_eq!(runner.matches("note \"ran=$1\"").count(), 1);
     assert_eq!(runner.matches("exit \"$STATUS\"").count(), 1);
+    let stat_knob = "if [ \"$TESTS\" = 1 ] && [ \"${T_STAT_UNIT:-}\" = 1 ]; then";
+    assert_eq!(runner.matches(stat_knob).count(), 1);
     let seams = r#"
 if [ "$#" -eq 1 ] && [ "$1" = tests/b.t ] && [ -e "$RVW_GATE" ]; then
     case "$RVW_ACTION" in
@@ -73,6 +81,10 @@ fi
 "#;
     runner
         .replace("STATUS=0\n", &format!("STATUS=0\n{seams}"))
+        .replace(
+            stat_knob,
+            "if [ \"$TESTS\" = 1 ] && [ \"${T_STAT_UNIT:-}\" = 1 ] && [ -e \"${RVW_GATE:-}\" ]; then",
+        )
         .replace(
             "note \"ran=$1\"",
             r#"note "ran=$1"
@@ -122,10 +134,11 @@ fn unit_proofs(s: &Suite) -> usize {
     })
 }
 
-/// The full form learns every unit's proof, as a suite does before a subset run.
-fn warm(s: &Suite, extra: &[(&str, &str)]) {
+/// The full form learns every unit's proof, as a suite does before a subset run. It runs with the row's environment,
+/// and the gate is still absent, so the knobs stay inert.
+fn warm(s: &Suite, env: &[(&str, &str)]) {
     s.clear_log();
-    let out = hook(s, extra);
+    let out = hook(s, env);
     assert_eq!(code(&out), 0, "{}", text(&out.stderr));
     assert_eq!(launched(s), ["", A, B, C], "{}", text(&out.stderr));
     s.clear_log();
@@ -158,31 +171,26 @@ fn fork_shim(s: &Suite) -> String {
     library.to_str().unwrap().to_owned()
 }
 
-/// Runs the full command traced, so it records a whole proof, and creates the gate as it ends. The completion launches
-/// that follow it are untraced, so the suite holds a whole proof and no unit proof. Returns the shim library, the gate
-/// and the run's output.
-fn whole_proof_without_unit_proofs(s: &Suite) -> (String, String, Output) {
-    let library = fork_shim(s);
-    let gate = gate(s);
-    let out = {
-        let env = [
-            ("LD_PRELOAD", library.as_str()),
-            ("STOOP_TEST_FORK_MARKER", gate.as_str()),
-            ("RVW_CREATE_GATE", gate.as_str()),
-        ];
-        hook(s, &env)
-    };
-    (library, gate, out)
+fn shim_env<'a>(library: &'a str, gate: &'a str) -> Vec<(&'a str, &'a str)> {
+    vec![("LD_PRELOAD", library), ("STOOP_TEST_FORK_MARKER", gate)]
+}
+
+/// The environment of a full run that records a whole proof and creates the gate as it ends. The learning launches
+/// that follow it are then untraced, so the suite keeps a whole proof and no unit proof.
+fn completion_env<'a>(library: &'a str, gate: &'a str) -> Vec<(&'a str, &'a str)> {
+    let mut env = shim_env(library, gate);
+    env.push(("RVW_CREATE_GATE", gate));
+    env
 }
 
 #[test]
 fn a_last_launch_that_skips_its_unit_cannot_exit_zero() {
     let s = suite();
     let gate = gate(&s);
-    warm(&s, &[]);
+    let env = [("T_SKIP_TEST", B), ("T_IF", gate.as_str())];
+    warm(&s, &env);
     arm(&gate);
     edit_shared(&s);
-    let env = [("T_SKIP_TEST", B), ("T_IF", gate.as_str())];
     s.clear_log();
     let out = hook(&s, &env);
     let stderr = text(&out.stderr);
@@ -200,10 +208,13 @@ fn a_last_launch_that_skips_its_unit_cannot_exit_zero() {
 #[test]
 fn a_last_stat_only_launch_cannot_exit_zero() {
     let s = suite();
-    warm(&s, &[]);
+    let gate = gate(&s);
+    let env = [("RVW_GATE", gate.as_str()), ("T_STAT_UNIT", "1")];
+    warm(&s, &env);
+    arm(&gate);
     edit_b_only(&s);
     s.clear_log();
-    let out = hook(&s, &[("T_STAT_UNIT", "1")]);
+    let out = hook(&s, &env);
     let stderr = text(&out.stderr);
     assert_eq!(launched(&s), [B], "{stderr}");
     assert!(
@@ -217,18 +228,16 @@ fn a_last_stat_only_launch_cannot_exit_zero() {
 fn a_last_launch_coupling_with_only_a_stat_of_its_unit_cannot_exit_zero() {
     let s = suite();
     let gate = gate(&s);
-    warm(&s, &[("RVW_GATE", gate.as_str())]);
+    let env = [
+        ("RVW_GATE", gate.as_str()),
+        ("RVW_ACTION", "read_c"),
+        ("T_STAT_UNIT", "1"),
+    ];
+    warm(&s, &env);
     arm(&gate);
     edit_b_only(&s);
     s.clear_log();
-    let out = hook(
-        &s,
-        &[
-            ("RVW_GATE", gate.as_str()),
-            ("RVW_ACTION", "read_c"),
-            ("T_STAT_UNIT", "1"),
-        ],
-    );
+    let out = hook(&s, &env);
     let stderr = text(&out.stderr);
     assert_eq!(launched(&s), [B], "{stderr}");
     assert!(stderr.contains("tests/b.t read tests/c.t"), "{stderr}");
@@ -243,15 +252,15 @@ fn a_last_launch_coupling_with_only_a_stat_of_its_unit_cannot_exit_zero() {
 fn a_last_launch_that_writes_its_own_unit_without_reading_it_cannot_exit_zero() {
     let s = suite();
     let gate = gate(&s);
-    warm(&s, &[("RVW_GATE", gate.as_str())]);
-    arm(&gate);
-    edit_shared(&s);
     let env = [
         ("T_SKIP_TEST", B),
         ("T_IF", gate.as_str()),
         ("RVW_GATE", gate.as_str()),
         ("RVW_ACTION", "write_own"),
     ];
+    warm(&s, &env);
+    arm(&gate);
+    edit_shared(&s);
     s.clear_log();
     let out = hook(&s, &env);
     let stderr = text(&out.stderr);
@@ -267,15 +276,15 @@ fn a_last_launch_that_writes_its_own_unit_without_reading_it_cannot_exit_zero() 
 fn a_last_launch_that_writes_a_named_input_without_reading_its_unit_cannot_exit_zero() {
     let s = suite();
     let gate = gate(&s);
-    warm(&s, &[("RVW_GATE", gate.as_str())]);
-    arm(&gate);
-    edit_shared(&s);
     let env = [
         ("T_SKIP_TEST", B),
         ("T_IF", gate.as_str()),
         ("RVW_GATE", gate.as_str()),
         ("RVW_ACTION", "write_input"),
     ];
+    warm(&s, &env);
+    arm(&gate);
+    edit_shared(&s);
     s.clear_log();
     let out = hook(&s, &env);
     let stderr = text(&out.stderr);
@@ -291,21 +300,19 @@ fn a_last_launch_that_writes_a_named_input_without_reading_its_unit_cannot_exit_
 fn a_last_launch_that_writes_a_named_output_without_reading_its_unit_cannot_exit_zero() {
     let s = suite();
     let gate = gate(&s);
-    let mut extra = vec![
+    let env = [
         ("T_WRITE_EACH", "1"),
         ("T_OUTPUT_DIR", ".outputs"),
-        ("RVW_GATE", gate.as_str()),
-    ];
-    warm(&s, &extra);
-    arm(&gate);
-    edit_shared(&s);
-    extra.extend([
         ("T_SKIP_TEST", B),
         ("T_IF", gate.as_str()),
+        ("RVW_GATE", gate.as_str()),
         ("RVW_ACTION", "write_output"),
-    ]);
+    ];
+    warm(&s, &env);
+    arm(&gate);
+    edit_shared(&s);
     s.clear_log();
-    let out = hook(&s, &extra);
+    let out = hook(&s, &env);
     let stderr = text(&out.stderr);
     assert_eq!(launched(&s), [A, B], "{stderr}");
     assert!(
@@ -319,15 +326,15 @@ fn a_last_launch_that_writes_a_named_output_without_reading_its_unit_cannot_exit
 fn a_last_launch_that_fails_without_reading_its_unit_keeps_its_status() {
     let s = suite();
     let gate = gate(&s);
-    warm(&s, &[("RVW_GATE", gate.as_str())]);
-    arm(&gate);
-    edit_shared(&s);
     let env = [
         ("T_SKIP_TEST", B),
         ("T_IF", gate.as_str()),
         ("RVW_GATE", gate.as_str()),
         ("RVW_ACTION", "fail"),
     ];
+    warm(&s, &env);
+    arm(&gate);
+    edit_shared(&s);
     s.clear_log();
     let out = hook(&s, &env);
     let stderr = text(&out.stderr);
@@ -354,11 +361,12 @@ fn a_last_launch_that_reads_its_unit_keeps_its_verdict() {
 fn a_last_launch_coupling_with_its_own_read_keeps_its_verdict() {
     let s = suite();
     let gate = gate(&s);
-    warm(&s, &[("RVW_GATE", gate.as_str())]);
+    let env = [("RVW_GATE", gate.as_str()), ("RVW_ACTION", "read_c")];
+    warm(&s, &env);
     arm(&gate);
     edit_shared(&s);
     s.clear_log();
-    let out = hook(&s, &[("RVW_GATE", gate.as_str()), ("RVW_ACTION", "read_c")]);
+    let out = hook(&s, &env);
     let stderr = text(&out.stderr);
     assert_eq!(launched(&s), [A, B], "{stderr}");
     assert!(stderr.contains("tests/b.t read tests/c.t"), "{stderr}");
@@ -375,14 +383,12 @@ fn a_last_launch_coupling_with_its_own_read_keeps_its_verdict() {
 fn a_last_launch_writing_a_named_input_with_its_own_read_keeps_its_verdict() {
     let s = suite();
     let gate = gate(&s);
-    warm(&s, &[("RVW_GATE", gate.as_str())]);
+    let env = [("RVW_GATE", gate.as_str()), ("RVW_ACTION", "write_input")];
+    warm(&s, &env);
     arm(&gate);
     edit_shared(&s);
     s.clear_log();
-    let out = hook(
-        &s,
-        &[("RVW_GATE", gate.as_str()), ("RVW_ACTION", "write_input")],
-    );
+    let out = hook(&s, &env);
     let stderr = text(&out.stderr);
     assert_eq!(launched(&s), [A, B], "{stderr}");
     assert!(!stderr.contains("did not run in its launch"), "{stderr}");
@@ -398,11 +404,12 @@ fn a_last_launch_writing_a_named_input_with_its_own_read_keeps_its_verdict() {
 fn a_non_last_launch_that_skips_its_unit_keeps_its_stop_message() {
     let s = suite();
     let gate = gate(&s);
-    warm(&s, &[]);
+    let env = [("T_SKIP_TEST", A), ("T_IF", gate.as_str())];
+    warm(&s, &env);
     arm(&gate);
     edit_shared(&s);
     s.clear_log();
-    let out = hook(&s, &[("T_SKIP_TEST", A), ("T_IF", gate.as_str())]);
+    let out = hook(&s, &env);
     let stderr = text(&out.stderr);
     assert_eq!(launched(&s), [A], "{stderr}");
     assert!(stderr.contains("only 1 of 2 launches ran"), "{stderr}");
@@ -415,16 +422,12 @@ fn an_untraced_launch_that_exits_zero_before_a_traced_pass_has_no_verdict() {
     let s = suite();
     let library = fork_shim(&s);
     let gate = gate(&s);
-    let shim = [
-        ("LD_PRELOAD", library.as_str()),
-        ("STOOP_TEST_FORK_MARKER", gate.as_str()),
-    ];
-    warm(&s, &shim);
+    let mut env = shim_env(&library, &gate);
+    env.extend([("RVW_GATE", gate.as_str()), ("RVW_DROP_GATE", "1")]);
+    warm(&s, &env);
     let before = s.bundle().unwrap();
     arm(&gate);
     edit_shared(&s);
-    let mut env = shim.to_vec();
-    env.extend([("RVW_GATE", gate.as_str()), ("RVW_DROP_GATE", "1")]);
     s.clear_log();
     let out = hook(&s, &env);
     let stderr = text(&out.stderr);
@@ -454,19 +457,19 @@ fn an_untraced_launch_that_fails_keeps_its_status_without_a_mark() {
     let s = suite();
     let library = fork_shim(&s);
     let gate = gate(&s);
-    let shim = [
-        ("LD_PRELOAD", library.as_str()),
-        ("STOOP_TEST_FORK_MARKER", gate.as_str()),
-    ];
-    warm(&s, &shim);
-    arm(&gate);
-    edit_shared(&s);
-    let mut env = shim.to_vec();
+    // The failure gate is separate from the fork gate, because the drop removes the fork gate in the launch of `a`.
+    let fail_gate = s.outside.join("fail-gate").to_str().unwrap().to_owned();
+    let mut env = shim_env(&library, &gate);
     env.extend([
         ("RVW_GATE", gate.as_str()),
         ("RVW_DROP_GATE", "1"),
+        ("T_IF", fail_gate.as_str()),
         ("T_FAIL_ALONE", A),
     ]);
+    warm(&s, &env);
+    arm(&fail_gate);
+    arm(&gate);
+    edit_shared(&s);
     s.clear_log();
     let out = hook(&s, &env);
     let stderr = text(&out.stderr);
@@ -481,7 +484,10 @@ fn an_untraced_launch_that_fails_keeps_its_status_without_a_mark() {
 #[test]
 fn a_completion_launch_that_cannot_be_traced_keeps_the_full_commands_status() {
     let s = suite();
-    let (_library, _gate, out) = whole_proof_without_unit_proofs(&s);
+    let library = fork_shim(&s);
+    let gate = gate(&s);
+    let env = completion_env(&library, &gate);
+    let out = hook(&s, &env);
     let stderr = text(&out.stderr);
     // Completion after a full run keeps the full command's status. Its untraced launches record nothing and say so.
     assert_eq!(code(&out), 0, "{stderr}");
@@ -501,18 +507,17 @@ fn a_completion_launch_that_cannot_be_traced_keeps_the_full_commands_status() {
 fn an_attribution_pass_of_a_suite_with_a_whole_proof_and_no_unit_proof_has_no_verdict_when_untraced(
 ) {
     let s = suite();
-    let (library, gate, first) = whole_proof_without_unit_proofs(&s);
+    let library = fork_shim(&s);
+    let gate = gate(&s);
+    let env = completion_env(&library, &gate);
+    let first = hook(&s, &env);
     assert_eq!(code(&first), 0, "{}", text(&first.stderr));
-    let shim = [
-        ("LD_PRELOAD", library.as_str()),
-        ("STOOP_TEST_FORK_MARKER", gate.as_str()),
-    ];
     // A changed run that starts an attribution pass takes its verdict from its launches: `attribution::pass` returns
     // their status as the run's exit, so an untraced exit 0 there is no verdict (decision A). Completion, in the first
     // run above, is different: `subset::learn` keeps the full command's status and never calls `finish`.
     edit_shared(&s);
     s.clear_log();
-    let out = hook(&s, &shim);
+    let out = hook(&s, &env);
     let stderr = text(&out.stderr);
     assert!(
         stderr.contains("stoop: attribution pass: 3 units, one launch each"),
