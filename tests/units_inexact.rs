@@ -267,3 +267,105 @@ fn a_deleted_input_read_by_grouped_members_takes_the_full_form() {
         text(&out.stderr)
     );
 }
+
+#[test]
+fn a_nonmember_writing_a_skipped_inexact_output_has_no_verdict() {
+    let s = Suite::new();
+    let marker = s.outside.join("go");
+    let env = [
+        ("STOOP_SPLIT", "1"),
+        ("T_WRITE_EACH", "1"),
+        ("T_IF", marker.to_str().unwrap()),
+        ("T_WRITE", "tests/a.out"),
+        ("T_WRITE_AT", C),
+    ];
+    warm(&s, &env);
+    inject_union(&s);
+    fs::write(&marker, "go").unwrap();
+    s.write("src/c.src", "changed\n");
+    s.clear_log();
+    let out = s.hook(&env);
+    assert_eq!(code(&out), 125, "{}", text(&out.stderr));
+    assert_eq!(launched(&s), [C]);
+    assert_ready(&s.bundle().unwrap());
+    assert!(text(&out.stderr).contains("which skipped unit tests/a.t reads"));
+    s.clear_log();
+    let retry = s.hook(&env);
+    assert_eq!(code(&retry), 0, "{}", text(&retry.stderr));
+    assert_eq!(launched(&s), ["", A]);
+    assert_eq!(s.bundle().unwrap()["state"]["code"], "wrote_output");
+}
+
+#[test]
+fn completion_names_a_grouped_member_that_fails_alone() {
+    let s = Suite::new();
+    let marker = s.outside.join("go");
+    let env = [
+        ("STOOP_SPLIT", "1"),
+        ("T_WRITE_EACH", "1"),
+        ("T_IF", marker.to_str().unwrap()),
+        ("T_FAIL_ALONE", A),
+    ];
+    warm(&s, &env);
+    inject_union(&s);
+    fs::write(&marker, "go").unwrap();
+    s.write("tests/d.t", "src/c.src\n");
+    s.clear_log();
+    let out = s.hook(&env);
+    let calls = launched(&s);
+    assert_eq!(code(&out), direct(&s, &env), "{}", text(&out.stderr));
+    assert_eq!(code(&out), 0);
+    assert_eq!(calls, ["", A, B, "tests/d.t"]);
+    let state = s.bundle().unwrap()["state"].clone();
+    assert_eq!(state["code"], "disagreement");
+    assert!(text(&out.stderr).contains("tests/a.t failed alone while the full command passed"));
+}
+
+#[test]
+fn a_failing_grouped_member_is_retried_until_it_passes() {
+    let s = Suite::new();
+    warm(&s, &ENV);
+    inject_union(&s);
+    s.write(B, "src/shared.src\nfail\n");
+    let first = s.hook(&ENV);
+    assert_eq!(code(&first), 1, "{}", text(&first.stderr));
+    s.clear_log();
+    let retry = s.hook(&ENV);
+    assert_eq!(code(&retry), 1, "{}", text(&retry.stderr));
+    assert_eq!(launched(&s), [B]);
+    assert_ready(&s.bundle().unwrap());
+    s.write(B, "src/shared.src\n\n");
+    s.clear_log();
+    let fixed = s.hook(&ENV);
+    assert_eq!(code(&fixed), 0, "{}", text(&fixed.stderr));
+    assert_eq!(launched(&s), [B]);
+    let bundle = s.bundle().unwrap();
+    assert_ready(&bundle);
+    assert_eq!(bundle["units"][A][0]["exact"], true);
+    assert_eq!(bundle["units"][B][0]["exact"], true);
+}
+
+#[test]
+fn a_coupling_found_at_the_last_launch_keeps_the_launches_status() {
+    let s = Suite::new();
+    let marker = s.outside.join("go");
+    let env = [
+        ("STOOP_SPLIT", "1"),
+        ("T_WRITE_EACH", "1"),
+        ("T_IF", marker.to_str().unwrap()),
+        ("T_WRITE", "tests/a.out"),
+        ("T_WRITE_AT", B),
+    ];
+    warm(&s, &env);
+    inject_union(&s);
+    fs::write(&marker, "go").unwrap();
+    s.write("src/shared.src", "changed\n");
+    s.clear_log();
+    let out = s.hook(&env);
+    let calls = launched(&s);
+    let state = s.bundle().unwrap()["state"].clone();
+    assert_eq!(code(&out), direct(&s, &env), "{}", text(&out.stderr));
+    assert_eq!(code(&out), 0);
+    assert_eq!(calls, [A, B]);
+    assert_eq!(state["code"], "wrote_output");
+}
