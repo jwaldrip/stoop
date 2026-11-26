@@ -8,7 +8,7 @@ mod units_common;
 
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
-use std::process::{Child, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use units_common::*;
 
 const A: &str = "tests/a.t";
@@ -872,6 +872,253 @@ fn a_missing_group_member_alone_has_no_verdict() {
     let after = s.bundle().unwrap();
     assert_eq!(after["units"][A], before["units"][A]);
     assert_eq!(after["units"][B], before["units"][B]);
+}
+
+/// A grouped output-only edit whose runner omits b and may also violate another independence check.
+fn missing_member_with_competing_check(action: &str, expected_code: &str) {
+    let s = Suite::new();
+    fs::create_dir(s.path(".outputs")).unwrap();
+    let gate = s.outside.join("review-gate");
+    let runner = include_str!("fixtures/hook/t");
+    let setup = r#"
+if [ "$#" -ge 2 ] && [ -e "$RVW_GATE" ]; then
+    case "$RVW_ACTION" in
+        read_unit) cat "$ROOT/tests/c.t" >/dev/null ;;
+        wrote_unit) printf 'written\n' > "$ROOT/tests/c.t" ;;
+        wrote_input) printf 'written\n' > "$ROOT/src/c.src" ;;
+        wrote_output) printf 'written\n' > "$ROOT/.outputs/c.t.out" ;;
+        listing) printf 'written\n' > "$ROOT/review-new" ;;
+    esac
+    FIRST=$1
+    shift
+    set -- "$FIRST"
+fi
+"#;
+    assert_eq!(runner.matches("STATUS=0\n").count(), 1);
+    assert_eq!(runner.matches("note \"ran=$1\"").count(), 1);
+    let runner = runner.replace("STATUS=0\n", &format!("STATUS=0\n{setup}"));
+    let runner = runner.replace(
+        "note \"ran=$1\"",
+        r#"note "ran=$1"
+    if [ "$1" = tests/b.t ] && [ -e "$RVW_GATE" ]; then STATUS=1; fi
+    if [ "$1" = tests/c.t ] && [ "$RVW_ACTION" = listing ]; then ls -a "$ROOT" >/dev/null; fi"#,
+    );
+    s.executable("t", &runner);
+    let extra = [
+        ("T_WRITE_EACH", "1"),
+        ("T_OUTPUT_DIR", ".outputs"),
+        ("RVW_GATE", gate.to_str().unwrap()),
+        ("RVW_ACTION", action),
+    ];
+    warm(&s, &extra);
+    let before = s.bundle().unwrap();
+    s.remove(".outputs/a.t.out");
+    s.remove(".outputs/b.t.out");
+    fs::write(&gate, "on").unwrap();
+    let out = run(&s, &extra);
+    let stderr = text(&out.stderr);
+    assert_eq!(launched(&s), [A], "{stderr}");
+    let after = s.bundle().unwrap();
+    assert_eq!(after["state"]["status"], "disabled", "{stderr}");
+    assert_eq!(after["state"]["code"], expected_code, "{stderr}");
+    assert_eq!(after["units"][A], before["units"][A]);
+    assert_eq!(after["units"][B], before["units"][B]);
+    assert!(
+        stderr.contains("tests/b.t did not run in its launch"),
+        "{stderr}"
+    );
+    assert_eq!(code(&out), 125, "{stderr}");
+    if action == "read_unit" {
+        let direct = s.direct(&s.root, &[], &extra);
+        assert_eq!(code(&direct), 1, "{}", text(&direct.stderr));
+    }
+}
+
+#[test]
+fn test_rvw_coupling_does_not_mask_missing_member_on_output_only_edit() {
+    missing_member_with_competing_check("read_unit", "read_unit");
+}
+
+#[test]
+fn a_written_unit_does_not_mask_missing_group_member() {
+    missing_member_with_competing_check("wrote_unit", "wrote_unit");
+}
+
+#[test]
+fn a_written_input_does_not_mask_missing_group_member() {
+    missing_member_with_competing_check("wrote_input", "wrote_input");
+}
+
+#[test]
+fn a_written_output_does_not_mask_missing_group_member() {
+    missing_member_with_competing_check("wrote_output", "wrote_output");
+}
+
+#[test]
+fn a_listing_breach_does_not_mask_missing_group_member() {
+    missing_member_with_competing_check("listing", "never_ran");
+}
+
+#[test]
+fn a_failing_group_keeps_its_status_when_a_member_is_unread() {
+    let s = Suite::new();
+    fs::create_dir(s.path(".outputs")).unwrap();
+    let gate = s.outside.join("gate");
+    let extra = [
+        ("T_WRITE_EACH", "1"),
+        ("T_OUTPUT_DIR", ".outputs"),
+        ("T_SKIP_TEST", B),
+        ("T_FAIL_ALONE", A),
+        ("T_IF", gate.to_str().unwrap()),
+    ];
+    warm(&s, &extra);
+    let before = s.bundle().unwrap();
+    s.remove(".outputs/a.t.out");
+    s.remove(".outputs/b.t.out");
+    fs::write(&gate, "on").unwrap();
+    let out = run(&s, &extra);
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+    assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+    let after = s.bundle().unwrap();
+    assert_eq!(after["state"]["status"], "ready");
+    assert_eq!(after["units"][A], before["units"][A]);
+    assert_eq!(after["units"][B], before["units"][B]);
+}
+
+#[test]
+fn a_group_whose_tracer_cannot_fork_has_no_verdict() {
+    let s = Suite::new();
+    fs::create_dir(s.path(".outputs")).unwrap();
+    let gate = s.outside.join("gate");
+    let source = s.outside.join("fork-shim.c");
+    let library = s.outside.join("fork-shim.so");
+    fs::write(
+        &source,
+        r#"
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
+pid_t fork(void) {
+    static pid_t (*real_fork)(void);
+    if (!real_fork) real_fork = (pid_t (*)(void))dlsym(RTLD_NEXT, "fork");
+    const char *gate = getenv("STOOP_TEST_FORK_MARKER");
+    struct stat st;
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (gate && n > 0 && stat(gate, &st) == 0) {
+        exe[n] = 0;
+        const char *name = strrchr(exe, '/');
+        if (name && strcmp(name + 1, "stoop") == 0) {
+            errno = EAGAIN;
+            return -1;
+        }
+    }
+    return real_fork();
+}
+"#,
+    )
+    .unwrap();
+    let built = spawning(|| {
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&library)
+            .arg(&source)
+            .arg("-ldl")
+            .output()
+    })
+    .unwrap();
+    assert!(built.status.success(), "{}", text(&built.stderr));
+    let extra = [
+        ("T_WRITE_EACH", "1"),
+        ("T_OUTPUT_DIR", ".outputs"),
+        ("T_SKIP_TEST", B),
+        ("T_IF", gate.to_str().unwrap()),
+        ("STOOP_TEST_FORK_MARKER", gate.to_str().unwrap()),
+        ("LD_PRELOAD", library.to_str().unwrap()),
+    ];
+    warm(&s, &extra);
+    let before = s.bundle().unwrap();
+    s.remove(".outputs/a.t.out");
+    s.remove(".outputs/b.t.out");
+    fs::write(&gate, "on").unwrap();
+    let out = run(&s, &extra);
+    let stderr = text(&out.stderr);
+    assert_eq!(code(&out), 125, "{stderr}");
+    assert!(
+        stderr.contains("not launched for tests/a.t (+1 more)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "this run has no verdict (exit 125): the tracer could not start for the grouped launch"
+        ),
+        "{stderr}"
+    );
+    assert!(s.launches().is_empty(), "{stderr}");
+    let after = s.bundle().unwrap();
+    assert_eq!(after["units"][A], before["units"][A]);
+    assert_eq!(after["units"][B], before["units"][B]);
+    assert_eq!(after["state"]["status"], "ready");
+    fs::remove_file(&gate).unwrap();
+    s.clear_log();
+    let retry = run(&s, &extra);
+    success(&retry);
+    let launches = launched(&s);
+    assert!(
+        launches
+            .first()
+            .is_some_and(|launch| launch.is_empty() || launch == "tests/a.t tests/b.t"),
+        "{}",
+        text(&retry.stderr)
+    );
+}
+#[test]
+fn known_gap_c5_ungrouped_last_launch_coupling_masks_missing_evidence() {
+    let s = Suite::new();
+    fs::create_dir(s.path(".outputs")).unwrap();
+    let gate = s.outside.join("review-gate");
+    let runner = include_str!("fixtures/hook/t");
+    let setup = r#"
+if [ "$#" -eq 1 ] && [ "$1" = tests/b.t ] && [ -e "$RVW_GATE" ]; then
+    cat "$ROOT/tests/c.t" >/dev/null
+fi
+"#;
+    assert_eq!(runner.matches("STATUS=0\n").count(), 1);
+    assert_eq!(runner.matches("note \"ran=$1\"").count(), 1);
+    let runner = runner.replace("STATUS=0\n", &format!("STATUS=0\n{setup}"));
+    let runner = runner.replace(
+        "note \"ran=$1\"",
+        r#"note "ran=$1"
+    if [ "$1" = tests/b.t ] && [ -e "$RVW_GATE" ]; then STATUS=1; fi"#,
+    );
+    s.executable("t", &runner);
+    let env = [
+        ("STOOP_SPLIT", "1"),
+        ("T_WRITE_EACH", "1"),
+        ("T_OUTPUT_DIR", ".outputs"),
+        ("T_SKIP_TEST", B),
+        ("T_IF", gate.to_str().unwrap()),
+        ("RVW_GATE", gate.to_str().unwrap()),
+    ];
+    success(&s.hook(&env));
+    s.remove(".outputs/a.t.out");
+    s.remove(".outputs/b.t.out");
+    fs::write(&gate, "on").unwrap();
+    s.clear_log();
+    let out = s.hook(&env);
+    let stderr = text(&out.stderr);
+    assert_eq!(launched(&s), [A, B], "{stderr}");
+    assert!(stderr.contains("tests/b.t read tests/c.t"), "{stderr}");
+    let direct = s.direct(&s.root, &[], &env);
+    assert_eq!(code(&direct), 1, "{}", text(&direct.stderr));
+    // Pre-existing dark per-unit C5 gap, tracked in jwaldrip/stoop#91.
+    assert_eq!(s.bundle().unwrap()["state"]["code"], "read_unit");
+    assert_eq!(code(&out), 0, "{stderr}");
 }
 
 #[test]
