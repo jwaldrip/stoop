@@ -224,7 +224,7 @@ fn rvw_explain_counts_inexact_and_new_units() {
     s.write("tests/d.t", "src/c.src\n");
     s.clear_log();
     let out = explain(&s, &ENV);
-    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert_eq!(code(&out), 1, "{}", text(&out.stderr));
     assert!(launched(&s).is_empty());
     assert!(
         text(&out.stderr)
