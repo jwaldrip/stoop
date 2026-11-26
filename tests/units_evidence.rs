@@ -7,6 +7,11 @@
 //! only the subject run sets would turn it into a full run. The knobs below are inert until their gate exists, so the
 //! learning run that comes first does not act on them: `T_IF` guards the skip and the failure knobs, `RVW_GATE` guards
 //! the seams and the stat knob, and `RVW_DROP_GATE` acts only while `RVW_GATE` exists.
+//!
+//! Rows run with `STOOP_SPLIT=1` unless they say otherwise. With the switch on, the engine decides the verdict and a
+//! suite without unit proofs takes the full command, so completion is the only learning path. With the switch off
+//! (the default), `attribution::pass` runs for a recorded suite whose roster has no unit proof, and its launches are
+//! its verdict. The last row runs with the switch off.
 #![cfg(all(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
@@ -503,31 +508,32 @@ fn a_completion_launch_that_cannot_be_traced_keeps_the_full_commands_status() {
     assert_eq!(unit_proofs(&s), 0, "{stderr}");
 }
 
+/// With the switch off (the default), a recorded full run stores the whole proof, and completion does not run: the
+/// suite holds a whole proof and no unit proof. The changed run then starts `attribution::pass`, whose launches are its
+/// verdict, so an untraced exit 0 there is no verdict (decision A).
 #[test]
 fn an_attribution_pass_of_a_suite_with_a_whole_proof_and_no_unit_proof_has_no_verdict_when_untraced(
 ) {
     let s = suite();
     let library = fork_shim(&s);
     let gate = gate(&s);
-    let env = completion_env(&library, &gate);
-    let first = hook(&s, &env);
+    let env = shim_env(&library, &gate);
+    let first = s.hook(&env);
     assert_eq!(code(&first), 0, "{}", text(&first.stderr));
-    // A changed run that starts an attribution pass takes its verdict from its launches: `attribution::pass` returns
-    // their status as the run's exit, so an untraced exit 0 there is no verdict (decision A). Completion, in the first
-    // run above, is different: `subset::learn` keeps the full command's status and never calls `finish`.
+    assert_eq!(unit_proofs(&s), 0, "{}", text(&first.stderr));
     edit_shared(&s);
+    arm(&gate);
     // Diagnostic: the decision the changed run makes with the row's environment, printed if the row fails.
     let mut explain = s.stoop(&s.root);
     explain
         .args(["explain", "--root"])
         .arg(&s.root)
         .args(["--", "./t", HOOK])
-        .envs(SPLIT)
         .envs(env.iter().copied());
     let explained = spawning(|| explain.output()).unwrap();
     eprintln!("EXPLAIN AFTER THE CHANGE:\n{}", text(&explained.stderr));
     s.clear_log();
-    let out = hook(&s, &env);
+    let out = s.hook(&env);
     let stderr = text(&out.stderr);
     assert!(
         stderr.contains("stoop: attribution pass: 3 units, one launch each"),
