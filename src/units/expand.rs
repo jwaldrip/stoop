@@ -454,6 +454,9 @@ fn filled(
 /// `-`, is longer than one character, and is not `--` (spec 4.13).
 fn option_before(hook: &Hook, index: usize) -> Option<OsString> {
     let before = index.checked_sub(1)?;
+    if before == 0 {
+        return None;
+    }
     let word = hook.original.get(before)?;
     let plain = hook.spans.get(before)?.is_empty();
     let option = word
@@ -776,6 +779,67 @@ mod tests {
                 .map(|word| word.to_string_lossy().into_owned())
                 .collect()
         })
+    }
+
+    #[test]
+    fn each_does_not_repeat_a_dash_named_executable() {
+        assert_eq!(
+            many(&["-runner", "{changed:each}"], &["a.t", "b.t"]),
+            Some(vec!["-runner".into(), "a.t".into(), "b.t".into()])
+        );
+        assert_eq!(
+            many(&["-runner", "-f", "{changed:each}"], &["a.t", "b.t"]),
+            Some(vec![
+                "-runner".into(),
+                "-f".into(),
+                "a.t".into(),
+                "-f".into(),
+                "b.t".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn dash_executable_and_unit_keep_argv_zero_for_each_base_and_shape() {
+        let units = vec!["-x.t".to_string(), "b.t".to_string()];
+        let root = Path::new("/r");
+        let cwd = Path::new("/r/sub");
+        let lists = |_: FileMode, _: Base| Some(OsString::from("<list>"));
+        for (placeholder, entries) in [
+            ("cwd", ["../-x.t", "../b.t"]),
+            ("root", ["./-x.t", "b.t"]),
+            ("abs", ["/r/-x.t", "/r/b.t"]),
+        ] {
+            for (word, expected) in [
+                (
+                    format!("{{changed:{placeholder}:each}}"),
+                    vec!["-runner".to_string(), entries[0].into(), entries[1].into()],
+                ),
+                (
+                    format!("--files={{changed:{placeholder}}}"),
+                    vec![
+                        "-runner".to_string(),
+                        format!("--files={}", entries[0]),
+                        format!("--files={}", entries[1]),
+                    ],
+                ),
+                (
+                    format!("--files={{changed:{placeholder}:comma}}"),
+                    vec![
+                        "-runner".to_string(),
+                        format!("--files={},{}", entries[0], entries[1]),
+                    ],
+                ),
+            ] {
+                let hook = hook(&["-runner", &word]);
+                let launch = launch_many(&hook, &units, root, cwd, &lists).unwrap();
+                assert_eq!(
+                    launch.argv,
+                    expected.into_iter().map(OsString::from).collect::<Vec<_>>(),
+                    "{word}"
+                );
+            }
+        }
     }
 
     #[test]
