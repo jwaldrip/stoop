@@ -1,4 +1,4 @@
-name: W7-4c singleton fallback probe
+name: W7-4c singleton probes
 
 on:
   push:
@@ -8,11 +8,11 @@ permissions:
   contents: read
 
 jobs:
-  singleton-fallback:
+  singleton-probes:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Probe the singleton untraced fallback
-        run: cargo test --test units_group singleton_untraced_last_launch_cannot_mask_missing_evidence -- --exact --nocapture
+      - name: Probe the singleton launches that cannot exit 0 without evidence
+        run: cargo test --test units_group singleton_ -- --nocapture

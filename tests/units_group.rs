@@ -1160,6 +1160,44 @@ pid_t fork(void) {
     );
     assert_eq!(code(&out), 125, "{stderr}");
 }
+
+#[test]
+fn singleton_last_launch_without_its_unit_cannot_exit_zero() {
+    let s = Suite::new();
+    fs::create_dir(s.path(".outputs")).unwrap();
+    let gate = s.outside.join("skip-gate");
+    let runner = include_str!("fixtures/hook/t");
+    assert_eq!(runner.matches("note \"ran=$1\"").count(), 1);
+    let runner = runner.replace(
+        "note \"ran=$1\"",
+        r#"note "ran=$1"
+    if [ "$1" = tests/b.t ] && [ -e "$RVW_GATE" ]; then STATUS=1; fi"#,
+    );
+    s.executable("t", &runner);
+    let env = [
+        ("STOOP_SPLIT", "1"),
+        ("T_WRITE_EACH", "1"),
+        ("T_OUTPUT_DIR", ".outputs"),
+        ("T_SKIP_TEST", B),
+        ("T_IF", gate.to_str().unwrap()),
+        ("RVW_GATE", gate.to_str().unwrap()),
+    ];
+    success(&s.hook(&env));
+    s.remove(".outputs/a.t.out");
+    s.remove(".outputs/b.t.out");
+    fs::write(&gate, "on").unwrap();
+    s.clear_log();
+    let out = s.hook(&env);
+    let stderr = text(&out.stderr);
+    assert_eq!(launched(&s), [A, B], "{stderr}");
+    let direct = s.direct(&s.root, &[], &env);
+    assert_eq!(code(&direct), 1, "{}", text(&direct.stderr));
+    assert!(
+        stderr.contains("stoop: no proof for tests/b.t: the launch never read it"),
+        "{stderr}"
+    );
+    assert_eq!(code(&out), 125, "{stderr}");
+}
 #[test]
 fn known_gap_c5_ungrouped_last_launch_coupling_masks_missing_evidence() {
     let s = Suite::new();
