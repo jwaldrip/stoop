@@ -365,6 +365,7 @@ struct RunnerTally {
     no_verdict: usize,
     no_verdict_failing: usize,
     no_verdict_no_reader: usize,
+    group: ModelGroupTally,
 }
 
 /// Runs one seeded sequence. Every step's subject verdict must equal the runner's, and its status is never 2. A status of
@@ -386,7 +387,12 @@ fn run_world(
     } else {
         Vec::new()
     };
-    let cold = split(&s, &env);
+    let grouped = model_group_enabled();
+    let subject_env = model_subject_env(&env, grouped);
+    let cold = split(&s, &subject_env);
+    if grouped {
+        tally.group.record(&s, &launched(&s));
+    }
     if code(&cold) != 0 {
         return Err(format!(
             "seed {seed}: the cold run failed: {}",
@@ -418,8 +424,12 @@ fn run_world(
         }
         log.push(format!("step {step}: {ops:?}"));
         s.clear_log();
-        let subject = split(&s, &env);
+        let subject = split(&s, &subject_env);
         let launches = launched(&s);
+        if grouped {
+            tally.group.record(&s, &launches);
+        }
+        let launched_units = model_launch_units(&launches, grouped);
         s.clear_log();
         let oracle = s.direct(&s.root, &[], &env);
         let failed = oracle_failed_tests(&s);
@@ -454,7 +464,7 @@ fn run_world(
                 return Err(report("a status of 125 without the no-verdict line"));
             };
             let stopped = world.units.iter().any(|unit| {
-                launches.contains(unit)
+                launched_units.contains(unit)
                     && before
                         .get(unit)
                         .zip(after.get(unit))
@@ -492,7 +502,7 @@ fn run_world(
         } else if (subject_code == 0) != (code(&oracle) == 0) {
             return Err(report("WRONG VERDICT"));
         }
-        if let Some(bad) = launches
+        if let Some(bad) = launched_units
             .iter()
             .find(|launch| !launch.is_empty() && !world.units.contains(launch))
         {
@@ -516,8 +526,9 @@ fn check_range(runner_only: bool) {
         }
     }
     let model = if runner_only { "E2" } else { "E1" };
+    let group_summary = tally.group.summary(model_group_enabled());
     println!(
-        "{model} sweep: seeds {first}..{}: {} accepted no-verdicts ({} on failing oracle, {} with no content reader), {} failing seeds",
+        "{model} sweep: seeds {first}..{}: {} accepted no-verdicts ({} on failing oracle, {} with no content reader), {} failing seeds{group_summary}",
         first + seeds - 1,
         tally.no_verdict,
         tally.no_verdict_failing,

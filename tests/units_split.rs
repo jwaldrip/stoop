@@ -926,6 +926,7 @@ struct Tally {
     no_verdict: usize,
     no_verdict_failing: usize,
     no_verdict_no_reader: usize,
+    group: ModelGroupTally,
 }
 
 /// M1 compares the subject with the direct runner, including runner-only tests under `T_U=1`.
@@ -952,14 +953,16 @@ fn model_split_runs_give_the_full_runs_verdict() {
         no_verdict,
         no_verdict_failing,
         no_verdict_no_reader,
+        group,
     } = tally;
     let share = if post_noops == 0 {
         0.0
     } else {
         exemptions as f64 * 100.0 / post_noops as f64
     };
+    let group_summary = group.summary(model_group_enabled());
     println!(
-        "M1 sweep: seeds {first}..{}: {post_noops} no-ops after a passing run, {exemptions} exempt full runs ({share:.2}%), {no_verdict} accepted no-verdicts ({no_verdict_failing} on failing oracle, {no_verdict_no_reader} with no content reader)",
+        "M1 sweep: seeds {first}..{}: {post_noops} no-ops after a passing run, {exemptions} exempt full runs ({share:.2}%), {no_verdict} accepted no-verdicts ({no_verdict_failing} on failing oracle, {no_verdict_no_reader} with no content reader){group_summary}",
         first + seeds
     );
     if post_noops >= MIN_POST_NOOPS {
@@ -1019,7 +1022,12 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
     let mut rng = Rng::new(seed);
     let mut model = Model::start(&s, &mut rng);
     let env = [("T_U", "1")];
-    let cold = split(&s, &env);
+    let grouped = model_group_enabled();
+    let subject_env = model_subject_env(&env, grouped);
+    let cold = split(&s, &subject_env);
+    if grouped {
+        tally.group.record(&s, &launched(&s));
+    }
     assert_eq!(
         code(&cold),
         0,
@@ -1077,8 +1085,12 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
             .iter()
             .any(|id| !model.runners_at_full.contains(id));
         s.clear_log();
-        let subject = split(&s, &env);
+        let subject = split(&s, &subject_env);
         let launches = launched(&s);
+        if grouped {
+            tally.group.record(&s, &launches);
+        }
+        let launched_units = model_launch_units(&launches, grouped);
         s.clear_log();
         let oracle = s.direct(&s.root, &[], &env);
         let failed = oracle_failed_tests(&s);
@@ -1126,7 +1138,7 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
                     report()
                 )
             });
-            let stopped = launches.iter().any(|unit| {
+            let stopped = launched_units.iter().any(|unit| {
                 before
                     .get(unit)
                     .zip(after.get(unit))
@@ -1174,7 +1186,7 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
         } else {
             assert_eq!(subject_code == 0, code(&oracle) == 0, "{}", report());
         }
-        for launch in launches.iter().filter(|launch| !launch.is_empty()) {
+        for launch in launched_units.iter().filter(|launch| !launch.is_empty()) {
             assert!(roster.contains(launch), "a non-unit argument: {}", report());
         }
         if noop && passing {

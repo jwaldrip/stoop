@@ -25,6 +25,68 @@ pub const ROSTER: [&str; 3] = ["tests/a.t", "tests/b.t", "tests/c.t"];
 
 const RUNNER: &str = include_str!("../fixtures/hook/t");
 
+/// Group only the seeded model subjects when explicitly requested.
+pub fn model_group_enabled() -> bool {
+    std::env::var("STOOP_MODEL_GROUP").is_ok_and(|value| value == "1")
+}
+
+pub fn model_subject_env<'a>(env: &[(&'a str, &'a str)], grouped: bool) -> Vec<(&'a str, &'a str)> {
+    let mut subject_env = env.to_vec();
+    if grouped {
+        subject_env.push(("STOOP_SPLIT_GROUP", "1"));
+    }
+    subject_env
+}
+
+/// Keep the empty full-run record while separating grouped unit arguments.
+pub fn model_launch_units(launches: &[String], grouped: bool) -> Vec<String> {
+    if grouped {
+        launches
+            .iter()
+            .flat_map(|launch| launch.split(' ').map(str::to_owned))
+            .collect()
+    } else {
+        launches.to_vec()
+    }
+}
+
+#[derive(Default)]
+pub struct ModelGroupTally {
+    grouped_launches: usize,
+    inexact_versions_written: usize,
+}
+
+impl ModelGroupTally {
+    /// Count grouped launch records and inexact versions observed after this subject run.
+    pub fn record(&mut self, s: &Suite, launches: &[String]) {
+        self.grouped_launches += launches
+            .iter()
+            .filter(|launch| launch.split(' ').count() > 1)
+            .count();
+        self.inexact_versions_written += s.bundle().map_or(0, |bundle| {
+            bundle["units"].as_object().map_or(0, |units| {
+                units
+                    .values()
+                    .filter_map(Value::as_array)
+                    .flat_map(|versions| versions.iter())
+                    .filter(|version| version["exact"].as_bool() == Some(false))
+                    .count()
+            })
+        });
+    }
+
+    pub fn summary(&self, grouped: bool) -> String {
+        if grouped {
+            format!(
+                ", grouped launches: {}, inexact versions written: {}",
+                self.grouped_launches, self.inexact_versions_written
+            )
+        } else {
+            String::new()
+        }
+    }
+}
+
 static NEXT: AtomicUsize = AtomicUsize::new(0);
 
 /// Writing an executable and spawning a child must not overlap. A child forked while a
