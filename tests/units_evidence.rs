@@ -516,6 +516,16 @@ fn an_attribution_pass_of_a_suite_with_a_whole_proof_and_no_unit_proof_has_no_ve
     // their status as the run's exit, so an untraced exit 0 there is no verdict (decision A). Completion, in the first
     // run above, is different: `subset::learn` keeps the full command's status and never calls `finish`.
     edit_shared(&s);
+    // Diagnostic: the decision the changed run makes with the row's environment, printed if the row fails.
+    let mut explain = s.stoop(&s.root);
+    explain
+        .args(["explain", "--root"])
+        .arg(&s.root)
+        .args(["--", "./t", HOOK])
+        .envs(SPLIT)
+        .envs(env.iter().copied());
+    let explained = spawning(|| explain.output()).unwrap();
+    eprintln!("EXPLAIN AFTER THE CHANGE:\n{}", text(&explained.stderr));
     s.clear_log();
     let out = hook(&s, &env);
     let stderr = text(&out.stderr);
