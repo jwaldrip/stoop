@@ -1026,19 +1026,23 @@ struct E3GapEvidence {
     flag_flipped: bool,
     stored_content: bool,
     launched_stored_content: bool,
+    held_current_content: bool,
     current_content: bool,
     appeared_test_content: bool,
 }
 
-/// A fresh W22 origin needs a unit launched in this step whose stored proof read the changed flag by content. Without
-/// that reader, the skip is the stale first change the reviewer found (PR 86 review round 8).
+/// A fresh W22 origin needs a launched reader of the previous flag or a held reader of its current content.
+/// A held reader of only the previous content does not excuse a stale first skip (PR 86 review round 8).
 fn e3_gap(evidence: E3GapEvidence) -> Option<E3Gap> {
     if !evidence.runner_only || !evidence.current_content {
         return None;
     }
     if evidence.appeared_now {
         evidence.appeared_test_content.then_some(E3Gap::E5)
-    } else if evidence.flag_flipped && evidence.stored_content && evidence.launched_stored_content {
+    } else if evidence.flag_flipped
+        && ((evidence.stored_content && evidence.launched_stored_content)
+            || evidence.held_current_content)
+    {
         Some(E3Gap::W22)
     } else {
         None
@@ -1113,6 +1117,43 @@ struct E3Diverged {
     shapes: Vec<E3Gap>,
 }
 
+type E3RunnerState = (Option<Vec<u8>>, Option<Vec<u8>>);
+
+fn e3_runner_snapshot(
+    s: &Suite,
+    divergence: &E3Diverged,
+) -> std::collections::BTreeMap<String, E3RunnerState> {
+    divergence
+        .failing
+        .iter()
+        .map(|test| {
+            (
+                test.clone(),
+                (
+                    fs::read(s.path(test)).ok(),
+                    fs::read(s.path(&flag_of(test))).ok(),
+                ),
+            )
+        })
+        .collect()
+}
+
+fn e3_note_runner_changes(
+    s: &Suite,
+    divergence: &mut E3Diverged,
+    before: &std::collections::BTreeMap<String, E3RunnerState>,
+) {
+    for (test, previous) in before {
+        let current = (
+            fs::read(s.path(test)).ok(),
+            fs::read(s.path(&flag_of(test))).ok(),
+        );
+        if &current != previous {
+            divergence.changed.insert(test.clone());
+        }
+    }
+}
+
 fn e3_changes_runner(step: &Step, test: &str) -> bool {
     match step {
         Step::Flag(path, _)
@@ -1159,6 +1200,31 @@ fn e3_sticky(
                 && !units.contains(test)
                 && !launches.contains(test)
         })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum E3Failure {
+    Sticky,
+    Fresh(E3Gap),
+}
+
+fn e3_classify_failure(
+    previous: Option<&E3Diverged>,
+    failure: &[String],
+    policy_failures: &[String],
+    runners: &[String],
+    units: &[String],
+    launches: &[String],
+    evidence: E3GapEvidence,
+) -> Option<E3Failure> {
+    debug_assert_eq!(failure.len(), 1);
+    if previous
+        .is_some_and(|old| e3_sticky(old, failure, policy_failures, runners, units, launches))
+    {
+        Some(E3Failure::Sticky)
+    } else {
+        e3_gap(evidence).map(E3Failure::Fresh)
+    }
 }
 
 #[test]
@@ -1319,6 +1385,10 @@ fn run_e3_recreating(
     let mut last_125 = false;
     for step in 1..=steps {
         let before = e3_listings(&s, &world.units);
+        let before_runners = divergence
+            .as_ref()
+            .map(|old| e3_runner_snapshot(&s, old))
+            .unwrap_or_default();
         let empty_policy_before = divergence.is_some() && e3_empty_policy_directory(&s);
         let before_flags: std::collections::BTreeMap<String, Option<String>> = world
             .runners
@@ -1425,11 +1495,7 @@ fn run_e3_recreating(
         {
             divergence = None;
         } else if let Some(previous) = &mut divergence {
-            for test in &previous.failing {
-                if ops.iter().any(|op| e3_changes_runner(op, test)) {
-                    previous.changed.insert(test.clone());
-                }
-            }
+            e3_note_runner_changes(&s, previous, &before_runners);
         }
         last_125 = subject_code == 125;
         if subject_code == 2 {
@@ -1540,7 +1606,20 @@ fn run_e3_recreating(
             })
         };
         let reads = stored_reads(&stored, &world.units);
-        let current = !failed.is_empty() && failed.iter().all(|test| listed_now(&flag_of(test)));
+        let current = !failed.is_empty()
+            && failed.iter().all(|test| {
+                listed_now(&flag_of(test))
+                    || divergence.as_ref().is_some_and(|old| {
+                        e3_sticky(
+                            old,
+                            std::slice::from_ref(test),
+                            &policy_failures,
+                            &world.runners,
+                            &world.units,
+                            &launched_units,
+                        )
+                    })
+            });
         let stored_gap = !failed.is_empty()
             && failed.iter().all(|test| {
                 let flag = flag_of(test);
@@ -1548,6 +1627,8 @@ fn run_e3_recreating(
             });
         if current {
             let mut kinds = Vec::new();
+            let mut fresh_failures = Vec::new();
+            let mut sticky_failures = Vec::new();
             for test in &failed {
                 let flag = flag_of(test);
                 let previous_flag = before_flags.get(test).and_then(|value| value.as_deref());
@@ -1575,15 +1656,42 @@ fn run_e3_recreating(
                     launched_stored_content: previous_flag.is_some_and(|value| {
                         e3_stored_content_flag(&stored, &s, &launched_units, &flag, value)
                     }),
+                    held_current_content: fs::read_to_string(s.path(&flag)).is_ok_and(|value| {
+                        e3_stored_content_flag(&stored, &s, &world.units, &flag, &value)
+                    }),
                     current_content: listed_now(&flag),
                     appeared_test_content: e3_launched_content_path(&after, &launched_units, test),
                 };
-                let Some(kind) = e3_gap(evidence) else {
+                match e3_classify_failure(
+                    divergence.as_ref(),
+                    std::slice::from_ref(test),
+                    &policy_failures,
+                    &world.runners,
+                    &world.units,
+                    &launched_units,
+                    evidence,
+                ) {
+                    Some(E3Failure::Sticky) => sticky_failures.push(test.clone()),
+                    Some(E3Failure::Fresh(kind)) => {
+                        fresh_failures.push(test.clone());
+                        kinds.push(kind);
+                    }
+                    None => {
+                        return Err(report(
+                            "WRONG VERDICT: the covered-file mismatch is outside w22 and E5",
+                        ));
+                    }
+                }
+            }
+            if !sticky_failures.is_empty() {
+                sticky_retries += 1;
+                if sticky_retries * 3 > steps {
                     return Err(report(
-                        "WRONG VERDICT: the covered-file mismatch is outside w22 and E5",
+                        "too many sticky covered-file retries in one sequence",
                     ));
-                };
-                kinds.push(kind);
+                }
+                tally.gap_sticky += 1;
+                println!("E3 sticky gap: seed {seed}, step {step}, failed {sticky_failures:?}");
             }
             gap_fires += 1;
             if gap_fires * 3 > steps {
@@ -1593,12 +1701,20 @@ fn run_e3_recreating(
             tally.gap_w22 += usize::from(kinds.contains(&E3Gap::W22));
             tally.gap_e5 += usize::from(kinds.contains(&E3Gap::E5));
             println!("E3 covered-file gap: seed {seed}, step {step}, shapes {kinds:?}");
-            divergence = Some(E3Diverged {
-                origin: step,
-                failing: failed.iter().cloned().collect(),
-                changed: Default::default(),
-                shapes: kinds,
-            });
+            if let Some(previous) = &mut divergence {
+                for test in fresh_failures {
+                    previous.changed.remove(&test);
+                    previous.failing.insert(test);
+                }
+                previous.shapes.extend(kinds);
+            } else {
+                divergence = Some(E3Diverged {
+                    origin: step,
+                    failing: fresh_failures.into_iter().collect(),
+                    changed: Default::default(),
+                    shapes: kinds,
+                });
+            }
             continue;
         }
         if stored_gap {
@@ -3168,13 +3284,9 @@ fn r8_sticky_rejects_independent_policy_and_runner_edits() {
         }
     }
     for value in ["ok", "fail"] {
+        let before = e3_runner_snapshot(&s, &divergence);
         s.write("tests/z.flag", &format!("{value}\n"));
-        let op = Step::Flag("tests/z.u".to_owned(), value);
-        for test in &divergence.failing {
-            if e3_changes_runner(&op, test) {
-                divergence.changed.insert(test.clone());
-            }
-        }
+        e3_note_runner_changes(&s, &mut divergence, &before);
     }
     let (status, failed, policy) = r7_oracle(&s, &TU);
     assert_eq!(
@@ -3276,6 +3388,8 @@ fn r8_fresh_w22_requires_a_unit_to_run_against_the_changed_flag() {
             && fs::read_to_string(s.path(flag)).unwrap().contains("fail"),
         stored_content: e3_stored_content_flag(&before, &s, &unit_names, flag, &old_flag),
         launched_stored_content: e3_stored_content_flag(&before, &s, &launches, flag, &old_flag),
+        held_current_content: fs::read_to_string(s.path(flag))
+            .is_ok_and(|value| e3_stored_content_flag(&before, &s, &unit_names, flag, &value)),
         current_content: !no_content_reader(&s, &after, flag),
         appeared_test_content: e3_launched_content_path(&after, &launches, failure),
         ..E3GapEvidence::default()
@@ -3379,12 +3493,10 @@ fn r9x_identical_flag_rewrite_keeps_a_sticky_retry() {
     };
     let stored = bundle(&s);
     let previous = fs::read_to_string(s.path(flag)).unwrap();
-    let op = Step::Flag("tests/z.u".to_owned(), "fail");
+    let before = e3_runner_snapshot(&s, &divergence);
     s.write(flag, "fail\n");
     assert_eq!(fs::read_to_string(s.path(flag)).unwrap(), previous);
-    if e3_changes_runner(&op, "tests/z.u") {
-        divergence.changed.insert("tests/z.u".to_owned());
-    }
+    e3_note_runner_changes(&s, &mut divergence, &before);
     let (_, retry, launches, oracle) = judge("r9x-flag-retry", &s, &TU, true);
     let (status, failed, policy) = r7_oracle(&s, &TU);
     let sticky = e3_sticky(&divergence, &failed, &policy, &runners, &units, &launches);
@@ -3448,6 +3560,7 @@ fn r9x_a_held_reader_version_after_a_round_trip_is_rejected() {
         flag_flipped: !previous.contains("fail"),
         stored_content: e3_stored_content_flag(&stored, &s, &units, flag, &previous),
         launched_stored_content: e3_stored_content_flag(&stored, &s, &launches, flag, &previous),
+        held_current_content: e3_stored_content_flag(&stored, &s, &units, flag, "fail\n"),
         current_content: !no_content_reader(&s, &after, flag),
         appeared_test_content: e3_launched_content_path(&after, &launches, failure),
         ..E3GapEvidence::default()
@@ -3539,18 +3652,29 @@ fn r9x_a_second_w22_during_a_sticky_retry_is_rejected() {
         shapes: vec![E3Gap::W22],
     };
     let stored = bundle(&s);
-    let op = Step::Flag("tests/y.u".to_owned(), "fail");
+    let before = e3_runner_snapshot(&s, &divergence);
     s.write("tests/y.flag", "fail\n");
-    for test in divergence.failing.clone() {
-        if e3_changes_runner(&op, &test) {
-            divergence.changed.insert(test);
-        }
-    }
+    e3_note_runner_changes(&s, &mut divergence, &before);
     let (_, second, launches, oracle) = judge("r9x-second-w22", &s, &TU, true);
     let (status, failed, policy) = r7_oracle(&s, &TU);
-    let sticky = e3_sticky(&divergence, &failed, &policy, &runners, &units, &launches);
-    let y = e3_gap(classify(&stored, &launches, "tests/y.u", "ok\n", true));
-    let z = e3_gap(classify(&stored, &launches, "tests/z.u", "fail\n", false));
+    let y = e3_classify_failure(
+        Some(&divergence),
+        &["tests/y.u".to_owned()],
+        &policy,
+        &runners,
+        &units,
+        &launches,
+        classify(&stored, &launches, "tests/y.u", "ok\n", true),
+    );
+    let z = e3_classify_failure(
+        Some(&divergence),
+        &["tests/z.u".to_owned()],
+        &policy,
+        &runners,
+        &units,
+        &launches,
+        classify(&stored, &launches, "tests/z.u", "fail\n", false),
+    );
     let z_alone = e3_sticky(
         &divergence,
         &["tests/z.u".to_owned()],
@@ -3568,10 +3692,145 @@ fn r9x_a_second_w22_during_a_sticky_retry_is_rejected() {
     assert_eq!(launches, ["tests/c.t"]);
     assert_eq!(failed, runners);
     assert!(policy.is_empty());
-    assert_eq!(y, Some(E3Gap::W22), "y is a fresh W22");
+    assert_eq!(y, Some(E3Failure::Fresh(E3Gap::W22)), "y is a fresh W22");
     assert!(z_alone, "z alone is still the sticky retry");
-    assert!(
-        sticky || (y.is_some() && z.is_some()),
-        "classify both failures independently"
+    assert_eq!(z, Some(E3Failure::Sticky), "z stays sticky beside y");
+}
+
+#[test]
+fn r10_runner_change_requires_different_file_or_flag_bytes() {
+    let s = Suite::new();
+    let test = "tests/z.u".to_owned();
+    let runners = vec![test.clone()];
+    s.write(&test, "src/c.src\n");
+    s.write("tests/z.flag", "fail\n");
+    let mut old = E3Diverged {
+        origin: 1,
+        failing: runners.iter().cloned().collect(),
+        changed: Default::default(),
+        shapes: vec![E3Gap::W22],
+    };
+    let before = e3_runner_snapshot(&s, &old);
+    s.write(&test, "src/c.src\n");
+    s.write("tests/z.flag", "fail\n");
+    e3_note_runner_changes(&s, &mut old, &before);
+    assert!(e3_sticky(&old, &runners, &[], &runners, &[], &[]));
+    let before = e3_runner_snapshot(&s, &old);
+    s.write(&test, "src/shared.src\n");
+    e3_note_runner_changes(&s, &mut old, &before);
+    assert!(!e3_sticky(&old, &runners, &[], &runners, &[], &[]));
+    old.changed.clear();
+    let before = e3_runner_snapshot(&s, &old);
+    s.write("tests/z.flag", "ok\n");
+    e3_note_runner_changes(&s, &mut old, &before);
+    assert!(!e3_sticky(&old, &runners, &[], &runners, &[], &[]));
+}
+
+#[test]
+fn r10_current_held_reader_does_not_excuse_a_stale_first_skip() {
+    let mut evidence = E3GapEvidence {
+        runner_only: true,
+        flag_flipped: true,
+        stored_content: true,
+        current_content: true,
+        ..E3GapEvidence::default()
+    };
+    assert_eq!(e3_gap(evidence), None, "the previous flag alone is stale");
+    evidence.held_current_content = true;
+    assert_eq!(e3_gap(evidence), Some(E3Gap::W22));
+    evidence.flag_flipped = false;
+    assert_eq!(
+        e3_gap(evidence),
+        None,
+        "a held reader does not excuse an unchanged flag"
+    );
+    evidence.flag_flipped = true;
+    evidence.current_content = false;
+    assert_eq!(
+        e3_gap(evidence),
+        None,
+        "the current content reader remains required"
+    );
+}
+
+#[test]
+fn r10_mixed_failure_rejects_unexplained_or_changed_runners() {
+    let z = "tests/z.u".to_owned();
+    let y = "tests/y.u".to_owned();
+    let runners = vec![y.clone(), z.clone()];
+    let mut old = E3Diverged {
+        origin: 1,
+        failing: [z.clone()].into_iter().collect(),
+        changed: Default::default(),
+        shapes: vec![E3Gap::W22],
+    };
+    let fresh = E3GapEvidence {
+        runner_only: true,
+        flag_flipped: true,
+        stored_content: true,
+        launched_stored_content: true,
+        current_content: true,
+        ..E3GapEvidence::default()
+    };
+    assert_eq!(
+        e3_classify_failure(
+            Some(&old),
+            std::slice::from_ref(&z),
+            &[],
+            &runners,
+            &[],
+            &[],
+            E3GapEvidence::default()
+        ),
+        Some(E3Failure::Sticky)
+    );
+    assert_eq!(
+        e3_classify_failure(
+            Some(&old),
+            std::slice::from_ref(&y),
+            &[],
+            &runners,
+            &[],
+            &[],
+            fresh
+        ),
+        Some(E3Failure::Fresh(E3Gap::W22))
+    );
+    assert_eq!(
+        e3_classify_failure(
+            Some(&old),
+            std::slice::from_ref(&y),
+            &[],
+            &runners,
+            &[],
+            &[],
+            E3GapEvidence::default()
+        ),
+        None
+    );
+    old.changed.insert(z.clone());
+    assert_eq!(
+        e3_classify_failure(
+            Some(&old),
+            std::slice::from_ref(&z),
+            &[],
+            &runners,
+            &[],
+            &[],
+            E3GapEvidence::default()
+        ),
+        None
+    );
+    assert_eq!(
+        e3_classify_failure(
+            Some(&old),
+            std::slice::from_ref(&z),
+            &["policy".into()],
+            &runners,
+            &[],
+            &[],
+            E3GapEvidence::default()
+        ),
+        None
     );
 }
