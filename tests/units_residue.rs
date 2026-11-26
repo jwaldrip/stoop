@@ -137,7 +137,7 @@ fn i16b_the_pinned_fixture_has_an_empty_residue_after_a_pass() {
     );
 }
 
-/// I17: a forced full run records its own proof, and the residue is measured for that proof.
+/// I17: with the switch off, a forced full run records its own proof, and the residue is measured for that proof.
 #[test]
 fn i17_a_forced_full_run_measures_the_residue_of_its_own_proof() {
     let s = Suite::new();
@@ -148,6 +148,7 @@ fn i17_a_forced_full_run_measures_the_residue_of_its_own_proof() {
     success(&s.hook(&[("T_LINT", "1"), ("STOOP_FULL", "1")]));
     let b = bundle(&s);
     assert_ne!(b["whole"], before, "the forced run records a new proof");
+    assert_eq!(b["residue"]["state"], "provisional", "{}", b["residue"]);
     assert_eq!(b["residue"]["whole"], b["whole"], "{}", b["residue"]);
     assert_eq!(paths(&b["residue"]), ["lint"], "{}", b["residue"]);
 }
@@ -217,8 +218,8 @@ fn i21_a_program_only_the_full_command_runs_is_residue_by_absolute_path() {
     assert!(paths(&r).contains(&"/usr/bin/od".to_owned()), "{r}");
 }
 
-/// I22: a unit that leaves the roster is no longer a version, so its reads are no longer covered: the full command's
-/// read of its file is residue once the roster is `a` and `b`.
+/// I22: with the switch off, a unit that leaves the roster no longer covers its reads, so the full command's read of
+/// its source is residue after a forced run.
 #[test]
 fn i22_a_unit_that_leaves_the_roster_stops_covering_its_reads() {
     let s = Suite::new();
@@ -230,6 +231,7 @@ fn i22_a_unit_that_leaves_the_roster_stops_covering_its_reads() {
     let units = bundle(&s)["units"].clone();
     assert!(units.get("tests/c.t").is_none(), "{units}");
     let r = residue(&s);
+    assert_eq!(r["state"], "provisional", "{r}");
     assert!(paths(&r).contains(&"src/c.src".to_owned()), "{r}");
 }
 

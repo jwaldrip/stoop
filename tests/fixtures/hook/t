@@ -37,6 +37,8 @@ hold() {
 		if [ -z "${T_FIFO_AT:-}" ] || [ "$T_FIFO_AT" = "$1" ]; then
 			HELD=1
 			read -r _ < "$T_FIFO" || true
+			# The pass marker that the test's release waits for (issue #87). The log's ran= line comes before the hold.
+			printf '%s\n' "$1" >> "$T_FIFO.passed"
 		fi
 	fi
 }
@@ -67,7 +69,12 @@ run_test() {
 	cat "$1"
 	while IFS= read -r line || [ -n "$line" ]; do
 		if [ -n "$line" ]; then
-			cat "$ROOT/$line"
+			if [ "$line" = fail ]; then
+				note "failed=$1"
+				STATUS=1
+			else
+				cat "$ROOT/$line"
+			fi
 		fi
 	done < "$1"
 	cat "$ROOT/setup.src"
@@ -122,7 +129,13 @@ if [ "${T_STAT_ROOT:-}" = 1 ]; then
 	note stat_root
 fi
 if [ -n "${T_READ_OTHER:-}" ] && armed; then
-	cat "$T_READ_OTHER" > /dev/null
+	if [ -p "$T_READ_OTHER" ]; then
+		# A FIFO is held (issue #87): one line releases it, then the pass marker that the test waits for.
+		read -r _ < "$T_READ_OTHER" || true
+		printf 'read-other\n' >> "$T_READ_OTHER.passed"
+	else
+		cat "$T_READ_OTHER" > /dev/null
+	fi
 fi
 if [ -n "${T_STAT_OTHER:-}" ] && armed; then
 	test -e "$T_STAT_OTHER"

@@ -6,15 +6,16 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, RwLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The hook every pin uses. Its inline filter is the roster; the full form runs the runner with no arguments.
 pub const HOOK: &str = "{changed:**/*.t|!slow/**}";
@@ -307,6 +308,16 @@ impl Suite {
             for entry in entries {
                 let path = entry.unwrap().path();
                 if path.is_dir() {
+                    // A directory's stamp changes when an entry in it is made or removed, even one removed again.
+                    let meta = fs::metadata(&path).unwrap();
+                    let stamp = format!(
+                        "{:?} {} {}",
+                        meta.modified().unwrap(),
+                        meta.ctime(),
+                        meta.ctime_nsec()
+                    );
+                    let rel = path.strip_prefix(&self.root).unwrap().to_path_buf();
+                    files.insert(rel, stamp.into_bytes());
                     pending.push(path);
                 } else {
                     let rel = path.strip_prefix(&self.root).unwrap().to_path_buf();
@@ -378,24 +389,83 @@ impl Launch {
     }
 }
 
-/// Wait until the runner opens the FIFO for reading, then return the writing end. The open
-/// blocks until a reader arrives, so this returns exactly when the runner reaches its hold.
-/// Dropping the returned file releases the runner.
-pub fn meet(fifo: &Path) -> File {
+/// A runner held at its FIFO hold, and the writer that releases it. See [`meet`] and [`release`].
+pub struct Held {
+    file: File,
+    fifo: PathBuf,
+}
+
+/// How long a release waits for the runner to pass its hold, and how often it looks.
+const HOLD_WAIT: Duration = Duration::from_secs(60);
+const HOLD_POLL: Duration = Duration::from_millis(20);
+
+/// Wait until the runner opens the FIFO for reading, then return the writer that releases it. The open blocks until a
+/// reader arrives. That reader is the runner's hold or the reader stoop opens to hash the FIFO (issue #87), so this can
+/// return before the runner reaches its hold. [`release`] works either way.
+pub fn meet(fifo: &Path) -> Held {
     let (sender, receiver) = mpsc::channel();
     let path = fifo.to_path_buf();
     thread::spawn(move || {
         let _ = sender.send(fs::OpenOptions::new().write(true).open(&path));
     });
-    receiver
+    let file = receiver
         .recv_timeout(Duration::from_secs(30))
         .expect("the runner never reached the FIFO")
-        .expect("open the FIFO for writing")
+        .expect("open the FIFO for writing");
+    Held {
+        file,
+        fifo: fifo.to_path_buf(),
+    }
 }
 
-/// Release a held runner with one line, then drop the writer.
-pub fn release(mut writer: File) {
-    writer.write_all(b"go\n").unwrap();
+/// The runner's pass marker for a FIFO: one line per hold it has passed, in `<fifo>.passed` (`fixtures/hook/t`).
+fn passes(fifo: &Path) -> usize {
+    let mut marker = fifo.as_os_str().to_owned();
+    marker.push(".passed");
+    fs::read_to_string(marker).map_or(0, |text| text.lines().count())
+}
+
+/// Release a runner held at its FIFO hold, and return once it has passed the hold.
+///
+/// Issue #87: stoop opens a FIFO that a traced command reads, to hash it, and that open can pair with the writer
+/// [`meet`] returned. A line written then is discarded when the pipe's last file closes, and the runner's own open
+/// waits for a writer that has gone, so the runner never passes. So the writer stays open until the runner passes,
+/// and the line goes in only once a reader is present (EPIPE means none is). A line stays in the pipe while a writer
+/// is open, so the first write that lands is the line the hold reads. Exactly one line is written, so none strays
+/// into a later hold on the same FIFO. Once issue #87 is fixed, the first write always lands and the retry never runs.
+pub fn release(held: Held) {
+    let Held { mut file, fifo } = held;
+    let before = passes(&fifo);
+    let deadline = Instant::now() + HOLD_WAIT;
+    while let Err(error) = file.write_all(b"go\n") {
+        assert_eq!(
+            error.kind(),
+            ErrorKind::BrokenPipe,
+            "write the release to {}",
+            fifo.display()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "no reader took the release on {}",
+            fifo.display()
+        );
+        thread::sleep(HOLD_POLL);
+    }
+    while passes(&fifo) == before {
+        assert!(
+            Instant::now() < deadline,
+            "the runner never passed its hold on {}; the log ends with {:?}",
+            fifo.display(),
+            last_line(&fifo)
+        );
+        thread::sleep(HOLD_POLL);
+    }
+}
+
+/// The last line of the suite's log, which sits beside its FIFOs (see [`Suite::fifo`]).
+fn last_line(fifo: &Path) -> String {
+    let log = fs::read_to_string(fifo.with_file_name("log")).unwrap_or_default();
+    log.lines().last().unwrap_or_default().to_owned()
 }
 
 /// Collect a child's output, failing rather than hanging when it does not finish.
@@ -416,4 +486,255 @@ pub fn code(out: &Output) -> i32 {
 
 pub fn text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// The exact changed-path refusal, excluding bare, appeared-path, or suffixed diagnostic lines.
+pub fn no_verdict_changed(out: &Output) -> Option<String> {
+    text(&out.stderr).lines().find_map(|line| {
+        let path = line
+            .strip_prefix("stoop: this run has no verdict (exit 125): ")?
+            .strip_suffix(" changed, and no unit's new proof reads it")?;
+        (!path.is_empty()).then(|| path.to_owned())
+    })
+}
+
+/// Failed test paths recorded by the most recent direct runner.
+pub fn oracle_failed_tests(s: &Suite) -> Vec<String> {
+    s.launches()
+        .iter()
+        .flat_map(|launch| {
+            launch
+                .lines
+                .iter()
+                .filter_map(|line| line.strip_prefix("failed=").map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Full-run policy failures recorded separately from failed tests.
+pub fn oracle_policy_failures(s: &Suite) -> Vec<String> {
+    s.launches()
+        .iter()
+        .flat_map(|launch| {
+            launch
+                .lines
+                .iter()
+                .filter_map(|line| line.strip_prefix("failed-policy=").map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// The refusal names a failing runner-only test or its flag, rather than an unrelated path.
+pub fn failing_runner_depends_on(failed: &[String], runners: &[String], path: &str) -> bool {
+    failed.iter().any(|test| {
+        runners.contains(test)
+            && (path == test
+                || test
+                    .strip_suffix(".u")
+                    .is_some_and(|stem| path.strip_suffix(".flag") == Some(stem)))
+    })
+}
+
+pub fn false_pass_after_125(previous_125: bool, noop: bool, subject: i32, oracle: i32) -> bool {
+    previous_125 && noop && subject == 0 && oracle != 0
+}
+/// Whether a unit actually stopped reading the path's contents, including a unit-only content line.
+pub fn content_read_dropped(
+    before: &std::collections::BTreeSet<String>,
+    after: &std::collections::BTreeSet<String>,
+    path: &str,
+) -> bool {
+    let unit_only = format!("unit-only:{path}");
+    let reads = |lines: &std::collections::BTreeSet<String>| {
+        lines.contains(path) || lines.contains(&unit_only)
+    };
+    reads(before) && !reads(after)
+}
+pub type ModelListings = BTreeMap<String, std::collections::BTreeSet<String>>;
+
+/// Paths the model observed the last successful full runner reading.
+#[derive(Default)]
+pub struct ModelWholeInputs {
+    paths: std::collections::BTreeSet<String>,
+}
+
+fn content_line(line: &str) -> Option<&str> {
+    if line.is_empty() || line == "fail" || line.starts_with("stat:") {
+        None
+    } else {
+        Some(line.strip_prefix("unit-only:").unwrap_or(line))
+    }
+}
+// Match the serialized fields and their order in Proof::digest. The bundle names the last full
+// proof by digest; neither the first proof file nor the first proof in it is necessarily that proof.
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ModelOidBasis {
+    text: String,
+    eol: String,
+    filter: String,
+    ident: String,
+    working_tree_encoding: String,
+    export_subst: String,
+    crlf: String,
+    autocrlf: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ModelProofInput {
+    path: String,
+    id: String,
+    #[serde(default)]
+    oid: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    oid_basis: Option<ModelOidBasis>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct ModelProvenance {
+    os: String,
+    arch: String,
+    tracer: String,
+    version: u32,
+}
+
+#[derive(serde::Deserialize)]
+struct ModelStoredProof {
+    inputs: Vec<ModelProofInput>,
+    #[serde(default)]
+    outputs: Vec<ModelProofInput>,
+    #[serde(default)]
+    removed: Vec<String>,
+    env: BTreeMap<String, String>,
+    #[serde(default)]
+    probes: BTreeMap<String, String>,
+    #[serde(default)]
+    env_excluded: Vec<String>,
+    #[serde(default)]
+    ignore: Option<Vec<String>>,
+    #[serde(default)]
+    priors: Option<Vec<ModelProofInput>>,
+    #[serde(default)]
+    unplannable: Vec<String>,
+    #[serde(default)]
+    cwd: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    provenance: Option<ModelProvenance>,
+}
+
+fn model_proof_digest(value: &Value) -> String {
+    let proof: ModelStoredProof =
+        serde_json::from_value(value.clone()).expect("a stored proof must match the model");
+    let bytes = serde_json::to_vec(&(
+        &proof.inputs,
+        &proof.outputs,
+        &proof.removed,
+        &proof.env,
+        &proof.probes,
+        &proof.env_excluded,
+        &proof.ignore,
+        &proof.priors,
+        &proof.unplannable,
+        &proof.cwd,
+        &proof.scope,
+        &proof.provenance,
+    ))
+    .expect("model proof fields serialize");
+    format!("p-{}", &blake3::hash(&bytes).to_hex()[..32])
+}
+
+impl ModelWholeInputs {
+    pub fn record(&mut self, s: &Suite, units: &[String], runners: &[String]) {
+        self.paths.clear();
+        self.paths.insert("t".to_owned());
+        self.paths.insert("setup.src".to_owned());
+        for test in units.iter().chain(runners) {
+            self.paths.insert(test.clone());
+            if let Some((stem, _)) = test.rsplit_once('.') {
+                self.paths.insert(format!("{stem}.flag"));
+            }
+            if let Ok(body) = fs::read_to_string(s.path(test)) {
+                for line in body.lines() {
+                    if line.is_empty() || line == "fail" || line.starts_with("unit-only:") {
+                        continue;
+                    }
+                    self.paths
+                        .insert(line.strip_prefix("stat:").unwrap_or(line).to_owned());
+                }
+            }
+        }
+    }
+
+    pub fn contains(&self, s: &Suite, path: &str) -> bool {
+        self.paths.contains(path)
+            && s.bundle()
+                .and_then(|bundle| bundle["whole"].as_str().map(str::to_owned))
+                .is_some_and(|whole| {
+                    s.proofs().iter().any(|proof| {
+                        model_proof_digest(proof) == whole
+                            && proof["inputs"].as_array().is_some_and(|inputs| {
+                                inputs
+                                    .iter()
+                                    .any(|input| input["path"].as_str() == Some(path))
+                            })
+                    })
+                })
+    }
+}
+
+/// Whether no roster unit reads this path by content in the current model state.
+pub fn no_content_reader(s: &Suite, units: &ModelListings, path: &str) -> bool {
+    if !units.is_empty() && matches!(path, "t" | "setup.src") {
+        return false;
+    }
+    units.iter().all(|(unit, lines)| {
+        let own_flag = unit
+            .rsplit_once('.')
+            .is_some_and(|(stem, _)| path.strip_suffix(".flag") == Some(stem));
+        unit != path
+            && !(own_flag && s.path(path).is_file())
+            && !lines.iter().any(|line| content_line(line) == Some(path))
+    })
+}
+
+/// Make the full runner list and require a directory that its unit discovery prunes.
+pub fn listed_policy_runner(script: &str) -> String {
+    let full = "\tset -f\n";
+    let prune = "-o -path ./slow ";
+    assert_eq!(script.matches(full).count(), 1);
+    assert_eq!(script.matches(prune).count(), 2);
+    script
+        .replace(prune, "-o -path ./slow -o -path ./policy-r6 ")
+        .replace(
+            full,
+            "\tfor item in \"$ROOT\"/policy-r6/zone/*; do :; done\n\tif [ ! -d \"$ROOT/policy-r6/zone\" ]; then note 'failed-policy=policy-r6/zone'; STATUS=1; fi\n\tset -f\n",
+        )
+}
+
+/// Start with two empty directories, one listed and one serving as a link target.
+pub fn listed_policy_setup(s: &Suite) {
+    fs::create_dir_all(s.path("policy-r6/zone")).unwrap();
+    fs::create_dir_all(s.path("policy-r6/target")).unwrap();
+}
+
+/// Replace the listed directory with an absence, empty directory, regular file or link.
+pub fn listed_policy_replace(s: &Suite, kind: usize) {
+    let path = s.path("policy-r6/zone");
+    match fs::symlink_metadata(&path) {
+        Ok(meta) if meta.is_dir() => fs::remove_dir(&path).unwrap(),
+        Ok(_) => fs::remove_file(&path).unwrap(),
+        Err(error) if error.kind() == ErrorKind::NotFound => {}
+        Err(error) => panic!("cannot inspect listed directory: {error}"),
+    }
+    match kind {
+        0 => {}
+        1 => fs::create_dir(&path).unwrap(),
+        2 => fs::write(&path, "not a directory\n").unwrap(),
+        3 => std::os::unix::fs::symlink("target", &path).unwrap(),
+        _ => panic!("unknown listed-directory kind {kind}"),
+    }
+    println!("R6 MODEL listed-directory kind={kind}");
 }

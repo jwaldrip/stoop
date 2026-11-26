@@ -25,7 +25,7 @@ use std::io;
 use std::path::Path;
 
 /// The output the pass names when it disables a suite for an over-budget set of proofs (spec 3.6).
-const OVER_BUDGET: &str = "unit proofs exceed 8 MiB";
+pub(super) const OVER_BUDGET: &str = "unit proofs exceed 8 MiB";
 
 /// Runs the attribution pass when every condition of spec 3.1 holds. `None` leaves the run to the legacy path,
 /// which then runs exactly as it did before this module existed.
@@ -80,6 +80,7 @@ pub(crate) fn pass(
         &[],
         &HashMap::new(),
         &real_root,
+        &[],
     );
     for name in run::HOOK_ENV {
         std::env::set_var(name, "");
@@ -179,14 +180,23 @@ pub(super) struct Ran {
     pub(super) breaches: Vec<Breach>,
     /// The units whose new proof this run stored, with the keys their launches read by content (spec 3.10, rv34, rv38).
     pub(super) proven: BTreeMap<String, BTreeSet<String>>,
+    /// Gap paths that a newly held proof observed only by stat.
+    pub(super) stat_gaps: BTreeSet<String>,
     /// The excused names that no new proof of this run reads by content (spec 3.10, rv34).
     pub(super) unread: Vec<Unread>,
+    /// The changed inputs of the whole proof that no kept version and no new proof of this run reads by content (spec
+    /// 3.10, PR 86 review round 2). Nothing covers them after the run, so the run has no verdict.
+    pub(super) uncovered: Vec<String>,
+    /// The first unit whose launch failed, in launch order. A learning run names it as the disagreement (spec 3.10).
+    pub(super) failed: Option<String>,
 }
 
 /// The launches of a pass or a subset, one traced launch per unit in `units` order (spec 3.3, 3.7, 3.11). Each launch
 /// is judged, and its proof replaces the unit's version when it holds. `named` holds the names the bundle's versions give,
 /// and `skipped` the units that are not launched, so a launch that breaks one of them is seen. `changed` gives each
 /// launched unit its changed inputs, which the launch exports as `STOOP_CHANGED_INPUTS` (spec 3.11).
+/// `gaps` names the changed inputs and the appeared names that no kept version covers. A proof that stats one of them is
+/// written with the residue unknown (`Pass::unsettle`, spec 3.8).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn launch_each(
     cx: &RunCx<'_>,
@@ -199,6 +209,7 @@ pub(super) fn launch_each(
     skipped: &[SkippedUnit],
     changed: &HashMap<String, Vec<String>>,
     real_root: &Path,
+    gaps: &[String],
 ) -> Ran {
     let quiet = cx.o.quiet;
     let forms = expand::list_forms(hook);
@@ -211,7 +222,10 @@ pub(super) fn launch_each(
         stopped: None,
         breaches: Vec::new(),
         proven: BTreeMap::new(),
+        stat_gaps: BTreeSet::new(),
         unread: Vec::new(),
+        uncovered: Vec::new(),
+        failed: None,
     };
     let mut listing_breach: Option<Breach> = None;
     for (index, unit) in units.iter().enumerate() {
@@ -286,10 +300,29 @@ pub(super) fn launch_each(
                     };
                     match launch::judge(&context, &trace, &observed) {
                         Verdict::Proven(kept) => {
+                            // A stat of a gap path covers it by identity alone. Until the run settles, nothing marks the
+                            // residue unknown, so a kill now would leave a known residue beside this proof. Mark it
+                            // unknown before the write that stores the proof (spec 3.8, PR 86 review round 3).
+                            if kept.inputs.iter().any(|input| {
+                                gaps.contains(&input.path)
+                                    && !observed.content.contains(&input.path)
+                            }) {
+                                pass.unsettle();
+                            }
                             let (old_inputs, old_outputs) = pass.held_of(unit);
                             let stored =
                                 pass.record(&launch.unit, &kept.inputs, &kept.outputs, now());
-                            if matches!(stored, Stored::Stored) {
+                            // A failed write keeps the proof in memory, and the end of the pass writes it (spec 3.11).
+                            if matches!(stored, Stored::Stored | Stored::WriteFailed) {
+                                ran.stat_gaps.extend(
+                                    kept.inputs
+                                        .iter()
+                                        .filter(|input| {
+                                            gaps.contains(&input.path)
+                                                && !observed.content.contains(&input.path)
+                                        })
+                                        .map(|input| input.path.clone()),
+                                );
                                 ran.proven.insert(unit.clone(), observed.content.clone());
                             }
                             match stored {
@@ -334,6 +367,9 @@ pub(super) fn launch_each(
             };
         // The first nonzero status in roster order. A failing unit never stops the pass (spec 3.9).
         ran.status = keep(ran.status, unit_status);
+        if unit_status != 0 && ran.failed.is_none() {
+            ran.failed = Some(unit.clone());
+        }
         if ran.stopped.is_some() {
             break;
         }
@@ -401,8 +437,41 @@ pub(super) fn finish(
     planned: usize,
     quiet: bool,
 ) -> i32 {
-    // The residue of the whole command, measured now that the run has launched every unit it could (spec 3.8).
-    pass.settle_residue(&lookup.proofs, pending.listings());
+    let stopped_early = matches!(&ran.stopped, Some((index, _)) if index + 1 < planned);
+    let no_verdict = ran.unlaunched
+        || stopped_early
+        || !ran.breaches.is_empty()
+        || !ran.unread.is_empty()
+        || !ran.uncovered.is_empty();
+    // An appeared name that a replaced proof no longer reads by content is covered by nothing once the run ends. A unit
+    // that failed or stayed stale keeps the proof that names the name, and that proof relaunches the unit next run (PR 86
+    // review round 3).
+    let replaced_unread = ran.unread.iter().any(|unread| {
+        unread
+            .units
+            .iter()
+            .any(|unit| ran.proven.contains_key(unit))
+    });
+    // A different successful unit can also store a stat of an unread name while its excusing unit fails. Its proof
+    // would otherwise make that name look covered on the next run, even though the excuser's old proof remains.
+    let stat_unread = ran
+        .unread
+        .iter()
+        .any(|unread| ran.stat_gaps.contains(&unread.path));
+    // Likewise, only a version stored by this run can turn an uncovered content input into a stat-only input.
+    let stored_uncovered = pass.held().iter().any(|(unit, inputs, _)| {
+        ran.proven.contains_key(unit)
+            && inputs
+                .iter()
+                .any(|input| ran.uncovered.contains(&input.path))
+    });
+    let unknown = stopped_early
+        || ran.unlaunched
+        || !ran.breaches.is_empty()
+        || replaced_unread
+        || stat_unread
+        || stored_uncovered;
+    pass.settle_residue(&lookup.proofs, pending.listings(), unknown);
     let id = pending.suite();
     // The state a stopped run stores is decided by `disabling` (spec 3.6). It is stored under the lock this run holds.
     if let Some(Disabling {
@@ -439,7 +508,6 @@ pub(super) fn finish(
     // A run with no failing launch has no verdict when a unit was not launched, when it stopped before its last
     // launch, or when a skipped unit's proof no longer holds because of the run's writes (spec 3.7). A stop says how
     // far it got (spec 3.12).
-    let stopped_early = matches!(&ran.stopped, Some((index, _)) if index + 1 < planned);
     if ran.status == 0 {
         if stopped_early {
             say(
@@ -456,9 +524,16 @@ pub(super) fn finish(
         for unread in &ran.unread {
             say(quiet, unread.line());
         }
+        for path in &ran.uncovered {
+            say(
+                quiet,
+                format!(
+                    "stoop: this run has no verdict (exit 125): {} changed, and no unit's new proof reads it",
+                    safe(path)
+                ),
+            );
+        }
     }
-    let no_verdict =
-        ran.unlaunched || stopped_early || !ran.breaches.is_empty() || !ran.unread.is_empty();
     exit_status(ran.status, no_verdict)
 }
 
@@ -481,6 +556,19 @@ pub(super) fn unread_excuses(
             path: excused.path.clone(),
             units: excused.units.clone(),
         })
+        .collect()
+}
+
+/// The changed inputs that no new proof of this run reads by content (spec 3.10, PR 86 review round 2). Only a launch can
+/// cover an input that the kept versions do not read, so an input stays uncovered when no launched unit read it.
+pub(super) fn uncovered_inputs(
+    uncovered: &[String],
+    proven: &BTreeMap<String, BTreeSet<String>>,
+) -> Vec<String> {
+    uncovered
+        .iter()
+        .filter(|path| !proven.values().any(|read| read.contains(path.as_str())))
+        .cloned()
         .collect()
 }
 
@@ -602,14 +690,25 @@ pub(crate) fn screen<'p>(
     if lookup.proofs.is_empty() {
         return Err(Refusal::NoProof);
     }
-    // 4 and 5: a CI job and an opted-out suite keep the full command.
+    // 4 to 7: a CI job, an opted-out suite, and a roster that cannot be launched as units keep the full command.
+    roster_screen(cx, hook, config, pending)?;
+    Ok(pending)
+}
+
+/// Spec 3.1, checks 4 to 7. `screen` runs them for an attribution pass, and a learning run after its full command runs
+/// them too (spec 3.10, completion), without the first-run gates that `screen` applies.
+pub(crate) fn roster_screen(
+    cx: &RunCx<'_>,
+    hook: &Hook,
+    config: &Config,
+    pending: &Pending,
+) -> Result<(), Refusal> {
     if policy::ci() {
         return Err(Refusal::Ci);
     }
     if config.splitting_disabled(&hook.original, cx.rel_cwd) {
         return Err(Refusal::Disabled);
     }
-    // 6 and 7: every placeholder must stand for one unit, and every unit of the roster must expand.
     if !expand::supported(hook) {
         return Err(Refusal::Form);
     }
@@ -619,7 +718,7 @@ pub(crate) fn screen<'p>(
     if !expand::lines_fit(hook, pending.units(), cx.root, cx.cwd) {
         return Err(Refusal::Line);
     }
-    Ok(pending)
+    Ok(())
 }
 
 /// The two lines `stoop explain` adds to a suite's decision (spec 4.16): the tracked counts, then

@@ -35,7 +35,7 @@ const LOCK_ATTEMPTS: usize = 3;
 const FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Origin {
     kind: String,
     cwd: String,
@@ -45,7 +45,7 @@ struct Origin {
     invocation: String,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Roster {
     source: String,
     units: Vec<String>,
@@ -106,7 +106,7 @@ enum ResultSource {
     Receipt { decoder: String },
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ResidueState {
     None,
@@ -114,7 +114,7 @@ enum ResidueState {
     Confirmed,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Residue {
     state: ResidueState,
     /// The first `residue::STORED` paths, in sorted order. `count` is how many paths the residue holds in all.
@@ -162,6 +162,11 @@ struct SuiteBundleV1 {
     guard: LaunchGuard,
     guard_digest: String,
     roster: Roster,
+    /// The roster that the whole proof was judged with (spec 3.10, PR 86 review round 5). Only a split run's full command
+    /// sets it. Empty when no split run recorded the proof, which makes every roster unit new until the next full run.
+    /// It is omitted when empty, so a bundle that no split run recorded keeps its bytes.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    whole_roster: Vec<String>,
     table: Vec<Input>,
     #[serde(deserialize_with = "unique_map")]
     units: BTreeMap<String, Vec<UnitVersion>>,
@@ -361,6 +366,8 @@ fn valid_bundle(bundle: &SuiteBundleV1, id: &str) -> bool {
         && bundle.suite == id
         && bundle.roster.units.len() <= MAX_UNITS
         && valid_roster(&bundle.roster.units)
+        && bundle.whole_roster.len() <= MAX_UNITS
+        && valid_roster(&bundle.whole_roster)
         && bundle.units.len() <= MAX_UNITS
         && bundle
             .units
@@ -1040,8 +1047,18 @@ fn write_bytes(area: &Area, suite: &str, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-/// Best effort only: no diagnostic or decision changes when a bundle cannot be saved.
-pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, proof: Proof) {
+/// Best effort only: no diagnostic or decision changes when a bundle cannot be saved. Both arguments are borrowed, so a
+/// learning run that follows the record still holds them (spec 3.10, completion). With the switch off the residue is
+/// measured as main measures it, so the bundle is the one main writes (PR 86 review round 2, switch-off parity). With the
+/// switch on, a residue is kept only when it is already known for this proof, and stored unknown otherwise.
+pub(crate) fn record(
+    store: &Path,
+    pending: &Pending,
+    key: &str,
+    digest: &str,
+    proof: &Proof,
+    split: bool,
+) {
     let Ok(Some(area)) = Area::open(store, true) else {
         return;
     };
@@ -1054,13 +1071,13 @@ pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, pr
         ReadBundle::Current(bundle) => Some(bundle),
         ReadBundle::Missing | ReadBundle::Corrupt => None,
     };
-    let Some(provenance) = proof.provenance else {
+    let Some(provenance) = proof.provenance.clone() else {
         return;
     };
     let guard = LaunchGuard {
-        env: proof.env,
-        env_excluded: proof.env_excluded,
-        ignore: proof.ignore.unwrap_or_default(),
+        env: proof.env.clone(),
+        env_excluded: proof.env_excluded.clone(),
+        ignore: proof.ignore.clone().unwrap_or_default(),
     };
     let guard_digest = guard.digest();
     // A full run keeps the suite's state whatever its roster: only `forget --units` or a generation bump clears a
@@ -1080,14 +1097,18 @@ pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, pr
         ),
     };
     // Only the roster's units keep a version (C19). A unit that left the roster is no longer a claim about this suite.
+    let removed = bundle_readers(
+        &table,
+        units
+            .iter()
+            .filter(|(unit, _)| pending.roster.units.binary_search(*unit).is_err())
+            .flat_map(|(_, versions)| versions.iter()),
+    );
     units.retain(|unit, _| pending.roster.units.binary_search(unit).is_ok());
-    let Pending {
-        suite,
-        origin,
-        roster,
-        policy,
-        listings,
-    } = pending;
+    let suite = pending.suite.clone();
+    let origin = pending.origin.clone();
+    let roster = pending.roster.clone();
+    let policy = pending.policy.clone();
     let mut bundle = SuiteBundleV1 {
         v: VERSION,
         generation: GENERATION,
@@ -1100,12 +1121,34 @@ pub(crate) fn record(store: &Path, pending: Pending, key: &str, digest: &str, pr
         guard,
         guard_digest,
         roster,
+        whole_roster: if split {
+            pending.roster.units.clone()
+        } else {
+            Vec::new()
+        },
         table,
         units,
         residue,
         state,
     };
-    store_residue(&mut bundle, &proof.inputs, digest, &listings);
+    if !split {
+        store_residue(&mut bundle, &proof.inputs, digest, pending.listings());
+    } else {
+        if !removed.is_empty()
+            && lost_reader(
+                &removed,
+                &bundle_readers(&bundle.table, bundle.units.values().flatten()),
+            )
+        {
+            bundle.residue = Residue::default();
+        }
+        // The residue of a new whole proof stays unknown until completion measures it against valid versions. The versions
+        // this bundle holds may be stale (a unit whose flag is gone still names it), so measuring them here would store a
+        // count that a later subset trusts. A residue already known for this proof stays (spec 3.8, PR 86 review round 2).
+        if !residue_known(&bundle.residue, digest) {
+            bundle.residue = Residue::default();
+        }
+    }
     let _ = write_bundle(&area, &bundle);
 }
 
@@ -1143,6 +1186,60 @@ fn store_residue(bundle: &mut SuiteBundleV1, whole: &[Input], digest: &str, list
 /// Whether `residue` is known for `digest`: it has a state, and it was measured for that proof.
 fn residue_known(residue: &Residue, digest: &str) -> bool {
     !matches!(residue.state, ResidueState::None) && residue.whole.as_deref() == Some(digest)
+}
+
+/// Whether an input id names content that a proof verifies: a file, a link, a listing, an absence or an unreadable mark.
+/// A stat-only read carries another id and checks metadata, not content (spec 3.8).
+pub(crate) fn content_id(id: &str) -> bool {
+    id == "a"
+        || id == "u"
+        || ["f:", "x:", "dl:", "l:"]
+            .iter()
+            .any(|prefix| id.starts_with(prefix))
+}
+
+/// Each path that some inputs name, with whether one of those names is a content read (spec 3.8).
+pub(crate) fn reader_map<'a>(inputs: impl Iterator<Item = &'a Input>) -> BTreeMap<String, bool> {
+    let mut out: BTreeMap<String, bool> = BTreeMap::new();
+    for input in inputs {
+        let content = content_id(&input.id);
+        *out.entry(input.path.clone()).or_insert(false) |= content;
+    }
+    out
+}
+
+/// The readers of the versions in `versions`, read through the bundle's table.
+fn bundle_readers<'a>(
+    table: &[Input],
+    versions: impl Iterator<Item = &'a UnitVersion>,
+) -> BTreeMap<String, bool> {
+    let len = table.len();
+    reader_map(
+        versions
+            .flat_map(|version| undelta(&version.inputs, len).unwrap_or_default())
+            .map(|index| &table[index as usize]),
+    )
+}
+
+/// Whether a path that `removed` reads has lost its last reader in `now` (spec 3.8). A path with no reader left is lost,
+/// and so is one whose last content reader is gone while only a stat-only read remains. Losing either makes the residue
+/// unknown until a full run measures it again.
+pub(crate) fn lost_reader(removed: &BTreeMap<String, bool>, now: &BTreeMap<String, bool>) -> bool {
+    removed.iter().any(|(path, content)| match now.get(path) {
+        None => true,
+        Some(now_content) => *content && !now_content,
+    })
+}
+
+/// The paths of `removed` that no reader in `now` covers, by the rule of [`lost_reader`]. Each path is judged alone.
+fn losses(removed: &BTreeMap<String, bool>, now: &BTreeMap<String, bool>) -> Vec<String> {
+    let mut lost = Vec::new();
+    for (path, content) in removed {
+        if lost_reader(&BTreeMap::from([(path.clone(), *content)]), now) {
+            lost.push(path.clone());
+        }
+    }
+    lost
 }
 
 /// The paths of the inputs of every unit version the bundle holds: what the units' own runs read (spec 3.8).
@@ -1295,11 +1392,20 @@ type Snapshot = (
     BTreeMap<String, Vec<UnitVersion>>,
     Vec<Input>,
     BTreeMap<String, u32>,
+    Residue,
+    bool,
+    BTreeSet<String>,
 );
 
 /// One attribution pass. It holds the suite lock until it is dropped, so no other stoop changes
 /// the suite meanwhile, and it rewrites the bundle after each stored proof.
 pub(crate) struct Pass {
+    /// Set when a version write took the last reader of a path (spec 3.8). The residue is unknown until a full run
+    /// measures it again.
+    residue_lost: bool,
+    /// The paths whose last content reader a write or a drop of this pass took. `settle_residue` decides whether a later
+    /// write of the pass read them again (spec 3.8, item 1).
+    lost_paths: BTreeSet<String>,
     area: Area,
     _lock: File,
     bundle: SuiteBundleV1,
@@ -1342,6 +1448,9 @@ impl Pass {
                 self.bundle.units.clone(),
                 self.bundle.table.clone(),
                 self.interned.clone(),
+                self.bundle.residue.clone(),
+                self.residue_lost,
+                self.lost_paths.clone(),
             )
         });
         let inputs = self.indices(inputs);
@@ -1354,10 +1463,15 @@ impl Pass {
             inputs: delta(&inputs),
             outputs: delta(&outputs),
         };
+        let removed = bundle_readers(
+            &self.bundle.table,
+            self.bundle.units.get(unit).into_iter().flatten(),
+        );
         let previous = self.bundle.units.insert(unit.to_owned(), vec![version]);
         if self.keep {
             self.compact_table();
         }
+        self.note_losses(&removed);
         let Ok(bytes) = serde_json::to_vec(&self.bundle) else {
             self.refuse(unit, previous, mark, snapshot);
             return Stored::WriteFailed;
@@ -1429,10 +1543,13 @@ impl Pass {
         mark: usize,
         snapshot: Option<Snapshot>,
     ) {
-        if let Some((units, table, interned)) = snapshot {
+        if let Some((units, table, interned, residue, lost, lost_paths)) = snapshot {
             self.bundle.units = units;
             self.bundle.table = table;
             self.interned = interned;
+            self.bundle.residue = residue;
+            self.residue_lost = lost;
+            self.lost_paths = lost_paths;
             return;
         }
         match previous {
@@ -1463,16 +1580,40 @@ impl Pass {
             .collect();
     }
 
+    /// Notes the paths that `removed` read with content and that no version reads with content now (spec 3.8, item 1).
+    /// The residue is unknown from here until `settle_residue` finds each of them read again.
+    fn note_losses(&mut self, removed: &BTreeMap<String, bool>) {
+        if removed.is_empty() {
+            return;
+        }
+        let now = bundle_readers(&self.bundle.table, self.bundle.units.values().flatten());
+        let lost = losses(removed, &now);
+        if !lost.is_empty() {
+            self.bundle.residue = Residue::default();
+            self.residue_lost = true;
+            self.lost_paths.extend(lost);
+        }
+    }
+
     /// Drops the versions of units that left the roster, and compacts the table (spec 3.11). A pass starts with no
     /// versions, so only a kept run has any to drop. Returns whether anything changed.
     fn prune(&mut self) -> bool {
         let units = self.bundle.units.len();
         let table = self.bundle.table.len();
         let roster = &self.bundle.roster.units;
+        let dropped = bundle_readers(
+            &self.bundle.table,
+            self.bundle
+                .units
+                .iter()
+                .filter(|(unit, _)| roster.binary_search(*unit).is_err())
+                .flat_map(|(_, versions)| versions.iter()),
+        );
         self.bundle
             .units
             .retain(|unit, _| roster.binary_search(unit).is_ok());
         self.compact_table();
+        self.note_losses(&dropped);
         let changed = self.bundle.units.len() != units || self.bundle.table.len() != table;
         self.dirty |= changed;
         changed
@@ -1549,9 +1690,47 @@ impl Pass {
         self.dirty = false;
     }
 
+    /// Marks the residue unknown in memory, before a proof that stats a changed input is written (spec 3.8, PR 86 review
+    /// round 3). The pass's next write stores it, so a run killed before it settles leaves no known residue beside it.
+    pub(crate) fn unsettle(&mut self) {
+        if !matches!(self.bundle.residue.state, ResidueState::None) {
+            self.bundle.residue = Residue::default();
+            self.dirty = true;
+        }
+    }
+
     /// Stores the residue of the suite's whole proof when a pass ends (spec 3.8, point i). The proof is the one of
     /// `proofs` whose digest is the bundle's `whole`. Without it, the residue stays unknown.
-    pub(crate) fn settle_residue(&mut self, proofs: &[Proof], listings: &[String]) {
+    pub(crate) fn settle_residue(
+        &mut self,
+        proofs: &[Proof],
+        listings: &[String],
+        no_verdict: bool,
+    ) {
+        // When a split run may have lost coverage, its residue stays unknown. A stored version can read a path by stat
+        // only, so measuring it as covered would let a later run skip without checking content. A switch-off pass keeps
+        // main's residue, which is the switch-off parity rule.
+        if no_verdict && self.keep {
+            if !matches!(self.bundle.residue.state, ResidueState::None) {
+                self.dirty = true;
+            }
+            self.bundle.residue = Residue::default();
+            return;
+        }
+        // A write or a drop took the last reader of a path (spec 3.8, item 1). The residue stays unknown while a path that
+        // it lost has no content reader in the final versions, where a kept version counts as much as a written one.
+        if self.residue_lost {
+            let readers = bundle_readers(&self.bundle.table, self.bundle.units.values().flatten());
+            if self
+                .lost_paths
+                .iter()
+                .any(|path| readers.get(path) != Some(&true))
+            {
+                return;
+            }
+            self.lost_paths.clear();
+            self.residue_lost = false;
+        }
         let Some(digest) = self.bundle.whole.clone() else {
             return;
         };
@@ -1627,6 +1806,8 @@ fn start_with(
     let stored = !matches!(bundle.residue.state, ResidueState::None);
     bundle.residue = Residue::default();
     Start::Pass(Pass {
+        residue_lost: false,
+        lost_paths: BTreeSet::new(),
         area,
         _lock: held,
         bundle,
@@ -1697,6 +1878,8 @@ pub(crate) fn keep<T, D>(
         units: pending.roster.units.clone(),
     };
     let mut pass = Pass {
+        residue_lost: false,
+        lost_paths: BTreeSet::new(),
         area,
         _lock: held,
         interned: interned_of(&bundle.table),
@@ -1868,6 +2051,8 @@ pub(crate) struct View {
     pub(crate) units: BTreeMap<String, Vec<Version>>,
     /// The residue, when it is known for `whole`: its count and its first paths.
     pub(crate) residue: Option<(usize, Vec<String>)>,
+    /// The roster that the whole proof was judged with (spec 3.10, PR 86 review round 5). Empty when no split run recorded it.
+    pub(crate) whole_roster: Vec<String>,
 }
 
 impl View {
@@ -1903,6 +2088,7 @@ impl View {
             table: bundle.table,
             units,
             residue,
+            whole_roster: bundle.whole_roster,
         })
     }
 }
@@ -1970,9 +2156,25 @@ pub(crate) fn drop_stale(
     let Some(mut bundle) = bundle_for(&area, pending, key) else {
         return Settled::Failed;
     };
+    let removed = bundle_readers(
+        &bundle.table,
+        bundle
+            .units
+            .iter()
+            .filter(|(unit, _)| pending.roster.units.binary_search(*unit).is_err())
+            .flat_map(|(_, versions)| versions.iter()),
+    );
     bundle
         .units
         .retain(|unit, _| pending.roster.units.binary_search(unit).is_ok());
+    if !removed.is_empty()
+        && lost_reader(
+            &removed,
+            &bundle_readers(&bundle.table, bundle.units.values().flatten()),
+        )
+    {
+        bundle.residue = Residue::default();
+    }
     compact(&mut bundle);
     match write_bundle(&area, &bundle) {
         Ok(()) => Settled::Written,
@@ -2041,6 +2243,66 @@ pub(crate) fn disable_full(
     };
     write_bundle(&area, &bundle)?;
     Ok(true)
+}
+
+/// Under the suite lock, judges the bundle with `holds`. When it holds, stores the residue of `whole`, the whole proof's
+/// inputs, as confirmed: it is measured against the versions that the bundle holds now (spec 3.8, point iii). A busy
+/// lock, a bundle that does not hold, or a bundle that cannot be written leaves the residue as it was.
+pub(crate) fn confirm(
+    store: &Path,
+    pending: &Pending,
+    key: &str,
+    proof_digest: &str,
+    whole: &[Input],
+    holds: impl FnOnce(&View) -> bool,
+) -> Settled {
+    let Ok(Some(area)) = Area::open(store, false) else {
+        return Settled::Failed;
+    };
+    let _lock = match lock(&area, &pending.suite) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Settled::Busy,
+        Err(_) => return Settled::Failed,
+    };
+    let Some(view) = view_in(&area, pending, key) else {
+        return Settled::Failed;
+    };
+    if !holds(&view) {
+        return Settled::Declined;
+    }
+    let Some(mut bundle) = bundle_for(&area, pending, key) else {
+        return Settled::Failed;
+    };
+    // The residue is labelled with the whole proof the bundle holds, so this run may label it only when that proof is the
+    // one it measured (spec 3.8, point iii). Another proof means another run wrote the bundle: decline.
+    if bundle.whole.as_deref() != Some(proof_digest) {
+        return Settled::Declined;
+    }
+    let Some(digest) = bundle.whole.clone() else {
+        return Settled::Failed;
+    };
+    let (count, paths) = residue::uncovered(whole, pending.listings(), &covered_paths(&bundle));
+    bundle.residue = Residue {
+        state: ResidueState::Confirmed,
+        paths,
+        count,
+        whole: Some(digest),
+    };
+    match write_bundle(&area, &bundle) {
+        Ok(()) => Settled::Written,
+        Err(_) => Settled::Failed,
+    }
+}
+
+/// Whether the suite's store can take a new entry, for `stoop explain` to predict a learning run (spec 3.10). An absent
+/// store is not refused, because the run creates it. Nothing is created or written here: the check reads the directory's
+/// write permission and makes no entry (PR 86 review round 2, c3).
+pub(crate) fn writable(store: &Path) -> bool {
+    match Area::open(store, false) {
+        Ok(Some(area)) => area.writable_dir(),
+        Ok(None) => true,
+        Err(_) => false,
+    }
 }
 
 /// Checked on read only: each version's indices must lie below the table and strictly increase.
@@ -2269,6 +2531,7 @@ mod tests {
             },
             guard_digest: "guard".into(),
             roster: pending.roster,
+            whole_roster: Vec::new(),
             table: Vec::new(),
             units: BTreeMap::new(),
             residue: Residue::default(),
@@ -2280,6 +2543,10 @@ mod tests {
         assert_eq!(serde_json::to_vec(&decoded).unwrap(), bytes);
         let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(json["roster"].get("inputs").is_none());
+        assert!(
+            json.get("whole_roster").is_none(),
+            "a bundle no split run recorded keeps its bytes"
+        );
         let mut bounded = decoded;
         let versions = (0..=MAX_VERSIONS)
             .map(|_| UnitVersion {
@@ -2474,6 +2741,7 @@ mod pass_tests {
             guard: guard(),
             guard_digest: "guard".into(),
             roster: pending.roster,
+            whole_roster: Vec::new(),
             table: Vec::new(),
             units: BTreeMap::new(),
             residue: Residue::default(),
@@ -3039,7 +3307,7 @@ mod pass_tests {
         // called again until the bundle carries the digest it records, within 2 s. Only then are the digests asserted.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         let stored = loop {
-            record(&dir, pending_for(&roster), "key", "p-1", proof());
+            record(&dir, &pending_for(&roster), "key", "p-1", &proof(), true);
             let area = Area::open(&dir, false).unwrap().unwrap();
             if let ReadBundle::Current(bundle) = read_bundle(&area, &id) {
                 if bundle.whole.as_deref() == Some("p-1") {
@@ -3105,7 +3373,7 @@ mod pass_tests {
         loop {
             let mut pending = pending_for(roster);
             pending.listings = listings.iter().map(|path| (*path).to_owned()).collect();
-            record(dir, pending, key, digest, proof.clone());
+            record(dir, &pending, key, digest, proof, true);
             let area = Area::open(dir, false).unwrap().unwrap();
             if let ReadBundle::Current(bundle) = read_bundle(&area, &id) {
                 if bundle.whole.as_deref() == Some(digest) {
@@ -3146,10 +3414,11 @@ mod pass_tests {
         assert_eq!(units.keys().collect::<Vec<_>>(), [&"tests/a.t".to_owned()]);
     }
 
-    /// Spec 3.8, point ii: a record stores the residue of its own proof once every roster unit holds a version. The
-    /// residue is the proof's inputs that neither a listing nor a unit version covers. It is provisional.
+    /// Spec 3.8, point ii, as amended by PR 86 review round 2: a record of a new whole proof leaves its residue unknown,
+    /// even when every roster unit holds a version. The versions held may be stale, so the residue is measured by completion
+    /// against valid versions instead. The residue is the proof's inputs that neither a listing nor a unit version covers.
     #[test]
-    fn a_record_stores_the_residue_of_its_proof_when_every_unit_holds_a_version() {
+    fn a_record_leaves_the_residue_unknown_when_every_unit_holds_a_version() {
         let roster = ["tests/a.t", "tests/b.t"];
         let mut bundle = bundle_for(pending_for(&roster), "key");
         bundle.table = vec![input("src/shared"), input("src/own")];
@@ -3164,10 +3433,9 @@ mod pass_tests {
         let proof = whole_proof(&[".", "tests", "src/shared", "lint", "/usr/bin/od"]);
         record_until_stored(&dir, &roster, &[".", "tests"], "key", "p-whole", &proof);
         let stored_residue = stored(&dir, &id).residue;
-        assert!(matches!(stored_residue.state, ResidueState::Provisional));
-        assert_eq!(stored_residue.count, 2);
-        assert_eq!(stored_residue.paths, ["/usr/bin/od", "lint"]);
-        assert_eq!(stored_residue.whole.as_deref(), Some("p-whole"));
+        assert!(matches!(stored_residue.state, ResidueState::None));
+        assert_eq!(stored_residue.count, 0);
+        assert!(stored_residue.paths.is_empty());
     }
 
     /// A roster unit without a version leaves the residue unknown, whatever the proof reads.
@@ -3236,13 +3504,35 @@ mod pass_tests {
         let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
         let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
         let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
-        pass.settle_residue(&[proof], &[]);
+        pass.settle_residue(&[proof], &[], false);
         drop(pass);
         let stored_residue = stored(&dir, &id).residue;
         assert!(matches!(stored_residue.state, ResidueState::Provisional));
         assert_eq!(stored_residue.paths, ["lint"]);
         assert_eq!(stored_residue.count, 1);
         assert_eq!(stored_residue.whole, Some(digest));
+    }
+
+    /// PR 86 review round 3, switch-off parity: a clear pass settles its residue as main does, also when its run has no
+    /// verdict. Only a split pass leaves the residue unknown.
+    #[test]
+    fn a_switch_off_pass_settles_its_residue_even_without_a_verdict() {
+        let roster = ["tests/a.t", "tests/b.t"];
+        let proof = whole_proof(&["src/shared", "lint"]);
+        let digest = proof.digest();
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.whole = Some(digest.clone());
+        let dir = seed("pass-no-verdict", &bundle);
+        let pending = pending_for(&roster);
+        let id = pending.suite().to_owned();
+        let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
+        let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
+        let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
+        pass.settle_residue(&[proof], &[], true);
+        drop(pass);
+        let stored_residue = stored(&dir, &id).residue;
+        assert!(matches!(stored_residue.state, ResidueState::Provisional));
+        assert_eq!(stored_residue.paths, ["lint"]);
     }
 
     /// A pass whose only write came first still stores its residue at its end: a single unit is written at once, so
@@ -3259,7 +3549,7 @@ mod pass_tests {
         let id = pending.suite().to_owned();
         let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
         let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
-        pass.settle_residue(&[proof], &[]);
+        pass.settle_residue(&[proof], &[], false);
         drop(pass);
         let stored_residue = stored(&dir, &id).residue;
         assert!(matches!(stored_residue.state, ResidueState::Provisional));
@@ -3439,7 +3729,7 @@ mod pass_tests {
         let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
         let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
         let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
-        pass.settle_residue(&[other], &[]);
+        pass.settle_residue(&[other], &[], false);
         drop(pass);
         let stored_residue = stored(&dir, &id).residue;
         assert!(matches!(stored_residue.state, ResidueState::None));
@@ -3463,7 +3753,7 @@ mod pass_tests {
         let mut pass = pass_of(start_after_release(&dir, &pending, "key"));
         let _ = pass.record("tests/a.t", &[input("src/shared")], &[], 1);
         let _ = pass.record("tests/b.t", &[input("src/shared")], &[], 1);
-        pass.settle_residue(&[other, measured], &[]);
+        pass.settle_residue(&[other, measured], &[], false);
         drop(pass);
         let stored_residue = stored(&dir, &id).residue;
         assert_eq!(stored_residue.paths, ["lint"]);
@@ -3535,6 +3825,7 @@ mod cost_tests {
             },
             guard_digest: "guard".into(),
             roster: pending.roster,
+            whole_roster: Vec::new(),
             table,
             units,
             residue: Residue::default(),
@@ -3684,6 +3975,7 @@ mod settle_tests {
             },
             guard_digest: "guard".into(),
             roster: shape.roster,
+            whole_roster: Vec::new(),
             table: vec![input("tests/a.t"), input("tests/gone.t")],
             units: BTreeMap::from([
                 ("tests/a.t".to_owned(), vec![version(0)]),
@@ -3837,6 +4129,7 @@ mod keep_tests {
             guard: guard(),
             guard_digest: "guard".into(),
             roster: pending.roster,
+            whole_roster: Vec::new(),
             table,
             units,
             residue: Residue::default(),
@@ -3865,6 +4158,83 @@ mod keep_tests {
 
     fn paths(entries: &[Input]) -> Vec<String> {
         entries.iter().map(|entry| entry.path.clone()).collect()
+    }
+
+    #[test]
+    fn a_path_whose_last_content_reader_turns_stat_only_is_lost() {
+        let content = BTreeMap::from([("src/a.src".to_owned(), true)]);
+        let stat_only = BTreeMap::from([("src/a.src".to_owned(), false)]);
+        let gone = BTreeMap::new();
+        assert!(
+            lost_reader(&content, &stat_only),
+            "a content read turned stat-only is a loss"
+        );
+        assert!(
+            lost_reader(&content, &gone),
+            "a path with no reader left is a loss"
+        );
+        assert!(
+            !lost_reader(&content, &content),
+            "a path still read by content is not lost"
+        );
+        assert!(
+            !lost_reader(&stat_only, &stat_only),
+            "a stat-only path stays stat-only"
+        );
+        assert!(
+            !lost_reader(&BTreeMap::new(), &gone),
+            "no removed reader, no loss"
+        );
+    }
+
+    #[test]
+    fn a_path_another_unit_still_reads_is_not_lost() {
+        let table = vec![input("src/shared.src")];
+        let one = version(vec![0]);
+        let other = version(vec![0]);
+        let removed = bundle_readers(&table, std::iter::once(&one));
+        let now = bundle_readers(&table, [&one, &other].into_iter());
+        assert!(
+            !lost_reader(&removed, &now),
+            "the other unit still reads the path"
+        );
+    }
+
+    #[test]
+    fn only_content_ids_read_content() {
+        assert!(content_id("f:1"));
+        assert!(content_id("x:1"));
+        assert!(content_id("dl:1"));
+        assert!(content_id("a"));
+        assert!(!content_id("s:1"));
+        assert!(!content_id("stat:1"));
+    }
+
+    #[test]
+    fn a_confirm_for_another_whole_proof_is_declined() {
+        let units = ["tests/a.t", "tests/b.t"];
+        let mut held = BTreeMap::new();
+        held.insert("tests/a.t".to_owned(), vec![version(vec![0])]);
+        held.insert("tests/b.t".to_owned(), vec![version(vec![0])]);
+        let mut bundle = bundle_for(pending_for(&units), "key", vec![input("src/a.src")], held);
+        bundle.whole = Some("p-1".to_owned());
+        let dir = seed("confirm-other-proof", &bundle);
+        let pending = pending_for(&units);
+        let outcome = confirm(&dir, &pending, "key", "p-2", &[input("src/a.src")], |_| {
+            true
+        });
+        assert!(
+            matches!(outcome, Settled::Declined),
+            "a bundle that holds another proof declines"
+        );
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        let ReadBundle::Current(stored) = read_bundle(&area, pending.suite()) else {
+            panic!("the bundle is current")
+        };
+        assert!(
+            matches!(stored.residue.state, ResidueState::None),
+            "the residue is as it was"
+        );
     }
 
     #[test]
@@ -3919,6 +4289,50 @@ mod keep_tests {
     }
 
     #[test]
+    fn w20_shape_a_subset_that_drops_the_last_readers_loses_the_residue() {
+        let units = ["tests/a.t", "tests/b.t", "tests/c.t"];
+        let mut held = BTreeMap::new();
+        held.insert("tests/a.t".to_owned(), vec![version(vec![0])]);
+        held.insert("tests/b.t".to_owned(), vec![version(vec![0])]);
+        // c reads src/c.src, the runner-only test and its flag as data.
+        held.insert("tests/c.t".to_owned(), vec![version(vec![0, 1, 1])]);
+        let table = vec![
+            input("src/c.src"),
+            input("tests/z.u"),
+            input("tests/z.flag"),
+        ];
+        let mut bundle = bundle_for(pending_for(&units), "key", table, held);
+        // The residue is known and empty for the stored whole proof, as after a completion.
+        bundle.residue = Residue {
+            state: ResidueState::Provisional,
+            paths: Vec::new(),
+            count: 0,
+            whole: Some("p-1".to_owned()),
+        };
+        let dir = seed("w20-shape", &bundle);
+        let pending = pending_for(&units);
+        let mut pass = kept(&dir, &pending);
+        assert!(matches!(
+            pass.record("tests/c.t", &[input("src/c.src")], &[], 2),
+            Stored::Stored
+        ));
+        assert!(
+            pass.residue_lost,
+            "dropping the last readers of tests/z.u and tests/z.flag loses the residue"
+        );
+        drop(pass);
+        let area = Area::open(&dir, false).unwrap().unwrap();
+        let ReadBundle::Current(stored) = read_bundle(&area, pending.suite()) else {
+            panic!("the bundle is current")
+        };
+        assert!(
+            matches!(stored.residue.state, ResidueState::None),
+            "the residue on disk is unknown: the write must carry the reset, not the residue measured before it"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_kept_pass_drops_the_versions_of_units_that_left_the_roster() {
         let all = ["tests/a.t", "tests/gone.t"];
         let mut held = BTreeMap::new();
@@ -3938,6 +4352,207 @@ mod keep_tests {
             "the pruned bundle is written when the pass ends"
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A path that a dropped unit or a rewrite of this pass stops reading may still be read with content by the final
+    /// versions. Each test below settles the residue against `proof`, and the bundle names the proof's digest.
+    #[test]
+    fn a_path_a_later_write_of_the_pass_reads_again_keeps_the_residue() {
+        let units = ["tests/m5.t", "tests/m6.t"];
+        let proof = proof_of(&["/usr/bin/grep"]);
+        let held = BTreeMap::from([
+            ("tests/m5.t".to_owned(), vec![version(vec![0])]),
+            ("tests/m6.t".to_owned(), vec![version(Vec::new())]),
+        ]);
+        let bundle = known_bundle(&units, vec![input("/usr/bin/grep")], held, &proof);
+        let dir = seed("reread", &bundle);
+        let mut pass = kept(&dir, &pending_for(&units));
+        // m5 stops reading the grep binary, and m6 reads it again later in the same pass.
+        assert!(matches!(
+            pass.record("tests/m5.t", &[], &[], 2),
+            Stored::Stored
+        ));
+        assert!(matches!(
+            pass.record("tests/m6.t", &[input("/usr/bin/grep")], &[], 3),
+            Stored::Stored
+        ));
+        pass.settle_residue(&[proof], &[], false);
+        assert!(
+            !matches!(pass.bundle.residue.state, ResidueState::None),
+            "the final versions read the path with content, so the residue stays known"
+        );
+        assert_eq!(pass.bundle.residue.count, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// PR 86 review round 3: a split run that has no verdict (exit 125) leaves the residue unknown. Its stored versions
+    /// may read a path by stat only, and a residue measured from them would let a later run skip on that proof.
+    #[test]
+    fn a_split_run_without_a_verdict_leaves_the_residue_unknown() {
+        let units = ["tests/m5.t", "tests/m6.t"];
+        let proof = proof_of(&["/usr/bin/grep"]);
+        let held = BTreeMap::from([
+            ("tests/m5.t".to_owned(), vec![version(vec![0])]),
+            ("tests/m6.t".to_owned(), vec![version(vec![0])]),
+        ]);
+        let bundle = known_bundle(&units, vec![input("/usr/bin/grep")], held, &proof);
+        let dir = seed("no-verdict", &bundle);
+        let mut pass = kept(&dir, &pending_for(&units));
+        assert!(!matches!(pass.bundle.residue.state, ResidueState::None));
+        pass.settle_residue(&[proof], &[], true);
+        assert!(
+            matches!(pass.bundle.residue.state, ResidueState::None),
+            "a run with no verdict leaves the residue unknown"
+        );
+        assert!(
+            pass.dirty,
+            "the unknown residue is written when the pass ends"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A later write that reads the path only as a stat is no content reader, so the path stays lost.
+    #[test]
+    fn a_path_a_later_write_reads_only_as_a_stat_stays_lost() {
+        let units = ["tests/m5.t", "tests/m6.t"];
+        let proof = proof_of(&["/usr/bin/grep"]);
+        let held = BTreeMap::from([
+            ("tests/m5.t".to_owned(), vec![version(vec![0])]),
+            ("tests/m6.t".to_owned(), vec![version(Vec::new())]),
+        ]);
+        let bundle = known_bundle(&units, vec![input("/usr/bin/grep")], held, &proof);
+        let dir = seed("stat-reread", &bundle);
+        let mut pass = kept(&dir, &pending_for(&units));
+        assert!(matches!(
+            pass.record("tests/m5.t", &[], &[], 2),
+            Stored::Stored
+        ));
+        let stat = Input {
+            path: "/usr/bin/grep".into(),
+            id: "s:00".into(),
+            oid: None,
+            oid_basis: None,
+        };
+        assert!(matches!(
+            pass.record("tests/m6.t", &[stat], &[], 3),
+            Stored::Stored
+        ));
+        pass.settle_residue(&[proof], &[], false);
+        assert!(
+            matches!(pass.bundle.residue.state, ResidueState::None),
+            "a stat-only read does not give the path a content reader"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A loss that no later write of the pass heals keeps the residue unknown.
+    #[test]
+    fn a_path_lost_by_the_passes_last_write_keeps_the_residue_unknown() {
+        let units = ["tests/m5.t", "tests/m6.t"];
+        let proof = proof_of(&["/usr/bin/grep"]);
+        let held = BTreeMap::from([
+            ("tests/m5.t".to_owned(), vec![version(vec![0])]),
+            ("tests/m6.t".to_owned(), vec![version(Vec::new())]),
+        ]);
+        let bundle = known_bundle(&units, vec![input("/usr/bin/grep")], held, &proof);
+        let dir = seed("last-write", &bundle);
+        let mut pass = kept(&dir, &pending_for(&units));
+        assert!(matches!(
+            pass.record("tests/m5.t", &[], &[], 2),
+            Stored::Stored
+        ));
+        pass.settle_residue(&[proof], &[], false);
+        assert!(
+            matches!(pass.bundle.residue.state, ResidueState::None),
+            "nothing reads the path after the last write"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A version that a kept pass drops, because its unit left the roster, can hold the last reader of a path. That loss
+    /// keeps the residue unknown, as a write's loss does.
+    #[test]
+    fn a_path_lost_by_a_dropped_version_keeps_the_residue_unknown() {
+        let roster = ["tests/a.t"];
+        let proof = proof_of(&["/usr/bin/grep"]);
+        let held = BTreeMap::from([
+            ("tests/a.t".to_owned(), vec![version(Vec::new())]),
+            ("tests/gone.t".to_owned(), vec![version(vec![0])]),
+        ]);
+        let bundle = known_bundle(&roster, vec![input("/usr/bin/grep")], held, &proof);
+        let dir = seed("dropped", &bundle);
+        let mut pass = kept(&dir, &pending_for(&roster));
+        pass.settle_residue(&[proof], &[], false);
+        assert!(
+            matches!(pass.bundle.residue.state, ResidueState::None),
+            "the dropped version was the last reader of the path"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A path that the rewritten unit stops reading, and that a unit the pass does not rewrite still reads with content,
+    /// is not lost: the residue stays known.
+    #[test]
+    fn a_path_read_by_an_unrewritten_unit_is_not_lost_at_the_pass() {
+        let units = ["tests/m5.t", "tests/m6.t"];
+        let proof = proof_of(&["/usr/bin/grep"]);
+        let held = BTreeMap::from([
+            ("tests/m5.t".to_owned(), vec![version(vec![0])]),
+            ("tests/m6.t".to_owned(), vec![version(vec![0])]),
+        ]);
+        let bundle = known_bundle(&units, vec![input("/usr/bin/grep")], held, &proof);
+        let dir = seed("still-read", &bundle);
+        let mut pass = kept(&dir, &pending_for(&units));
+        assert!(matches!(
+            pass.record("tests/m5.t", &[], &[], 2),
+            Stored::Stored
+        ));
+        assert!(
+            matches!(pass.bundle.residue.state, ResidueState::Provisional),
+            "m6 still reads the path, so the record does not reset the residue"
+        );
+        pass.settle_residue(&[proof], &[], false);
+        assert!(!matches!(pass.bundle.residue.state, ResidueState::None));
+        assert_eq!(pass.bundle.residue.count, 0);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A whole-command proof that reads `inputs`, for settling a pass's residue.
+    fn proof_of(inputs: &[&str]) -> Proof {
+        Proof {
+            created: 1,
+            argv: Vec::new(),
+            cwd: Some(String::new()),
+            scope: None,
+            provenance: Some(Provenance::current()),
+            env: BTreeMap::new(),
+            inputs: inputs.iter().map(|path| input(path)).collect(),
+            outputs: Vec::new(),
+            removed: Vec::new(),
+            ignore: Some(Vec::new()),
+            priors: None,
+            unplannable: Vec::new(),
+            probes: BTreeMap::new(),
+            env_excluded: Vec::new(),
+        }
+    }
+
+    /// A stored bundle for `units` over `table` whose residue is known and empty for `proof`.
+    fn known_bundle(
+        units: &[&str],
+        table: Vec<Input>,
+        held: BTreeMap<String, Vec<UnitVersion>>,
+        proof: &Proof,
+    ) -> SuiteBundleV1 {
+        let mut bundle = bundle_for(pending_for(units), "key", table, held);
+        bundle.whole = Some(proof.digest());
+        bundle.residue = Residue {
+            state: ResidueState::Provisional,
+            paths: Vec::new(),
+            count: 0,
+            whole: Some(proof.digest()),
+        };
+        bundle
     }
 
     #[test]

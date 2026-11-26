@@ -14,7 +14,7 @@ mod units_common;
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Output;
+use std::process::{Output, Stdio};
 use units_common::*;
 
 /// The switch that turns the engine on (spec 3.1).
@@ -25,7 +25,7 @@ const NOTE_FILE: &str = "note \"changed_inputs_file=$(flat \"${STOOP_CHANGED_INP
 
 /// The fixture runner with four review knobs, inserted at its two fixed anchors:
 /// - `T_LS_DIR` with `T_LS_AT=P`: test P lists `$ROOT/$T_LS_DIR`, so the listing is one of its reads.
-/// - `T_READ_ABS` with `T_READ_ABS_AT=P`: test P reads that absolute path by content.
+/// - `T_READ_ABS` with `T_READ_ABS_AT=P`: unit P reads that absolute path by content when launched alone.
 /// - `T_BIG_AT=P` with `T_BIG_DIR`: test P reads every file under that directory by content.
 ///
 /// Every launch also logs whether `STOOP_CHANGED_INPUTS` is set (`changed_inputs_set`, empty when unset) and the text of
@@ -40,7 +40,7 @@ fn review_runner() -> String {
     let knobs = concat!(
         "\tcat \"$ROOT/setup.src\"\n",
         "\tif [ -n \"${T_LS_DIR:-}\" ] && [ \"${T_LS_AT:-}\" = \"$1\" ]; then ls \"$ROOT/$T_LS_DIR\" > /dev/null; fi\n",
-        "\tif [ -n \"${T_READ_ABS:-}\" ] && [ \"${T_READ_ABS_AT:-}\" = \"$1\" ]; then cat \"$T_READ_ABS\" > /dev/null; fi\n",
+        "\tif [ \"$TESTS\" = 1 ] && [ -n \"${T_READ_ABS:-}\" ] && [ \"${T_READ_ABS_AT:-}\" = \"$1\" ]; then cat \"$T_READ_ABS\" > /dev/null; fi\n",
         "\tif [ -n \"${T_BIG_AT:-}\" ] && [ \"$T_BIG_AT\" = \"$1\" ] && [ -d \"${T_BIG_DIR:-/nonexistent}\" ]; then find \"$T_BIG_DIR\" -type f -exec cat {} + > /dev/null; fi\n",
         "\tif [ -n \"${T_STAT_REL:-}\" ] && [ \"${T_STAT_AT:-}\" = \"$1\" ]; then test -e \"$ROOT/$T_STAT_REL\"; fi\n",
     );
@@ -80,17 +80,31 @@ fn split(s: &Suite, env: &[(&str, &str)]) -> Output {
     s.hook(&all)
 }
 
-/// A cold run, then one change to the shared source and the attribution pass under `env`, which launches every unit.
-fn attributed(s: &Suite, env: &[(&str, &str)]) {
-    success(&split(s, env));
-    edit(s, 2);
-    let pass = split(s, env);
-    success(&pass);
+/// The line a cold run prints when its completion learns the three units (spec 3.12).
+const COMPLETION_HEADER: &str =
+    "stoop: attribution pass after the full run: 3 units, one launch each";
+
+/// A cold run, then one change to the shared source and the subset run that launches the two units reading it, `a` and
+/// `b`, under `env`. The cold run's completion learns every unit's proof, so this subset is the first changed run.
+fn proven(s: &Suite, env: &[(&str, &str)]) {
+    let cold = split(s, env);
+    success(&cold);
     assert!(
-        stderr(&pass).contains("stoop: attribution pass: "),
+        stderr(&cold).contains(COMPLETION_HEADER),
         "{}",
-        stderr(&pass)
+        stderr(&cold)
     );
+    edit(s, 2);
+    s.clear_log();
+    let subset = split(s, env);
+    success(&subset);
+    assert_eq!(
+        launched(s),
+        ["tests/a.t", "tests/b.t"],
+        "{}",
+        stderr(&subset)
+    );
+    assert_eq!(category(&subset), "subset", "{}", stderr(&subset));
 }
 
 /// `stoop explain` of the pinned hook under `env`, with the engine on.
@@ -252,7 +266,7 @@ fn rv32_a_new_directory_named_by_an_affected_units_stale_version_keeps_the_full_
         ("T_LS_DIR", "tests/sub"),
         ("T_LS_AT", "tests/c.t"),
     ];
-    attributed(&s, &env);
+    proven(&s, &env);
     s.write("tests/sub/z.u", "src/c.src\n");
     s.write("tests/sub/z.flag", "fail\n");
     let judged = judge(&s, &env);
@@ -270,7 +284,7 @@ fn rv32_a_new_directory_named_by_an_affected_units_stale_version_keeps_the_full_
 fn rv32b_a_link_named_by_an_affected_units_stale_version_keeps_the_full_form() {
     let s = review_suite();
     let env = [("T_LS_DIR", "tests/sub"), ("T_LS_AT", "tests/c.t")];
-    attributed(&s, &env);
+    proven(&s, &env);
     std::os::unix::fs::symlink("../src/c.src", s.path("tests/sub")).unwrap();
     let judged = judge(&s, &env);
     assert_eq!(category(&judged.ran), "full", "{}", stderr(&judged.ran));
@@ -286,7 +300,7 @@ fn rv34_a_name_that_no_new_proof_reads_is_no_verdict_and_names_the_file() {
     let s = review_suite();
     let env = [("T_U", "1")];
     s.write("tests/c.t", "src/c.src\ntests/z.u\ntests/z.flag\n");
-    attributed(&s, &env);
+    proven(&s, &env);
     s.write("tests/c.t", "src/c.src\n");
     s.write("tests/z.u", "src/c.src\n");
     s.write("tests/z.flag", "fail\n");
@@ -316,7 +330,7 @@ fn rv34b_a_failing_launch_wins_over_the_no_verdict() {
     let env = [("T_U", "1")];
     s.write("tests/a.flag", "ok\n");
     s.write("tests/c.t", "src/c.src\ntests/z.u\ntests/z.flag\n");
-    attributed(&s, &env);
+    proven(&s, &env);
     s.write("tests/c.t", "src/c.src\n");
     s.write("tests/a.flag", "fail\n");
     s.write("tests/z.u", "src/c.src\n");
@@ -335,6 +349,120 @@ fn rv34b_a_failing_launch_wins_over_the_no_verdict() {
         stderr(&judged.ran)
     );
     same_verdict("rv34b", &judged);
+    assert_eq!(s.bundle().unwrap()["residue"]["state"], "none");
+    s.write("tests/a.flag", "ok\n");
+    let next = judge(&s, &env);
+    assert_eq!(next.direct, 1);
+    assert_eq!(category(&next.ran), "full", "{}", stderr(&next.ran));
+    same_verdict("rv34b-next", &next);
+}
+
+/// An appearing runner-only test was named by `c`'s old proof. If `c` fails, that proof remains and the unchanged retry
+/// must fail again. Once `c` passes after dropping or only statting the names, its replacement cannot excuse a skip.
+#[test]
+fn a_failing_excusing_unit_keeps_its_old_proof_until_a_lost_read_is_detected() {
+    for mode in ["drop", "stat"] {
+        let s = review_suite();
+        if mode == "stat" {
+            let runner = review_runner();
+            let anchor = "cat \"$ROOT/$line\"";
+            assert_eq!(runner.matches(anchor).count(), 1);
+            let runner = runner.replace(
+                anchor,
+                "case $line in\nstat:*) test -e \"$ROOT/${line#stat:}\" ;;\n*) cat \"$ROOT/$line\" ;;\nesac",
+            );
+            s.executable("t", &runner);
+        }
+        let env = [("T_U", "1")];
+        s.write("tests/c.flag", "ok\n");
+        s.write("tests/c.t", "src/c.src\ntests/z.u\ntests/z.flag\n");
+        proven(&s, &env);
+        s.write(
+            "tests/c.t",
+            if mode == "stat" {
+                "src/c.src\nstat:tests/z.flag\n"
+            } else {
+                "src/c.src\n"
+            },
+        );
+        s.write("tests/c.flag", "fail\n");
+        s.write("tests/z.u", "src/c.src\n");
+        s.write("tests/z.flag", "fail\n");
+        let first = judge(&s, &env);
+        assert_eq!(first.direct, 1, "{mode}");
+        assert_eq!(code(&first.ran), 1, "{mode}: {}", stderr(&first.ran));
+        assert_eq!(first.launches, ["tests/c.t"], "{mode}");
+        assert_ne!(s.bundle().unwrap()["residue"]["state"], "none", "{mode}");
+
+        let retry = judge(&s, &env);
+        assert_eq!(retry.direct, 1, "{mode}");
+        assert_eq!(code(&retry.ran), 1, "{mode}: {}", stderr(&retry.ran));
+        assert_eq!(retry.launches, ["tests/c.t"], "{mode}");
+
+        s.write("tests/c.flag", "ok\n");
+        let refusal = judge(&s, &env);
+        assert_eq!(refusal.direct, 1, "{mode}");
+        assert_eq!(code(&refusal.ran), 125, "{mode}: {}", stderr(&refusal.ran));
+        assert_eq!(refusal.launches, ["tests/c.t"], "{mode}");
+        assert_eq!(s.bundle().unwrap()["residue"]["state"], "none", "{mode}");
+
+        let after_refusal = judge(&s, &env);
+        assert_eq!(after_refusal.direct, 1, "{mode}");
+        assert_eq!(
+            category(&after_refusal.ran),
+            "full",
+            "{mode}: {}",
+            stderr(&after_refusal.ran)
+        );
+        same_verdict(mode, &after_refusal);
+    }
+}
+
+/// A unit that stats a changed input launches first, so its proof replaces its version and reaches the disk before the
+/// run ends. The run is killed while its second unit holds, after that write and before the run settles. The next run
+/// must not skip on the stat: the runner-only test reads the input's content and fails (PR 86 review round 3).
+#[test]
+fn a_kill_after_a_stat_only_replacement_leaves_the_residue_unknown() {
+    let s = review_suite();
+    // The cold run's residue must name nothing: `c` reads the runner-only test's file, `a` stats its flag, and `c`'s own
+    // flag makes `c` run grep, which the full command reads too.
+    s.write("tests/c.flag", "ok\n");
+    s.write("tests/c.t", "src/c.src\ntests/z.u\n");
+    s.write("tests/z.u", "src/c.src\n");
+    s.write("tests/z.flag", "ok\n");
+    let env = [
+        ("T_U", "1"),
+        ("T_STAT_REL", "tests/z.flag"),
+        ("T_STAT_AT", "tests/a.t"),
+    ];
+    proven(&s, &env);
+    s.write("tests/z.flag", "fail\n");
+    edit(&s, 3);
+    let fifo = s.fifo();
+    let fifo_text = fifo.display().to_string();
+    let hold = [("T_FIFO", fifo_text.as_str()), ("T_FIFO_AT", "tests/b.t")];
+    let mut command = s.stoop(&s.root);
+    command
+        .args(["run", "--root"])
+        .arg(&s.root)
+        .args(["--", "./t", HOOK])
+        .env(SPLIT.0, SPLIT.1)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (name, value) in env.iter().chain(&hold) {
+        command.env(name, value);
+    }
+    let mut child = spawning(|| command.spawn()).unwrap();
+    let writer = meet(&fifo);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    drop(writer);
+    let judged = judge(&s, &env);
+    assert_eq!(
+        judged.direct, 1,
+        "the full command runs tests/z.u and fails"
+    );
+    same_verdict("kill", &judged);
 }
 
 /// rv35: `c` names `tests/z.u`, absent when the full command passed. When `z.u` appears and `c`'s new proof reads it by content,
@@ -345,7 +473,7 @@ fn rv35_a_name_an_affected_unit_reads_is_covered_by_its_new_proof() {
     let s = review_suite();
     let env = [("T_U", "1")];
     s.write("tests/c.t", "src/c.src\ntests/z.u\n");
-    attributed(&s, &env);
+    proven(&s, &env);
     s.write("tests/z.u", "src/c.src\n");
     s.clear_log();
     let out = split(&s, &env);
@@ -362,7 +490,7 @@ fn rv31_a_unit_over_128_kib_of_changed_inputs_launches_with_the_file() {
     let s = review_suite();
     let env = [("T_BIG_AT", "tests/a.t"), ("T_BIG_DIR", "big")];
     big(&s, 3_000, "one");
-    attributed(&s, &env);
+    proven(&s, &env);
     big(&s, 3_000, "two");
     s.clear_log();
     let out = split(&s, &env);
@@ -397,7 +525,7 @@ fn rv31b_changed_inputs_between_64_and_128_kib_are_not_exported() {
     let s = review_suite();
     let env = [("T_BIG_AT", "tests/a.t"), ("T_BIG_DIR", "big")];
     big(&s, 1_500, "one");
-    attributed(&s, &env);
+    proven(&s, &env);
     big(&s, 1_500, "two");
     s.clear_log();
     let out = split(&s, &env);
@@ -438,7 +566,7 @@ fn rv17_changed_inputs_are_sorted_root_relative_and_inside_the_root() {
     ];
     s.write("src/zz.src", "zz\n");
     s.write("tests/a.t", "src/zz.src\nsrc/shared.src\n");
-    attributed(&s, &env);
+    proven(&s, &env);
     let (_, inputs, _) = version_of(&s.bundle().unwrap(), "tests/a.t").unwrap();
     assert!(
         inputs.iter().any(|(path, _)| path == &abs_text),
@@ -496,7 +624,7 @@ fn changed_inputs_at(total: usize) -> (String, String, bool, i32) {
     let s = review_suite();
     let env = [("T_BIG_AT", "tests/a.t"), ("T_BIG_DIR", "big")];
     let paths = exact_big(&s, total, 640, "one\n");
-    attributed(&s, &env);
+    proven(&s, &env);
     for path in &paths {
         s.write(path, "two\n");
     }
@@ -545,7 +673,7 @@ fn rv38_a_name_the_new_proof_only_stats_is_not_a_pass() {
     ];
     s.write("tests/z.flag", "fail\n");
     s.write("tests/c.t", "src/c.src\ntests/z.u\n");
-    attributed(&s, &env);
+    proven(&s, &env);
     s.write("tests/c.t", "src/c.src\n");
     s.write("tests/z.u", "src/c.src\n");
     let judged = judge(&s, &env);
@@ -566,7 +694,7 @@ fn rv38_a_name_the_new_proof_only_stats_is_not_a_pass() {
 #[test]
 fn rv43_a_unit_that_stops_reading_a_file_the_full_run_never_read_is_not_125() {
     let s = Suite::new();
-    attributed(&s, &[]);
+    proven(&s, &[]);
     s.write("tests/c.t", "src/c.src\nsrc/dead.src\n");
     let first = judge(&s, &[]);
     same_verdict("rv43-first", &first);
