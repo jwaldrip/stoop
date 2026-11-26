@@ -2781,6 +2781,153 @@ mod pass_tests {
     }
 
     #[test]
+    fn a_residue_is_never_measured_from_an_inexact_version() {
+        let mut bundle = bundle_for(pending_for(&["tests/a.t", "tests/b.t"]), "key");
+        bundle.table = vec![input("src/a"), input("src/b")];
+        let exact = version(delta(&[0]));
+        let mut inexact = version(delta(&[1]));
+        inexact.exact = false;
+        bundle.units.insert("tests/a.t".into(), vec![exact]);
+        bundle.units.insert("tests/b.t".into(), vec![inexact]);
+
+        let whole = vec![input("src/a"), input("src/b")];
+        store_residue(&mut bundle, &whole, "p-1", &[]);
+        assert!(
+            matches!(bundle.residue.state, ResidueState::None),
+            "a roster member with only an inexact proof cannot complete the residue"
+        );
+
+        bundle.units.get_mut("tests/b.t").unwrap()[0].exact = true;
+        store_residue(&mut bundle, &whole, "p-1", &[]);
+        assert!(matches!(bundle.residue.state, ResidueState::Provisional));
+        assert_eq!(bundle.residue.count, 0);
+    }
+
+    #[test]
+    fn confirm_counts_only_exact_versions() {
+        let roster = ["tests/a.t", "tests/b.t"];
+        let pending = pending_for(&roster);
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.table = vec![input("src/exact"), input("src/inexact")];
+        let mut inexact = version(delta(&[1]));
+        inexact.exact = false;
+        bundle
+            .units
+            .insert("tests/a.t".into(), vec![version(delta(&[0]))]);
+        bundle.units.insert("tests/b.t".into(), vec![inexact]);
+        let dir = seed("confirm-exact-only", &bundle);
+        let outcome = confirm(
+            &dir,
+            &pending,
+            "key",
+            "p-1",
+            &[input("src/exact"), input("src/inexact")],
+            |_| true,
+        );
+        assert!(matches!(outcome, Settled::Written));
+        let residue = stored(&dir, pending.suite()).residue;
+        assert!(matches!(residue.state, ResidueState::Confirmed));
+        assert_eq!(residue.count, 1);
+        assert_eq!(residue.paths, ["src/inexact"]);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn with_inexact_engine_fixture(
+        name: &str,
+        check: impl FnOnce(&super::super::engine::Judged<'_>, &View, &Path),
+    ) {
+        use super::super::engine::Judged;
+        use crate::run::{Opts, RunCx};
+
+        let dir = store(name);
+        let root = dir.join("root");
+        fs::create_dir_all(root.join("tests")).unwrap();
+        for name in ["a.t", "b.t", "c.t", "shared"] {
+            fs::write(root.join("tests").join(name), name).unwrap();
+        }
+        let opts = Opts::default();
+        let rel_cwd = String::new();
+        let scope = None;
+        let store = crate::proof::Store::new(dir.join("proofs"));
+        let hook = None;
+        let full_reason = None;
+        let salt = None;
+        let cx = RunCx {
+            o: &opts,
+            cwd: &root,
+            root: &root,
+            rel_cwd: &rel_cwd,
+            scope: &scope,
+            store: &store,
+            hook: &hook,
+            full_reason: &full_reason,
+            max_age: 0,
+            bypass: false,
+            explain: false,
+            observe_runners: true,
+            env_now: BTreeMap::new(),
+            env_excluded: Vec::new(),
+            salt: &salt,
+            remote: None,
+        };
+        let ignore = crate::ignore::Ignore::new(
+            &opts.ignore,
+            Some(&root.join(".stoopignore")),
+            &opts.transient,
+        );
+        let guard = super::super::attribution::guard_of(&cx, &ignore).digest();
+        let roster = ["tests/a.t", "tests/b.t", "tests/c.t"];
+        let pending = pending_for(&roster);
+        let proof = whole_proof(&[]);
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.whole = Some(proof.digest());
+        bundle.table = ["tests/a.t", "tests/b.t", "tests/shared", "tests/c.t"]
+            .iter()
+            .map(|path| Input {
+                path: (*path).into(),
+                id: crate::input::identify(&root.join(path), true, false).unwrap(),
+                oid: None,
+                oid_basis: None,
+            })
+            .collect();
+        let mut grouped = version(delta(&[0, 1, 2]));
+        grouped.exact = false;
+        grouped.guard = guard.clone();
+        let mut single = version(delta(&[3]));
+        single.guard = guard;
+        bundle.units.insert(roster[0].into(), vec![grouped.clone()]);
+        bundle.units.insert(roster[1].into(), vec![grouped]);
+        bundle.units.insert(roster[2].into(), vec![single]);
+        let view = View::of(bundle).unwrap();
+        let proofs = [proof];
+        let judged = Judged::new(&cx, &pending, &proofs, 0);
+        check(&judged, &view, &root);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn learn_relaunches_units_whose_valid_proofs_are_all_inexact() {
+        with_inexact_engine_fixture("learn-inexact", |judged, view, root| {
+            assert_eq!(
+                super::super::engine::learn(judged, view).unwrap(),
+                ["tests/a.t", "tests/b.t"]
+            );
+            fs::write(root.join("tests/c.t"), "changed").unwrap();
+            assert_eq!(
+                super::super::engine::learn(judged, view).unwrap(),
+                ["tests/a.t", "tests/b.t", "tests/c.t"]
+            );
+        });
+    }
+
+    #[test]
+    fn holds_is_false_while_a_unit_holds_only_an_inexact_proof() {
+        with_inexact_engine_fixture("holds-inexact", |judged, view, _| {
+            assert!(!super::super::engine::holds(judged, view));
+        });
+    }
+
+    #[test]
     fn delta_round_trips_and_decoding_refuses_out_of_range_and_unordered_indices() {
         let indices = [0, 3, 4, 10];
         let stored = delta(&indices);
@@ -4158,6 +4305,139 @@ mod keep_tests {
 
     fn paths(entries: &[Input]) -> Vec<String> {
         entries.iter().map(|entry| entry.path.clone()).collect()
+    }
+
+    // The baseline writes members separately. The implementation replaces this adapter with one atomic record.
+    fn record_group(
+        pass: &mut Pass,
+        members: &[String],
+        inputs: &[Input],
+        outputs: &[Input],
+    ) -> Stored {
+        for member in members {
+            let result = pass.record(member, inputs, outputs, 2);
+            if !matches!(result, Stored::Stored) {
+                return result;
+            }
+        }
+        Stored::Stored
+    }
+
+    fn group_fixture(name: &str, first_reads: &str, second_reads: &str) -> (PathBuf, Pass) {
+        let units = ["tests/a.t", "tests/b.t"];
+        let mut held = BTreeMap::new();
+        held.insert("tests/a.t".to_owned(), vec![version(vec![0])]);
+        held.insert("tests/b.t".to_owned(), vec![version(vec![1])]);
+        let table = vec![input(first_reads), input(second_reads)];
+        let mut bundle = bundle_for(pending_for(&units), "key", table, held);
+        bundle.residue = Residue {
+            state: ResidueState::Confirmed,
+            paths: Vec::new(),
+            count: 0,
+            whole: Some("p-1".into()),
+        };
+        let dir = seed(name, &bundle);
+        let pass = kept(&dir, &pending_for(&units));
+        (dir, pass)
+    }
+
+    fn group_members() -> [String; 2] {
+        ["tests/a.t".to_owned(), "tests/b.t".to_owned()]
+    }
+
+    #[test]
+    fn a_two_member_record_stores_identical_inexact_versions_in_one_write() {
+        let (dir, mut pass) = group_fixture("group-write", "src/old-a", "src/old-b");
+        let group_input = input("src/group");
+        let output = input("out/group");
+        assert!(matches!(
+            record_group(&mut pass, &group_members(), &[group_input], &[output]),
+            Stored::Stored
+        ));
+        assert_eq!(pass.writes, 1, "the group is stored in one write");
+        let a = &pass.bundle.units["tests/a.t"][0];
+        let b = &pass.bundle.units["tests/b.t"][0];
+        assert!(!a.exact && !b.exact, "a grouped version is inexact");
+        assert_eq!(
+            serde_json::to_vec(a).unwrap(),
+            serde_json::to_vec(b).unwrap()
+        );
+        let file = dir.join("units/v1").join(bundle_name(&pass.bundle.suite));
+        let disk: SuiteBundleV1 = serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
+        assert_eq!(disk.units.len(), 2);
+        assert!(!disk.units["tests/a.t"][0].exact && !disk.units["tests/b.t"][0].exact);
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_refused_two_member_record_keeps_every_member_s_old_version() {
+        let (dir, mut pass) = group_fixture("group-refused", "src/old-a", "src/old-b");
+        let before = serde_json::to_vec(&pass.bundle).unwrap();
+        pass.budget = 1;
+        assert!(matches!(
+            record_group(&mut pass, &group_members(), &[input("src/group")], &[]),
+            Stored::OverBudget
+        ));
+        assert_eq!(serde_json::to_vec(&pass.bundle).unwrap(), before);
+        assert!(!pass.residue_lost);
+        assert!(pass.lost_paths.is_empty());
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_two_member_record_loses_no_reader_another_member_keeps() {
+        let (dir, mut pass) = group_fixture("group-keeps-reader", "src/shared", "src/shared");
+        assert!(matches!(
+            record_group(&mut pass, &group_members(), &[input("src/shared")], &[]),
+            Stored::Stored
+        ));
+        assert!(!pass.residue_lost);
+        assert!(pass.lost_paths.is_empty());
+        assert!(matches!(pass.bundle.residue.state, ResidueState::Confirmed));
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    fn assert_group_loses_last_reader(name: &str, first: &str, second: &str) {
+        let (dir, mut pass) = group_fixture(name, first, second);
+        assert!(matches!(
+            record_group(&mut pass, &group_members(), &[input("src/group")], &[]),
+            Stored::Stored
+        ));
+        assert!(pass.residue_lost);
+        assert!(pass.lost_paths.contains("src/last-reader"));
+        assert!(matches!(pass.bundle.residue.state, ResidueState::None));
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_two_member_record_marks_a_path_lost_when_its_last_reader_is_a_replaced_member() {
+        assert_group_loses_last_reader("group-lost-first", "src/last-reader", "src/other");
+    }
+
+    #[test]
+    fn a_two_member_record_loses_the_second_members_last_reader() {
+        assert_group_loses_last_reader("group-lost-second", "src/other", "src/last-reader");
+    }
+
+    #[test]
+    fn a_one_member_record_writes_the_bytes_it_wrote_before() {
+        let (dir, mut pass) = group_fixture("single-record-bytes", "src/old-a", "src/old-b");
+        assert!(matches!(
+            pass.record("tests/a.t", &[input("src/old-a")], &[], 2),
+            Stored::Stored
+        ));
+        let version = &pass.bundle.units["tests/a.t"][0];
+        let expected = format!(
+            "{{\"created\":2,\"exact\":true,\"source\":{{\"kind\":\"exit\"}},\"guard\":\"{}\",\"inputs\":[0],\"outputs\":[]}}",
+            pass.bundle.guard_digest
+        );
+        assert_eq!(serde_json::to_string(version).unwrap(), expected);
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
