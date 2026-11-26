@@ -73,6 +73,284 @@ fn assert_full(s: &Suite, out: &Output, reason: &str) {
     assert!(text(&out.stderr).contains(reason), "{}", text(&out.stderr));
 }
 #[test]
+fn g_v5_a_missing_output_reruns_the_group() {
+    let s = Suite::new();
+    fs::create_dir(s.path(".outputs")).unwrap();
+    let extra = [("T_WRITE_EACH", "1"), ("T_OUTPUT_DIR", ".outputs")];
+    warm(&s, &extra);
+    make_group(&s, &extra);
+    s.remove(".outputs/a.t.out");
+    let out = run(&s, &extra);
+    success(&out);
+    assert_eq!(
+        launched(&s),
+        ["tests/a.t tests/b.t"],
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(s.path(".outputs/a.t.out").is_file());
+}
+
+#[test]
+fn g_v6_listing_link_and_unreadable_identities_rerun_the_group() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let s = Suite::new();
+    fs::create_dir_all(s.path(".inputs/dir")).unwrap();
+    let runner = include_str!("fixtures/hook/t");
+    let anchor = "cat \"$ROOT/$line\"";
+    assert_eq!(runner.matches(anchor).count(), 1);
+    s.executable(
+        "t",
+        &runner.replace(
+            anchor,
+            "case $line in\nls:*) ls -a \"$ROOT/${line#ls:}\" >/dev/null ;;\n*) cat \"$ROOT/$line\" ;;\nesac",
+        ),
+    );
+    s.write(A, "src/shared.src\nls:.inputs/dir\n.inputs/dir/added\n");
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    s.write(".inputs/dir/added", "now present\n");
+    let listed = run(&s, &[]);
+    success(&listed);
+    assert_eq!(
+        launched(&s),
+        ["tests/a.t tests/b.t"],
+        "listing: {}",
+        text(&listed.stderr)
+    );
+
+    let s = Suite::new();
+    s.write(".inputs/one", "one\n");
+    s.write(".inputs/two", "two\n");
+    symlink("one", s.path(".inputs/link")).unwrap();
+    s.write(A, "src/shared.src\n.inputs/link\n");
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    s.remove(".inputs/link");
+    symlink("two", s.path(".inputs/link")).unwrap();
+    let linked = run(&s, &[]);
+    success(&linked);
+    assert_eq!(
+        launched(&s),
+        ["tests/a.t tests/b.t"],
+        "link: {}",
+        text(&linked.stderr)
+    );
+
+    let s = Suite::new();
+    s.write(".inputs/secret", "secret\n");
+    fs::set_permissions(s.path(".inputs/secret"), fs::Permissions::from_mode(0o000)).unwrap();
+    s.write(A, "src/shared.src\n.inputs/secret\n");
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    let bundle = s.bundle().unwrap();
+    assert!(
+        bundle["table"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| { entry["path"] == ".inputs/secret" && entry["id"] == "u" }),
+        "the grouped proof must record an unreadable identity: {bundle}"
+    );
+    fs::set_permissions(s.path(".inputs/secret"), fs::Permissions::from_mode(0o600)).unwrap();
+    let readable = run(&s, &[]);
+    success(&readable);
+    assert_eq!(
+        launched(&s),
+        ["tests/a.t tests/b.t"],
+        "unreadable: {}",
+        text(&readable.stderr)
+    );
+}
+
+#[test]
+fn g_g1_over_claimed_reads_can_make_a_change_global() {
+    let s = Suite::new();
+    s.write("src/x.src", "old\n");
+    s.write(A, "src/shared.src\nsrc/x.src\n");
+    s.write(C, "src/c.src\nsrc/x.src\n");
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    s.write(B, "src/shared.src\n\n");
+    let per_unit = s.hook(&[("STOOP_SPLIT", "1")]);
+    success(&per_unit);
+    assert_eq!(launched(&s), [A, B], "{}", text(&per_unit.stderr));
+    s.clear_log();
+    s.write(B, "src/shared.src\n\n\n");
+    s.write(C, "src/c.src\nsrc/x.src\n\n");
+    let second = run(&s, &[]);
+    success(&second);
+    assert_eq!(
+        launched(&s),
+        ["tests/b.t tests/c.t"],
+        "{}",
+        text(&second.stderr)
+    );
+    s.clear_log();
+    s.write("src/x.src", "changed\n");
+    let out = run(&s, &[]);
+    success(&out);
+    assert_full(&s, &out, "src/x.src changed and every unit reads it");
+    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &[])));
+}
+
+#[test]
+fn g_x2_an_excused_name_read_by_another_member_is_covered() {
+    let s = Suite::new();
+    s.remove("e2e/x.u");
+    s.write(A, "src/shared.src\ntests/z.u\n");
+    let extra = [("T_U", "1")];
+    warm(&s, &extra);
+    make_group(&s, &extra);
+    s.write(A, "src/shared.src\n");
+    s.write(B, "src/shared.src\ntests/z.u\n");
+    s.write("tests/z.u", "src/c.src\n");
+    let out = run(&s, &extra);
+    success(&out);
+    assert_eq!(
+        launched(&s),
+        ["tests/a.t tests/b.t"],
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &extra)));
+}
+
+#[test]
+fn g_e_a_missing_group_member_disables_without_recording_any_member() {
+    let s = Suite::new();
+    let gate = s.outside.join("skip");
+    let extra = [("T_IF", gate.to_str().unwrap()), ("T_SKIP_TEST", B)];
+    warm(&s, &extra);
+    make_group(&s, &extra);
+    let before = s.bundle().unwrap();
+    s.write(A, "src/shared.src\n\n");
+    fs::write(&gate, "skip").unwrap();
+    let out = run(&s, &extra);
+    let stderr = text(&out.stderr);
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+    assert_eq!(code(&out), 125, "{stderr}");
+    assert!(
+        stderr.contains("tests/b.t did not run in its launch"),
+        "{stderr}"
+    );
+    let after = s.bundle().unwrap();
+    assert_eq!(after["state"]["status"], "disabled", "{after}");
+    assert_eq!(after["units"][A], before["units"][A]);
+    assert_eq!(after["units"][B], before["units"][B]);
+}
+
+#[test]
+fn g_h1_coupling_inside_a_group_is_caught_by_the_next_exact_launch() {
+    let s = Suite::new();
+    warm(&s, &[]);
+    make_group(&s, &[]);
+    s.write(A, "src/shared.src\ntests/b.t\n");
+    let grouped = run(&s, &[]);
+    success(&grouped);
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+    assert_eq!(s.bundle().unwrap()["state"]["status"], "ready");
+    s.clear_log();
+    s.write("tests/d.t", "src/c.src\n");
+    let out = run(&s, &[]);
+    success(&out);
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
+    assert!(launched(&s).iter().any(|call| call == A));
+    let stderr = text(&out.stderr);
+    assert!(stderr.contains("tests/a.t read tests/b.t"), "{stderr}");
+    assert_eq!(s.bundle().unwrap()["state"]["code"], "read_unit");
+}
+
+#[test]
+fn g_h3_a_group_changing_a_skipped_listing_has_no_verdict() {
+    let s = Suite::new();
+    let gate = s.outside.join("write");
+    let extra = [
+        ("T_IF", gate.to_str().unwrap()),
+        ("T_LS_ROOT", "1"),
+        ("T_WRITE", "new.top"),
+        ("T_WRITE_AT", A),
+    ];
+    warm(&s, &extra);
+    edit_shared(&s);
+    fs::write(&gate, "write").unwrap();
+    let out = run(&s, &extra);
+    let stderr = text(&out.stderr);
+    assert_eq!(launched(&s), ["tests/a.t tests/b.t"]);
+    assert_eq!(code(&out), 125, "{stderr}");
+    assert!(
+        stderr.contains("which skipped unit tests/c.t lists"),
+        "{stderr}"
+    );
+}
+
+fn premise_violation(s: &Suite, extra: &[(&str, &str)]) {
+    s.write("gate", "ok\n");
+    s.write(A, "src/shared.src\ngate\n");
+    warm(s, extra);
+    make_group(s, extra);
+    s.write(A, "src/shared.src\n");
+    s.write("src/shared.src", "changed again\n");
+    let dropped = run(s, extra);
+    success(&dropped);
+    assert_eq!(
+        launched(s),
+        ["tests/a.t tests/b.t"],
+        "{}",
+        text(&dropped.stderr)
+    );
+    s.clear_log();
+    s.write("gate", "fail\n");
+    let grouped = run(s, extra);
+    assert_eq!(
+        launched(s),
+        ["tests/a.t tests/b.t"],
+        "{}",
+        text(&grouped.stderr)
+    );
+    // Premise G is deliberately violated: only a multi-unit invocation reads gate.
+    assert_eq!(code(&grouped), 0, "{}", text(&grouped.stderr));
+    assert_eq!(code(&s.direct(&s.root, &[], extra)), 1);
+    s.clear_log();
+}
+
+#[test]
+fn g_p1_a_group_only_read_is_the_documented_premise() {
+    let extra = [("T_GATE", "gate"), ("T_GROUP_READ", "gate")];
+
+    let s = Suite::new();
+    premise_violation(&s, &extra);
+    let forced = [
+        ("T_GATE", "gate"),
+        ("T_GROUP_READ", "gate"),
+        ("STOOP_FULL", "1"),
+    ];
+    let failed = run(&s, &forced);
+    assert_eq!(code(&failed), 1, "{}", text(&failed.stderr));
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
+    assert_eq!(s.bundle().unwrap()["state"]["code"], "disagreement");
+
+    let s = Suite::new();
+    premise_violation(&s, &extra);
+    s.write("gate", "ok\n");
+    let repaired = run(&s, &forced);
+    success(&repaired);
+    assert_eq!(launched(&s), ["", A, B], "{}", text(&repaired.stderr));
+    let bundle = s.bundle().unwrap();
+    assert_eq!(bundle["units"][A][0]["exact"], true);
+    assert_eq!(bundle["units"][B][0]["exact"], true);
+    assert_eq!(bundle["residue"]["state"], "confirmed", "{bundle}");
+    assert_eq!(bundle["residue"]["count"], 1, "{bundle}");
+    s.clear_log();
+    s.write("gate", "fail\n");
+    let out = run(&s, &extra);
+    assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+    assert_eq!(launched(&s).first().map(String::as_str), Some(""));
+    assert_eq!(code(&out), code(&s.direct(&s.root, &[], &extra)));
+}
+
+#[test]
 fn g_v1_a_file_one_member_read_reruns_the_group() {
     let s = Suite::new();
     s.write("src/private.src", "private\n");

@@ -85,7 +85,11 @@ run_test() {
 	done < "$1"
 	cat "$ROOT/setup.src"
 	if [ "${T_WRITE_EACH:-}" = 1 ]; then
-		printf 'written\n' > "${1%.*}.out"
+		output="${1%.*}.out"
+		if [ -n "${T_OUTPUT_DIR:-}" ]; then
+			output="$ROOT/$T_OUTPUT_DIR/${1##*/}.out"
+		fi
+		printf 'written\n' > "$output"
 	fi
 	hold "$1"
 	flag=${1%.*}.flag

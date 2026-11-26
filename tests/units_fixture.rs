@@ -23,7 +23,7 @@
 //! | `T_IF=<path>` | The toggle for the rows marked (IF). |
 //! | `T_WRITE=<path>` (IF) | Writes `written` to that path, relative to the cwd, once per invocation before any test. With `T_WRITE_AT` set it writes only in that test's invocation: see the next row. |
 //! | `T_WRITE_AT=<P>` (IF) | Narrows `T_WRITE` to the invocation that runs test P, written right before P's reads. P must exist and be run, not statted by `T_STAT_UNIT`. The path rules depend on the form. In the no-argument form the write runs after the runner has moved to the root, so a relative `T_WRITE` path is root-relative, as `T_WRITE_FULL` is, and P is spelled as the roster lists it: root-relative, for example `tests/b.t`. In the test-word form the write stays relative to the cwd, and P is spelled as the test word is: relative to the cwd, for example `../tests/b.t` from `docs`. |
-//! | `T_WRITE_EACH=1` | Each test P writes `written` to `${P%.*}.out` after its reads, in every invocation that runs it. Not (IF). |
+//! | `T_WRITE_EACH=1` | Each test P writes `written` to `${P%.*}.out` after its reads, in every invocation that runs it. With `T_OUTPUT_DIR`, it writes to `<root>/$T_OUTPUT_DIR/${P##*/}.out` instead. Not (IF). |
 //! | `T_WRITE_FULL=<path>` | The no-argument form writes `written` to the path after it moves to the root and before its first test, so a relative path is root-relative. Not (IF). |
 //! | `T_READ_OTHER=<path>` (IF) | Reads that path once per invocation, relative to the cwd. A FIFO is read one line, then its `<path>.passed` marker is written, as `T_FIFO` does. |
 //! | `T_STAT_OTHER=<path>` (IF) | Runs `test -e <path>` once per invocation, relative to the cwd, and logs `stat_other=<path>`. The answer does not change the exit status. |
@@ -51,6 +51,33 @@ use std::process::Stdio;
 use units_common::*;
 
 // The runner, run directly: order, arguments, the environment log, and each knob.
+#[test]
+fn grouped_test_output_and_hold_controls_are_independent() {
+    let s = Suite::new();
+    fs::create_dir(s.path(".outputs")).unwrap();
+    let output = [("T_WRITE_EACH", "1"), ("T_OUTPUT_DIR", ".outputs")];
+    let out = s.direct(&s.root, &["tests/a.t"], &output);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert_eq!(
+        fs::read_to_string(s.path(".outputs/a.t.out")).unwrap(),
+        "written\n"
+    );
+    assert!(!s.path("tests/a.out").exists());
+
+    let fifo = s.fifo();
+    let gate = s.outside.join("hold");
+    let hold = [
+        ("T_FIFO", fifo.to_str().unwrap()),
+        ("T_FIFO_AT", "tests/a.t"),
+        ("T_FIFO_IF", gate.to_str().unwrap()),
+    ];
+    assert_eq!(code(&s.direct(&s.root, &["tests/a.t"], &hold)), 0);
+    fs::write(&gate, "hold").unwrap();
+    let child = s.direct_child(&s.root, &["tests/a.t"], &hold, Stdio::null());
+    release(meet(&fifo));
+    let out = finish(child);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+}
 
 #[test]
 fn group_knobs_are_scoped_to_the_requested_launches() {
