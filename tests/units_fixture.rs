@@ -32,6 +32,8 @@
 //! | `T_SKIP_TEST=<P>` (IF) | In the test-word form, logs `skipped=P` and does not read P. |
 //! | `T_GROUP_READ=<path>` (IF) | With at least two test words, reads the root-relative path once. |
 //! | `T_GATE=<path>` | In the no-argument form, fails if the root-relative path contains `fail`. |
+//! | `T_CACHE=<dir>` | Each test's stat header and contents are cached in `<dir>/<inode>.c`, with relative directories resolved from the root. A matching header logs `cache_hit=P` and serves the stored lines without opening P. Cache write failures are ignored. Each invocation logs `cache=<value>`. |
+//! | `env:NAME` | A test line fails when the named environment variable is `fail`; an invalid variable name fails the test. |
 //! | `T_LS_ROOT=1` / `T_STAT_ROOT=1` | `ls -a <root>` (logs `ls_root`) / `test -d <root>` (logs `stat_root`), once per invocation. |
 //! | `LOG=<path>` (outside the root) | Per invocation it logs `launch`, then `arg=<w>` for each argument, then `changed=`, `units=`, `changed_file=`, `changed_inputs=`, `changed_inputs_file=` (newlines inside a value logged as `\|`), `changed_set=`, `units_set=`, then the per-test lines. |
 //! | exit | 1 if any test failed, or if `T_FAIL_FULL` (IF) fails the no-argument form after its tests; else 0. |
@@ -491,6 +493,98 @@ fn f4_t_ls_root_and_t_stat_root_log_once_each() {
     assert!(!s.launches()[0].lines.iter().any(|line| line == "ls_root"));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn f13_the_cache_knob_serves_a_matching_entry_without_opening_the_test() {
+    use std::os::unix::fs::MetadataExt;
+
+    let s = Suite::new();
+    fs::create_dir(s.path(".tcache")).unwrap();
+    let env = [("T_CACHE", ".tcache")];
+    let first = s.direct(&s.root, &["tests/a.t"], &env);
+    assert_eq!(code(&first), 0, "{}", text(&first.stderr));
+    let entry = s.path(&format!(
+        ".tcache/{}.c",
+        fs::metadata(s.path("tests/a.t")).unwrap().ino()
+    ));
+    let cached = fs::read_to_string(&entry).unwrap();
+    let header = cached.lines().next().unwrap();
+    fs::write(&entry, format!("{header}\nfail\n")).unwrap();
+    s.clear_log();
+    let hit = s.direct(&s.root.join("docs"), &["../tests/a.t"], &env);
+    assert_eq!(code(&hit), 1, "{}", text(&hit.stderr));
+    let lines = &s.launches()[0].lines;
+    assert!(lines.contains(&"cache=.tcache".to_string()), "{lines:?}");
+    assert!(
+        lines.contains(&"cache_hit=../tests/a.t".to_string()),
+        "{lines:?}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn f14_a_write_between_runs_retires_the_cache_entry() {
+    let s = Suite::new();
+    fs::create_dir(s.path(".tcache")).unwrap();
+    let env = [("T_CACHE", ".tcache")];
+    assert_eq!(code(&s.direct(&s.root, &["tests/c.t"], &env)), 0);
+    let timestamp = s.outside.join("timestamp");
+    fs::write(&timestamp, "").unwrap();
+    assert!(spawning(|| std::process::Command::new("touch")
+        .arg("-r")
+        .arg(s.path("tests/c.t"))
+        .arg(&timestamp)
+        .status())
+    .unwrap()
+    .success());
+    s.write("tests/c.t", "fail\n\n\n\n\n\n");
+    assert!(spawning(|| std::process::Command::new("touch")
+        .arg("-r")
+        .arg(&timestamp)
+        .arg(s.path("tests/c.t"))
+        .status())
+    .unwrap()
+    .success());
+    s.clear_log();
+    let out = s.direct(&s.root, &["tests/c.t"], &env);
+    assert_eq!(code(&out), 1, "{}", text(&out.stderr));
+    assert!(!s.launches()[0]
+        .lines
+        .iter()
+        .any(|line| line.starts_with("cache_hit=")));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn f15_an_unwritable_cache_location_is_silent() {
+    let s = Suite::new();
+    let out = s.direct(&s.root, &["tests/a.t"], &[("T_CACHE", "/dev/null/t")]);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert!(out.stderr.is_empty(), "{}", text(&out.stderr));
+    assert!(s.launches()[0]
+        .lines
+        .contains(&"cache=/dev/null/t".to_string()));
+}
+
+#[test]
+fn f16_an_env_line_fails_the_test_when_its_variable_holds_fail() {
+    let s = Suite::new();
+    s.write("tests/a.t", "env:MODE\n");
+    assert_eq!(code(&s.direct(&s.root, &["tests/a.t"], &[])), 0);
+    assert_eq!(
+        code(&s.direct(&s.root, &["tests/a.t"], &[("MODE", "pass")])),
+        0
+    );
+    assert_eq!(
+        code(&s.direct(&s.root, &["tests/a.t"], &[("MODE", "fail")])),
+        1
+    );
+    for name in ["", "1MODE", "MODE-X", "MODE;false", "MODE=x"] {
+        s.write("tests/a.t", &format!("env:{name}\n"));
+        assert_eq!(code(&s.direct(&s.root, &["tests/a.t"], &[])), 1, "{name:?}");
+    }
+}
+
 // W6-0 (spec 3.2): the purity rule of the runner and its knobs. Each knob has a test that drives
 // the runner directly and reads its log or its files. A knob with a T_IF gate also shows that an
 // absent path turns it off.
@@ -552,6 +646,34 @@ mod purity {
             stray.is_empty(),
             "the full form reads what no unit launch reads: {stray:?}"
         );
+    }
+
+    #[test]
+    fn f5c_the_cache_knob_keeps_the_full_form_pure() {
+        let s = Suite::new();
+        fs::create_dir(s.path(".tcache")).unwrap();
+        s.write(".stoopignore", ".tcache\n");
+        let env = [("T_CACHE", ".tcache")];
+        assert_eq!(code(&s.direct(&s.root, &[], &env)), 0);
+        for (key, words) in [
+            ("full", vec!["./t"]),
+            ("a", vec!["./t", "tests/a.t"]),
+            ("b", vec!["./t", "tests/b.t"]),
+            ("c", vec!["./t", "tests/c.t"]),
+        ] {
+            let out = s.run(&s.root, &["--key", key], &words, &env);
+            assert_eq!(code(&out), 0, "{key}: {}", text(&out.stderr));
+        }
+        let units: BTreeSet<_> = ["a", "b", "c"]
+            .into_iter()
+            .flat_map(|key| stored_inputs(&s, key))
+            .collect();
+        let stray: Vec<_> = stored_inputs(&s, "full")
+            .into_iter()
+            .filter(|(_, id)| id != "d" && !id.starts_with("dl:"))
+            .filter(|input| !units.contains(input))
+            .collect();
+        assert!(stray.is_empty(), "full-only inputs: {stray:?}");
     }
 
     // F10, traced: a stat of T_STAT_OTHER is an input of its launch. `test -e` only looks at the
