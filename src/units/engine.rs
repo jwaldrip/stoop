@@ -677,7 +677,14 @@ pub(super) fn learn(cx: &Judged<'_>, view: &View) -> Result<Vec<String>, &'stati
         return Err("the bundle holds another whole proof");
     }
     let wanted = view.residue.as_ref().is_none_or(|(count, _)| *count > 0);
-    if !wanted {
+    let versions_current = bundle::versions_hold_current_unit_env(
+        cx.unit_env_digest.as_deref(),
+        view.units
+            .values()
+            .flatten()
+            .map(|version| version.unit_env.as_deref()),
+    );
+    if !wanted && versions_current {
         return Err("the residue is known and empty");
     }
     let current = Current::of(cx.root, &checked(cx, view));
@@ -685,10 +692,28 @@ pub(super) fn learn(cx: &Judged<'_>, view: &View) -> Result<Vec<String>, &'stati
         .into_iter()
         .map(|affected| affected.unit)
         .collect();
+    if !versions_current {
+        units.extend(
+            cx.roster
+                .iter()
+                .filter(|unit| {
+                    view.units.get(*unit).is_some_and(|versions| {
+                        versions
+                            .iter()
+                            .any(|version| version.unit_env != cx.unit_env_digest)
+                    })
+                })
+                .cloned(),
+        );
+    }
     let mut inexact = inexact_only(cx, view, &current).peekable();
-    if inexact.peek().is_some() {
+    let has_inexact = inexact.peek().is_some();
+    if has_inexact {
         units.extend(inexact.cloned());
+    }
+    if !versions_current || has_inexact {
         units.sort_unstable();
+        units.dedup();
     }
     Ok(units)
 }
@@ -696,7 +721,14 @@ pub(super) fn learn(cx: &Judged<'_>, view: &View) -> Result<Vec<String>, &'stati
 /// Whether every roster unit holds a valid exact version, which lets the residue be confirmed.
 pub(super) fn holds(cx: &Judged<'_>, view: &View) -> bool {
     let current = Current::of(cx.root, &checked(cx, view));
-    analyse(cx, view, &current).is_empty() && inexact_only(cx, view, &current).next().is_none()
+    bundle::versions_hold_current_unit_env(
+        cx.unit_env_digest.as_deref(),
+        view.units
+            .values()
+            .flatten()
+            .map(|version| version.unit_env.as_deref()),
+    ) && analyse(cx, view, &current).is_empty()
+        && inexact_only(cx, view, &current).next().is_none()
 }
 
 /// Units with a valid inexact version, but no valid exact version, in roster order.
@@ -1684,6 +1716,7 @@ mod tests {
             created,
             exact: true,
             guard: "g".to_owned(),
+            unit_env: None,
             inputs,
             outputs: Vec::new(),
         }

@@ -99,6 +99,8 @@ struct UnitVersion {
     exact: bool,
     source: ResultSource,
     guard: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unit_env: Option<String>,
     inputs: Vec<u32>,
     outputs: Vec<u32>,
 }
@@ -1174,6 +1176,16 @@ pub(crate) fn record(
         residue,
         state,
     };
+    if !versions_hold_current_unit_env(
+        bundle.guard.unit_env.as_deref(),
+        bundle
+            .units
+            .values()
+            .flatten()
+            .map(|version| version.unit_env.as_deref()),
+    ) {
+        bundle.residue = Residue::default();
+    }
     if !split {
         store_residue(&mut bundle, &proof.inputs, digest, pending.listings());
     } else {
@@ -1199,6 +1211,17 @@ pub(crate) fn record(
 /// holds an exact version, and it is kept while it is already known for `digest`. It is stored provisional: W6 compares
 /// paths and cannot confirm them (C4, C5). A residue that would take the bundle past its bound is not kept.
 fn store_residue(bundle: &mut SuiteBundleV1, whole: &[Input], digest: &str, listings: &[String]) {
+    if !versions_hold_current_unit_env(
+        bundle.guard.unit_env.as_deref(),
+        bundle
+            .units
+            .values()
+            .flatten()
+            .map(|version| version.unit_env.as_deref()),
+    ) {
+        bundle.residue = Residue::default();
+        return;
+    }
     if residue_known(&bundle.residue, digest) {
         return;
     }
@@ -1229,6 +1252,14 @@ fn store_residue(bundle: &mut SuiteBundleV1, whole: &[Input], digest: &str, list
 /// Whether `residue` is known for `digest`: it has a state, and it was measured for that proof.
 fn residue_known(residue: &Residue, digest: &str) -> bool {
     !matches!(residue.state, ResidueState::None) && residue.whole.as_deref() == Some(digest)
+}
+
+/// Whether each held version was recorded under the current unit-only environment.
+pub(super) fn versions_hold_current_unit_env<'a>(
+    current: Option<&str>,
+    mut versions: impl Iterator<Item = Option<&'a str>>,
+) -> bool {
+    versions.all(|unit_env| unit_env == current)
 }
 
 /// Whether an input id names content that a proof verifies: a file, a link, a listing, an absence or an unreadable mark.
@@ -1505,6 +1536,7 @@ impl Pass {
             exact: members.len() == 1,
             source: ResultSource::Exit,
             guard: self.bundle.guard_digest.clone(),
+            unit_env: self.bundle.guard.unit_env.clone(),
             inputs: delta(&inputs),
             outputs: delta(&outputs),
         };
@@ -1635,10 +1667,27 @@ impl Pass {
     /// Notes the paths that `removed` read with content and that no version reads with content now (spec 3.8, item 1).
     /// The residue is unknown from here until `settle_residue` finds each of them read again.
     fn note_losses(&mut self, removed: &BTreeMap<String, bool>) {
+        if !versions_hold_current_unit_env(
+            self.bundle.guard.unit_env.as_deref(),
+            self.bundle
+                .units
+                .values()
+                .flatten()
+                .map(|version| version.unit_env.as_deref()),
+        ) {
+            self.unsettle();
+        }
         if removed.is_empty() {
             return;
         }
-        let now = bundle_readers(&self.bundle.table, self.bundle.units.values().flatten());
+        let now = bundle_readers(
+            &self.bundle.table,
+            self.bundle
+                .units
+                .values()
+                .flatten()
+                .filter(|version| version.unit_env == self.bundle.guard.unit_env),
+        );
         let lost = losses(removed, &now);
         if !lost.is_empty() {
             self.bundle.residue = Residue::default();
@@ -1786,6 +1835,17 @@ impl Pass {
         listings: &[String],
         no_verdict: bool,
     ) {
+        if !versions_hold_current_unit_env(
+            self.bundle.guard.unit_env.as_deref(),
+            self.bundle
+                .units
+                .values()
+                .flatten()
+                .map(|version| version.unit_env.as_deref()),
+        ) {
+            self.unsettle();
+            return;
+        }
         // When a split run may have lost coverage, its residue stays unknown. A stored version can read a path by stat
         // only, so measuring it as covered would let a later run skip without checking content. A switch-off pass keeps
         // main's residue, which is the switch-off parity rule.
@@ -1949,6 +2009,18 @@ pub(crate) fn keep<T, D>(
     if matches!(bundle.state, SuiteState::Disabled { .. }) {
         return Kept::Unavailable;
     }
+    let stale_residue = !matches!(bundle.residue.state, ResidueState::None)
+        && !versions_hold_current_unit_env(
+            guard.unit_env.as_deref(),
+            bundle
+                .units
+                .values()
+                .flatten()
+                .map(|version| version.unit_env.as_deref()),
+        );
+    if stale_residue {
+        bundle.residue = Residue::default();
+    }
     bundle.guard_digest = guard.digest();
     bundle.guard = guard;
     bundle.policy.clone_from(&pending.policy);
@@ -1965,7 +2037,7 @@ pub(crate) fn keep<T, D>(
         bundle,
         budget: MAX_BYTES,
         last_write: None,
-        dirty: false,
+        dirty: stale_residue,
         phase: "subset",
         keep: true,
         #[cfg(test)]
@@ -2100,6 +2172,14 @@ pub(crate) fn known_residue(store: &Path, id: &str, key: &str) -> Option<(usize,
     if bundle.generation != GENERATION
         || !matches!(bundle.state, SuiteState::Ready)
         || !recorded(&bundle, &digest_text("stoop whole key v1", key))
+        || !versions_hold_current_unit_env(
+            bundle.guard.unit_env.as_deref(),
+            bundle
+                .units
+                .values()
+                .flatten()
+                .map(|version| version.unit_env.as_deref()),
+        )
     {
         return None;
     }
@@ -2114,6 +2194,7 @@ pub(crate) struct Version {
     pub(crate) created: u64,
     pub(crate) exact: bool,
     pub(crate) guard: String,
+    pub(crate) unit_env: Option<String>,
     pub(crate) inputs: Vec<u32>,
     pub(crate) outputs: Vec<u32>,
 }
@@ -2141,8 +2222,16 @@ impl View {
     fn of(bundle: SuiteBundleV1) -> Option<View> {
         let whole = bundle.whole?;
         let len = bundle.table.len();
-        let residue = residue_known(&bundle.residue, &whole)
-            .then_some((bundle.residue.count, bundle.residue.paths));
+        let residue = (residue_known(&bundle.residue, &whole)
+            && versions_hold_current_unit_env(
+                bundle.guard.unit_env.as_deref(),
+                bundle
+                    .units
+                    .values()
+                    .flatten()
+                    .map(|version| version.unit_env.as_deref()),
+            ))
+        .then_some((bundle.residue.count, bundle.residue.paths));
         let mut units = BTreeMap::new();
         for (unit, versions) in bundle.units {
             let views = versions
@@ -2154,6 +2243,7 @@ impl View {
                         inputs: undelta(&version.inputs, len)?,
                         outputs: undelta(&version.outputs, len)?,
                         guard: version.guard,
+                        unit_env: version.unit_env,
                     })
                 })
                 .collect::<Option<Vec<_>>>()?;
@@ -2248,11 +2338,18 @@ pub(crate) fn drop_stale(
     bundle
         .units
         .retain(|unit, _| pending.roster.units.binary_search(unit).is_ok());
-    if !removed.is_empty()
+    if !versions_hold_current_unit_env(
+        pending.unit_env_digest.as_deref(),
+        bundle
+            .units
+            .values()
+            .flatten()
+            .map(|version| version.unit_env.as_deref()),
+    ) || (!removed.is_empty()
         && lost_reader(
             &removed,
             &bundle_readers(&bundle.table, bundle.units.values().flatten()),
-        )
+        ))
     {
         bundle.residue = Residue::default();
     }
@@ -2348,6 +2445,22 @@ pub(crate) fn confirm(
     let Some(view) = view_in(&area, pending, key) else {
         return Settled::Failed;
     };
+    if !versions_hold_current_unit_env(
+        pending.unit_env_digest.as_deref(),
+        view.units
+            .values()
+            .flatten()
+            .map(|version| version.unit_env.as_deref()),
+    ) {
+        let Some(mut bundle) = bundle_for(&area, pending, key) else {
+            return Settled::Failed;
+        };
+        bundle.residue = Residue::default();
+        return match write_bundle(&area, &bundle) {
+            Ok(()) => Settled::Declined,
+            Err(_) => Settled::Failed,
+        };
+    }
     if !holds(&view) {
         return Settled::Declined;
     }
@@ -2551,6 +2664,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_version_bytes_and_mixed_unit_env_stamps() {
+        let main_bytes = r#"{"created":1,"exact":true,"source":{"kind":"exit"},"guard":"g","inputs":[],"outputs":[]}"#;
+        let version: UnitVersion = serde_json::from_str(main_bytes).unwrap();
+        assert_eq!(version.unit_env, None);
+        assert_eq!(serde_json::to_string(&version).unwrap(), main_bytes);
+        assert!(versions_hold_current_unit_env(
+            None,
+            [None, None].into_iter()
+        ));
+        assert!(!versions_hold_current_unit_env(
+            Some("new"),
+            [None].into_iter()
+        ));
+        assert!(!versions_hold_current_unit_env(
+            None,
+            [Some("old")].into_iter()
+        ));
+        assert!(!versions_hold_current_unit_env(
+            Some("new"),
+            [Some("new"), Some("old")].into_iter()
+        ));
+        assert!(versions_hold_current_unit_env(
+            Some("new"),
+            [Some("new"), Some("new")].into_iter()
+        ));
+    }
+
+    #[test]
     fn suite_ids_are_length_delimited_and_bind_every_field() {
         let words = vec![OsString::from("runner"), OsString::from("{changed:*.t}")];
         let id = suite_id(&words, "a", Some("scope"), Some("label"));
@@ -2637,6 +2778,7 @@ mod tests {
                 exact: true,
                 source: ResultSource::Exit,
                 guard: "guard".into(),
+                unit_env: None,
                 inputs: Vec::new(),
                 outputs: Vec::new(),
             })
@@ -2864,6 +3006,7 @@ mod pass_tests {
             exact: true,
             source: ResultSource::Exit,
             guard: "g".into(),
+            unit_env: None,
             inputs,
             outputs: Vec::new(),
         }
@@ -4138,6 +4281,7 @@ mod cost_tests {
                     exact: true,
                     source: ResultSource::Exit,
                     guard: "guard".into(),
+                    unit_env: None,
                     inputs: delta(&pair),
                     outputs: Vec::new(),
                 };
@@ -4286,6 +4430,7 @@ mod settle_tests {
             exact: true,
             source: ResultSource::Exit,
             guard: "g".into(),
+            unit_env: None,
             inputs: delta(&[index]),
             outputs: Vec::new(),
         }
@@ -4445,6 +4590,7 @@ mod keep_tests {
             exact: true,
             source: ResultSource::Exit,
             guard: "guard".into(),
+            unit_env: None,
             inputs,
             outputs: Vec::new(),
         }
