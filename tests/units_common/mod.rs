@@ -657,6 +657,154 @@ pub fn content_read_dropped(
     };
     reads(before) && !reads(after)
 }
+
+/// The current guard for the fixture command. The fixture clears its environment before adding these values.
+pub fn model_current_guard(s: &Suite, bundle: &Value, extra: &[(&str, &str)]) -> Option<String> {
+    #[derive(serde::Serialize)]
+    struct Guard {
+        env: BTreeMap<String, String>,
+        env_excluded: Vec<String>,
+        ignore: Vec<String>,
+    }
+    let guard = bundle.get("guard")?;
+    let mut values = BTreeMap::from([
+        ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+        ("HOME".to_owned(), s.outside.to_str()?.to_owned()),
+        ("LOG".to_owned(), s.log.to_str()?.to_owned()),
+    ]);
+    for &(name, value) in extra {
+        if !name.starts_with("STOOP_") {
+            values.insert(name.to_owned(), value.to_owned());
+        }
+    }
+    let mut env_excluded: Vec<String> = guard["env_excluded"]
+        .as_array()?
+        .iter()
+        .map(|value| value.as_str().map(str::to_owned))
+        .collect::<Option<_>>()?;
+    env_excluded.retain(|name| values.contains_key(name));
+    env_excluded.sort();
+    env_excluded.dedup();
+    let env = values
+        .into_iter()
+        .filter(|(name, _)| !env_excluded.contains(name))
+        .map(|(name, value)| (name, blake3::hash(value.as_bytes()).to_hex().to_string()))
+        .collect();
+    let mut ignore: Vec<String> = guard["ignore"]
+        .as_array()?
+        .iter()
+        .map(|value| value.as_str().map(str::to_owned))
+        .collect::<Option<_>>()?;
+    ignore.sort();
+    ignore.dedup();
+    let canonical = Guard {
+        env,
+        env_excluded,
+        ignore,
+    };
+    Some(
+        blake3::hash(&serde_json::to_vec(&canonical).ok()?)
+            .to_hex()
+            .to_string(),
+    )
+}
+
+/// Identify a fixture path with the same regular-file, link, absence and directory identities as the engine.
+pub fn model_identity(s: &Suite, key: &str, listed: bool) -> Option<String> {
+    let path = s.path(key);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            return (!key.starts_with('/')).then(|| "a".to_owned());
+        }
+        Err(_) => return None,
+    };
+    if meta.file_type().is_symlink() {
+        return Some(format!("l:{}", fs::read_link(path).ok()?.to_string_lossy()));
+    }
+    if meta.is_dir() {
+        if !listed {
+            return Some("d".to_owned());
+        }
+        let mut names = fs::read_dir(path)
+            .ok()?
+            .map(|entry| {
+                entry
+                    .ok()
+                    .map(|entry| entry.file_name().as_bytes().to_vec())
+            })
+            .collect::<Option<Vec<_>>>()?;
+        names.sort();
+        let mut hash = blake3::Hasher::new();
+        for name in names {
+            hash.update(&(name.len() as u64).to_le_bytes());
+            hash.update(&name);
+        }
+        return Some(format!("dl:{}", hash.finalize().to_hex()));
+    }
+    if meta.is_file() {
+        let bytes = fs::read(path).ok()?;
+        let kind = if meta.mode() & 0o111 == 0 { "f" } else { "x" };
+        return Some(format!("{kind}:{}", blake3::hash(&bytes).to_hex()));
+    }
+    None
+}
+
+/// A stored version holds only if its guard, age, every input and every output hold.
+/// `previous` supplies the observed pre-step identity of the one flag a launched reader is rerunning for.
+pub fn model_version_holds(
+    s: &Suite,
+    table: &[Value],
+    version: &Value,
+    guard: &str,
+    previous: Option<(&str, &str)>,
+) -> bool {
+    if version["guard"].as_str() != Some(guard) {
+        return false;
+    }
+    let Some(created) = version["created"].as_u64() else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs());
+    if now.saturating_sub(created) > 7 * 86_400 {
+        return false;
+    }
+    for field in ["inputs", "outputs"] {
+        let Some(entries) = version[field].as_array() else {
+            return false;
+        };
+        let mut index = 0u64;
+        for (at, delta) in entries.iter().enumerate() {
+            let Some(delta) = delta.as_u64() else {
+                return false;
+            };
+            let Some(next) = (if at == 0 {
+                Some(delta)
+            } else {
+                index.checked_add(delta)
+            }) else {
+                return false;
+            };
+            index = next;
+            let Some(entry) = table.get(index as usize) else {
+                return false;
+            };
+            let (Some(path), Some(id)) = (entry["path"].as_str(), entry["id"].as_str()) else {
+                return false;
+            };
+            let current = previous
+                .filter(|(name, _)| field == "inputs" && *name == path)
+                .map(|(_, id)| id.to_owned())
+                .or_else(|| model_identity(s, path, id.starts_with("dl:")));
+            if current.as_deref() != Some(id) {
+                return false;
+            }
+        }
+    }
+    true
+}
 pub type ModelListings = BTreeMap<String, std::collections::BTreeSet<String>>;
 
 /// Paths the model observed the last successful full runner reading.

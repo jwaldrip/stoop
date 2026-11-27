@@ -925,13 +925,14 @@ fn stored_reads(stored: &Value, units: &[String]) -> Vec<String> {
     out
 }
 
-/// A stat and a content read share an identity. Check the unit's recorded own-file bytes and its runner line too.
-fn e3_stored_content_flag(
+/// The version that read the flag and the unit must be the same version that passes the requested validity check.
+fn e3_flag_reader(
     stored: &Value,
     s: &Suite,
     units: &[String],
     flag: &str,
     previous: &str,
+    validity: Option<(&str, Option<(&str, &str)>)>,
 ) -> bool {
     let Some(table) = stored["table"].as_array() else {
         return false;
@@ -975,12 +976,44 @@ fn e3_stored_content_flag(
                 has_unit |= path == unit && hash == unit_hash;
                 has_flag |= path == flag && hash == flag_hash;
             }
-            if has_unit && has_flag {
+            if has_unit
+                && has_flag
+                && validity.is_none_or(|(guard, previous)| {
+                    model_version_holds(s, table, version, guard, previous)
+                })
+            {
                 return true;
             }
         }
     }
     false
+}
+
+/// Historical evidence that a stored version read these bytes, without claiming it is still valid.
+fn e3_stored_content_flag(
+    stored: &Value,
+    s: &Suite,
+    units: &[String],
+    flag: &str,
+    previous: &str,
+) -> bool {
+    e3_flag_reader(stored, s, units, flag, previous, None)
+}
+
+/// A held reader must have a valid guard, all inputs and outputs, and the requested flag content.
+fn e3_valid_flag_reader(
+    stored: &Value,
+    s: &Suite,
+    units: &[String],
+    flag: &str,
+    content: &str,
+    env: &[(&str, &str)],
+    previous: Option<(&str, &str)>,
+) -> bool {
+    let Some(guard) = model_current_guard(s, stored, env) else {
+        return false;
+    };
+    e3_flag_reader(stored, s, units, flag, content, Some((&guard, previous)))
 }
 
 #[test]
@@ -1027,6 +1060,7 @@ struct E3GapEvidence {
     stored_content: bool,
     launched_stored_content: bool,
     held_current_content: bool,
+    sticky_reader_valid: bool,
     current_content: bool,
     appeared_test_content: bool,
 }
@@ -1218,8 +1252,9 @@ fn e3_classify_failure(
     evidence: E3GapEvidence,
 ) -> Option<E3Failure> {
     debug_assert_eq!(failure.len(), 1);
-    if previous
-        .is_some_and(|old| e3_sticky(old, failure, policy_failures, runners, units, launches))
+    if evidence.sticky_reader_valid
+        && previous
+            .is_some_and(|old| e3_sticky(old, failure, policy_failures, runners, units, launches))
     {
         Some(E3Failure::Sticky)
     } else {
@@ -1323,6 +1358,16 @@ fn run_e3_recreating(
     tally: &mut E3Tally,
     recreate: bool,
 ) -> Result<(), String> {
+    r10x_run_e3(seed, steps, tally, recreate, None)
+}
+
+fn r10x_run_e3(
+    seed: u64,
+    steps: usize,
+    tally: &mut E3Tally,
+    recreate: bool,
+    case: Option<R10Case>,
+) -> Result<(), String> {
     let grouped = model_group_enabled();
     let s = Suite::new();
     let mut rng = Rng::new(seed);
@@ -1400,6 +1445,11 @@ fn run_e3_recreating(
                 )
             })
             .collect();
+        let before_flag_ids: std::collections::BTreeMap<String, Option<String>> = world
+            .runners
+            .iter()
+            .map(|runner| (runner.clone(), model_identity(&s, &flag_of(runner), false)))
+            .collect();
         let forced_noop = last_125 && rng.below(2) == 0;
         let recreate_empty = recreate && seed == 10037 && step == 9;
         if recreate_empty {
@@ -1409,13 +1459,19 @@ fn run_e3_recreating(
             assert_eq!(fs::read_dir(dir).unwrap().count(), 0);
             eprintln!("R8 INSERTED MODEL OP: replacing a present empty directory with an identical empty directory after the accepted w22 gap");
         }
-        let count = if forced_noop || recreate_empty {
+        let scripted = case.and_then(|case| r10x_ops(case, step, world.foo));
+        let count = if scripted.is_some() {
+            0
+        } else if forced_noop || recreate_empty {
             1
         } else {
             1 + rng.below(3)
         };
-        let mut ops = Vec::new();
+        let mut ops = scripted.unwrap_or_default();
         world.forced = false;
+        for op in &ops {
+            world.apply(&s, &mut rng, op);
+        }
         for _ in 0..count {
             let op = if recreate_empty {
                 Step::ListedDirectory(1)
@@ -1436,12 +1492,28 @@ fn run_e3_recreating(
         }
         let stored = s.bundle().unwrap_or(Value::Null);
         s.clear_log();
-        let subject = split(&s, &subject_env);
-        let launches = launched(&s);
+        let mut subject = split(&s, &subject_env);
+        let mut launches = launched(&s);
+        // Exercise the real CLI before feeding the classifier the reviewer's simulated wrong skip.
+        if let Some(case) = case {
+            if step == 12 {
+                assert_eq!(code(&subject), 1, "{}", stderr(&subject));
+                assert_eq!(launches, [""], "the actual CLI must run full");
+                let reason = match case {
+                    R10Case::HeldEnv => "the environment changed since the last full run",
+                    R10Case::HeldSetup => "setup.src changed and every unit reads it",
+                };
+                assert!(stderr(&subject).contains(reason), "{}", stderr(&subject));
+                use std::os::unix::process::ExitStatusExt;
+                subject.status = std::process::ExitStatus::from_raw(0);
+                launches.clear();
+            }
+        }
         if grouped {
             tally.group.record(&s, &launches);
         }
         let launched_units = model_launch_units(&launches, grouped);
+        let after_stored = s.bundle().unwrap_or(Value::Null);
         s.clear_log();
         let oracle = s.direct(&s.root, &[], &env);
         let failed = oracle_failed_tests(&s);
@@ -1562,15 +1634,31 @@ fn run_e3_recreating(
                 "WRONG VERDICT: the full runner has an independent policy failure",
             ));
         }
+        let valid_sticky_reader = |test: &String| {
+            let flag = flag_of(test);
+            fs::read_to_string(s.path(&flag)).is_ok_and(|content| {
+                e3_valid_flag_reader(&stored, &s, &world.units, &flag, &content, &env, None)
+                    || e3_valid_flag_reader(
+                        &after_stored,
+                        &s,
+                        &launched_units,
+                        &flag,
+                        &content,
+                        &env,
+                        None,
+                    )
+            })
+        };
         if let Some(previous) = divergence.as_ref().filter(|previous| {
-            e3_sticky(
-                previous,
-                &failed,
-                &policy_failures,
-                &world.runners,
-                &world.units,
-                &launched_units,
-            )
+            failed.iter().all(&valid_sticky_reader)
+                && e3_sticky(
+                    previous,
+                    &failed,
+                    &policy_failures,
+                    &world.runners,
+                    &world.units,
+                    &launched_units,
+                )
         }) {
             sticky_retries += 1;
             if sticky_retries * 3 > steps {
@@ -1609,16 +1697,17 @@ fn run_e3_recreating(
         let current = !failed.is_empty()
             && failed.iter().all(|test| {
                 listed_now(&flag_of(test))
-                    || divergence.as_ref().is_some_and(|old| {
-                        e3_sticky(
-                            old,
-                            std::slice::from_ref(test),
-                            &policy_failures,
-                            &world.runners,
-                            &world.units,
-                            &launched_units,
-                        )
-                    })
+                    || (valid_sticky_reader(test)
+                        && divergence.as_ref().is_some_and(|old| {
+                            e3_sticky(
+                                old,
+                                std::slice::from_ref(test),
+                                &policy_failures,
+                                &world.runners,
+                                &world.units,
+                                &launched_units,
+                            )
+                        }))
             });
         let stored_gap = !failed.is_empty()
             && failed.iter().all(|test| {
@@ -1654,11 +1743,25 @@ fn run_e3_recreating(
                         e3_stored_content_flag(&stored, &s, &world.units, &flag, value)
                     }),
                     launched_stored_content: previous_flag.is_some_and(|value| {
-                        e3_stored_content_flag(&stored, &s, &launched_units, &flag, value)
+                        before_flag_ids
+                            .get(test)
+                            .and_then(|id| id.as_deref())
+                            .is_some_and(|id| {
+                                e3_valid_flag_reader(
+                                    &stored,
+                                    &s,
+                                    &launched_units,
+                                    &flag,
+                                    value,
+                                    &env,
+                                    Some((&flag, id)),
+                                )
+                            })
                     }),
                     held_current_content: fs::read_to_string(s.path(&flag)).is_ok_and(|value| {
-                        e3_stored_content_flag(&stored, &s, &world.units, &flag, &value)
+                        e3_valid_flag_reader(&stored, &s, &world.units, &flag, &value, &env, None)
                     }),
+                    sticky_reader_valid: valid_sticky_reader(test),
                     current_content: listed_now(&flag),
                     appeared_test_content: e3_launched_content_path(&after, &launched_units, test),
                 };
@@ -3560,7 +3663,7 @@ fn r9x_a_held_reader_version_after_a_round_trip_is_rejected() {
         flag_flipped: !previous.contains("fail"),
         stored_content: e3_stored_content_flag(&stored, &s, &units, flag, &previous),
         launched_stored_content: e3_stored_content_flag(&stored, &s, &launches, flag, &previous),
-        held_current_content: e3_stored_content_flag(&stored, &s, &units, flag, "fail\n"),
+        held_current_content: e3_valid_flag_reader(&stored, &s, &units, flag, "fail\n", &TU, None),
         current_content: !no_content_reader(&s, &after, flag),
         appeared_test_content: e3_launched_content_path(&after, &launches, failure),
         ..E3GapEvidence::default()
@@ -3607,24 +3710,29 @@ fn r9x_a_second_w22_during_a_sticky_retry_is_rejected() {
     assert_eq!(known(&s), Some(0), "{}", residue(&s));
     let units: Vec<String> = ROSTER.iter().map(|unit| (*unit).to_owned()).collect();
     let runners = vec!["tests/y.u".to_owned(), "tests/z.u".to_owned()];
-    let classify =
-        |stored: &Value, launches: &[String], test: &str, previous: &str, flipped: bool| {
-            let flag = flag_of(test);
-            let after = e3_listings(&s, &units);
-            E3GapEvidence {
-                runner_only: !launches
-                    .iter()
-                    .any(|launch| launch == test || launch.is_empty()),
-                flag_flipped: flipped && !previous.contains("fail"),
-                stored_content: e3_stored_content_flag(stored, &s, &units, &flag, previous),
-                launched_stored_content: e3_stored_content_flag(
-                    stored, &s, launches, &flag, previous,
-                ),
-                current_content: !no_content_reader(&s, &after, &flag),
-                appeared_test_content: e3_launched_content_path(&after, launches, test),
-                ..E3GapEvidence::default()
-            }
-        };
+    let classify = |stored: &Value,
+                    launches: &[String],
+                    test: &str,
+                    previous: &str,
+                    flipped: bool| {
+        let flag = flag_of(test);
+        let after = e3_listings(&s, &units);
+        E3GapEvidence {
+            runner_only: !launches
+                .iter()
+                .any(|launch| launch == test || launch.is_empty()),
+            flag_flipped: flipped && !previous.contains("fail"),
+            stored_content: e3_stored_content_flag(stored, &s, &units, &flag, previous),
+            launched_stored_content: e3_stored_content_flag(stored, &s, launches, &flag, previous),
+            sticky_reader_valid: fs::read_to_string(s.path(&flag)).is_ok_and(|content| {
+                e3_valid_flag_reader(stored, &s, &units, &flag, &content, &TU, None)
+                    || e3_valid_flag_reader(&bundle(&s), &s, launches, &flag, &content, &TU, None)
+            }),
+            current_content: !no_content_reader(&s, &after, &flag),
+            appeared_test_content: e3_launched_content_path(&after, launches, test),
+            ..E3GapEvidence::default()
+        }
+    };
     let stored = bundle(&s);
     s.write("tests/z.flag", "fail\n");
     let (_, origin, origin_launches, origin_oracle) = judge("r9x-second-origin", &s, &TU, true);
@@ -3769,6 +3877,7 @@ fn r10_mixed_failure_rejects_unexplained_or_changed_runners() {
         flag_flipped: true,
         stored_content: true,
         launched_stored_content: true,
+        sticky_reader_valid: true,
         current_content: true,
         ..E3GapEvidence::default()
     };
@@ -3780,7 +3889,10 @@ fn r10_mixed_failure_rejects_unexplained_or_changed_runners() {
             &runners,
             &[],
             &[],
-            E3GapEvidence::default()
+            E3GapEvidence {
+                sticky_reader_valid: true,
+                ..E3GapEvidence::default()
+            }
         ),
         Some(E3Failure::Sticky)
     );
@@ -3817,7 +3929,10 @@ fn r10_mixed_failure_rejects_unexplained_or_changed_runners() {
             &runners,
             &[],
             &[],
-            E3GapEvidence::default()
+            E3GapEvidence {
+                sticky_reader_valid: true,
+                ..E3GapEvidence::default()
+            }
         ),
         None
     );
@@ -3829,8 +3944,172 @@ fn r10_mixed_failure_rejects_unexplained_or_changed_runners() {
             &runners,
             &[],
             &[],
-            E3GapEvidence::default()
+            E3GapEvidence {
+                sticky_reader_valid: true,
+                ..E3GapEvidence::default()
+            }
         ),
         None
     );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum R10Case {
+    HeldEnv,
+    HeldSetup,
+}
+
+fn r10x_ops(case: R10Case, step: usize, foo: usize) -> Option<Vec<Step>> {
+    let flag = |value| Step::Flag("tests/m0.u".to_owned(), value);
+    match (case, step) {
+        (R10Case::HeldEnv | R10Case::HeldSetup, 9) => Some(vec![flag("ok"), Step::Forced]),
+        (R10Case::HeldEnv | R10Case::HeldSetup, 10) => Some(vec![flag("fail")]),
+        (R10Case::HeldEnv | R10Case::HeldSetup, 11) => Some(vec![flag("ok")]),
+        (R10Case::HeldEnv, 12) => Some(vec![flag("fail"), Step::Env((foo + 1) % 3)]),
+        (R10Case::HeldSetup, 12) => Some(vec![flag("fail"), Step::Setup]),
+        _ => None,
+    }
+}
+
+#[test]
+fn r10x_stale_held_proofs_must_not_excuse_a_required_full_run() {
+    let mut wrongly_accepted = Vec::new();
+    for case in [R10Case::HeldEnv, R10Case::HeldSetup] {
+        let mut tally = E3Tally::default();
+        let result = r10x_run_e3(10037, 12, &mut tally, false, Some(case));
+        eprintln!(
+            "R10 model {case:?}: {result:?} w22={} sticky={}",
+            tally.gap_w22, tally.gap_sticky
+        );
+        match result {
+            Ok(()) => wrongly_accepted.push(case),
+            Err(why) => {
+                assert!(why.contains("WRONG VERDICT"), "{why}");
+                assert!(why.contains("seed 10037, step 12"), "{why}");
+                assert!(why.contains("subject exit 0, oracle exit 1, oracle failed [\"tests/m0.u\"], policy failures [], launches []"), "{why}");
+            }
+        }
+    }
+    assert!(wrongly_accepted.is_empty(), "the oracle rejected a required full run, but E3 excused the simulated skip as a fresh W22: {wrongly_accepted:?}");
+}
+
+/// A real held reader plus a synthetic output, so each validity component can be changed independently.
+fn r11_reader_fixture() -> (Suite, Value, Vec<String>, String) {
+    let s = r7_policy_fixture();
+    let flag = "tests/z.flag";
+    s.write(flag, "fail\n");
+    let (_, run, launches, oracle) = judge("r11-reader", &s, &TU, true);
+    assert_eq!((code(&run), oracle), (0, 1), "{}", stderr(&run));
+    assert_eq!(launches, ["tests/c.t"]);
+    let mut stored = bundle(&s);
+    let units = vec!["tests/c.t".to_owned()];
+    let output = s.outside.join("model-output");
+    fs::write(&output, "output\n").unwrap();
+    let output = output.to_str().unwrap().to_owned();
+    let id = model_identity(&s, &output, false).unwrap();
+    let table = stored["table"].as_array_mut().unwrap();
+    let index = table.len();
+    table.push(serde_json::json!({"path": output, "id": id}));
+    stored["units"]["tests/c.t"][0]["outputs"] = serde_json::json!([index]);
+    assert!(e3_valid_flag_reader(
+        &stored, &s, &units, flag, "fail\n", &TU, None
+    ));
+    (s, stored, units, output)
+}
+
+fn r11_stale_reader_case(case: &str) {
+    let (s, stored, units, output) = r11_reader_fixture();
+    let flag = "tests/z.flag";
+    let old_id = model_identity(&s, flag, false).unwrap();
+    s.write(flag, "ok\n");
+    assert!(
+        e3_valid_flag_reader(
+            &stored,
+            &s,
+            &units,
+            flag,
+            "fail\n",
+            &TU,
+            Some((flag, &old_id))
+        ),
+        "a launched reader may use the observed pre-step flag identity"
+    );
+    s.write(flag, "fail\n");
+    let mut env = TU.to_vec();
+    match case {
+        "guard" => env.push(("FOO", "different")),
+        "input" => s.write("setup.src", "changed setup\n"),
+        "output" => fs::write(&output, "changed output\n").unwrap(),
+        _ => unreachable!(),
+    }
+    assert!(
+        e3_stored_content_flag(&stored, &s, &units, flag, "fail\n"),
+        "the old hash-only check must match"
+    );
+    let held = e3_valid_flag_reader(&stored, &s, &units, flag, "fail\n", &env, None);
+    assert!(!held, "{case}: a stale held reader cannot grant W22");
+    let failure = "tests/z.u".to_owned();
+    let runners = vec![failure.clone()];
+    let old = E3Diverged {
+        origin: 1,
+        failing: runners.iter().cloned().collect(),
+        changed: Default::default(),
+        shapes: vec![E3Gap::W22],
+    };
+    assert_eq!(
+        e3_classify_failure(
+            Some(&old),
+            &runners,
+            &[],
+            &runners,
+            &units,
+            &[],
+            E3GapEvidence {
+                sticky_reader_valid: held,
+                ..E3GapEvidence::default()
+            }
+        ),
+        None,
+        "{case}: stale proof cannot grant a sticky retry"
+    );
+    assert_eq!(
+        e3_gap(E3GapEvidence {
+            runner_only: true,
+            appeared_now: true,
+            current_content: true,
+            held_current_content: held,
+            appeared_test_content: false,
+            ..E3GapEvidence::default()
+        }),
+        None,
+        "{case}: E5 still needs the appeared test's launched reader"
+    );
+    s.write(flag, "ok\n");
+    assert!(
+        !e3_valid_flag_reader(
+            &stored,
+            &s,
+            &units,
+            flag,
+            "fail\n",
+            &env,
+            Some((flag, &old_id))
+        ),
+        "{case}: a launched reader cannot rely on a stale previous version"
+    );
+}
+
+#[test]
+fn r11_reader_rejects_a_stale_guard_in_every_proof_based_exemption() {
+    r11_stale_reader_case("guard");
+}
+
+#[test]
+fn r11_reader_rejects_a_stale_input_in_every_proof_based_exemption() {
+    r11_stale_reader_case("input");
+}
+
+#[test]
+fn r11_reader_rejects_a_stale_output_in_every_proof_based_exemption() {
+    r11_stale_reader_case("output");
 }
