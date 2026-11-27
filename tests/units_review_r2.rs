@@ -4077,7 +4077,9 @@ fn r11_stale_reader_case(case: &str) {
             runner_only: true,
             appeared_now: true,
             current_content: true,
-            held_current_content: held,
+            stored_content: true,
+            launched_stored_content: true,
+            held_current_content: true,
             appeared_test_content: false,
             ..E3GapEvidence::default()
         }),
