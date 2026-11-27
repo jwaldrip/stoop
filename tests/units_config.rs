@@ -665,6 +665,14 @@ fn unit_env_takes_a_table_of_strings_and_refuses_the_rest() {
             stderr(&out)
         );
     }
+    let boundary = (0..32)
+        .map(|n| format!("V{n} = '{}'", "x".repeat(4096)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    f.config(&format!("{prefix}unit_env = {{ {boundary} }}\n"));
+    let out = f.off(&["{changed}"]);
+    assert_ran(&out);
+    assert!(!stderr(&out).contains("ignoring the unit configuration"));
 
     let names = "unit_env names are letters, digits and underscores, not starting with a digit or with STOOP_";
     let limits = "unit_env holds at most 32 variables, each value at most 4096 bytes";
@@ -677,6 +685,7 @@ fn unit_env_takes_a_table_of_strings_and_refuses_the_rest() {
         ("unit_env = { MODE = 1 }".to_string(), "invalid type"),
         ("unit_env = { '1MODE' = 'x' }".to_string(), names),
         ("unit_env = { 'BAD-NAME' = 'x' }".to_string(), names),
+        ("unit_env = { 'É' = 'x' }".to_string(), names),
         ("unit_env = { STOOP_SPLIT = '1' }".to_string(), names),
         (
             "unit_env = { MODE = \"a\\u0000b\" }".to_string(),

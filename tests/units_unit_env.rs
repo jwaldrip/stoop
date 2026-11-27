@@ -138,13 +138,24 @@ fn uenv_u4_switch_off_attribution_and_switch_on_completion_share_unit_env() {
     ok(&s.hook(&[CACHE]));
     s.write("src/shared.src", "changed\n");
     s.clear_log();
-    s.clear_log();
     ok(&s.hook(&[CACHE]));
     assert_eq!(unit_count(&s), 3);
     assert_eq!(
         cache_values(&s),
         ["/dev/null/t", "/dev/null/t", "/dev/null/t"]
     );
+    s.write("tests/d.t", "src/c.src\n");
+    s.clear_log();
+    let completed = run(&s, &[]);
+    ok(&completed);
+    assert_eq!(
+        launches(&s),
+        [vec![], vec!["tests/d.t"]],
+        "{}",
+        text(&completed.stderr)
+    );
+    assert_eq!(cache_values(&s), [".tcache", "/dev/null/t"]);
+    assert_eq!(unit_count(&s), 4);
     s.write("src/shared.src", "changed again\n");
     s.clear_log();
     let out = run(&s, &[]);
