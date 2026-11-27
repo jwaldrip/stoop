@@ -1706,6 +1706,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_version_with_another_unit_env_digest_is_invalid() {
+        let guard = |unit_env: &str| {
+            LaunchGuard {
+                env: BTreeMap::new(),
+                env_excluded: Vec::new(),
+                ignore: Vec::new(),
+                unit_env: Some(unit_env.to_owned()),
+            }
+            .digest()
+        };
+        let (view, current) = view_of(Vec::new(), Vec::new());
+        let mut cx = judged(&[], 0);
+        cx.guard = guard("old overlay");
+        let mut saved = version(1_000, Vec::new());
+        saved.guard = cx.guard.clone();
+        assert!(version_reasons(&cx, &view, &current, &saved).0.is_empty());
+        cx.guard = guard("new overlay");
+        assert_eq!(
+            version_reasons(&cx, &view, &current, &saved).0,
+            ["the environment changed"]
+        );
+    }
+
     fn inexact_version(inputs: Vec<u32>) -> Version {
         let mut version = version(1_000, inputs);
         version.exact = false;

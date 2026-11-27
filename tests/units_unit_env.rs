@@ -54,7 +54,14 @@ fn unit_count(s: &Suite) -> usize {
 fn cache_values(s: &Suite) -> Vec<String> {
     s.launches()
         .iter()
-        .map(|launch| launch.env("cache").to_string())
+        .map(|launch| {
+            launch
+                .lines
+                .iter()
+                .find_map(|line| line.strip_prefix("cache="))
+                .expect("cache line")
+                .to_owned()
+        })
         .collect()
 }
 
@@ -180,15 +187,36 @@ fn uenv_u5_changing_unit_env_retires_every_proof() {
     let before = s.bundle().unwrap();
     let old_guard = before["guard_digest"].as_str().unwrap().to_owned();
     s.config(&format!(
+        "[[units.suite]]\nid = 'tests'\nmatch = ['./t', '{HOOK}']\n{OVERLAY}\n# harmless config edit\n"
+    ));
+    s.clear_log();
+    let control = run(&s, &[]);
+    ok(&control);
+    assert_eq!(
+        launches(&s),
+        [Vec::<String>::new()],
+        "{}",
+        text(&control.stderr)
+    );
+    let preserved = s.bundle().unwrap();
+    assert_ne!(before["whole_key_digest"], preserved["whole_key_digest"]);
+    assert_eq!(before["guard_digest"], preserved["guard_digest"]);
+    assert_eq!(before["units"], preserved["units"]);
+
+    s.config(&format!(
         "[[units.suite]]\nid = 'tests'\nmatch = ['./t', '{HOOK}']\nunit_env = {{ T_CACHE = '/dev/null/t', MODE = 'pass' }}\n"
     ));
-    s.write("src/shared.src", "changed\n");
     s.clear_log();
     let out = run(&s, &[]);
     ok(&out);
     assert_eq!(
         launches(&s),
-        [vec!["tests/a.t"], vec!["tests/b.t"], vec!["tests/c.t"]],
+        [
+            vec![],
+            vec!["tests/a.t"],
+            vec!["tests/b.t"],
+            vec!["tests/c.t"]
+        ],
         "{}",
         text(&out.stderr)
     );
