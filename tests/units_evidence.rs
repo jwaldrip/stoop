@@ -458,6 +458,35 @@ fn an_untraced_launch_that_exits_zero_before_a_traced_pass_has_no_verdict() {
 }
 
 #[test]
+fn an_untraced_launch_escapes_its_percent_once() {
+    const PERCENT: &str = "tests/a%.t";
+    let s = suite();
+    fs::rename(s.path(A), s.path(PERCENT)).unwrap();
+    s.executable("t", &runner().replace(A, PERCENT));
+    let library = fork_shim(&s);
+    let gate = gate(&s);
+    let mut env = shim_env(&library, &gate);
+    env.extend([("RVW_GATE", gate.as_str()), ("RVW_DROP_GATE", "1")]);
+    let first = hook(&s, &env);
+    assert_eq!(code(&first), 0, "{}", text(&first.stderr));
+    assert_eq!(launched(&s), ["", PERCENT, B, C]);
+    arm(&gate);
+    edit_shared(&s);
+    s.clear_log();
+    let out = hook(&s, &env);
+    let stderr = text(&out.stderr);
+    assert_eq!(launched(&s), [PERCENT, B], "{stderr}");
+    assert_eq!(code(&out), 125, "{stderr}");
+    assert!(
+        stderr.contains(
+            "the launch of tests/a%25.t could not be traced, so it has no member evidence"
+        ),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("tests/a%2525.t"), "{stderr}");
+}
+
+#[test]
 fn an_untraced_launch_that_fails_keeps_its_status_without_a_mark() {
     let s = suite();
     let library = fork_shim(&s);
