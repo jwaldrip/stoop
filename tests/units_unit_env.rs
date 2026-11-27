@@ -130,7 +130,7 @@ fn uenv_mixed_version_stamps_relearn_only_the_stale_unit() {
     )
     .unwrap();
     s.clear_log();
-    let out = s.hook(&[SPLIT]);
+    let out = s.hook(&[SPLIT, ("STOOP_FULL", "1")]);
     ok(&out);
     assert_eq!(
         launches(&s),
@@ -156,7 +156,11 @@ fn uenv_switch_off_cannot_keep_a_residue_from_the_old_overlay() {
     ok(&s.hook(&[]));
     assert_eq!(s.bundle().unwrap()["residue"]["state"], "none");
     s.clear_log();
-    let out = s.hook(&[SPLIT]);
+    let cached = s.hook(&[SPLIT]);
+    ok(&cached);
+    assert!(launches(&s).is_empty(), "{}", text(&cached.stderr));
+    s.clear_log();
+    let out = s.hook(&[SPLIT, ("STOOP_FULL", "1")]);
     assert_full_and_all_units(&s, &out);
 }
 
@@ -464,6 +468,42 @@ fn uenv_f1_unit_env_counts_toward_the_grouped_fit() {
 
 #[test]
 fn uenv_f1_replacing_large_inherited_values_allows_grouping() {
+    // Bound the child's stack so Linux's ARG_MAX leaves room for at most 31 overridden names.
+    const CHILD: &str = "STOOP_UENV_FIT_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        use std::os::unix::process::CommandExt;
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "uenv_f1_replacing_large_inherited_values_allows_grouping",
+            ])
+            .env(CHILD, "1");
+        unsafe {
+            child.pre_exec(|| {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_STACK, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limit.rlim_cur = limit.rlim_cur.min(8 * 1024 * 1024);
+                if libc::setrlimit(libc::RLIMIT_STACK, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let out = child.output().unwrap();
+        assert!(
+            out.status.success() && text(&out.stdout).contains("1 passed"),
+            "{}\n{}",
+            text(&out.stdout),
+            text(&out.stderr)
+        );
+        return;
+    }
     let limit = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize / 2;
     assert!(
         limit > 150_000 && limit < 1_700_000,
