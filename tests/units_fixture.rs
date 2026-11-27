@@ -670,8 +670,6 @@ mod purity {
             .collect();
         let stray: Vec<_> = stored_inputs(&s, "full")
             .into_iter()
-            // The ignore file is stoop's own configuration, not a runner input.
-            .filter(|(path, _)| path != ".stoopignore")
             .filter(|(_, id)| id != "d" && !id.starts_with("dl:"))
             .filter(|input| !units.contains(input))
             .collect();
