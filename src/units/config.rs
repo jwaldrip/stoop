@@ -290,6 +290,29 @@ pub(crate) fn load(root: &Path) -> Result<Config, ConfigError> {
                 "unit_env holds at most 32 variables, each value at most 4096 bytes",
             ));
         }
+        if unit_env.keys().any(|name| name.len() > 255) {
+            return Err(ConfigError::named(
+                &source,
+                "unit_env",
+                "unit_env names hold at most 255 bytes",
+            ));
+        }
+        // Include '=' and the trailing NUL, as exec does for each environment entry.
+        let entry_bytes = |(name, value): (&String, &String)| name.len() + value.len() + 2;
+        if unit_env.iter().any(|entry| entry_bytes(entry) > 4352) {
+            return Err(ConfigError::named(
+                &source,
+                "unit_env",
+                "unit_env entries hold at most 4352 bytes including '=' and the terminator",
+            ));
+        }
+        if unit_env.iter().map(entry_bytes).sum::<usize>() > 32 * 1024 {
+            return Err(ConfigError::named(
+                &source,
+                "unit_env",
+                "unit_env holds at most 32768 serialized bytes",
+            ));
+        }
         let matches = raw
             .matches
             .iter()

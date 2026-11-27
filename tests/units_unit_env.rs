@@ -92,6 +92,37 @@ fn assert_full_and_all_units(s: &Suite, out: &Output) {
 }
 
 #[test]
+fn test_rvw_unit_env_name_must_fit_a_linux_environment_entry() {
+    let overlay = format!("unit_env = {{ {} = 'x' }}", "A".repeat(131_072));
+    let s = setup(Some(&overlay), true);
+    let first = s.hook(&[]);
+    assert_eq!(code(&first), 0, "{}", text(&first.stderr));
+    assert!(
+        text(&first.stderr).contains("unit_env names hold at most 255 bytes"),
+        "{}",
+        text(&first.stderr)
+    );
+    s.write("src/shared.src", "changed\n");
+    s.clear_log();
+    let out = s.hook(&[]);
+    assert_eq!(code(&out), 0, "{}", text(&out.stderr));
+    assert!(
+        text(&out.stderr).contains("unit_env names hold at most 255 bytes"),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(
+        launches(&s),
+        [Vec::<String>::new()],
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(!text(&out.stderr).contains("attribution pass"));
+    let direct = s.direct(&s.root, &[], &[]);
+    assert_eq!(code(&direct), 0, "{}", text(&direct.stderr));
+}
+
+#[test]
 fn uenv_adding_an_overlay_relearns_versions_written_without_one() {
     let s = setup(Some(""), true);
     ok(&s.hook(&[SPLIT]));
@@ -429,7 +460,7 @@ fn uenv_u9_a_unit_env_variable_a_test_reads_is_the_documented_premise() {
 #[test]
 fn uenv_f1_unit_env_counts_toward_the_grouped_fit() {
     let mut fields = vec!["T_CACHE = '/dev/null/t'".to_owned()];
-    fields.extend((0..31).map(|n| format!("OVERLAY_{n} = '{}'", "x".repeat(4096))));
+    fields.extend((0..7).map(|n| format!("OVERLAY_{n} = '{}'", "x".repeat(4096))));
     let s = setup(
         Some(&format!("unit_env = {{ {} }}", fields.join(", "))),
         true,
@@ -439,7 +470,7 @@ fn uenv_f1_unit_env_counts_toward_the_grouped_fit() {
         limit > 150_000 && limit < 8_000_000,
         "unexpected ARG_MAX: {limit}"
     );
-    let target = limit - 65_536;
+    let target = limit - 16_384;
     let mut padding = Vec::new();
     let mut remaining = target.saturating_sub(4096);
     while remaining > 0 {
