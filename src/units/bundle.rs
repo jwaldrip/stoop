@@ -2691,6 +2691,32 @@ mod tests {
         ));
     }
 
+    // The same bytes are produced by the main-branch codec in the compatibility probe.
+    const MAIN_UNSET_BUNDLE: &str = concat!(
+        r#"{"v":1,"generation":2,"suite":"00000000000000000000000000000000","#,
+        r#""provenance":{"os":"linux","arch":"x86_64","tracer":"ptrace-seccomp","version":1},"#,
+        r#""origin":{"kind":"hook","cwd":"","scope":null,"invocation":"invocation"},"#,
+        r#""whole_key_digest":"key-digest","whole":"p-1","policy":"policy","#,
+        r#""guard":{"env":{},"env_excluded":[],"ignore":[]},"guard_digest":"guard","#,
+        r#""roster":{"source":"filter","units":["tests/a.t"]},"whole_roster":["tests/a.t"],"#,
+        r#""table":[{"path":"tests/a.t","id":"f:00","oid":null}],"#,
+        r#""units":{"tests/a.t":[{"created":1,"exact":true,"source":{"kind":"exit"},"guard":"guard","inputs":[0],"outputs":[]}]},"#,
+        r#""residue":{"state":"confirmed","paths":[],"count":0,"whole":"p-1"},"state":{"status":"ready"}}"#
+    );
+
+    #[test]
+    fn a_main_written_unset_bundle_loads_and_keeps_its_exact_bytes() {
+        let bundle: SuiteBundleV1 = serde_json::from_str(MAIN_UNSET_BUNDLE).unwrap();
+        assert!(valid_bundle(&bundle, "00000000000000000000000000000000"));
+        assert!(valid_versions(&bundle));
+        assert!(bundle.guard.unit_env.is_none());
+        assert!(bundle.units["tests/a.t"][0].unit_env.is_none());
+        assert_eq!(encode(&bundle).unwrap(), MAIN_UNSET_BUNDLE.as_bytes());
+        let view = View::of(bundle).unwrap();
+        assert_eq!(view.residue, Some((0, Vec::new())));
+        assert!(view.units["tests/a.t"][0].unit_env.is_none());
+    }
+
     #[test]
     fn suite_ids_are_length_delimited_and_bind_every_field() {
         let words = vec![OsString::from("runner"), OsString::from("{changed:*.t}")];
