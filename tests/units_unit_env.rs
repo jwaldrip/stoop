@@ -188,6 +188,17 @@ fn test_rvw_valid_overlay_overfills_singleton_aggregate_environment() {
 }
 
 #[test]
+fn uenv_singleton_fit_excludes_overridden_inherited_values() {
+    let s = setup(
+        Some("unit_env = { RUNNER_PAD_A = 'a', RUNNER_PAD_B = 'b' }"),
+        true,
+    );
+    let out = fit_run(&s, true, false, true, false);
+    assert_full_and_all_units(&s, &out);
+    assert!(!text(&out.stderr).contains(FIT_REASON));
+}
+
+#[test]
 fn uenv_subset_fit_checks_the_actual_inherited_environment() {
     let s = setup(Some(&large_overlay()), true);
     ok(&fit_run(&s, true, false, false, false));
