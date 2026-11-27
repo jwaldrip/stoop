@@ -18,6 +18,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Output;
 use std::time::Duration;
+use units_common::engine_model::{engine_would_decide, model_whole_proof, ModelDecision};
 use units_common::*;
 
 const SPLIT: (&str, &str) = ("STOOP_SPLIT", "1");

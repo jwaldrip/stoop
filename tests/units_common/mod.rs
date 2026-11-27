@@ -2,8 +2,7 @@
 //! and a small tree), the stoop CLI with a clean environment, and a reader for the runner's log.
 #![allow(dead_code)]
 
-mod engine_model;
-pub use engine_model::{engine_would_decide, model_whole_proof, ModelDecision};
+pub mod engine_model;
 
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
