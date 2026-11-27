@@ -648,6 +648,58 @@ options = [{ names = ["--label"], values = 1 }]
 }
 
 #[test]
+fn unit_env_takes_a_table_of_strings_and_refuses_the_rest() {
+    let f = Fixture::new();
+    let prefix = "[[units.suite]]\nid = 'x'\nmatch = ['./runner', '{changed}']\n";
+    for table in [
+        "unit_env = {}\n",
+        "unit_env = { MODE = 'pass', _NAME9 = 'literal $HOME' }\n",
+        "[units.suite.unit_env]\nPATH = '/usr/bin'\n",
+    ] {
+        f.config(&format!("{prefix}{table}"));
+        let out = f.off(&["{changed}"]);
+        assert_ran(&out);
+        assert!(
+            !stderr(&out).contains("ignoring the unit configuration"),
+            "{table}: {}",
+            stderr(&out)
+        );
+    }
+
+    let names = "unit_env names are letters, digits and underscores, not starting with a digit or with STOOP_";
+    let limits = "unit_env holds at most 32 variables, each value at most 4096 bytes";
+    let too_many = (0..33)
+        .map(|n| format!("V{n} = 'x'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cases = [
+        ("unit_env = 1".to_string(), "invalid type"),
+        ("unit_env = { MODE = 1 }".to_string(), "invalid type"),
+        ("unit_env = { '1MODE' = 'x' }".to_string(), names),
+        ("unit_env = { 'BAD-NAME' = 'x' }".to_string(), names),
+        ("unit_env = { STOOP_SPLIT = '1' }".to_string(), names),
+        (
+            "unit_env = { MODE = \"a\\u0000b\" }".to_string(),
+            "unit_env values cannot hold NUL",
+        ),
+        (
+            format!("unit_env = {{ MODE = '{}' }}", "x".repeat(4097)),
+            limits,
+        ),
+        (format!("unit_env = {{ {too_many} }}"), limits),
+    ];
+    for (table, message) in cases {
+        f.config(&format!("{prefix}{table}\n"));
+        let out = f.off(&["{changed}"]);
+        assert_ran(&out);
+        let error = stderr(&out);
+        assert!(error.contains(message), "{table}: {error}");
+        assert!(error.contains(".stoop.toml:4:"), "{table}: {error}");
+        assert!(error.contains("ignoring the unit configuration"), "{error}");
+    }
+}
+
+#[test]
 fn parser_errors_report_the_offending_line() {
     let f = Fixture::new();
     for (text, line) in [
