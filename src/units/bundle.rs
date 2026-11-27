@@ -3142,7 +3142,9 @@ mod pass_tests {
     #[test]
     fn unit_env_kept_pass_clears_residue_before_changing_guard() {
         let bundle = mixed_env_bundle();
-        let pending = pending_for(&["tests/a.t", "tests/b.t"]);
+        // The departing stale version shares its only read with the kept version, so pruning
+        // alone cannot notice that the old residue was measured under another environment.
+        let pending = pending_for(&["tests/a.t"]);
         let dir = seed("unit-env-keep-mixed", &bundle);
         let launch_guard = LaunchGuard {
             unit_env: Some("new".into()),
