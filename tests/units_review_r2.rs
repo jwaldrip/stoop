@@ -1445,10 +1445,39 @@ fn r10x_run_e3(
                 )
             })
             .collect();
-        let before_flag_ids: std::collections::BTreeMap<String, Option<String>> = world
+        let stored = s.bundle().unwrap_or(Value::Null);
+        let whole_proof = model_whole_proof(&s, &stored);
+        let before_foo = world.foo.to_string();
+        let before_env = [("T_U", "1"), ("FOO", before_foo.as_str())];
+        let before_readers: std::collections::BTreeMap<String, Vec<String>> = world
             .runners
             .iter()
-            .map(|runner| (runner.clone(), model_identity(&s, &flag_of(runner), false)))
+            .map(|test| {
+                let flag = flag_of(test);
+                let readers = before_flags
+                    .get(test)
+                    .and_then(|content| content.as_deref())
+                    .map(|content| {
+                        world
+                            .units
+                            .iter()
+                            .filter(|unit| {
+                                e3_valid_flag_reader(
+                                    &stored,
+                                    &s,
+                                    std::slice::from_ref(*unit),
+                                    &flag,
+                                    content,
+                                    &before_env,
+                                    None,
+                                )
+                            })
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                (test.clone(), readers)
+            })
             .collect();
         let forced_noop = last_125 && rng.below(2) == 0;
         let recreate_empty = recreate && seed == 10037 && step == 9;
@@ -1490,18 +1519,30 @@ fn r10x_run_e3(
         if world.forced {
             subject_env.push(("STOOP_FULL", "1"));
         }
-        let stored = s.bundle().unwrap_or(Value::Null);
+        let decision = engine_would_decide(
+            &s,
+            &stored,
+            whole_proof.as_ref(),
+            &world.units,
+            &env,
+            world.forced,
+        );
         s.clear_log();
         let mut subject = split(&s, &subject_env);
         let mut launches = launched(&s);
         // Exercise the real CLI before feeding the classifier the reviewer's simulated wrong skip.
         if let Some(case) = case {
-            if step == 12 {
+            if step == 12 && !matches!(case, R10Case::LaunchedSources) {
                 assert_eq!(code(&subject), 1, "{}", stderr(&subject));
                 assert_eq!(launches, [""], "the actual CLI must run full");
                 let reason = match case {
                     R10Case::HeldEnv => "the environment changed since the last full run",
                     R10Case::HeldSetup => "setup.src changed and every unit reads it",
+                    R10Case::HeldRoster => {
+                        "tests/r11-new.t was not on the roster of the last full run"
+                    }
+                    R10Case::HeldForced => "STOOP_FULL is set",
+                    R10Case::LaunchedSources => unreachable!(),
                 };
                 assert!(stderr(&subject).contains(reason), "{}", stderr(&subject));
                 use std::os::unix::process::ExitStatusExt;
@@ -1634,6 +1675,25 @@ fn r10x_run_e3(
                 "WRONG VERDICT: the full runner has an independent policy failure",
             ));
         }
+        match &decision {
+            ModelDecision::Full(reason) => {
+                return Err(report(&format!(
+                    "WRONG VERDICT: model requires the full command ({reason})"
+                )));
+            }
+            ModelDecision::Subset(units) => {
+                if units != &launched_units {
+                    return Err(report(&format!(
+                        "WRONG VERDICT: model requires launches {units:?}, observed {launched_units:?}"
+                    )));
+                }
+            }
+            ModelDecision::Skip => {
+                if !launched_units.is_empty() {
+                    return Err(report("WRONG VERDICT: model requires a skip"));
+                }
+            }
+        }
         let valid_sticky_reader = |test: &String| {
             let flag = flag_of(test);
             fs::read_to_string(s.path(&flag)).is_ok_and(|content| {
@@ -1742,28 +1802,49 @@ fn r10x_run_e3(
                     stored_content: previous_flag.is_some_and(|value| {
                         e3_stored_content_flag(&stored, &s, &world.units, &flag, value)
                     }),
-                    launched_stored_content: previous_flag.is_some_and(|value| {
-                        before_flag_ids
-                            .get(test)
-                            .and_then(|id| id.as_deref())
-                            .is_some_and(|id| {
-                                e3_valid_flag_reader(
-                                    &stored,
-                                    &s,
-                                    &launched_units,
-                                    &flag,
-                                    value,
-                                    &env,
-                                    Some((&flag, id)),
-                                )
-                            })
+                    launched_stored_content: before_readers.get(test).is_some_and(|readers| {
+                        let candidates: Vec<String> = readers
+                            .iter()
+                            .filter(|unit| launched_units.contains(unit))
+                            .cloned()
+                            .collect();
+                        fs::read_to_string(s.path(&flag)).is_ok_and(|content| {
+                            e3_valid_flag_reader(
+                                &after_stored,
+                                &s,
+                                &candidates,
+                                &flag,
+                                &content,
+                                &env,
+                                None,
+                            )
+                        })
                     }),
                     held_current_content: fs::read_to_string(s.path(&flag)).is_ok_and(|value| {
                         e3_valid_flag_reader(&stored, &s, &world.units, &flag, &value, &env, None)
                     }),
                     sticky_reader_valid: valid_sticky_reader(test),
                     current_content: listed_now(&flag),
-                    appeared_test_content: e3_launched_content_path(&after, &launched_units, test),
+                    appeared_test_content: {
+                        let readers: Vec<String> = launched_units
+                            .iter()
+                            .filter(|unit| {
+                                e3_launched_content_path(&after, std::slice::from_ref(*unit), test)
+                            })
+                            .cloned()
+                            .collect();
+                        fs::read_to_string(s.path(&flag)).is_ok_and(|content| {
+                            e3_valid_flag_reader(
+                                &after_stored,
+                                &s,
+                                &readers,
+                                &flag,
+                                &content,
+                                &env,
+                                None,
+                            )
+                        })
+                    },
                 };
                 match e3_classify_failure(
                     divergence.as_ref(),
@@ -3957,16 +4038,37 @@ fn r10_mixed_failure_rejects_unexplained_or_changed_runners() {
 enum R10Case {
     HeldEnv,
     HeldSetup,
+    HeldRoster,
+    HeldForced,
+    LaunchedSources,
 }
 
 fn r10x_ops(case: R10Case, step: usize, foo: usize) -> Option<Vec<Step>> {
     let flag = |value| Step::Flag("tests/m0.u".to_owned(), value);
     match (case, step) {
-        (R10Case::HeldEnv | R10Case::HeldSetup, 9) => Some(vec![flag("ok"), Step::Forced]),
-        (R10Case::HeldEnv | R10Case::HeldSetup, 10) => Some(vec![flag("fail")]),
-        (R10Case::HeldEnv | R10Case::HeldSetup, 11) => Some(vec![flag("ok")]),
+        (
+            R10Case::HeldEnv
+            | R10Case::HeldSetup
+            | R10Case::HeldRoster
+            | R10Case::HeldForced
+            | R10Case::LaunchedSources,
+            9,
+        ) => Some(vec![flag("ok"), Step::Forced]),
+        (R10Case::LaunchedSources, 10) => {
+            Some(vec![Step::Source(0), Step::Source(2), flag("fail")])
+        }
+        (R10Case::HeldEnv | R10Case::HeldSetup | R10Case::HeldRoster | R10Case::HeldForced, 10) => {
+            Some(vec![flag("fail")])
+        }
+        (R10Case::HeldEnv | R10Case::HeldSetup | R10Case::HeldRoster | R10Case::HeldForced, 11) => {
+            Some(vec![flag("ok")])
+        }
         (R10Case::HeldEnv, 12) => Some(vec![flag("fail"), Step::Env((foo + 1) % 3)]),
         (R10Case::HeldSetup, 12) => Some(vec![flag("fail"), Step::Setup]),
+        (R10Case::HeldRoster, 12) => {
+            Some(vec![flag("fail"), Step::Add("tests/r11-new.t".to_owned())])
+        }
+        (R10Case::HeldForced, 12) => Some(vec![flag("fail"), Step::Forced]),
         _ => None,
     }
 }
@@ -3991,6 +4093,68 @@ fn r10x_stale_held_proofs_must_not_excuse_a_required_full_run() {
         }
     }
     assert!(wrongly_accepted.is_empty(), "the oracle rejected a required full run, but E3 excused the simulated skip as a fresh W22: {wrongly_accepted:?}");
+}
+
+#[test]
+fn r11x_a_valid_unit_proof_does_not_cancel_a_required_full_run() {
+    let mut accepted = Vec::new();
+    for case in [R10Case::HeldRoster, R10Case::HeldForced] {
+        let mut tally = E3Tally::default();
+        let result = r10x_run_e3(10037, 12, &mut tally, false, Some(case));
+        match result {
+            Ok(()) => accepted.push(case),
+            Err(why) => {
+                assert!(why.contains("WRONG VERDICT"), "{why}");
+                assert!(why.contains("seed 10037, step 12"), "{why}");
+                assert!(
+                    why.contains("oracle failed [\"tests/m0.u\"], policy failures [], launches []"),
+                    "{why}"
+                );
+            }
+        }
+    }
+    assert!(accepted.is_empty(), "the E3 model accepted a simulated skip even though non-unit reasons required full: {accepted:?}");
+}
+
+#[test]
+fn r11x_a_same_step_source_edit_preserves_a_genuine_launched_w22() {
+    let mut tally = E3Tally::default();
+    if let Err(why) = r10x_run_e3(10037, 10, &mut tally, false, Some(R10Case::LaunchedSources)) {
+        panic!("a genuine W22 with fresh proofs for both sources and the failing flag was rejected:\n{why}");
+    }
+    assert_eq!(tally.gap_w22, 2);
+}
+
+#[test]
+fn r12_forced_run_rejects_the_simulated_skip() {
+    let why = r10x_run_e3(
+        10037,
+        12,
+        &mut E3Tally::default(),
+        false,
+        Some(R10Case::HeldForced),
+    )
+    .unwrap_err();
+    assert!(
+        why.contains("model requires the full command (forced)"),
+        "{why}"
+    );
+}
+
+#[test]
+fn r12_new_roster_rejects_the_simulated_skip() {
+    let why = r10x_run_e3(
+        10037,
+        12,
+        &mut E3Tally::default(),
+        false,
+        Some(R10Case::HeldRoster),
+    )
+    .unwrap_err();
+    assert!(
+        why.contains("model requires the full command (new roster)"),
+        "{why}"
+    );
 }
 
 /// A real held reader plus a synthetic output, so each validity component can be changed independently.
