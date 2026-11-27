@@ -4157,6 +4157,66 @@ fn r12_new_roster_rejects_the_simulated_skip() {
     );
 }
 
+#[test]
+fn r12_environment_change_rejects_the_simulated_skip() {
+    let why = r10x_run_e3(
+        10037,
+        12,
+        &mut E3Tally::default(),
+        false,
+        Some(R10Case::HeldEnv),
+    )
+    .unwrap_err();
+    assert!(
+        why.contains("model requires the full command (environment)"),
+        "{why}"
+    );
+}
+
+#[test]
+fn r12_shared_input_change_rejects_the_simulated_skip() {
+    let why = r10x_run_e3(
+        10037,
+        12,
+        &mut E3Tally::default(),
+        false,
+        Some(R10Case::HeldSetup),
+    )
+    .unwrap_err();
+    assert!(
+        why.contains("model requires the full command (shared input)"),
+        "{why}"
+    );
+}
+
+#[test]
+fn r12_launched_reader_needs_a_current_replacement_proof() {
+    let s = r7_policy_fixture();
+    let flag = "tests/z.flag";
+    let readers = vec!["tests/c.t".to_owned()];
+    let previous = bundle(&s);
+    assert!(e3_valid_flag_reader(
+        &previous, &s, &readers, flag, "ok\n", &TU, None
+    ));
+    s.write(flag, "fail\n");
+    assert!(!e3_valid_flag_reader(
+        &previous, &s, &readers, flag, "fail\n", &TU, None
+    ));
+    let (_, run, launches, oracle) = judge("r12-replacement", &s, &TU, true);
+    assert_eq!((code(&run), oracle), (0, 1), "{}", stderr(&run));
+    assert_eq!(launches, readers);
+    let replacement = bundle(&s);
+    assert!(e3_valid_flag_reader(
+        &replacement,
+        &s,
+        &readers,
+        flag,
+        "fail\n",
+        &TU,
+        None
+    ));
+}
+
 /// A real held reader plus a synthetic output, so each validity component can be changed independently.
 fn r11_reader_fixture() -> (Suite, Value, Vec<String>, String) {
     let s = r7_policy_fixture();

@@ -54,6 +54,14 @@ fn regular_id(id: &str) -> bool {
     id.starts_with("f:") || id.starts_with("x:")
 }
 
+fn content_id(id: &str) -> bool {
+    id == "a"
+        || id == "u"
+        || ["f:", "x:", "dl:", "l:"]
+            .iter()
+            .any(|prefix| id.starts_with(prefix))
+}
+
 fn listing_holds(
     s: &Suite,
     listing: &Value,
@@ -77,6 +85,9 @@ fn listing_holds(
     let Some(expected) = id.strip_prefix("dl:") else {
         return false;
     };
+    if !fs::symlink_metadata(s.path(dir)).is_ok_and(|meta| meta.is_dir()) {
+        return false;
+    }
     let Ok(entries_now) = fs::read_dir(s.path(dir)) else {
         return false;
     };
@@ -303,6 +314,41 @@ pub fn engine_would_decide(
     {
         return ModelDecision::Full("whole output");
     }
+    if !affected.is_empty() {
+        let mut readers: std::collections::BTreeMap<String, (bool, bool)> = Default::default();
+        for (unit, versions) in units {
+            for version in versions.as_array().into_iter().flatten() {
+                let Some(reads) = entries(table, version, "inputs") else {
+                    return ModelDecision::Full("invalid unit inputs");
+                };
+                for entry in reads {
+                    let (Some(key), Some(identity)) = (path(entry), id(entry)) else {
+                        return ModelDecision::Full("invalid unit input");
+                    };
+                    if content_id(identity) {
+                        let reader = readers.entry(key.to_owned()).or_default();
+                        if roster.contains(unit) {
+                            reader.0 = true;
+                        } else {
+                            reader.1 = true;
+                        }
+                    }
+                }
+            }
+        }
+        if inputs.iter().any(|entry| {
+            let (Some(key), Some(identity)) = (path(entry), id(entry)) else {
+                return true;
+            };
+            content_id(identity)
+                && !identity.starts_with("dl:")
+                && readers.get(key).is_some_and(|&(live, gone)| gone && !live)
+                && !holds(s, entry)
+                && model_identity(s, key, false).as_deref() != Some("a")
+        }) {
+            return ModelDecision::Full("departed-only input");
+        }
+    }
     for entry in inputs {
         let (Some(key), Some(identity)) = (path(entry), id(entry)) else {
             return ModelDecision::Full("invalid whole input");
@@ -358,7 +404,11 @@ pub fn engine_would_decide(
                     let Some(key) = path(entry) else { return true };
                     (roster.contains(unit) || key != unit)
                         && inputs.iter().any(|whole| {
-                            path(whole) == Some(key) && id(whole).is_some_and(regular_id)
+                            path(whole) == Some(key)
+                                && id(whole).is_some_and(|identity| {
+                                    content_id(identity) && !identity.starts_with("dl:")
+                                })
+                                && !holds(s, whole)
                         })
                         && model_identity(s, key, false).as_deref() == Some("a")
                 }) {
@@ -368,8 +418,29 @@ pub fn engine_would_decide(
         }
         return ModelDecision::Subset(affected);
     }
-    if units.iter().any(|(unit, versions)| {
-        !roster.contains(unit) && versions.as_array().is_some_and(|v| !v.is_empty())
+    let mut live = std::collections::BTreeMap::<String, bool>::new();
+    let mut departed = std::collections::BTreeMap::<String, bool>::new();
+    for (unit, versions) in units {
+        let target = if roster.contains(unit) {
+            &mut live
+        } else {
+            &mut departed
+        };
+        for version in versions.as_array().into_iter().flatten() {
+            let Some(reads) = entries(table, version, "inputs") else {
+                return ModelDecision::Full("invalid unit inputs");
+            };
+            for entry in reads {
+                let (Some(key), Some(identity)) = (path(entry), id(entry)) else {
+                    return ModelDecision::Full("invalid unit input");
+                };
+                *target.entry(key.to_owned()).or_default() |= content_id(identity);
+            }
+        }
+    }
+    if departed.iter().any(|(key, content)| {
+        live.get(key)
+            .is_none_or(|live_content| *content && !live_content)
     }) {
         return ModelDecision::Full("departed reader");
     }
