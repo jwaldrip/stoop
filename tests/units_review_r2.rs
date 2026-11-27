@@ -1532,22 +1532,36 @@ fn r10x_run_e3(
         let mut launches = launched(&s);
         // Exercise the real CLI before feeding the classifier the reviewer's simulated wrong skip.
         if let Some(case) = case {
-            if step == 12 && !matches!(case, R10Case::LaunchedSources) {
-                assert_eq!(code(&subject), 1, "{}", stderr(&subject));
-                assert_eq!(launches, [""], "the actual CLI must run full");
-                let reason = match case {
-                    R10Case::HeldEnv => "the environment changed since the last full run",
-                    R10Case::HeldSetup => "setup.src changed and every unit reads it",
-                    R10Case::HeldRoster => {
-                        "tests/r11-new.t was not on the roster of the last full run"
-                    }
-                    R10Case::HeldForced => "STOOP_FULL is set",
-                    R10Case::LaunchedSources => unreachable!(),
-                };
-                assert!(stderr(&subject).contains(reason), "{}", stderr(&subject));
-                use std::os::unix::process::ExitStatusExt;
-                subject.status = std::process::ExitStatus::from_raw(0);
-                launches.clear();
+            match (case, step) {
+                (
+                    R10Case::HeldEnv
+                    | R10Case::HeldSetup
+                    | R10Case::HeldRoster
+                    | R10Case::HeldForced,
+                    12,
+                ) => {
+                    assert_eq!(code(&subject), 1, "{}", stderr(&subject));
+                    assert_eq!(launches, [""], "the actual CLI must run full");
+                    let reason = match case {
+                        R10Case::HeldEnv => "the environment changed since the last full run",
+                        R10Case::HeldSetup => "setup.src changed and every unit reads it",
+                        R10Case::HeldRoster => {
+                            "tests/r11-new.t was not on the roster of the last full run"
+                        }
+                        R10Case::HeldForced => "STOOP_FULL is set",
+                        _ => unreachable!(),
+                    };
+                    assert!(stderr(&subject).contains(reason), "{}", stderr(&subject));
+                    use std::os::unix::process::ExitStatusExt;
+                    subject.status = std::process::ExitStatus::from_raw(0);
+                    launches.clear();
+                }
+                (R10Case::UnexplainedSecond, 9) => {
+                    assert_eq!(code(&subject), 0, "{}", stderr(&subject));
+                    assert_eq!(launches, ["tests/m3.t"]);
+                    launches.clear();
+                }
+                _ => {}
             }
         }
         if grouped {
@@ -4041,6 +4055,8 @@ enum R10Case {
     HeldRoster,
     HeldForced,
     LaunchedSources,
+    Mixed,
+    UnexplainedSecond,
 }
 
 fn r10x_ops(case: R10Case, step: usize, foo: usize) -> Option<Vec<Step>> {
@@ -4069,6 +4085,11 @@ fn r10x_ops(case: R10Case, step: usize, foo: usize) -> Option<Vec<Step>> {
             Some(vec![flag("fail"), Step::Add("tests/r11-new.t".to_owned())])
         }
         (R10Case::HeldForced, 12) => Some(vec![flag("fail"), Step::Forced]),
+        (R10Case::Mixed | R10Case::UnexplainedSecond, 9) => Some(vec![
+            Step::ListedDirectory(0),
+            Step::ListedDirectory(1),
+            Step::Flag("tests/m1.u".to_owned(), "fail"),
+        ]),
         _ => None,
     }
 }
@@ -4123,6 +4144,23 @@ fn r11x_a_same_step_source_edit_preserves_a_genuine_launched_w22() {
         panic!("a genuine W22 with fresh proofs for both sources and the failing flag was rejected:\n{why}");
     }
     assert_eq!(tally.gap_w22, 2);
+}
+
+#[test]
+fn r12_mixed_failures_need_the_second_reader_to_launch() {
+    let mut tally = E3Tally::default();
+    r10x_run_e3(10037, 9, &mut tally, false, Some(R10Case::Mixed)).unwrap();
+    assert_eq!((tally.gap_w22, tally.gap_sticky), (2, 1));
+    let why = r10x_run_e3(
+        10037,
+        9,
+        &mut E3Tally::default(),
+        false,
+        Some(R10Case::UnexplainedSecond),
+    )
+    .expect_err("a sticky failure cannot excuse an unlaunched second reader");
+    assert!(why.contains("model requires launches"), "{why}");
+    assert!(why.contains("seed 10037, step 9"), "{why}");
 }
 
 #[test]
