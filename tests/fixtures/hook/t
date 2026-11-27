@@ -154,11 +154,10 @@ run_test() {
 }
 
 list_tests() {
-	set +f
 	if [ "${T_U:-}" = 1 ]; then
-		find ./* \( -name '.?*' -o -path ./slow \) -prune -o -type f \( -name '*.t' -o -name '*.u' \) -print
+		find . \( -name '.?*' -o -path ./slow \) -prune -o -type f \( -name '*.t' -o -name '*.u' \) -print
 	else
-		find ./* \( -name '.?*' -o -path ./slow \) -prune -o -type f -name '*.t' -print
+		find . \( -name '.?*' -o -path ./slow \) -prune -o -type f -name '*.t' -print
 	fi | sed 's|^\./||' | LC_ALL=C sort
 }
 

@@ -17,9 +17,11 @@ const OVERLAY: &str = "unit_env = { T_CACHE = '/dev/null/t' }";
 fn setup(overlay: Option<&str>, ignore_cache: bool) -> Suite {
     let s = Suite::new();
     fs::create_dir(s.path(".tcache")).unwrap();
-    if ignore_cache {
-        s.write(".stoopignore", ".tcache\n");
-    }
+    let cache_rule = if ignore_cache { ".tcache\n" } else { "" };
+    s.write(
+        ".stoopignore",
+        &format!(".stoop.toml\n.stoopignore\n{cache_rule}"),
+    );
     if let Some(overlay) = overlay {
         s.config(&format!(
             "[[units.suite]]\nid = 'tests'\nmatch = ['./t', '{HOOK}']\n{overlay}\n"

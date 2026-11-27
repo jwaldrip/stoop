@@ -652,7 +652,7 @@ mod purity {
     fn f5c_the_cache_knob_keeps_the_full_form_pure() {
         let s = Suite::new();
         fs::create_dir(s.path(".tcache")).unwrap();
-        s.write(".stoopignore", ".tcache\n");
+        s.write(".stoopignore", ".tcache\n.stoopignore\n");
         let env = [("T_CACHE", ".tcache")];
         assert_eq!(code(&s.direct(&s.root, &[], &env)), 0);
         for (key, words) in [
