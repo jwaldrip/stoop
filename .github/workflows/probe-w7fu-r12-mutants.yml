@@ -1,0 +1,53 @@
+name: W7 E3 predicate mutants
+
+on:
+  push:
+    branches: [probe/w7fu-r12-mutants]
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: |
+          cargo test --test units_review_r2 r11x_ -- --nocapture --test-threads=1
+          cargo test --test units_review_r2 r12_ -- --nocapture --test-threads=1
+  mutant:
+    needs: baseline
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mutant:
+          - FU15-ignore-forced
+          - FU16-ignore-roster
+          - FU17-old-reader-on-post-tree
+          - FU18-ignore-environment
+          - FU19-ignore-shared-input
+          - FU20-no-replacement-proof
+          - FU21-ignore-required-launches
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Require the named regression to kill the mutant
+        env:
+          MUTANT: ${{ matrix.mutant }}
+        run: |
+          set -eu
+          killer=$(python3 .github/w7fu-review/r12-mutants.py "$MUTANT")
+          echo "MUTANT=$MUTANT KILLER=$killer"
+          set +e
+          cargo test --test units_review_r2 "$killer" -- --exact --nocapture > result.log 2>&1
+          status=$?
+          set -e
+          cat result.log
+          test "$status" -ne 0
+          grep -F "test $killer ... FAILED" result.log
+          if grep -F 'could not compile' result.log; then exit 1; fi
+          echo "KILLED $MUTANT BY $killer"
