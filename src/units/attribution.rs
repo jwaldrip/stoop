@@ -676,8 +676,7 @@ pub(super) fn finish(
             say(
                 quiet,
                 format!(
-                    "stoop: this run has no verdict (exit 125): the launch of {} could not be traced, so it has no member evidence",
-                    safe(unit)
+                    "stoop: this run has no verdict (exit 125): the launch of {unit} could not be traced, so it has no member evidence"
                 ),
             );
         }
