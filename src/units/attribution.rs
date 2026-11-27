@@ -40,6 +40,24 @@ pub(crate) fn pass(
     let hook = cx.hook.as_ref()?;
     // Checks 1 to 7 are decided by `screen`, which `stoop explain` calls too.
     let pending = screen(cx, hook, config, lookup, Ok(pending)).ok()?;
+    if !pending.unit_env().is_empty()
+        && bundle::probe(store, pending, key).is_ok()
+        && !super::engine::singleton_fit(
+            cx,
+            pending,
+            store,
+            pending.units().iter().map(|unit| (unit.as_str(), &[][..])),
+        )
+    {
+        say(
+            cx.o.quiet,
+            format!(
+                "stoop: {}; running the full command",
+                super::engine::UNIT_ENV_FIT
+            ),
+        );
+        return None;
+    }
     // 8 and 9: the bundle is checked without the lock, then again under it. The store's unit folder is
     // excluded by its literal name, wherever the store sits, so no trace of it becomes an input (spec 4.7).
     let ignore = ignore_for(cx, store);
@@ -753,6 +771,8 @@ pub(crate) enum Refusal {
     Form,
     /// A unit's text holds the separator of a joined placeholder.
     Join,
+    /// The planned unit launch with its overlay exceeds the command-line fit bound.
+    EnvFit,
     /// A unit's absolute path holds a newline, which a newline list cannot name.
     Line,
     /// The suite has no current record of an earlier full run.
@@ -789,6 +809,7 @@ impl fmt::Display for Refusal {
             }
             Self::Join => "a unit's text contains the separator of a joined placeholder",
             Self::Line => "a unit's absolute path holds a newline, which a newline list cannot name",
+            Self::EnvFit => super::engine::UNIT_ENV_FIT,
             Self::NoBundle => "the suite has no current record of an earlier full run",
             Self::Unwritable => "the suite store cannot take a new entry",
             Self::Proven => "a unit of the roster already has a proof",
@@ -886,7 +907,18 @@ pub(crate) fn explain_lines(
         lookup,
         suite.pending.as_ref().map_err(|refusal| *refusal),
     )
-    .and_then(|pending| bundle::probe(store, pending, key).map(|()| pending.units().len()));
+    .and_then(|pending| {
+        bundle::probe(store, pending, key)?;
+        if !super::engine::singleton_fit(
+            cx,
+            pending,
+            store,
+            pending.units().iter().map(|unit| (unit.as_str(), &[][..])),
+        ) {
+            return Err(Refusal::EnvFit);
+        }
+        Ok(pending.units().len())
+    });
     let residue_text = bundle::known_residue(store, &suite.id, key)
         .map(|(count, paths)| residue::line(count, &paths));
     let tracked = tracked(store, &suite.id, &suite.units, key);

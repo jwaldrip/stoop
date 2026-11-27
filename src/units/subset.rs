@@ -111,6 +111,18 @@ pub(crate) fn learn(
         Kept::Locked(pass, units) => (pass, units),
         Kept::Busy | Kept::Unavailable | Kept::Declined(_) => return,
     };
+    if !engine::singleton_fit(
+        cx,
+        pending,
+        store,
+        units.iter().map(|unit| (unit.as_str(), &[][..])),
+    ) {
+        pass.unsettle();
+        if !cx.o.quiet {
+            eprintln!("stoop: {}; skipping completion", engine::UNIT_ENV_FIT);
+        }
+        return;
+    }
     pass.set_phase("completion");
     let quiet = cx.o.quiet;
     if !units.is_empty() {

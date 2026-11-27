@@ -17,6 +17,7 @@ use crate::input::{identify, list_hash_of_names, par_map, Input};
 use crate::pathutil::from_key;
 use crate::proof::{now, Proof};
 use crate::run::{Lookup, RunCx, HOOK_ENV};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -214,53 +215,78 @@ impl<'a> Judged<'a> {
     /// The grouped form of this decision, when `STOOP_SPLIT_GROUP` is on and the hook takes that form (spec 5.1). `store`
     /// names the list paths that the fit check counts.
     pub(super) fn grouping(mut self, cx: &RunCx<'_>, store: &Path) -> Judged<'a> {
-        if !grouped() {
+        let group = grouped() && cx.hook.as_ref().is_some_and(expand::groups);
+        if !group && self.unit_env.is_empty() {
             return self;
         }
-        let Some(hook) = cx.hook.as_ref() else {
-            return self;
-        };
-        if !expand::groups(hook) {
-            return self;
-        }
-        self.group = Some(Group {
-            hook: hook.clone(),
-            cwd: cx.cwd.clone(),
-            env: std::env::vars_os()
-                .filter(|(name, _)| {
-                    !HOOK_ENV
-                        .iter()
-                        .any(|var| name.as_os_str() == OsStr::new(var))
-                        && !name
-                            .to_str()
-                            .is_some_and(|name| self.unit_env.contains_key(name))
-                })
-                .chain(
-                    self.unit_env
-                        .iter()
-                        .map(|(name, value)| (OsString::from(name), OsString::from(value))),
-                )
-                .collect(),
-            stand_in: bundle::scratch_path_max(store, self.suite),
-            arg_max: expand::arg_max(),
-        });
+        self.group = Group::new(cx, self.unit_env, store, self.suite, group);
         self
     }
 }
 
-/// What a decision needs to check that a grouped launch fits the command line (spec 6): the hook, the cwd, the environment
-/// the launch inherits without the five hook variables it replaces, the length a list path takes, and the argument limit.
+/// One environment and argument-size rule for both grouped and single-unit launches.
 struct Group {
     hook: Hook,
     cwd: PathBuf,
-    env: Vec<(OsString, OsString)>,
+    env: RefCell<Vec<(OsString, OsString)>>,
     stand_in: usize,
     arg_max: usize,
+    grouped: bool,
 }
 
 impl Group {
-    /// Whether the grouped launch of `affected` fits the command line (spec 6): its argv, and its environment with each list
-    /// path at the stand-in length.
+    fn new(
+        cx: &RunCx<'_>,
+        unit_env: &BTreeMap<String, String>,
+        store: &Path,
+        suite: &str,
+        grouped: bool,
+    ) -> Option<Self> {
+        Some(Self {
+            hook: cx.hook.as_ref()?.clone(),
+            cwd: cx.cwd.clone(),
+            env: RefCell::new(
+                std::env::vars_os()
+                    .filter(|(name, _)| {
+                        !HOOK_ENV
+                            .iter()
+                            .any(|var| name.as_os_str() == OsStr::new(var))
+                            && !name
+                                .to_str()
+                                .is_some_and(|name| unit_env.contains_key(name))
+                    })
+                    .chain(
+                        unit_env
+                            .iter()
+                            .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+                    )
+                    .collect(),
+            ),
+            stand_in: bundle::scratch_path_max(store, suite),
+            arg_max: expand::arg_max(),
+            grouped,
+        })
+    }
+
+    fn fits_expanded(&self, argv: &[OsString], value: &OsStr, inputs: &OsStr) -> bool {
+        let mut env = self.env.borrow_mut();
+        let inherited = env.len();
+        env.extend(expand::exports(value, inputs, self.stand_in));
+        let fits = expand::fits(argv, &env, self.arg_max);
+        env.truncate(inherited);
+        fits
+    }
+
+    fn fits_one(&self, root: &Path, unit: &str, changed: &[String]) -> bool {
+        let list = |_: FileMode, _: Base| Some(OsString::from("x".repeat(self.stand_in)));
+        let Some(launch) = expand::launch(&self.hook, unit, root, &self.cwd, &list) else {
+            return false;
+        };
+        let inputs = expand::inputs_text(root, &self.cwd, changed.iter());
+        self.fits_expanded(&launch.argv, &launch.value, &inputs)
+    }
+
+    /// Whether a grouped launch fits, using the same effective environment as a singleton.
     fn fits(&self, root: &Path, affected: &[Affected]) -> bool {
         let members: Vec<String> = affected
             .iter()
@@ -276,10 +302,29 @@ impl Group {
             &self.cwd,
             affected.iter().flat_map(|affected| affected.changed.iter()),
         );
-        let mut env = self.env.clone();
-        env.extend(expand::exports(&many.value, &inputs, stand_in));
-        expand::fits(&many.argv, &env, self.arg_max)
+        self.fits_expanded(&many.argv, &many.value, &inputs)
     }
+}
+
+pub(super) const UNIT_ENV_FIT: &str =
+    "the unit launch environment does not fit on the command line";
+
+/// No added fit work or behavioral change is made for suites without an overlay.
+pub(super) fn singleton_fit<'a>(
+    cx: &RunCx<'_>,
+    pending: &Pending,
+    store: &Path,
+    launches: impl Iterator<Item = (&'a str, &'a [String])>,
+) -> bool {
+    if pending.unit_env().is_empty() {
+        return true;
+    }
+    let Some(fit) = Group::new(cx, pending.unit_env(), store, pending.suite(), false) else {
+        return false;
+    };
+    launches
+        .into_iter()
+        .all(|(unit, changed)| fit.fits_one(cx.root, unit, changed))
 }
 
 /// Whether grouped launches are on (spec 5.1): the engine is on, and `STOOP_SPLIT_GROUP` holds a true value.
@@ -616,7 +661,8 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
     // (spec 5.1, 6). A launch that does not fit takes the full form, and the reason says so.
     let whole = affected.len() == cx.roster.len();
     let uncovered = uncovered_changes(cx, view, &current, proof);
-    let as_group = !whole && affected.len() >= 2 && cx.group.is_some();
+    let as_group =
+        !whole && affected.len() >= 2 && cx.group.as_ref().is_some_and(|fit| fit.grouped);
     if as_group
         && !cx
             .group
@@ -631,6 +677,16 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
             shown,
             clean,
         );
+    }
+    if !as_group
+        && !cx.unit_env.is_empty()
+        && !cx.group.as_ref().is_some_and(|fit| {
+            affected.iter().all(|unit| {
+                fit.fits_one(cx.root, &unit.unit, if whole { &[] } else { &unit.changed })
+            })
+        })
+    {
+        return verdict(Decision::Full(Some(UNIT_ENV_FIT.to_owned())), shown, clean);
     }
     let plan = Plan {
         units: cx.roster.len(),
@@ -687,6 +743,10 @@ pub(super) fn learn(cx: &Judged<'_>, view: &View) -> Result<Vec<String>, &'stati
     if !wanted && versions_current {
         return Err("the residue is known and empty");
     }
+    Ok(learning_units(cx, view, versions_current).0)
+}
+
+fn learning_units(cx: &Judged<'_>, view: &View, versions_current: bool) -> (Vec<String>, bool) {
     let current = Current::of(cx.root, &checked(cx, view));
     let mut units: Vec<String> = analyse(cx, view, &current)
         .into_iter()
@@ -715,7 +775,7 @@ pub(super) fn learn(cx: &Judged<'_>, view: &View) -> Result<Vec<String>, &'stati
         units.sort_unstable();
         units.dedup();
     }
-    Ok(units)
+    (units, has_inexact)
 }
 
 /// Whether every roster unit holds a valid exact version, which lets the residue be confirmed.
@@ -1519,6 +1579,35 @@ pub(crate) fn learn_line(
     // residue for that same proof (`record`, PR 86 review round 2). Completion then learns each unit without a valid
     // version, whatever the residue was before the run. Explain cannot tell the same-proof case before the run, so it
     // names those units here.
+    if !pending.unit_env().is_empty() {
+        let (units, has_inexact) = match bundle::view(store, pending, key) {
+            None => (pending.units().to_vec(), false),
+            Some(view) => {
+                if view.disabled.is_some() {
+                    return None;
+                }
+                let current = bundle::versions_hold_current_unit_env(
+                    judged.unit_env_digest.as_deref(),
+                    view.units
+                        .values()
+                        .flatten()
+                        .map(|version| version.unit_env.as_deref()),
+                );
+                learning_units(&judged, &view, current)
+            }
+        };
+        if !singleton_fit(
+            cx,
+            pending,
+            store,
+            units.iter().map(|unit| (unit.as_str(), &[][..])),
+        ) {
+            return Some(format!(
+                "stoop: if the full command passes, {UNIT_ENV_FIT}; skipping completion"
+            ));
+        }
+        return learning_line(units.len(), has_inexact);
+    }
     let (lacking, has_inexact) = match bundle::view(store, pending, key) {
         None => (pending.units().len(), false),
         Some(view) => {

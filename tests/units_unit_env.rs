@@ -91,6 +91,187 @@ fn assert_full_and_all_units(s: &Suite, out: &Output) {
     assert_eq!(bundle["residue"]["count"], 0, "{bundle}");
 }
 
+const FIT_REASON: &str = "the unit launch environment does not fit on the command line";
+
+fn large_overlay() -> String {
+    let entries = (0..8)
+        .map(|index| format!("UNIT_PAD_{index} = '{}'", "u".repeat(4000)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("unit_env = {{ {entries} }}")
+}
+
+fn fit_run(s: &Suite, split: bool, group: bool, small_stack: bool, explain: bool) -> Output {
+    fit_run_with_padding(s, split, group, small_stack, explain, 56_000)
+}
+
+fn fit_run_with_padding(
+    s: &Suite,
+    split: bool,
+    group: bool,
+    small_stack: bool,
+    explain: bool,
+    padding: usize,
+) -> Output {
+    use std::os::unix::process::CommandExt;
+    let mut command = s.stoop(&s.root);
+    command
+        .arg(if explain { "explain" } else { "run" })
+        .arg("--root")
+        .arg(&s.root)
+        .args(["--", "./t", HOOK])
+        .env("STOOP_SPLIT", if split { "1" } else { "0" })
+        .env("STOOP_SPLIT_GROUP", if group { "1" } else { "0" })
+        .env("RUNNER_PAD_A", "e".repeat(padding))
+        .env("RUNNER_PAD_B", "e".repeat(padding));
+    if small_stack {
+        unsafe {
+            command.pre_exec(|| {
+                let mut limit = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                if libc::getrlimit(libc::RLIMIT_STACK, &mut limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                limit.rlim_cur = limit.rlim_cur.min(512 * 1024);
+                if libc::setrlimit(libc::RLIMIT_STACK, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    spawning(|| command.output()).unwrap()
+}
+
+#[test]
+fn test_rvw_valid_overlay_overfills_singleton_aggregate_environment() {
+    let s = setup(Some(&large_overlay()), true);
+    ok(&fit_run(&s, false, false, true, false));
+    s.write("src/shared.src", "changed\n");
+    let explained = fit_run(&s, false, false, true, true);
+    assert!(
+        text(&explained.stderr).contains(FIT_REASON),
+        "{}",
+        text(&explained.stderr)
+    );
+    s.clear_log();
+    let out = fit_run(&s, false, false, true, false);
+    ok(&out);
+    assert_eq!(
+        launches(&s),
+        [Vec::<String>::new()],
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(
+        text(&out.stderr).contains(FIT_REASON),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(code(&s.direct(&s.root, &[], &[])), 0);
+
+    let no_overlay = setup(Some(""), true);
+    ok(&fit_run(&no_overlay, false, false, true, false));
+    no_overlay.write("src/shared.src", "changed\n");
+    no_overlay.clear_log();
+    let control = fit_run(&no_overlay, false, false, true, false);
+    ok(&control);
+    assert_eq!(
+        launches(&no_overlay),
+        [vec!["tests/a.t"], vec!["tests/b.t"], vec!["tests/c.t"]],
+        "{}",
+        text(&control.stderr)
+    );
+    assert!(!text(&control.stderr).contains(FIT_REASON));
+}
+
+#[test]
+fn uenv_subset_fit_checks_the_actual_inherited_environment() {
+    let s = setup(Some(&large_overlay()), true);
+    ok(&fit_run(&s, true, false, false, false));
+    assert_eq!(unit_count(&s), 3);
+    s.write("src/shared.src", "changed\n");
+    let explained = fit_run(&s, true, false, true, true);
+    assert!(
+        text(&explained.stderr).contains(FIT_REASON),
+        "{}",
+        text(&explained.stderr)
+    );
+    s.clear_log();
+    let out = fit_run(&s, true, false, true, false);
+    ok(&out);
+    assert_eq!(
+        launches(&s),
+        [Vec::<String>::new()],
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(
+        text(&out.stderr).contains(FIT_REASON),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(s.bundle().unwrap()["residue"]["state"], "none");
+}
+
+#[test]
+fn uenv_completion_fit_keeps_full_status_and_unknown_residue() {
+    let s = setup(Some(&large_overlay()), true);
+    let out = fit_run(&s, true, false, true, false);
+    ok(&out);
+    assert_eq!(
+        launches(&s),
+        [Vec::<String>::new()],
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(
+        text(&out.stderr).contains(FIT_REASON),
+        "{}",
+        text(&out.stderr)
+    );
+    let bundle = s.bundle().unwrap();
+    assert_eq!(bundle["residue"]["state"], "none", "{bundle}");
+    assert!(bundle["units"].as_object().unwrap().is_empty(), "{bundle}");
+    s.write("src/shared.src", "changed\n");
+    let explained = fit_run(&s, true, false, true, true);
+    assert!(
+        text(&explained.stderr).contains(FIT_REASON),
+        "{}",
+        text(&explained.stderr)
+    );
+}
+
+#[test]
+fn uenv_grouped_fit_uses_the_same_effective_environment() {
+    let s = setup(Some(&large_overlay()), true);
+    ok(&fit_run(&s, true, true, false, false));
+    assert_eq!(unit_count(&s), 3);
+    s.write("src/shared.src", "changed\n");
+    let explained = fit_run(&s, true, true, true, true);
+    assert!(
+        text(&explained.stderr).contains("do not fit on the command line"),
+        "{}",
+        text(&explained.stderr)
+    );
+    s.clear_log();
+    let out = fit_run(&s, true, true, true, false);
+    ok(&out);
+    assert_eq!(
+        launches(&s),
+        [Vec::<String>::new()],
+        "{}",
+        text(&out.stderr)
+    );
+    assert!(
+        text(&out.stderr).contains("do not fit on the command line"),
+        "{}",
+        text(&out.stderr)
+    );
+}
+
 #[test]
 fn test_rvw_unit_env_name_must_fit_a_linux_environment_entry() {
     let overlay = format!("unit_env = {{ {} = 'x' }}", "A".repeat(131_072));
@@ -459,35 +640,11 @@ fn uenv_u9_a_unit_env_variable_a_test_reads_is_the_documented_premise() {
 
 #[test]
 fn uenv_f1_unit_env_counts_toward_the_grouped_fit() {
-    let mut fields = vec!["T_CACHE = '/dev/null/t'".to_owned()];
-    fields.extend((0..7).map(|n| format!("OVERLAY_{n} = '{}'", "x".repeat(4096))));
-    let s = setup(
-        Some(&format!("unit_env = {{ {} }}", fields.join(", "))),
-        true,
-    );
-    let limit = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize / 2;
-    assert!(
-        limit > 150_000 && limit < 8_000_000,
-        "unexpected ARG_MAX: {limit}"
-    );
-    let target = limit - 16_384;
-    let mut padding = Vec::new();
-    let mut remaining = target.saturating_sub(4096);
-    while remaining > 0 {
-        let len = remaining.min(60_000);
-        padding.push((format!("PADDING_{}", padding.len()), "p".repeat(len)));
-        remaining -= len;
-    }
-    let mut env = vec![SPLIT, CACHE, ("STOOP_SPLIT_GROUP", "1")];
-    env.extend(
-        padding
-            .iter()
-            .map(|(key, value)| (key.as_str(), value.as_str())),
-    );
-    ok(&s.hook(&env));
+    let s = setup(Some(&large_overlay()), true);
+    ok(&fit_run_with_padding(&s, true, true, false, false, 20_000));
     s.write("src/shared.src", "changed\n");
     s.clear_log();
-    let out = s.hook(&env);
+    let out = fit_run_with_padding(&s, true, true, true, false, 20_000);
     ok(&out);
     assert!(
         text(&out.stderr).contains("do not fit on the command line"),
