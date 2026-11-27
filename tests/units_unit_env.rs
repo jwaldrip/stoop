@@ -67,6 +67,99 @@ fn cache_values(s: &Suite) -> Vec<String> {
         .collect()
 }
 
+fn config_overlay(s: &Suite, overlay: &str) {
+    s.config(&format!(
+        "[[units.suite]]\nid = 'tests'\nmatch = ['./t', '{HOOK}']\n{overlay}\n"
+    ));
+}
+
+fn assert_full_and_all_units(s: &Suite, out: &Output) {
+    ok(out);
+    assert_eq!(
+        launches(s),
+        [
+            vec![],
+            vec!["tests/a.t"],
+            vec!["tests/b.t"],
+            vec!["tests/c.t"]
+        ],
+        "{}",
+        text(&out.stderr)
+    );
+    let bundle = s.bundle().unwrap();
+    assert_eq!(bundle["residue"]["state"], "confirmed", "{bundle}");
+    assert_eq!(bundle["residue"]["count"], 0, "{bundle}");
+}
+
+#[test]
+fn uenv_adding_an_overlay_relearns_versions_written_without_one() {
+    let s = setup(Some(""), true);
+    ok(&s.hook(&[SPLIT]));
+    assert_eq!(s.bundle().unwrap()["residue"]["state"], "confirmed");
+    config_overlay(&s, "unit_env = { MODE = 'pass' }");
+    s.clear_log();
+    let out = s.hook(&[SPLIT]);
+    assert_full_and_all_units(&s, &out);
+}
+
+#[test]
+fn uenv_removing_an_overlay_relearns_versions_written_with_one() {
+    let s = setup(Some("unit_env = { MODE = 'pass' }"), true);
+    ok(&s.hook(&[SPLIT]));
+    assert_eq!(s.bundle().unwrap()["residue"]["state"], "confirmed");
+    config_overlay(&s, "");
+    s.clear_log();
+    let out = s.hook(&[SPLIT]);
+    assert_full_and_all_units(&s, &out);
+    let bundle = s.bundle().unwrap();
+    assert!(bundle["guard"].get("unit_env").is_none());
+    for versions in bundle["units"].as_object().unwrap().values() {
+        assert!(versions[0].get("unit_env").is_none(), "{versions}");
+    }
+}
+
+#[test]
+fn uenv_mixed_version_stamps_relearn_only_the_stale_unit() {
+    let s = setup(Some("unit_env = { MODE = 'pass' }"), true);
+    ok(&s.hook(&[SPLIT]));
+    let mut bundle = s.bundle().unwrap();
+    bundle["units"]["tests/b.t"][0]["unit_env"] = "older overlay".into();
+    fs::write(
+        s.bundle_path().unwrap(),
+        serde_json::to_vec(&bundle).unwrap(),
+    )
+    .unwrap();
+    s.clear_log();
+    let out = s.hook(&[SPLIT]);
+    ok(&out);
+    assert_eq!(
+        launches(&s),
+        [vec![], vec!["tests/b.t"]],
+        "{}",
+        text(&out.stderr)
+    );
+    let after = s.bundle().unwrap();
+    assert_eq!(after["residue"]["state"], "confirmed", "{after}");
+    assert_eq!(
+        after["units"]["tests/b.t"][0]["unit_env"],
+        after["guard"]["unit_env"]
+    );
+}
+
+#[test]
+fn uenv_switch_off_cannot_keep_a_residue_from_the_old_overlay() {
+    let s = setup(Some("unit_env = { MODE = 'old' }"), true);
+    ok(&s.hook(&[SPLIT]));
+    assert_eq!(s.bundle().unwrap()["residue"]["state"], "confirmed");
+    config_overlay(&s, "unit_env = { MODE = 'new' }");
+    s.clear_log();
+    ok(&s.hook(&[]));
+    assert_eq!(s.bundle().unwrap()["residue"]["state"], "none");
+    s.clear_log();
+    let out = s.hook(&[SPLIT]);
+    assert_full_and_all_units(&s, &out);
+}
+
 #[test]
 fn uenv_u0_a_cached_test_without_unit_env_is_never_evidence() {
     let s = setup(None, true);
@@ -224,13 +317,17 @@ fn uenv_u5_changing_unit_env_retires_every_proof() {
     );
     let after = s.bundle().unwrap();
     assert_ne!(after["guard_digest"], old_guard);
+    assert_ne!(before["guard"]["unit_env"], after["guard"]["unit_env"]);
+    assert_eq!(after["residue"]["state"], "confirmed", "{after}");
+    assert_eq!(after["residue"]["count"], 0, "{after}");
     for versions in after["units"].as_object().unwrap().values() {
         assert!(
             versions
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|version| version["guard"] == after["guard_digest"]),
+                .any(|version| version["guard"] == after["guard_digest"]
+                    && version["unit_env"] == after["guard"]["unit_env"]),
             "{versions}"
         );
     }

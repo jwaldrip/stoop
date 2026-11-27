@@ -3064,6 +3064,197 @@ mod pass_tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    fn mixed_env_bundle() -> SuiteBundleV1 {
+        let roster = ["tests/a.t", "tests/b.t"];
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.guard.unit_env = Some("new".into());
+        bundle.table = vec![input("src/shared")];
+        let mut current = version(vec![0]);
+        current.unit_env = Some("new".into());
+        let mut old = version(vec![0]);
+        old.unit_env = Some("old".into());
+        bundle.units.insert(roster[0].into(), vec![current]);
+        bundle.units.insert(roster[1].into(), vec![old]);
+        bundle.residue = Residue {
+            state: ResidueState::Confirmed,
+            paths: Vec::new(),
+            count: 0,
+            whole: Some("p-1".into()),
+        };
+        bundle
+    }
+
+    #[test]
+    fn unit_env_confirm_declines_mixed_versions_even_when_caller_claims_holds() {
+        let roster = ["tests/a.t", "tests/b.t"];
+        let pending = pending_for_env(&roster, BTreeMap::from([("MODE".into(), "new".into())]));
+        let mut bundle = mixed_env_bundle();
+        let digest = pending.unit_env_digest();
+        bundle.guard.unit_env.clone_from(&digest);
+        bundle.units.get_mut(roster[0]).unwrap()[0].unit_env = digest;
+        let dir = seed("unit-env-confirm-mixed", &bundle);
+        assert!(matches!(
+            confirm(&dir, &pending, "key", "p-1", &[input("src/shared")], |_| {
+                true
+            }),
+            Settled::Declined
+        ));
+        assert!(matches!(
+            stored(&dir, pending.suite()).residue.state,
+            ResidueState::None
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unit_env_switch_off_residue_rejects_mixed_versions() {
+        let mut bundle = mixed_env_bundle();
+        store_residue(&mut bundle, &[input("src/shared")], "p-1", &[]);
+        assert!(matches!(bundle.residue.state, ResidueState::None));
+    }
+
+    #[test]
+    fn unit_env_kept_pass_clears_residue_before_changing_guard() {
+        let bundle = mixed_env_bundle();
+        let pending = pending_for(&["tests/a.t", "tests/b.t"]);
+        let dir = seed("unit-env-keep-mixed", &bundle);
+        let launch_guard = LaunchGuard {
+            unit_env: Some("new".into()),
+            ..guard()
+        };
+        let pass = match keep(&dir, &pending, "key", launch_guard, |_| Ok::<(), ()>(())) {
+            Kept::Locked(pass, ()) => pass,
+            _ => panic!("the pass was not kept"),
+        };
+        assert!(matches!(pass.bundle.residue.state, ResidueState::None));
+        assert!(pass.dirty);
+        drop(pass);
+        assert!(matches!(
+            stored(&dir, pending.suite()).residue.state,
+            ResidueState::None
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unit_env_note_losses_clears_mixed_residue_without_removed_paths() {
+        let bundle = mixed_env_bundle();
+        let pending = pending_for(&["tests/a.t", "tests/b.t"]);
+        let dir = seed("unit-env-note-losses", &bundle);
+        let launch_guard = LaunchGuard {
+            unit_env: Some("new".into()),
+            ..guard()
+        };
+        let mut pass = match keep(&dir, &pending, "key", launch_guard, |_| Ok::<(), ()>(())) {
+            Kept::Locked(pass, ()) => pass,
+            _ => panic!("the pass was not kept"),
+        };
+        pass.bundle.residue = mixed_env_bundle().residue;
+        pass.note_losses(&BTreeMap::new());
+        assert!(matches!(pass.bundle.residue.state, ResidueState::None));
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unit_env_settle_does_not_heal_a_loss_with_a_stale_reader() {
+        let bundle = mixed_env_bundle();
+        let pending = pending_for(&["tests/a.t", "tests/b.t"]);
+        let dir = seed("unit-env-settle-mixed", &bundle);
+        let launch_guard = LaunchGuard {
+            unit_env: Some("new".into()),
+            ..guard()
+        };
+        let mut pass = match keep(&dir, &pending, "key", launch_guard, |_| Ok::<(), ()>(())) {
+            Kept::Locked(pass, ()) => pass,
+            _ => panic!("the pass was not kept"),
+        };
+        pass.bundle.residue = mixed_env_bundle().residue;
+        pass.residue_lost = true;
+        pass.lost_paths.insert("src/shared".into());
+        pass.settle_residue(&[], &[], false);
+        assert!(matches!(pass.bundle.residue.state, ResidueState::None));
+        assert!(pass.residue_lost);
+        assert!(pass.lost_paths.contains("src/shared"));
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unit_env_view_and_known_residue_reject_mixed_versions() {
+        let mut bundle = mixed_env_bundle();
+        bundle.residue.paths = vec!["src/uncovered".into()];
+        bundle.residue.count = 1;
+        let pending = pending_for(&["tests/a.t", "tests/b.t"]);
+        let dir = seed("unit-env-view-mixed", &bundle);
+        assert!(View::of(bundle).unwrap().residue.is_none());
+        assert!(known_residue(&dir, pending.suite(), "key").is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unit_env_learn_does_not_trust_confirmed_residue_with_a_stale_stamp() {
+        with_inexact_engine_fixture("unit-env-learn-mixed", |judged, original, _| {
+            let mut view = View {
+                whole: original.whole.clone(),
+                disabled: None,
+                table: original.table.clone(),
+                units: original
+                    .units
+                    .iter()
+                    .map(|(unit, versions)| {
+                        let copies = versions
+                            .iter()
+                            .map(|version| Version {
+                                created: version.created,
+                                exact: true,
+                                guard: version.guard.clone(),
+                                unit_env: None,
+                                inputs: version.inputs.clone(),
+                                outputs: version.outputs.clone(),
+                            })
+                            .collect();
+                        (unit.clone(), copies)
+                    })
+                    .collect(),
+                residue: Some((0, Vec::new())),
+                whole_roster: original.whole_roster.clone(),
+            };
+            view.units.get_mut("tests/b.t").unwrap()[0].unit_env = Some("old".into());
+            assert_eq!(
+                super::super::engine::learn(judged, &view).unwrap(),
+                ["tests/b.t"]
+            );
+            assert!(!super::super::engine::holds(judged, &view));
+        });
+    }
+
+    #[test]
+    fn unit_env_version_is_stamped_from_the_actual_launch_guard() {
+        let roster = ["tests/a.t"];
+        let pending = pending_for_env(&roster, BTreeMap::from([("MODE".into(), "pending".into())]));
+        let dir = seed(
+            "unit-env-version-stamp",
+            &bundle_for(pending_for(&roster), "key"),
+        );
+        let launch_guard = LaunchGuard {
+            unit_env: Some("actual-launch".into()),
+            ..guard()
+        };
+        let mut pass = pass_of(start(&dir, &pending, "key", launch_guard));
+        assert!(matches!(
+            pass.record(&[roster[0].into()], &[input("src/shared")], &[], 1),
+            Stored::Stored
+        ));
+        drop(pass);
+        let bundle = stored(&dir, pending.suite());
+        let version = &bundle.units[roster[0]][0];
+        assert_eq!(version.unit_env.as_deref(), Some("actual-launch"));
+        assert_eq!(version.guard, bundle.guard.digest());
+        assert_ne!(version.unit_env, pending.unit_env_digest());
+        let _ = fs::remove_dir_all(dir);
+    }
+
     fn with_inexact_engine_fixture(
         name: &str,
         check: impl FnOnce(&super::super::engine::Judged<'_>, &View, &Path),
