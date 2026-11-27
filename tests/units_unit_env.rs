@@ -366,6 +366,47 @@ fn uenv_f1_unit_env_counts_toward_the_grouped_fit() {
 }
 
 #[test]
+fn uenv_f1_replacing_large_inherited_values_allows_grouping() {
+    let limit = unsafe { libc::sysconf(libc::_SC_ARG_MAX) } as usize / 2;
+    assert!(
+        limit > 150_000 && limit < 1_700_000,
+        "unexpected ARG_MAX: {limit}"
+    );
+    let mut padding = Vec::new();
+    let mut remaining = limit + 65_536;
+    while remaining > 0 {
+        let len = remaining.min(60_000);
+        padding.push((format!("OVERRIDE_{}", padding.len()), "p".repeat(len)));
+        remaining -= len;
+    }
+    assert!(padding.len() <= 31);
+    let mut fields = vec!["T_CACHE = '/dev/null/t'".to_owned()];
+    fields.extend(padding.iter().map(|(name, _)| format!("{name} = 'small'")));
+    let s = setup(
+        Some(&format!("unit_env = {{ {} }}", fields.join(", "))),
+        true,
+    );
+    let mut env = vec![SPLIT, CACHE, ("STOOP_SPLIT_GROUP", "1")];
+    env.extend(
+        padding
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_str())),
+    );
+    ok(&s.hook(&env));
+    s.write("src/shared.src", "changed\n");
+    s.clear_log();
+    let out = s.hook(&env);
+    ok(&out);
+    assert_eq!(
+        launches(&s),
+        [vec!["tests/a.t", "tests/b.t"]],
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(cache_values(&s), ["/dev/null/t"]);
+}
+
+#[test]
 fn uenv_c2_an_empty_unit_env_writes_mains_guard() {
     let s = setup(None, true);
     ok(&s.hook(&[SPLIT]));
