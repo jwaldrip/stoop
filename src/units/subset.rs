@@ -52,7 +52,7 @@ pub(crate) fn execute(
         return Attempt::Decided(engine::unrun());
     };
     let ignore = attribution::ignore_for(cx, store);
-    let guard = attribution::guard_of(cx, &ignore);
+    let guard = attribution::guard_of(cx, &ignore, pending);
     let judged = Judged::new(cx, pending, &lookup.proofs, max_age).grouping(cx, store);
     match bundle::keep(store, pending, key, guard, |view| {
         engine::judge_units(&judged, view)
@@ -103,7 +103,7 @@ pub(crate) fn learn(
         return;
     }
     let ignore = attribution::ignore_for(cx, store);
-    let guard = attribution::guard_of(cx, &ignore);
+    let guard = attribution::guard_of(cx, &ignore, pending);
     let judged = Judged::new(cx, pending, std::slice::from_ref(proof), max_age);
     let (mut pass, units) = match bundle::keep(store, pending, key, guard, |view| {
         engine::learn(&judged, view)
@@ -141,6 +141,7 @@ pub(crate) fn learn(
         &HashMap::new(),
         &real_root,
         &[],
+        pending.unit_env(),
     );
     for name in run::HOOK_ENV {
         std::env::set_var(name, "");
@@ -272,6 +273,7 @@ fn launch(frame: &Frame<'_, '_>, mut pass: Pass, plan: &Plan) -> Outcome {
         &changed,
         &real_root,
         &gaps,
+        frame.pending.unit_env(),
     );
     for name in run::HOOK_ENV {
         std::env::set_var(name, "");

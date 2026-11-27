@@ -43,7 +43,7 @@ pub(crate) fn pass(
     // 8 and 9: the bundle is checked without the lock, then again under it. The store's unit folder is
     // excluded by its literal name, wherever the store sits, so no trace of it becomes an input (spec 4.7).
     let ignore = ignore_for(cx, store);
-    let guard = guard_of(cx, &ignore);
+    let guard = guard_of(cx, &ignore, pending);
     let quiet = cx.o.quiet;
     let mut bundle_pass: Pass = match bundle::start(store, pending, key, guard) {
         Start::Pass(bundle_pass) => bundle_pass,
@@ -82,6 +82,7 @@ pub(crate) fn pass(
         &HashMap::new(),
         &real_root,
         &[],
+        pending.unit_env(),
     );
     for name in run::HOOK_ENV {
         std::env::set_var(name, "");
@@ -109,11 +110,12 @@ pub(super) fn ignore_for(cx: &RunCx<'_>, store: &Path) -> Ignore {
 }
 
 /// The guard that a version and a whole proof are judged against, for the ignore set of `ignore_for` (spec 3.6).
-pub(super) fn guard_of(cx: &RunCx<'_>, ignore: &Ignore) -> LaunchGuard {
+pub(super) fn guard_of(cx: &RunCx<'_>, ignore: &Ignore, pending: &Pending) -> LaunchGuard {
     LaunchGuard {
         env: cx.env_now.clone(),
         env_excluded: cx.env_excluded.clone(),
         ignore: ignore.patterns(),
+        unit_env: pending.unit_env_digest(),
     }
 }
 
@@ -202,6 +204,33 @@ pub(super) struct Ran {
     untraced_success: Option<String>,
 }
 
+/// Restores the caller's environment even when a launch returns early or unwinds.
+struct ScopedEnv<'a> {
+    previous: Vec<(&'a str, Option<OsString>)>,
+}
+
+impl<'a> ScopedEnv<'a> {
+    fn apply(values: &'a BTreeMap<String, String>) -> Self {
+        let mut previous = Vec::with_capacity(values.len());
+        for (name, value) in values {
+            previous.push((name.as_str(), std::env::var_os(name)));
+            std::env::set_var(name, value);
+        }
+        Self { previous }
+    }
+}
+
+impl Drop for ScopedEnv<'_> {
+    fn drop(&mut self) {
+        for (name, value) in self.previous.drain(..).rev() {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+}
+
 /// The launches of a pass or a subset, one traced launch per entry of `launches`, in order (spec 3.3, 3.7, 3.11). An
 /// entry holds one unit, or the members of a grouped launch (spec 5.1). Each launch is judged, and its proof replaces the
 /// version of each member when it holds. `named` holds the paths exact versions give, and `skipped` the units that are not
@@ -221,6 +250,7 @@ pub(super) fn launch_each(
     changed: &HashMap<String, Vec<String>>,
     real_root: &Path,
     gaps: &[String],
+    unit_env: &BTreeMap<String, String>,
 ) -> Ran {
     let quiet = cx.o.quiet;
     let forms = expand::list_forms(hook);
@@ -261,127 +291,126 @@ pub(super) fn launch_each(
         export(&lists, &value, &inputs);
         // The root listing before the launch, which the root guard compares with the one after it (spec 3.5).
         let root_before = launch::root_names(cx.root);
-        let unit_status =
-            match run::launch_traced(cx, &argv, ignore, real_root, false, false, false) {
-                // A grouped launch must not run without tracing: then no member's evidence could be checked.
-                Err(error) if grouped_trace_failure(&mut ran, grouped, quiet, &name, &error) => {
-                    continue;
+        let traced = {
+            let _environment = ScopedEnv::apply(unit_env);
+            run::launch_traced(cx, &argv, ignore, real_root, false, false, false)
+        };
+        let unit_status = match traced {
+            // A grouped launch must not run without tracing: then no member's evidence could be checked.
+            Err(error) if grouped_trace_failure(&mut ran, grouped, quiet, &name, &error) => {
+                continue;
+            }
+            // A trace that fails before the command starts has run nothing. The unit runs once untraced and keeps no
+            // proof. It is never retried traced, because that could run it a second time.
+            Err(error) => {
+                say(
+                    quiet,
+                    format!(
+                        "stoop: not traced ({}); running {name} without a proof",
+                        safe(&error.to_string())
+                    ),
+                );
+                ran.ran += 1;
+                let status = {
+                    let _environment = ScopedEnv::apply(unit_env);
+                    run::plain(&argv, &[])
+                };
+                record_untraced(&mut ran, status, &name);
+                status
+            }
+            Ok(trace) => {
+                ran.ran += 1;
+                let observed = Observed::of(&trace, cx.root, real_root, ignore);
+                // A launch that exits 0 must have read the own file of each member, whatever judge reports first (spec
+                // 3.7, C5). A coupling diagnostic can come before NeverRan, and it must not turn that into a verdict.
+                if let Some(unit) = unverified_member(
+                    grouped,
+                    index + 1 == launches.len(),
+                    observed.status,
+                    members,
+                    &observed.content,
+                ) {
+                    ran.unverified = Some(unit);
                 }
-                // A trace that fails before the command starts has run nothing. The unit runs once untraced and keeps no
-                // proof. It is never retried traced, because that could run it a second time.
-                Err(error) => {
-                    say(
+                let context = launch::Context {
+                    root: cx.root,
+                    real_root,
+                    ignore,
+                    roster,
+                    members,
+                    written: &written,
+                    named,
+                    root_before: &root_before,
+                };
+                match launch::judge(&context, &trace, &observed) {
+                    Verdict::Proven(kept) => {
+                        // A stat of a gap path covers it by identity alone. Until the run settles, nothing marks the
+                        // residue unknown, so a kill now would leave a known residue beside this proof. Mark it unknown
+                        // before the write that stores the proof (spec 3.8, PR 86 review round 3).
+                        let gap_stat = |input: &Input| {
+                            gaps.contains(&input.path) && !observed.content.contains(&input.path)
+                        };
+                        if kept.inputs.iter().any(gap_stat) {
+                            pass.unsettle();
+                        }
+                        let olds: Vec<(Vec<Input>, Vec<Input>)> =
+                            members.iter().map(|unit| pass.held_of(unit)).collect();
+                        let stored = pass.record(members, &kept.inputs, &kept.outputs, now());
+                        // A failed write keeps the proof in memory, and the end of the pass writes it (spec 3.11).
+                        if matches!(stored, Stored::Stored | Stored::WriteFailed) {
+                            ran.stat_gaps.extend(
+                                kept.inputs
+                                    .iter()
+                                    .filter(|input| gap_stat(input))
+                                    .map(|input| input.path.clone()),
+                            );
+                            for unit in members {
+                                ran.proven.insert(unit.clone(), observed.content.clone());
+                            }
+                        }
+                        match stored {
+                            Stored::OverBudget => budget_refused(&mut ran, grouped),
+                            Stored::Stored | Stored::WriteFailed => {
+                                for (unit, (old_inputs, old_outputs)) in members.iter().zip(&olds) {
+                                    named.forget(unit, &paths(old_inputs), &paths(old_outputs));
+                                    named.store(unit, &paths(&kept.inputs), &paths(&kept.outputs));
+                                }
+                            }
+                        }
+                    }
+                    Verdict::Failed => {}
+                    Verdict::Unrecorded(why) => say(
                         quiet,
-                        format!(
-                            "stoop: not traced ({}); running {name} without a proof",
-                            safe(&error.to_string())
-                        ),
+                        format!("stoop: not recorded for {name}: {}", safe(&why)),
+                    ),
+                    Verdict::Coupled(violation) => {
+                        if let Violation::NeverRan { unit } = &violation {
+                            say(
+                                quiet,
+                                format!(
+                                    "stoop: no proof for {}: the launch never read it",
+                                    safe(unit)
+                                ),
+                            );
+                        }
+                        ran.stopped = Some((index, violation));
+                    }
+                }
+                // The listing level of the 125 rule, judged while the trace is still here (spec 3.7).
+                if listing_breach.is_none() {
+                    listing_breach = launch::listing(skipped, cx.root, real_root, &trace).map(
+                        |(skip, key, dir)| Breach {
+                            writer: launch_name(members),
+                            key,
+                            dir: Some(dir),
+                            skipped: skip,
+                        },
                     );
-                    ran.ran += 1;
-                    let status = run::plain(&argv, &[]);
-                    record_untraced(&mut ran, status, &name);
-                    status
                 }
-                Ok(trace) => {
-                    ran.ran += 1;
-                    let observed = Observed::of(&trace, cx.root, real_root, ignore);
-                    // A launch that exits 0 must have read the own file of each member, whatever judge reports first (spec
-                    // 3.7, C5). A coupling diagnostic can come before NeverRan, and it must not turn that into a verdict.
-                    if let Some(unit) = unverified_member(
-                        grouped,
-                        index + 1 == launches.len(),
-                        observed.status,
-                        members,
-                        &observed.content,
-                    ) {
-                        ran.unverified = Some(unit);
-                    }
-                    let context = launch::Context {
-                        root: cx.root,
-                        real_root,
-                        ignore,
-                        roster,
-                        members,
-                        written: &written,
-                        named,
-                        root_before: &root_before,
-                    };
-                    match launch::judge(&context, &trace, &observed) {
-                        Verdict::Proven(kept) => {
-                            // A stat of a gap path covers it by identity alone. Until the run settles, nothing marks the
-                            // residue unknown, so a kill now would leave a known residue beside this proof. Mark it unknown
-                            // before the write that stores the proof (spec 3.8, PR 86 review round 3).
-                            let gap_stat = |input: &Input| {
-                                gaps.contains(&input.path)
-                                    && !observed.content.contains(&input.path)
-                            };
-                            if kept.inputs.iter().any(gap_stat) {
-                                pass.unsettle();
-                            }
-                            let olds: Vec<(Vec<Input>, Vec<Input>)> =
-                                members.iter().map(|unit| pass.held_of(unit)).collect();
-                            let stored = pass.record(members, &kept.inputs, &kept.outputs, now());
-                            // A failed write keeps the proof in memory, and the end of the pass writes it (spec 3.11).
-                            if matches!(stored, Stored::Stored | Stored::WriteFailed) {
-                                ran.stat_gaps.extend(
-                                    kept.inputs
-                                        .iter()
-                                        .filter(|input| gap_stat(input))
-                                        .map(|input| input.path.clone()),
-                                );
-                                for unit in members {
-                                    ran.proven.insert(unit.clone(), observed.content.clone());
-                                }
-                            }
-                            match stored {
-                                Stored::OverBudget => budget_refused(&mut ran, grouped),
-                                Stored::Stored | Stored::WriteFailed => {
-                                    for (unit, (old_inputs, old_outputs)) in
-                                        members.iter().zip(&olds)
-                                    {
-                                        named.forget(unit, &paths(old_inputs), &paths(old_outputs));
-                                        named.store(
-                                            unit,
-                                            &paths(&kept.inputs),
-                                            &paths(&kept.outputs),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        Verdict::Failed => {}
-                        Verdict::Unrecorded(why) => say(
-                            quiet,
-                            format!("stoop: not recorded for {name}: {}", safe(&why)),
-                        ),
-                        Verdict::Coupled(violation) => {
-                            if let Violation::NeverRan { unit } = &violation {
-                                say(
-                                    quiet,
-                                    format!(
-                                        "stoop: no proof for {}: the launch never read it",
-                                        safe(unit)
-                                    ),
-                                );
-                            }
-                            ran.stopped = Some((index, violation));
-                        }
-                    }
-                    // The listing level of the 125 rule, judged while the trace is still here (spec 3.7).
-                    if listing_breach.is_none() {
-                        listing_breach = launch::listing(skipped, cx.root, real_root, &trace).map(
-                            |(skip, key, dir)| Breach {
-                                writer: launch_name(members),
-                                key,
-                                dir: Some(dir),
-                                skipped: skip,
-                            },
-                        );
-                    }
-                    written.add(&observed.writes, members);
-                    trace.status
-                }
-            };
+                written.add(&observed.writes, members);
+                trace.status
+            }
+        };
         // The first nonzero status in roster order. A failing unit never stops the pass (spec 3.9).
         ran.status = keep(ran.status, unit_status);
         if unit_status != 0 && ran.failed.is_none() {
@@ -1063,6 +1092,67 @@ mod tests {
     use std::io;
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_unit_env_is_restored_exactly_after_a_launch() {
+        use std::collections::BTreeMap;
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        const CHILD: &str = "STOOP_UENV_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "run::units::attribution::tests::a_unit_env_is_restored_exactly_after_a_launch",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+                "{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            return;
+        }
+        let raw = OsString::from_vec(vec![b'b', 0xff, b'x']);
+        std::env::set_var("UENV_TEST_PRESENT", "before");
+        std::env::remove_var("UENV_TEST_MISSING");
+        std::env::set_var("UENV_TEST_RAW", &raw);
+        let overlay = BTreeMap::from([
+            ("UENV_TEST_PRESENT".into(), "after".into()),
+            ("UENV_TEST_MISSING".into(), "added".into()),
+            ("UENV_TEST_RAW".into(), "utf8".into()),
+        ]);
+        {
+            let _guard = super::ScopedEnv::apply(&overlay);
+            let argv = [
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(
+                    "test \"$UENV_TEST_PRESENT\" = after && test \"$UENV_TEST_MISSING\" = added && test \"$UENV_TEST_RAW\" = utf8",
+                ),
+            ];
+            assert_eq!(crate::run::plain(&argv, &[]), 0);
+        }
+        assert_eq!(std::env::var_os("UENV_TEST_PRESENT"), Some("before".into()));
+        assert_eq!(std::env::var_os("UENV_TEST_MISSING"), None);
+        assert_eq!(std::env::var_os("UENV_TEST_RAW"), Some(raw.clone()));
+        let unwound = std::panic::catch_unwind(|| {
+            let _guard = super::ScopedEnv::apply(&overlay);
+            panic!("exercise unwind");
+        });
+        assert!(unwound.is_err());
+        assert_eq!(std::env::var_os("UENV_TEST_PRESENT"), Some("before".into()));
+        assert_eq!(std::env::var_os("UENV_TEST_MISSING"), None);
+        assert_eq!(std::env::var_os("UENV_TEST_RAW"), Some(raw));
+    }
 
     const READ: Touch = Touch {
         listed: false,

@@ -926,6 +926,9 @@ fn unit_suite(
             units: roster.clone(),
             config: config.key_source(),
             config_suite: suite.map(|suite| suite.id.as_str()),
+            unit_env: suite
+                .map(|suite| suite.unit_env.clone())
+                .unwrap_or_default(),
             listings,
         }),
     };

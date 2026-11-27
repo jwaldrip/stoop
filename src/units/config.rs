@@ -2,7 +2,7 @@
 
 use super::hook::{self, Arity, OptionDeclaration};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ffi::OsString;
 use std::io::{self, Read};
 use std::path::Path;
@@ -32,6 +32,7 @@ struct RawSuite {
     #[serde(default)]
     options: Vec<RawOption>,
     units: Option<Vec<String>>,
+    unit_env: Option<BTreeMap<String, String>>,
     independent: Option<bool>,
     enabled: Option<bool>,
 }
@@ -56,6 +57,7 @@ pub(crate) struct Suite {
     matches: Vec<String>,
     pub options: Vec<OptionDeclaration>,
     pub units: Option<Vec<String>>,
+    pub unit_env: BTreeMap<String, String>,
     pub independent: Option<bool>,
     pub disabled: bool,
 }
@@ -259,6 +261,35 @@ pub(crate) fn load(root: &Path) -> Result<Config, ConfigError> {
         {
             return Err(ConfigError::named(&source, "units", "invalid unit pattern"));
         }
+        let unit_env = raw.unit_env.unwrap_or_default();
+        if unit_env.keys().any(|name| {
+            let mut bytes = name.bytes();
+            !bytes
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+                || name.starts_with("STOOP_")
+        }) {
+            return Err(ConfigError::named(
+                &source,
+                "unit_env",
+                "unit_env names are letters, digits and underscores, not starting with a digit or with STOOP_",
+            ));
+        }
+        if unit_env.values().any(|value| value.contains('\0')) {
+            return Err(ConfigError::named(
+                &source,
+                "unit_env",
+                "unit_env values cannot hold NUL",
+            ));
+        }
+        if unit_env.len() > 32 || unit_env.values().any(|value| value.len() > 4096) {
+            return Err(ConfigError::named(
+                &source,
+                "unit_env",
+                "unit_env holds at most 32 variables, each value at most 4096 bytes",
+            ));
+        }
         let matches = raw
             .matches
             .iter()
@@ -306,6 +337,7 @@ pub(crate) fn load(root: &Path) -> Result<Config, ConfigError> {
             matches,
             options,
             units: raw.units,
+            unit_env,
             independent: raw.independent,
             disabled: raw.enabled == Some(false),
         });

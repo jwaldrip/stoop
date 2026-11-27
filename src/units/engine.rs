@@ -182,6 +182,8 @@ pub(super) struct Judged<'a> {
     roster: &'a [String],
     proofs: &'a [Proof],
     guard: String,
+    unit_env: &'a BTreeMap<String, String>,
+    unit_env_digest: Option<String>,
     max_age: u64,
     now: u64,
     /// The grouped launch of this decision, when grouping is on and the hook takes it (spec 5.1).
@@ -200,7 +202,9 @@ impl<'a> Judged<'a> {
             suite: pending.suite(),
             roster: pending.units(),
             proofs,
-            guard: guard_now(cx),
+            guard: guard_now(cx, pending),
+            unit_env: pending.unit_env(),
+            unit_env_digest: pending.unit_env_digest(),
             max_age,
             now: now(),
             group: None,
@@ -227,7 +231,15 @@ impl<'a> Judged<'a> {
                     !HOOK_ENV
                         .iter()
                         .any(|var| name.as_os_str() == OsStr::new(var))
+                        && !name
+                            .to_str()
+                            .is_some_and(|name| self.unit_env.contains_key(name))
                 })
+                .chain(
+                    self.unit_env
+                        .iter()
+                        .map(|(name, value)| (OsString::from(name), OsString::from(value))),
+                )
                 .collect(),
             stand_in: bundle::scratch_path_max(store, self.suite),
             arg_max: expand::arg_max(),
@@ -277,7 +289,7 @@ fn grouped() -> bool {
 
 /// The guard digest the run would record now (spec 3.6). It is built as `attribution::pass` builds its guard, so a
 /// version and the whole proof agree on it.
-fn guard_now(cx: &RunCx<'_>) -> String {
+fn guard_now(cx: &RunCx<'_>, pending: &Pending) -> String {
     let ignore = Ignore::new(
         &cx.o.ignore,
         Some(&cx.root.join(".stoopignore")),
@@ -287,16 +299,18 @@ fn guard_now(cx: &RunCx<'_>) -> String {
         env: cx.env_now.clone(),
         env_excluded: cx.env_excluded.clone(),
         ignore: ignore.patterns(),
+        unit_env: pending.unit_env_digest(),
     }
     .digest()
 }
 
 /// The guard digest the whole proof records, which a version's guard is compared with.
-fn whole_guard(proof: &Proof) -> String {
+fn whole_guard(proof: &Proof, unit_env: Option<String>) -> String {
     LaunchGuard {
         env: proof.env.clone(),
         env_excluded: proof.env_excluded.clone(),
         ignore: proof.ignore.clone().unwrap_or_default(),
+        unit_env,
     }
     .digest()
 }
@@ -358,7 +372,7 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
     }
     // E13 onward: the affected units are known, and explain shows them.
     let shown = Some(pairs(&affected));
-    if whole_guard(proof) != cx.guard {
+    if whole_guard(proof, cx.unit_env_digest.clone()) != cx.guard {
         return verdict(
             Decision::Full(Some(
                 "the environment changed since the last full run".to_owned(),
@@ -1676,12 +1690,16 @@ mod tests {
     }
 
     fn judged<'a>(roster: &'a [String], max_age: u64) -> Judged<'a> {
+        static EMPTY: std::sync::LazyLock<BTreeMap<String, String>> =
+            std::sync::LazyLock::new(BTreeMap::new);
         Judged {
             root: Path::new("."),
             suite: "suite",
             roster,
             proofs: &[],
             guard: "g".to_owned(),
+            unit_env: &EMPTY,
+            unit_env_digest: None,
             max_age,
             now: 1_000,
             group: None,
@@ -1894,7 +1912,7 @@ mod tests {
             &identify(&root.0.join("only.dat"), true, false).unwrap(),
         );
         let proof = test_proof(vec![live.clone(), only.clone()]);
-        let guard = whole_guard(&proof);
+        let guard = whole_guard(&proof, None);
         let (mut view, _) = view_of(
             vec![
                 ("live.t", vec![version(1_000, vec![0])]),
@@ -2198,7 +2216,7 @@ mod tests {
         inputs.extend(extra);
         inputs.sort_by(|a, b| a.path.cmp(&b.path));
         let proof = test_proof(inputs);
-        let guard = whole_guard(&proof);
+        let guard = whole_guard(&proof, None);
         let (mut view, _) = view_of(
             vec![
                 ("live.t", vec![version(1_000, vec![0])]),
@@ -2223,7 +2241,7 @@ mod tests {
         let (mut proof, mut view, roster) = two_units_judged(&root, Vec::new());
         proof.inputs.retain(|input| input.path != "other.t");
         view.whole = proof.digest();
-        let guard = whole_guard(&proof);
+        let guard = whole_guard(&proof, None);
         let proofs = [proof];
         let cx = Judged {
             root: &root.0,
@@ -2242,7 +2260,7 @@ mod tests {
         let root = TreeDir::new("metadata", &[("live.t", "live"), ("other.t", "other")]);
         // The full command stat'd `policy`, which is a directory then. It is gone now.
         let (proof, view, roster) = two_units_judged(&root, vec![input("policy", "d")]);
-        let guard = whole_guard(&proof);
+        let guard = whole_guard(&proof, None);
         let proofs = [proof];
         let cx = Judged {
             root: &root.0,
@@ -2272,7 +2290,7 @@ mod tests {
         assert!(view.whole_roster.iter().any(|unit| unit == "other.t"));
         // `other.t` was not on the roster of the full run, even though the full command had read its file.
         view.whole_roster = vec!["live.t".to_owned()];
-        let guard = whole_guard(&proof);
+        let guard = whole_guard(&proof, None);
         let proofs = [proof];
         let cx = Judged {
             root: &root.0,
@@ -2293,7 +2311,7 @@ mod tests {
         let root = TreeDir::new("bit", &[("live.t", "live"), ("other.t", "other")]);
         let (proof, view, roster) = two_units_judged(&root, Vec::new());
         fs::set_permissions(root.0.join("live.t"), fs::Permissions::from_mode(0o755)).unwrap();
-        let guard = whole_guard(&proof);
+        let guard = whole_guard(&proof, None);
         let proofs = [proof];
         let cx = Judged {
             root: &root.0,
@@ -2323,7 +2341,7 @@ mod tests {
             } else {
                 std::os::unix::fs::symlink("other.t", &path).unwrap();
             }
-            let guard = whole_guard(&proof);
+            let guard = whole_guard(&proof, None);
             let proofs = [proof];
             let cx = Judged {
                 root: &root.0,
@@ -2346,7 +2364,7 @@ mod tests {
         let root = TreeDir::new("content", &[("live.t", "live"), ("other.t", "other")]);
         let (proof, view, roster) = two_units_judged(&root, Vec::new());
         fs::write(root.0.join("live.t"), "changed").unwrap();
-        let guard = whole_guard(&proof);
+        let guard = whole_guard(&proof, None);
         let proofs = [proof];
         let cx = Judged {
             root: &root.0,
