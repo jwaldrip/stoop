@@ -3906,25 +3906,31 @@ mod pass_tests {
     fn start_and_record_agree_with_a_unit_env() {
         let roster = ["tests/a.t"];
         let pending = pending_for_env(&roster, BTreeMap::from([("MODE".into(), "pass".into())]));
-        let mut seeded = bundle_for(pending_for(&roster), "key");
-        seeded.whole = Some("p-0".into());
-        let dir = seed("unit-env-guard", &seeded);
+        let seeded = || {
+            let mut bundle = bundle_for(pending_for(&roster), "key");
+            bundle.whole = Some("p-0".into());
+            bundle
+        };
+        let start_dir = seed("unit-env-guard-start", &seeded());
+        let record_dir = seed("unit-env-guard-record", &seeded());
         let guard = LaunchGuard {
             unit_env: pending.unit_env_digest(),
             ..guard()
         };
-        let started = pass_of(start(&dir, &pending, "key", guard));
+        let started = pass_of(start(&start_dir, &pending, "key", guard));
         let at_start = started.bundle.guard_digest.clone();
-        drop(started);
         let proof = whole_proof(&[]);
-        record(&dir, &pending, "key", "p-1", &proof, true);
-        let area = Area::open(&dir, false).unwrap().unwrap();
+        record(&record_dir, &pending, "key", "p-1", &proof, true);
+        let area = Area::open(&record_dir, false).unwrap().unwrap();
         let ReadBundle::Current(stored) = read_bundle(&area, pending.suite()) else {
             panic!("record stored no bundle");
         };
         assert_eq!(stored.whole.as_deref(), Some("p-1"));
         assert_eq!(stored.guard_digest, at_start);
         assert_eq!(stored.guard.unit_env, pending.unit_env_digest());
+        drop(started);
+        let _ = fs::remove_dir_all(start_dir);
+        let _ = fs::remove_dir_all(record_dir);
     }
 
     #[test]
