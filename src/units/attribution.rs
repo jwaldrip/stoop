@@ -40,30 +40,12 @@ pub(crate) fn pass(
     let hook = cx.hook.as_ref()?;
     // Checks 1 to 7 are decided by `screen`, which `stoop explain` calls too.
     let pending = screen(cx, hook, config, lookup, Ok(pending)).ok()?;
-    if !pending.unit_env().is_empty()
-        && bundle::probe(store, pending, key).is_ok()
-        && !super::engine::singleton_fit(
-            cx,
-            pending,
-            store,
-            pending.units().iter().map(|unit| (unit.as_str(), &[][..])),
-        )
-    {
-        say(
-            cx.o.quiet,
-            format!(
-                "stoop: {}; running the full command",
-                super::engine::UNIT_ENV_FIT
-            ),
-        );
-        return None;
-    }
     // 8 and 9: the bundle is checked without the lock, then again under it. The store's unit folder is
     // excluded by its literal name, wherever the store sits, so no trace of it becomes an input (spec 4.7).
     let ignore = ignore_for(cx, store);
     let guard = guard_of(cx, &ignore, pending);
     let quiet = cx.o.quiet;
-    let mut bundle_pass: Pass = match bundle::start(store, pending, key, guard) {
+    let bundle_pass: Pass = match bundle::start(store, pending, key, guard) {
         Start::Pass(bundle_pass) => bundle_pass,
         Start::Busy => {
             say(
@@ -76,6 +58,30 @@ pub(crate) fn pass(
             return None;
         }
         Start::No => return None,
+    };
+    let mut bundle_pass = if pending.unit_env().is_empty() {
+        bundle_pass
+    } else {
+        match fit_admitted(bundle_pass, || {
+            super::engine::singleton_fit(
+                cx,
+                pending,
+                store,
+                pending.units().iter().map(|unit| (unit.as_str(), &[][..])),
+            )
+        }) {
+            Ok(pass) => pass,
+            Err(_pass) => {
+                say(
+                    quiet,
+                    format!(
+                        "stoop: {}; running the full command",
+                        super::engine::UNIT_ENV_FIT
+                    ),
+                );
+                return None;
+            }
+        }
     };
     let units = pending.units();
     say(
@@ -111,6 +117,15 @@ pub(crate) fn pass(
         key: key.to_owned(),
         how: How::Units,
     })
+}
+
+/// The fit check takes place only after admission and cannot be skipped by an earlier probe.
+fn fit_admitted<T>(pass: T, fits: impl FnOnce() -> bool) -> Result<T, T> {
+    if fits() {
+        Ok(pass)
+    } else {
+        Err(pass)
+    }
 }
 
 /// The ignore set a run's launches are judged with: the command's own rules, with the store's unit folder excluded
@@ -1108,6 +1123,24 @@ fn write_form(
 
 #[cfg(all(test, unix))]
 mod tests {
+
+    #[test]
+    fn unit_env_admitted_pass_checks_fit_after_locked_admission() {
+        let stage = std::cell::Cell::new(0);
+        let probe_was_eligible = stage.get() != 0;
+        assert!(!probe_was_eligible);
+        let admitted = {
+            stage.set(1);
+            "pass"
+        };
+        let result = super::fit_admitted(admitted, || {
+            assert_eq!(stage.get(), 1, "fit must follow admission");
+            stage.set(2);
+            false
+        });
+        assert_eq!(result, Err("pass"));
+        assert_eq!(stage.get(), 2, "an admitted pass must always check fit");
+    }
     use super::super::independence::unit_evidence;
     use super::super::independence::Violation;
     use super::super::independence::{Named, Roster, Written};
