@@ -78,9 +78,11 @@ Install stoop in an earlier step with the one-line installer. Pull request runs 
 
 ## The changed-unit placeholder
 
-Write `'{changed}'` where a test command accepts test files, and single-quote it. The environment spelling `'$STOOP_CHANGED'` works the same way. On Linux x86-64 and arm64, a changed run of a recorded suite launches the command once per test file and stores each file's proof when its launch exits 0 and reads that file. That pass runs once per suite until `stoop forget --units` clears it, and a launch that breaks an independence check disables the suite instead. Otherwise stoop removes the placeholder and its owning option and runs the full command. Ambiguous ownership is refused with exit 2. An unchanged tree can still skip through the whole-command proof. Default-branch pushes, sync writers, and configured verification runs do not skip.
+Write `'{changed}'` where a test command accepts test files, and single-quote it. The environment spelling `'$STOOP_CHANGED'` works the same way. On Linux x86-64 and arm64, a changed run of a recorded suite launches the command once per test file and stores each file's proof when its launch exits 0 and reads that file. With `STOOP_SPLIT` off, that pass runs once per suite until `stoop forget --units <suite-id>` clears it. A launch that breaks an independence check disables the suite instead. Otherwise stoop removes the placeholder and its owning option and runs the full command. Ambiguous ownership is refused with exit 2. An unchanged tree can still skip through the whole-command proof. Default-branch pushes, sync writers, and configured verification runs do not skip.
 
 On Linux and macOS, `stoop explain -- ./test '{changed:*.t}'` counts matching files without launching the test command. It does not save per-unit proofs. The optional `.stoop.toml` supplies a default `units` filter for a matching suite; an inline filter overrides it. On Windows the unit universe is unknown. See https://stoop.build/docs/cli.html#changed-hook.
+
+A matching suite may set `unit_env` to a table of string overrides for unit launches; the full command keeps its original environment. The overrides must preserve test results and repository file behavior apart from runner-cache effects. Learn unit proofs on a local traced Linux run: attribution passes and completion are suppressed whenever `CI` is set. See https://stoop.build/docs/blind-spots.html#unit-env for the pytest recipe, limitations, and recovery from a disabled suite.
 
 ## What a skip means
 

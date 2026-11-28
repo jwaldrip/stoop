@@ -927,6 +927,8 @@ struct Tally {
     no_verdict_failing: usize,
     no_verdict_no_reader: usize,
     group: ModelGroupTally,
+    unit_env_launches: usize,
+    unit_env_proofs_written: usize,
 }
 
 /// M1 compares the subject with the direct runner, including runner-only tests under `T_U=1`.
@@ -938,14 +940,16 @@ struct Tally {
 /// A sweep fails above `EXEMPTION_LIMIT_PERCENT` exempt no-ops after a passing run. Seeds come from `STOOP_MODEL_FIRST`
 /// (1 by default) for `STOOP_MODEL_SEEDS` (4 by default), and steps from `STOOP_MODEL_STEPS` (30). A step applies one
 /// to three operations, or repeats unchanged after a no-verdict.
+/// `STOOP_MODEL_UNIT_ENV=1` runs M1u with a cached full command and a unit-only cache overlay.
 #[test]
 fn model_split_runs_give_the_full_runs_verdict() {
     let first = count_from_env("STOOP_MODEL_FIRST", 1);
     let seeds = count_from_env("STOOP_MODEL_SEEDS", 4);
     let steps = count_from_env("STOOP_MODEL_STEPS", 30);
+    let unit_env = std::env::var("STOOP_MODEL_UNIT_ENV").is_ok_and(|value| value == "1");
     let mut tally = Tally::default();
     for seed in first..first + seeds {
-        run_model(seed as u64, steps, &mut tally);
+        run_model(seed as u64, steps, &mut tally, unit_env);
     }
     let Tally {
         post_noops,
@@ -954,6 +958,8 @@ fn model_split_runs_give_the_full_runs_verdict() {
         no_verdict_failing,
         no_verdict_no_reader,
         group,
+        unit_env_launches,
+        unit_env_proofs_written,
     } = tally;
     let share = if post_noops == 0 {
         0.0
@@ -965,6 +971,11 @@ fn model_split_runs_give_the_full_runs_verdict() {
         "M1 sweep: seeds {first}..{}: {post_noops} no-ops after a passing run, {exemptions} exempt full runs ({share:.2}%), {no_verdict} accepted no-verdicts ({no_verdict_failing} on failing oracle, {no_verdict_no_reader} with no content reader){group_summary}",
         first + seeds
     );
+    if unit_env {
+        println!(
+            "M1u sweep: {unit_env_launches} overlay launches, {unit_env_proofs_written} unit proofs written (observed lower bound)"
+        );
+    }
     if post_noops >= MIN_POST_NOOPS {
         assert!(
             exemptions * 100 <= post_noops * EXEMPTION_LIMIT_PERCENT,
@@ -1017,16 +1028,99 @@ fn model_listed_lines(
         .collect()
 }
 
-fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
+/// Count overlay launches and proof writes observable through new creation timestamps. Timestamps have one-second
+/// resolution, so replacing a proof within the same second is not counted.
+fn report_model_unit_env_run(
+    s: &Suite,
+    previous: &mut std::collections::BTreeMap<String, Vec<u64>>,
+    seed: u64,
+    run: usize,
+) -> (usize, usize) {
+    let launches = s.launches();
+    let mut overlay_launches = 0;
+    let mut members = std::collections::BTreeSet::new();
+    for launch in &launches {
+        let expected = if launch.args.is_empty() {
+            "cache=.tcache"
+        } else {
+            overlay_launches += 1;
+            members.extend(launch.args.iter().map(String::as_str));
+            "cache=/dev/null/t"
+        };
+        assert!(
+            launch.lines.iter().any(|line| line == expected),
+            "M1u seed {seed}, run {run}: expected {expected} in {launch:?}"
+        );
+    }
+
+    let mut current = std::collections::BTreeMap::new();
+    let mut proofs_written = 0;
+    if let Some(bundle) = s.bundle() {
+        if let Some(digest) = bundle["guard"]["unit_env"].as_str() {
+            for (unit, versions) in bundle["units"].as_object().expect("bundle units") {
+                let mut stamps = Vec::new();
+                for version in versions.as_array().expect("unit versions") {
+                    if version["unit_env"].as_str() != Some(digest)
+                        || version["guard"] != bundle["guard_digest"]
+                    {
+                        continue;
+                    }
+                    let stamp = version["created"].as_u64().expect("version timestamp");
+                    if members.contains(unit.as_str())
+                        && !previous.get(unit).is_some_and(|old| old.contains(&stamp))
+                    {
+                        proofs_written += 1;
+                    }
+                    stamps.push(stamp);
+                }
+                if !stamps.is_empty() {
+                    current.insert(unit.clone(), stamps);
+                }
+            }
+        }
+    }
+    *previous = current;
+    println!(
+        "M1u seed {seed}, run {run}: {overlay_launches} overlay launches, {proofs_written} unit proofs written (observed lower bound)"
+    );
+    (overlay_launches, proofs_written)
+}
+
+fn run_model(seed: u64, steps: usize, tally: &mut Tally, unit_env: bool) {
     let s = Suite::new();
     let mut rng = Rng::new(seed);
     let mut model = Model::start(&s, &mut rng);
-    let env = [("T_U", "1")];
+    let default_env = [("T_U", "1")];
+    let cached_env = [("T_U", "1"), ("T_CACHE", ".tcache")];
+    let env: &[(&str, &str)] = if unit_env {
+        // The fixture keys cached entries on ctime, so edits cannot leave the direct oracle stale.
+        fs::create_dir(s.path(".tcache")).unwrap();
+        s.write(".stoopignore", ".tcache\n.stoop.toml\n.stoopignore\n");
+        s.config(&format!(
+            "[[units.suite]]\nid = 'tests'\nmatch = ['./t', '{HOOK}']\nunit_env = {{ T_CACHE = '/dev/null/t' }}\n"
+        ));
+        &cached_env
+    } else {
+        &default_env
+    };
+    let mut unit_env_versions = std::collections::BTreeMap::new();
+    let mut unit_env_launches = 0;
+    let mut unit_env_proofs_written = 0;
     let grouped = model_group_enabled();
-    let subject_env = model_subject_env(&env, grouped);
+    let subject_env = model_subject_env(env, grouped);
     let cold = split(&s, &subject_env);
     if grouped {
         tally.group.record(&s, &launched(&s));
+    }
+    if unit_env {
+        let (launches, proofs) = report_model_unit_env_run(&s, &mut unit_env_versions, seed, 0);
+        assert!(
+            launches > 0 && proofs > 0,
+            "M1u seed {seed}: cold run did not launch the overlay and write a unit proof: {}",
+            stderr(&cold)
+        );
+        unit_env_launches += launches;
+        unit_env_proofs_written += proofs;
     }
     assert_eq!(
         code(&cold),
@@ -1090,9 +1184,15 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
         if grouped {
             tally.group.record(&s, &launches);
         }
+        if unit_env {
+            let (launches, proofs) =
+                report_model_unit_env_run(&s, &mut unit_env_versions, seed, step);
+            unit_env_launches += launches;
+            unit_env_proofs_written += proofs;
+        }
         let launched_units = model_launch_units(&launches, grouped);
         s.clear_log();
-        let oracle = s.direct(&s.root, &[], &env);
+        let oracle = s.direct(&s.root, &[], env);
         let failed = oracle_failed_tests(&s);
         let report = || {
             let mut listing: Vec<String> = std::fs::read_dir(s.path("tests"))
@@ -1237,6 +1337,13 @@ fn run_model(seed: u64, steps: usize, tally: &mut Tally) {
             model.runners_at_full = model.runners.iter().copied().collect();
         }
         passing = subject_code == 0;
+    }
+    if unit_env {
+        println!(
+            "M1u seed {seed} total: {unit_env_launches} overlay launches, {unit_env_proofs_written} unit proofs written (observed lower bound)"
+        );
+        tally.unit_env_launches += unit_env_launches;
+        tally.unit_env_proofs_written += unit_env_proofs_written;
     }
 }
 
