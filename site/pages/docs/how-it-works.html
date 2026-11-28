@@ -57,6 +57,7 @@
   <li>Values that differ on every start of the same machine: <code>_</code>, <code>PWD</code>, <code>OLDPWD</code>, <code>SHLVL</code>, <code>TERM</code>, <code>HOSTNAME</code>, <code>INVOCATION_ID</code>, <code>JOURNAL_STREAM</code>, <code>SSH_AUTH_SOCK</code>, <code>XDG_RUNTIME_DIR</code>.</li>
 </ul>
 <p><code>--ignore-env NAME</code> leaves out one more. <code>--env NAME</code> puts one back in, for example a <code>GITHUB_</code> variable the step depends on without naming it.</p>
+<p>Unit launches inherit the run's environment plus the matching suite's <code>unit_env</code> overlay; the full command keeps the original environment. The overlay is part of the unit proof guard. See <a href="blind-spots.html#unit-env">its assumptions and the Python cache recipe</a>.</p>
 
 <h2 id="residue">The residue of a unit suite</h2>
 <p>The proof of a unit run alone covers what that run reads. The whole command can read more: a lint script that runs once, a program that only the full run starts, or a file that no unit opens. That remainder is the residue. stoop measures it by path: the input paths of the whole command's proof, less the directories this run's catalog walk listed, less every input path that an exact unit proof names. A path outside the repository keeps its absolute form.</p>

@@ -60,6 +60,13 @@
     const newline = cut > 0 ? text.lastIndexOf("\n", cut - 1) : -1;
     if (newline >= 0 && newline > cut - 200) cut = newline + 1;
     if (cut > 0 && /[\ud800-\udbff]/.test(text[cut - 1])) cut -= 1;
+    // Moving back to a newline can change the next section and increase metadata.
+    // Check the final object, not just the prefix selected by the binary search.
+    while (cut > 0 && measure(at(cut)) > LIMIT) {
+      cut -= 1;
+      if (cut > 0 && /[\ud800-\udbff]/.test(text[cut - 1])) cut -= 1;
+    }
+    if (cut === 0) return { error: "Result metadata leaves no room for content." };
     return at(cut);
   };
 

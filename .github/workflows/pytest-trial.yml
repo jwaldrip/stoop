@@ -1,0 +1,75 @@
+name: Real pytest trial
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pytest-trial-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trial:
+    name: real pytest trial (${{ matrix.arch.name }})
+    runs-on: ${{ matrix.arch.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - {name: x86-64, runner: ubuntu-latest}
+          - {name: arm64, runner: ubuntu-24.04-arm}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check changed paths
+        id: paths
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          paths=('src/**' 'Cargo.*' '.github/pytest-trial/**' '.github/workflows/pytest-trial.yml')
+          if [[ -z "$BASE_SHA" || "$BASE_SHA" =~ ^0+$ ]] || ! git cat-file -e "$BASE_SHA^{commit}" 2>/dev/null; then
+            echo 'Base unavailable; running trial conservatively.'
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- "${paths[@]}"; then
+            echo 'skipped: no change under src/**, Cargo.*, .github/pytest-trial/** or .github/workflows/pytest-trial.yml'
+            echo 'run=false' >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- "${paths[@]}"
+            echo 'run=true' >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.paths.outputs.run == 'true'
+      - uses: Swatinem/rust-cache@v2
+        if: steps.paths.outputs.run == 'true'
+      - uses: actions/setup-python@v5
+        if: steps.paths.outputs.run == 'true'
+        with:
+          python-version: '3.12'
+          cache: pip
+          cache-dependency-path: .github/pytest-trial/requirements.txt
+      - name: Install pinned pytest
+        if: steps.paths.outputs.run == 'true'
+        run: >-
+          python -m pip install --require-hashes --retries 5 --only-binary=:all: -r .github/pytest-trial/requirements.txt
+      - name: Build release stoop
+        if: steps.paths.outputs.run == 'true'
+        run: cargo build --release --locked
+      - name: Compare with real pytest
+        if: steps.paths.outputs.run == 'true'
+        run: python .github/pytest-trial/driver.py target/release/stoop --tests 12
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.paths.outputs.run == 'true'
+        with:
+          name: pytest-trial-${{ matrix.arch.name }}
+          path: ${{ runner.temp }}/pytest-trial-evidence
+          retention-days: 14
+          if-no-files-found: warn
