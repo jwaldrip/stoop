@@ -50,6 +50,36 @@ test("following next_offset rebuilds a long page exactly", async () => {
   assert.deepEqual(await paginationProblems(readShipped(), SITE_DIR, "docs/cli.md"), []);
 });
 
+test("a newline cut accounts for a longer next section in the final window", async () => {
+  const text = `${"a".repeat(1279)}\n${"b".repeat(3000)}`;
+  const longId = "long-section-".repeat(20);
+  const index = { pages: [{ path: "docs/window.md", body_length: text.length, sections: [
+    { id: longId, start: 1280, tree_end: 2500 },
+    { id: "x", start: 2500, tree_end: text.length },
+  ] }] };
+  const fetch = async (url) => ({
+    ok: true,
+    text: async () => String(url).endsWith("/docs-index.json") ? JSON.stringify(index) : text,
+  });
+  const readWindow = async (source) => {
+    const { tools } = await loadScript({ source, fetch });
+    return tools.find((tool) => tool.name === "read_page").execute(
+      { path: "docs/window.md" }, { signal: new AbortController().signal },
+    );
+  };
+  const old = mutate("while (cut > 0 && measure(at(cut)) > LIMIT)", "while (false)");
+  const oversized = await readWindow(old);
+  assert.ok(JSON.stringify(oversized).length > LIMITS.output, "the old cut exceeds the budget");
+
+  const result = await readWindow(readShipped());
+  assert.ok(JSON.stringify(result).length <= LIMITS.output);
+  assert.equal(result.next_section, longId);
+  assert.ok(result.next_offset > 0);
+  assert.equal(result.next_offset, result.markdown.length);
+  assert.equal(result.markdown, text.slice(0, result.next_offset));
+  assert.deepEqual(await paginationProblems(readShipped(), SITE_DIR, "docs/cli.md"), []);
+});
+
 test("every fetch passes the tool's AbortSignal, and an aborted call rejects with AbortError", async () => {
   assert.deepEqual(staticProblems(readShipped()), []);
   assert.deepEqual(await signalProblems(readShipped(), SITE_DIR), []);
