@@ -56,6 +56,32 @@ pid_t fork(void) {
 }
 "#;
 
+// The tracer-failure test records only this process's writes to the selected environment name.
+const ENV_SHIM: &str = r#"
+#include <fcntl.h>
+int setenv(const char *name, const char *value, int overwrite) {
+    static int (*real_setenv)(const char *, const char *, int);
+    if (!real_setenv) real_setenv = dlsym(RTLD_NEXT, "setenv");
+    int result = real_setenv(name, value, overwrite);
+    const char *log = getenv("STOOP_TEST_OVERLAY_LOG");
+    char exe[4096];
+    ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (log && n > 0 && strcmp(name, "UENV_PROBE") == 0) {
+        exe[n] = 0;
+        const char *base = strrchr(exe, '/');
+        if (base && strcmp(base + 1, "stoop") == 0) {
+            int fd = open(log, O_WRONLY | O_CREAT | O_APPEND, 0600);
+            if (fd >= 0) {
+                write(fd, value, strlen(value));
+                write(fd, "\n", 1);
+                close(fd);
+            }
+        }
+    }
+    return result;
+}
+"#;
+
 /// The fixture runner with five seams. `RVW_ACTION` acts in the launch of `tests/b.t` alone, and only while `RVW_GATE`
 /// exists: `read_c` reads `tests/c.t`, `write_own` writes `tests/b.t`, `write_input` writes `src/shared.src` (an input
 /// of `tests/a.t`), `write_output` writes `.outputs/a.t.out` (an output of `tests/a.t`), and `fail` exits 1.
@@ -160,9 +186,13 @@ fn edit_b_only(s: &Suite) {
 }
 
 fn fork_shim(s: &Suite) -> String {
+    compile_shim(s, FORK_SHIM)
+}
+
+fn compile_shim(s: &Suite, code: &str) -> String {
     let source = s.outside.join("fork-shim.c");
     let library = s.outside.join("fork-shim.so");
-    fs::write(&source, FORK_SHIM).unwrap();
+    fs::write(&source, code).unwrap();
     let built = spawning(|| {
         Command::new("cc")
             .args(["-shared", "-fPIC", "-o"])
@@ -454,6 +484,47 @@ fn an_untraced_launch_that_exits_zero_before_a_traced_pass_has_no_verdict() {
     assert_eq!(
         after["units"][A][0]["created"], before["units"][A][0]["created"],
         "{stderr}"
+    );
+}
+
+#[test]
+fn a_tracer_start_failure_restores_unit_env_after_each_launch_attempt() {
+    let s = suite();
+    s.write(".stoopignore", ".stoop.toml\n.stoopignore\n");
+    s.config(&format!(
+        "[[units.suite]]\nid = 'tests'\nmatch = ['./t', '{HOOK}']\nunit_env = {{ UENV_PROBE = 'unit' }}\n"
+    ));
+    let library = compile_shim(&s, &format!("{FORK_SHIM}\n{ENV_SHIM}"));
+    let gate = gate(&s);
+    let log = s.outside.join("overlay-env.log");
+    let mut env = shim_env(&library, &gate);
+    env.extend([
+        ("RVW_GATE", gate.as_str()),
+        ("RVW_DROP_GATE", "1"),
+        ("UENV_PROBE", "caller"),
+        ("STOOP_TEST_OVERLAY_LOG", log.to_str().unwrap()),
+    ]);
+    warm(&s, &env);
+    fs::write(&log, "").unwrap();
+    arm(&gate);
+    edit_shared(&s);
+    s.clear_log();
+    let out = hook(&s, &env);
+    let stderr = text(&out.stderr);
+    assert_eq!(launched(&s), [A, B], "{stderr}");
+    assert_eq!(code(&out), 125, "{stderr}");
+    assert!(
+        stderr.contains("running tests/a.t without a proof"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("could not be traced, so it has no member evidence"),
+        "{stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(log).unwrap().lines().collect::<Vec<_>>(),
+        ["unit", "caller", "unit", "caller", "unit", "caller"],
+        "traced failure, plain fallback, and the next traced launch must each restore the caller's value"
     );
 }
 

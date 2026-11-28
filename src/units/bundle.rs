@@ -57,6 +57,8 @@ pub(crate) struct LaunchGuard {
     pub(crate) env: BTreeMap<String, String>,
     pub(crate) env_excluded: Vec<String>,
     pub(crate) ignore: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) unit_env: Option<String>,
 }
 
 impl LaunchGuard {
@@ -69,11 +71,14 @@ impl LaunchGuard {
             env: &'a BTreeMap<String, String>,
             env_excluded: Vec<&'a str>,
             ignore: Vec<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            unit_env: Option<&'a str>,
         }
         let canonical = Canonical {
             env: &self.env,
             env_excluded: sorted(&self.env_excluded),
             ignore: sorted(&self.ignore),
+            unit_env: self.unit_env.as_deref(),
         };
         let bytes = serde_json::to_vec(&canonical).expect("a guard always serializes");
         blake3::hash(&bytes).to_hex().to_string()
@@ -94,6 +99,8 @@ struct UnitVersion {
     exact: bool,
     source: ResultSource,
     guard: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unit_env: Option<String>,
     inputs: Vec<u32>,
     outputs: Vec<u32>,
 }
@@ -214,6 +221,8 @@ pub(crate) struct Pending {
     policy: String,
     /// The catalog's listing paths for this run's walk, sorted. The residue leaves them out (spec 3.8).
     listings: Vec<String>,
+    unit_env: BTreeMap<String, String>,
+    unit_env_digest: Option<String>,
 }
 
 impl Pending {
@@ -227,6 +236,14 @@ impl Pending {
 
     pub(crate) fn listings(&self) -> &[String] {
         &self.listings
+    }
+
+    pub(crate) fn unit_env(&self) -> &BTreeMap<String, String> {
+        &self.unit_env
+    }
+
+    pub(crate) fn unit_env_digest(&self) -> Option<String> {
+        self.unit_env_digest.clone()
     }
 }
 
@@ -292,6 +309,7 @@ pub(crate) struct PendingSpec<'a> {
     pub units: Vec<String>,
     pub config: Option<&'a [u8]>,
     pub config_suite: Option<&'a str>,
+    pub unit_env: BTreeMap<String, String>,
     /// The listing paths of this run's catalog walk, which the residue leaves out (spec 3.8).
     pub listings: Vec<String>,
 }
@@ -308,6 +326,7 @@ pub(crate) fn pending(spec: PendingSpec<'_>) -> Result<Pending, Refusal> {
         units,
         config,
         config_suite,
+        unit_env,
         listings,
     } = spec;
     if units.is_empty() {
@@ -324,6 +343,14 @@ pub(crate) fn pending(spec: PendingSpec<'_>) -> Result<Pending, Refusal> {
     field(&mut hash, filter.as_bytes());
     field(&mut hash, config_suite.unwrap_or("").as_bytes());
     field(&mut hash, config.unwrap_or_default());
+    let unit_env_digest = (!unit_env.is_empty()).then(|| {
+        let mut hash = blake3::Hasher::new_derive_key("stoop unit env v1");
+        for (name, value) in &unit_env {
+            field(&mut hash, name.as_bytes());
+            field(&mut hash, value.as_bytes());
+        }
+        hash.finalize().to_hex().to_string()
+    });
     Ok(Pending {
         suite: suite_id(argv, cwd, scope, label),
         origin: Origin {
@@ -338,6 +365,8 @@ pub(crate) fn pending(spec: PendingSpec<'_>) -> Result<Pending, Refusal> {
         },
         policy: hash.finalize().to_hex().to_string(),
         listings,
+        unit_env,
+        unit_env_digest,
     })
 }
 
@@ -1093,6 +1122,7 @@ pub(crate) fn record(
         env: proof.env.clone(),
         env_excluded: proof.env_excluded.clone(),
         ignore: proof.ignore.clone().unwrap_or_default(),
+        unit_env: pending.unit_env_digest(),
     };
     let guard_digest = guard.digest();
     // A full run keeps the suite's state whatever its roster: only `forget --units` or a generation bump clears a
@@ -1146,6 +1176,16 @@ pub(crate) fn record(
         residue,
         state,
     };
+    if !versions_hold_current_unit_env(
+        bundle.guard.unit_env.as_deref(),
+        bundle
+            .units
+            .values()
+            .flatten()
+            .map(|version| version.unit_env.as_deref()),
+    ) {
+        bundle.residue = Residue::default();
+    }
     if !split {
         store_residue(&mut bundle, &proof.inputs, digest, pending.listings());
     } else {
@@ -1171,6 +1211,17 @@ pub(crate) fn record(
 /// holds an exact version, and it is kept while it is already known for `digest`. It is stored provisional: W6 compares
 /// paths and cannot confirm them (C4, C5). A residue that would take the bundle past its bound is not kept.
 fn store_residue(bundle: &mut SuiteBundleV1, whole: &[Input], digest: &str, listings: &[String]) {
+    if !versions_hold_current_unit_env(
+        bundle.guard.unit_env.as_deref(),
+        bundle
+            .units
+            .values()
+            .flatten()
+            .map(|version| version.unit_env.as_deref()),
+    ) {
+        bundle.residue = Residue::default();
+        return;
+    }
     if residue_known(&bundle.residue, digest) {
         return;
     }
@@ -1201,6 +1252,14 @@ fn store_residue(bundle: &mut SuiteBundleV1, whole: &[Input], digest: &str, list
 /// Whether `residue` is known for `digest`: it has a state, and it was measured for that proof.
 fn residue_known(residue: &Residue, digest: &str) -> bool {
     !matches!(residue.state, ResidueState::None) && residue.whole.as_deref() == Some(digest)
+}
+
+/// Whether each held version was recorded under the current unit-only environment.
+pub(super) fn versions_hold_current_unit_env<'a>(
+    current: Option<&str>,
+    mut versions: impl Iterator<Item = Option<&'a str>>,
+) -> bool {
+    versions.all(|unit_env| unit_env == current)
 }
 
 /// Whether an input id names content that a proof verifies: a file, a link, a listing, an absence or an unreadable mark.
@@ -1477,6 +1536,7 @@ impl Pass {
             exact: members.len() == 1,
             source: ResultSource::Exit,
             guard: self.bundle.guard_digest.clone(),
+            unit_env: self.bundle.guard.unit_env.clone(),
             inputs: delta(&inputs),
             outputs: delta(&outputs),
         };
@@ -1607,10 +1667,27 @@ impl Pass {
     /// Notes the paths that `removed` read with content and that no version reads with content now (spec 3.8, item 1).
     /// The residue is unknown from here until `settle_residue` finds each of them read again.
     fn note_losses(&mut self, removed: &BTreeMap<String, bool>) {
+        if !versions_hold_current_unit_env(
+            self.bundle.guard.unit_env.as_deref(),
+            self.bundle
+                .units
+                .values()
+                .flatten()
+                .map(|version| version.unit_env.as_deref()),
+        ) {
+            self.unsettle();
+        }
         if removed.is_empty() {
             return;
         }
-        let now = bundle_readers(&self.bundle.table, self.bundle.units.values().flatten());
+        let now = bundle_readers(
+            &self.bundle.table,
+            self.bundle
+                .units
+                .values()
+                .flatten()
+                .filter(|version| version.unit_env == self.bundle.guard.unit_env),
+        );
         let lost = losses(removed, &now);
         if !lost.is_empty() {
             self.bundle.residue = Residue::default();
@@ -1758,6 +1835,17 @@ impl Pass {
         listings: &[String],
         no_verdict: bool,
     ) {
+        if !versions_hold_current_unit_env(
+            self.bundle.guard.unit_env.as_deref(),
+            self.bundle
+                .units
+                .values()
+                .flatten()
+                .map(|version| version.unit_env.as_deref()),
+        ) {
+            self.unsettle();
+            return;
+        }
         // When a split run may have lost coverage, its residue stays unknown. A stored version can read a path by stat
         // only, so measuring it as covered would let a later run skip without checking content. A switch-off pass keeps
         // main's residue, which is the switch-off parity rule.
@@ -1921,6 +2009,18 @@ pub(crate) fn keep<T, D>(
     if matches!(bundle.state, SuiteState::Disabled { .. }) {
         return Kept::Unavailable;
     }
+    let stale_residue = !matches!(bundle.residue.state, ResidueState::None)
+        && !versions_hold_current_unit_env(
+            guard.unit_env.as_deref(),
+            bundle
+                .units
+                .values()
+                .flatten()
+                .map(|version| version.unit_env.as_deref()),
+        );
+    if stale_residue {
+        bundle.residue = Residue::default();
+    }
     bundle.guard_digest = guard.digest();
     bundle.guard = guard;
     bundle.policy.clone_from(&pending.policy);
@@ -1937,7 +2037,7 @@ pub(crate) fn keep<T, D>(
         bundle,
         budget: MAX_BYTES,
         last_write: None,
-        dirty: false,
+        dirty: stale_residue,
         phase: "subset",
         keep: true,
         #[cfg(test)]
@@ -2072,6 +2172,14 @@ pub(crate) fn known_residue(store: &Path, id: &str, key: &str) -> Option<(usize,
     if bundle.generation != GENERATION
         || !matches!(bundle.state, SuiteState::Ready)
         || !recorded(&bundle, &digest_text("stoop whole key v1", key))
+        || !versions_hold_current_unit_env(
+            bundle.guard.unit_env.as_deref(),
+            bundle
+                .units
+                .values()
+                .flatten()
+                .map(|version| version.unit_env.as_deref()),
+        )
     {
         return None;
     }
@@ -2086,6 +2194,7 @@ pub(crate) struct Version {
     pub(crate) created: u64,
     pub(crate) exact: bool,
     pub(crate) guard: String,
+    pub(crate) unit_env: Option<String>,
     pub(crate) inputs: Vec<u32>,
     pub(crate) outputs: Vec<u32>,
 }
@@ -2113,8 +2222,16 @@ impl View {
     fn of(bundle: SuiteBundleV1) -> Option<View> {
         let whole = bundle.whole?;
         let len = bundle.table.len();
-        let residue = residue_known(&bundle.residue, &whole)
-            .then_some((bundle.residue.count, bundle.residue.paths));
+        let residue = (residue_known(&bundle.residue, &whole)
+            && versions_hold_current_unit_env(
+                bundle.guard.unit_env.as_deref(),
+                bundle
+                    .units
+                    .values()
+                    .flatten()
+                    .map(|version| version.unit_env.as_deref()),
+            ))
+        .then_some((bundle.residue.count, bundle.residue.paths));
         let mut units = BTreeMap::new();
         for (unit, versions) in bundle.units {
             let views = versions
@@ -2126,6 +2243,7 @@ impl View {
                         inputs: undelta(&version.inputs, len)?,
                         outputs: undelta(&version.outputs, len)?,
                         guard: version.guard,
+                        unit_env: version.unit_env,
                     })
                 })
                 .collect::<Option<Vec<_>>>()?;
@@ -2220,11 +2338,18 @@ pub(crate) fn drop_stale(
     bundle
         .units
         .retain(|unit, _| pending.roster.units.binary_search(unit).is_ok());
-    if !removed.is_empty()
+    if !versions_hold_current_unit_env(
+        pending.unit_env_digest.as_deref(),
+        bundle
+            .units
+            .values()
+            .flatten()
+            .map(|version| version.unit_env.as_deref()),
+    ) || (!removed.is_empty()
         && lost_reader(
             &removed,
             &bundle_readers(&bundle.table, bundle.units.values().flatten()),
-        )
+        ))
     {
         bundle.residue = Residue::default();
     }
@@ -2320,6 +2445,22 @@ pub(crate) fn confirm(
     let Some(view) = view_in(&area, pending, key) else {
         return Settled::Failed;
     };
+    if !versions_hold_current_unit_env(
+        pending.unit_env_digest.as_deref(),
+        view.units
+            .values()
+            .flatten()
+            .map(|version| version.unit_env.as_deref()),
+    ) {
+        let Some(mut bundle) = bundle_for(&area, pending, key) else {
+            return Settled::Failed;
+        };
+        bundle.residue = Residue::default();
+        return match write_bundle(&area, &bundle) {
+            Ok(()) => Settled::Declined,
+            Err(_) => Settled::Failed,
+        };
+    }
     if !holds(&view) {
         return Settled::Declined;
     }
@@ -2523,6 +2664,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn legacy_version_bytes_and_mixed_unit_env_stamps() {
+        let main_bytes = r#"{"created":1,"exact":true,"source":{"kind":"exit"},"guard":"g","inputs":[],"outputs":[]}"#;
+        let version: UnitVersion = serde_json::from_str(main_bytes).unwrap();
+        assert_eq!(version.unit_env, None);
+        assert_eq!(serde_json::to_string(&version).unwrap(), main_bytes);
+        assert!(versions_hold_current_unit_env(
+            None,
+            [None, None].into_iter()
+        ));
+        assert!(!versions_hold_current_unit_env(
+            Some("new"),
+            [None].into_iter()
+        ));
+        assert!(!versions_hold_current_unit_env(
+            None,
+            [Some("old")].into_iter()
+        ));
+        assert!(!versions_hold_current_unit_env(
+            Some("new"),
+            [Some("new"), Some("old")].into_iter()
+        ));
+        assert!(versions_hold_current_unit_env(
+            Some("new"),
+            [Some("new"), Some("new")].into_iter()
+        ));
+    }
+
+    // The same bytes are produced by the main-branch codec in the compatibility probe.
+    const MAIN_UNSET_BUNDLE: &str = concat!(
+        r#"{"v":1,"generation":2,"suite":"00000000000000000000000000000000","#,
+        r#""provenance":{"os":"linux","arch":"x86_64","tracer":"ptrace-seccomp","version":1},"#,
+        r#""origin":{"kind":"hook","cwd":"","scope":null,"invocation":"invocation"},"#,
+        r#""whole_key_digest":"key-digest","whole":"p-1","policy":"policy","#,
+        r#""guard":{"env":{},"env_excluded":[],"ignore":[]},"guard_digest":"guard","#,
+        r#""roster":{"source":"filter","units":["tests/a.t"]},"whole_roster":["tests/a.t"],"#,
+        r#""table":[{"path":"tests/a.t","id":"f:00","oid":null}],"#,
+        r#""units":{"tests/a.t":[{"created":1,"exact":true,"source":{"kind":"exit"},"guard":"guard","inputs":[0],"outputs":[]}]},"#,
+        r#""residue":{"state":"confirmed","paths":[],"count":0,"whole":"p-1"},"state":{"status":"ready"}}"#
+    );
+
+    #[test]
+    fn a_main_written_unset_bundle_loads_and_keeps_its_exact_bytes() {
+        let bundle: SuiteBundleV1 = serde_json::from_str(MAIN_UNSET_BUNDLE).unwrap();
+        assert!(valid_bundle(&bundle, "00000000000000000000000000000000"));
+        assert!(valid_versions(&bundle));
+        assert!(bundle.guard.unit_env.is_none());
+        assert!(bundle.units["tests/a.t"][0].unit_env.is_none());
+        assert_eq!(encode(&bundle).unwrap(), MAIN_UNSET_BUNDLE.as_bytes());
+        let view = View::of(bundle).unwrap();
+        assert_eq!(view.residue, Some((0, Vec::new())));
+        assert!(view.units["tests/a.t"][0].unit_env.is_none());
+    }
+
+    #[test]
     fn suite_ids_are_length_delimited_and_bind_every_field() {
         let words = vec![OsString::from("runner"), OsString::from("{changed:*.t}")];
         let id = suite_id(&words, "a", Some("scope"), Some("label"));
@@ -2565,6 +2760,7 @@ mod tests {
             units: vec!["tests/a.t".into()],
             config: None,
             config_suite: None,
+            unit_env: BTreeMap::new(),
             listings: Vec::new(),
         })
         .unwrap();
@@ -2581,6 +2777,7 @@ mod tests {
                 env: BTreeMap::new(),
                 env_excluded: Vec::new(),
                 ignore: Vec::new(),
+                unit_env: None,
             },
             guard_digest: "guard".into(),
             roster: pending.roster,
@@ -2607,6 +2804,7 @@ mod tests {
                 exact: true,
                 source: ResultSource::Exit,
                 guard: "guard".into(),
+                unit_env: None,
                 inputs: Vec::new(),
                 outputs: Vec::new(),
             })
@@ -2755,10 +2953,15 @@ mod pass_tests {
             env: BTreeMap::new(),
             env_excluded: Vec::new(),
             ignore: Vec::new(),
+            unit_env: None,
         }
     }
 
     fn pending_for(units: &[&str]) -> Pending {
+        pending_for_env(units, BTreeMap::new())
+    }
+
+    fn pending_for_env(units: &[&str], unit_env: BTreeMap<String, String>) -> Pending {
         pending(PendingSpec {
             argv: &["runner".into(), "{changed:*.t}".into()],
             cwd: "",
@@ -2769,6 +2972,7 @@ mod pass_tests {
             units: units.iter().map(|unit| unit.to_string()).collect(),
             config: None,
             config_suite: None,
+            unit_env,
             listings: Vec::new(),
         })
         .unwrap()
@@ -2828,6 +3032,7 @@ mod pass_tests {
             exact: true,
             source: ResultSource::Exit,
             guard: "g".into(),
+            unit_env: None,
             inputs,
             outputs: Vec::new(),
         }
@@ -2885,6 +3090,199 @@ mod pass_tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    fn mixed_env_bundle() -> SuiteBundleV1 {
+        let roster = ["tests/a.t", "tests/b.t"];
+        let mut bundle = bundle_for(pending_for(&roster), "key");
+        bundle.guard.unit_env = Some("new".into());
+        bundle.table = vec![input("src/shared")];
+        let mut current = version(vec![0]);
+        current.unit_env = Some("new".into());
+        let mut old = version(vec![0]);
+        old.unit_env = Some("old".into());
+        bundle.units.insert(roster[0].into(), vec![current]);
+        bundle.units.insert(roster[1].into(), vec![old]);
+        bundle.residue = Residue {
+            state: ResidueState::Confirmed,
+            paths: Vec::new(),
+            count: 0,
+            whole: Some("p-1".into()),
+        };
+        bundle
+    }
+
+    #[test]
+    fn unit_env_confirm_declines_mixed_versions_even_when_caller_claims_holds() {
+        let roster = ["tests/a.t", "tests/b.t"];
+        let pending = pending_for_env(&roster, BTreeMap::from([("MODE".into(), "new".into())]));
+        let mut bundle = mixed_env_bundle();
+        let digest = pending.unit_env_digest();
+        bundle.guard.unit_env.clone_from(&digest);
+        bundle.units.get_mut(roster[0]).unwrap()[0].unit_env = digest;
+        let dir = seed("unit-env-confirm-mixed", &bundle);
+        assert!(matches!(
+            confirm(&dir, &pending, "key", "p-1", &[input("src/shared")], |_| {
+                true
+            }),
+            Settled::Declined
+        ));
+        assert!(matches!(
+            stored(&dir, pending.suite()).residue.state,
+            ResidueState::None
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unit_env_switch_off_residue_rejects_mixed_versions() {
+        let mut bundle = mixed_env_bundle();
+        store_residue(&mut bundle, &[input("src/shared")], "p-1", &[]);
+        assert!(matches!(bundle.residue.state, ResidueState::None));
+    }
+
+    #[test]
+    fn unit_env_kept_pass_clears_residue_before_changing_guard() {
+        let bundle = mixed_env_bundle();
+        // The departing stale version shares its only read with the kept version, so pruning
+        // alone cannot notice that the old residue was measured under another environment.
+        let pending = pending_for(&["tests/a.t"]);
+        let dir = seed("unit-env-keep-mixed", &bundle);
+        let launch_guard = LaunchGuard {
+            unit_env: Some("new".into()),
+            ..guard()
+        };
+        let pass = match keep(&dir, &pending, "key", launch_guard, |_| Ok::<(), ()>(())) {
+            Kept::Locked(pass, ()) => pass,
+            _ => panic!("the pass was not kept"),
+        };
+        assert!(matches!(pass.bundle.residue.state, ResidueState::None));
+        assert!(pass.dirty);
+        drop(pass);
+        assert!(matches!(
+            stored(&dir, pending.suite()).residue.state,
+            ResidueState::None
+        ));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unit_env_note_losses_clears_mixed_residue_without_removed_paths() {
+        let bundle = mixed_env_bundle();
+        let pending = pending_for(&["tests/a.t", "tests/b.t"]);
+        let dir = seed("unit-env-note-losses", &bundle);
+        let launch_guard = LaunchGuard {
+            unit_env: Some("new".into()),
+            ..guard()
+        };
+        let mut pass = match keep(&dir, &pending, "key", launch_guard, |_| Ok::<(), ()>(())) {
+            Kept::Locked(pass, ()) => pass,
+            _ => panic!("the pass was not kept"),
+        };
+        pass.bundle.residue = mixed_env_bundle().residue;
+        pass.note_losses(&BTreeMap::new());
+        assert!(matches!(pass.bundle.residue.state, ResidueState::None));
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unit_env_settle_does_not_heal_a_loss_with_a_stale_reader() {
+        let bundle = mixed_env_bundle();
+        let pending = pending_for(&["tests/a.t", "tests/b.t"]);
+        let dir = seed("unit-env-settle-mixed", &bundle);
+        let launch_guard = LaunchGuard {
+            unit_env: Some("new".into()),
+            ..guard()
+        };
+        let mut pass = match keep(&dir, &pending, "key", launch_guard, |_| Ok::<(), ()>(())) {
+            Kept::Locked(pass, ()) => pass,
+            _ => panic!("the pass was not kept"),
+        };
+        pass.bundle.residue = mixed_env_bundle().residue;
+        pass.residue_lost = true;
+        pass.lost_paths.insert("src/shared".into());
+        pass.settle_residue(&[], &[], false);
+        assert!(matches!(pass.bundle.residue.state, ResidueState::None));
+        assert!(pass.residue_lost);
+        assert!(pass.lost_paths.contains("src/shared"));
+        drop(pass);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unit_env_view_and_known_residue_reject_mixed_versions() {
+        let mut bundle = mixed_env_bundle();
+        bundle.residue.paths = vec!["src/uncovered".into()];
+        bundle.residue.count = 1;
+        let pending = pending_for(&["tests/a.t", "tests/b.t"]);
+        let dir = seed("unit-env-view-mixed", &bundle);
+        assert!(View::of(bundle).unwrap().residue.is_none());
+        assert!(known_residue(&dir, pending.suite(), "key").is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn unit_env_learn_does_not_trust_confirmed_residue_with_a_stale_stamp() {
+        with_inexact_engine_fixture("unit-env-learn-mixed", |judged, original, _| {
+            let mut view = View {
+                whole: original.whole.clone(),
+                disabled: None,
+                table: original.table.clone(),
+                units: original
+                    .units
+                    .iter()
+                    .map(|(unit, versions)| {
+                        let copies = versions
+                            .iter()
+                            .map(|version| Version {
+                                created: version.created,
+                                exact: true,
+                                guard: version.guard.clone(),
+                                unit_env: None,
+                                inputs: version.inputs.clone(),
+                                outputs: version.outputs.clone(),
+                            })
+                            .collect();
+                        (unit.clone(), copies)
+                    })
+                    .collect(),
+                residue: Some((0, Vec::new())),
+                whole_roster: original.whole_roster.clone(),
+            };
+            view.units.get_mut("tests/b.t").unwrap()[0].unit_env = Some("old".into());
+            assert_eq!(
+                super::super::engine::learn(judged, &view).unwrap(),
+                ["tests/b.t"]
+            );
+            assert!(!super::super::engine::holds(judged, &view));
+        });
+    }
+
+    #[test]
+    fn unit_env_version_is_stamped_from_the_actual_launch_guard() {
+        let roster = ["tests/a.t"];
+        let pending = pending_for_env(&roster, BTreeMap::from([("MODE".into(), "pending".into())]));
+        let dir = seed(
+            "unit-env-version-stamp",
+            &bundle_for(pending_for(&roster), "key"),
+        );
+        let launch_guard = LaunchGuard {
+            unit_env: Some("actual-launch".into()),
+            ..guard()
+        };
+        let mut pass = pass_of(start(&dir, &pending, "key", launch_guard));
+        assert!(matches!(
+            pass.record(&[roster[0].into()], &[input("src/shared")], &[], 1),
+            Stored::Stored
+        ));
+        drop(pass);
+        let bundle = stored(&dir, pending.suite());
+        let version = &bundle.units[roster[0]][0];
+        assert_eq!(version.unit_env.as_deref(), Some("actual-launch"));
+        assert_eq!(version.guard, bundle.guard.digest());
+        assert_ne!(version.unit_env, pending.unit_env_digest());
+        let _ = fs::remove_dir_all(dir);
+    }
+
     fn with_inexact_engine_fixture(
         name: &str,
         check: impl FnOnce(&super::super::engine::Judged<'_>, &View, &Path),
@@ -2928,9 +3326,9 @@ mod pass_tests {
             Some(&root.join(".stoopignore")),
             &opts.transient,
         );
-        let guard = super::super::attribution::guard_of(&cx, &ignore).digest();
         let roster = ["tests/a.t", "tests/b.t", "tests/c.t"];
         let pending = pending_for(&roster);
+        let guard = super::super::attribution::guard_of(&cx, &ignore, &pending).digest();
         let proof = whole_proof(&[]);
         let mut bundle = bundle_for(pending_for(&roster), "key");
         bundle.whole = Some(proof.digest());
@@ -3228,6 +3626,7 @@ mod pass_tests {
             units: units.to_vec(),
             config: None,
             config_suite: None,
+            unit_env: BTreeMap::new(),
             listings: Vec::new(),
         })
         .unwrap()
@@ -3475,7 +3874,65 @@ mod pass_tests {
             env: BTreeMap::from([("FOO".to_owned(), "a".to_owned())]),
             env_excluded: excluded.iter().map(|name| (*name).to_owned()).collect(),
             ignore: ignore.iter().map(|pattern| (*pattern).to_owned()).collect(),
+            unit_env: None,
         }
+    }
+    #[test]
+    fn a_guard_without_unit_env_keeps_mains_bytes_and_digest() {
+        let guard = guard_with(&["A", "B"], &["x", "y"]);
+        let canonical = r#"{"env":{"FOO":"a"},"env_excluded":["A","B"],"ignore":["x","y"]}"#;
+        assert_eq!(serde_json::to_string(&guard).unwrap(), canonical);
+        assert_eq!(
+            guard.digest(),
+            "7420774a68461eb228cb34965250da2d0985c267a614041bcecaebc09b089fb4"
+        );
+    }
+
+    #[test]
+    fn a_unit_env_digest_is_order_free_and_value_bound() {
+        let make = |pairs: &[(&str, &str)]| {
+            let env = pairs
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+                .collect();
+            pending_for_env(&["tests/a.t"], env).unit_env_digest()
+        };
+        assert_eq!(make(&[]), None);
+        let first = make(&[("B", "two"), ("A", "one")]);
+        assert_eq!(first, make(&[("A", "one"), ("B", "two")]));
+        assert_ne!(first, make(&[("A", "one"), ("B", "changed")]));
+        assert_ne!(make(&[("A", "bc")]), make(&[("Ab", "c")]));
+    }
+
+    #[test]
+    fn start_and_record_agree_with_a_unit_env() {
+        let roster = ["tests/a.t"];
+        let pending = pending_for_env(&roster, BTreeMap::from([("MODE".into(), "pass".into())]));
+        let seeded = || {
+            let mut bundle = bundle_for(pending_for(&roster), "key");
+            bundle.whole = Some("p-0".into());
+            bundle
+        };
+        let start_dir = seed("unit-env-guard-start", &seeded());
+        let record_dir = seed("unit-env-guard-record", &seeded());
+        let guard = LaunchGuard {
+            unit_env: pending.unit_env_digest(),
+            ..guard()
+        };
+        let started = pass_of(start(&start_dir, &pending, "key", guard));
+        let at_start = started.bundle.guard_digest.clone();
+        let proof = whole_proof(&[]);
+        record(&record_dir, &pending, "key", "p-1", &proof, true);
+        let area = Area::open(&record_dir, false).unwrap().unwrap();
+        let ReadBundle::Current(stored) = read_bundle(&area, pending.suite()) else {
+            panic!("record stored no bundle");
+        };
+        assert_eq!(stored.whole.as_deref(), Some("p-1"));
+        assert_eq!(stored.guard_digest, at_start);
+        assert_eq!(stored.guard.unit_env, pending.unit_env_digest());
+        drop(started);
+        let _ = fs::remove_dir_all(start_dir);
+        let _ = fs::remove_dir_all(record_dir);
     }
 
     #[test]
@@ -4027,6 +4484,7 @@ mod cost_tests {
             units: units.to_vec(),
             config: None,
             config_suite: None,
+            unit_env: BTreeMap::new(),
             listings: Vec::new(),
         })
         .unwrap();
@@ -4048,6 +4506,7 @@ mod cost_tests {
                     exact: true,
                     source: ResultSource::Exit,
                     guard: "guard".into(),
+                    unit_env: None,
                     inputs: delta(&pair),
                     outputs: Vec::new(),
                 };
@@ -4067,6 +4526,7 @@ mod cost_tests {
                 env: BTreeMap::new(),
                 env_excluded: Vec::new(),
                 ignore: Vec::new(),
+                unit_env: None,
             },
             guard_digest: "guard".into(),
             roster: pending.roster,
@@ -4183,6 +4643,7 @@ mod settle_tests {
             units: units.iter().map(|unit| unit.to_string()).collect(),
             config: None,
             config_suite: None,
+            unit_env: BTreeMap::new(),
             listings: Vec::new(),
         })
         .unwrap()
@@ -4194,6 +4655,7 @@ mod settle_tests {
             exact: true,
             source: ResultSource::Exit,
             guard: "g".into(),
+            unit_env: None,
             inputs: delta(&[index]),
             outputs: Vec::new(),
         }
@@ -4217,6 +4679,7 @@ mod settle_tests {
                 env: BTreeMap::new(),
                 env_excluded: Vec::new(),
                 ignore: Vec::new(),
+                unit_env: None,
             },
             guard_digest: "guard".into(),
             roster: shape.roster,
@@ -4325,6 +4788,7 @@ mod keep_tests {
             env: BTreeMap::new(),
             env_excluded: Vec::new(),
             ignore: Vec::new(),
+            unit_env: None,
         }
     }
 
@@ -4339,6 +4803,7 @@ mod keep_tests {
             units: units.iter().map(|unit| unit.to_string()).collect(),
             config: None,
             config_suite: None,
+            unit_env: BTreeMap::new(),
             listings: Vec::new(),
         })
         .unwrap()
@@ -4350,6 +4815,7 @@ mod keep_tests {
             exact: true,
             source: ResultSource::Exit,
             guard: "guard".into(),
+            unit_env: None,
             inputs,
             outputs: Vec::new(),
         }

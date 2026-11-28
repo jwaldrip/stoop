@@ -50,6 +50,39 @@ armed() {
 	[ -z "${T_IF:-}" ] || [ -e "$T_IF" ]
 }
 
+run_lines() {
+	if [ "$1" = 1 ]; then
+		IFS= read -r _ || true
+	fi
+	while IFS= read -r line || [ -n "$line" ]; do
+		if [ -n "$line" ]; then
+			case $line in
+				fail)
+					note "failed=$2"
+					STATUS=1
+					;;
+				env:*)
+					name=${line#env:}
+					case $name in
+						''|[!A-Za-z_]*|*[!A-Za-z0-9_]*)
+							note "failed=$2"
+							STATUS=1
+							;;
+						*)
+							eval "value=\${$name-}"
+							if [ "$value" = fail ]; then
+								note "failed=$2"
+								STATUS=1
+							fi
+							;;
+					esac
+					;;
+				*) cat "$ROOT/$line" ;;
+			esac
+		fi
+	done
+}
+
 run_test() {
 	if [ "$TESTS" = 1 ] && [ -n "${T_SKIP_TEST:-}" ] && [ "$1" = "$T_SKIP_TEST" ] && armed; then
 		note "skipped=$1"
@@ -72,17 +105,34 @@ run_test() {
 	if [ -n "${T_WRITE:-}" ] && [ "${T_WRITE_AT:-}" = "$1" ] && armed; then
 		printf 'written\n' > "$T_WRITE"
 	fi
-	cat "$1"
-	while IFS= read -r line || [ -n "$line" ]; do
-		if [ -n "$line" ]; then
-			if [ "$line" = fail ]; then
-				note "failed=$1"
-				STATUS=1
-			else
-				cat "$ROOT/$line"
-			fi
+	cached=0
+	if [ "${T_CACHE+x}" = x ]; then
+		case $T_CACHE in
+			/*) cache_dir=$T_CACHE ;;
+			*) cache_dir=$ROOT/$T_CACHE ;;
+		esac
+		header=$(stat -L -c '%i %s %y %z' -- "$1") || {
+			note "failed=$1"
+			STATUS=1
+			return
+		}
+		entry=$cache_dir/${header%% *}.c
+		if [ -f "$entry" ] && {
+			IFS= read -r cached_header < "$entry" && [ "$cached_header" = "$header" ]
+		}; then
+			cached=1
+			note "cache_hit=$1"
+		else
+			{ { printf '%s\n' "$header"; cat -- "$1"; } > "$entry"; } 2>/dev/null || true
 		fi
-	done < "$1"
+	fi
+	if [ "$cached" = 1 ]; then
+		sed '1d' "$entry"
+		run_lines 1 "$1" < "$entry"
+	else
+		cat "$1"
+		run_lines 0 "$1" < "$1"
+	fi
 	cat "$ROOT/setup.src"
 	if [ "${T_WRITE_EACH:-}" = 1 ]; then
 		output="${1%.*}.out"
@@ -122,6 +172,9 @@ note "changed_inputs=$(flat "${STOOP_CHANGED_INPUTS:-}")"
 note "changed_inputs_file=$(flat "${STOOP_CHANGED_INPUTS_FILE:-}")"
 note "changed_set=${STOOP_CHANGED+1}"
 note "units_set=${STOOP_UNITS+1}"
+if [ "${T_CACHE+x}" = x ]; then
+	note "cache=$T_CACHE"
+fi
 
 if [ -n "${T_WRITE:-}" ] && [ -z "${T_WRITE_AT:-}" ] && armed; then
 	printf 'written\n' > "$T_WRITE"

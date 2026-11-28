@@ -17,6 +17,7 @@ use crate::input::{identify, list_hash_of_names, par_map, Input};
 use crate::pathutil::from_key;
 use crate::proof::{now, Proof};
 use crate::run::{Lookup, RunCx, HOOK_ENV};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
@@ -182,6 +183,8 @@ pub(super) struct Judged<'a> {
     roster: &'a [String],
     proofs: &'a [Proof],
     guard: String,
+    unit_env: &'a BTreeMap<String, String>,
+    unit_env_digest: Option<String>,
     max_age: u64,
     now: u64,
     /// The grouped launch of this decision, when grouping is on and the hook takes it (spec 5.1).
@@ -200,7 +203,9 @@ impl<'a> Judged<'a> {
             suite: pending.suite(),
             roster: pending.units(),
             proofs,
-            guard: guard_now(cx),
+            guard: guard_now(cx, pending),
+            unit_env: pending.unit_env(),
+            unit_env_digest: pending.unit_env_digest(),
             max_age,
             now: now(),
             group: None,
@@ -210,45 +215,266 @@ impl<'a> Judged<'a> {
     /// The grouped form of this decision, when `STOOP_SPLIT_GROUP` is on and the hook takes that form (spec 5.1). `store`
     /// names the list paths that the fit check counts.
     pub(super) fn grouping(mut self, cx: &RunCx<'_>, store: &Path) -> Judged<'a> {
-        if !grouped() {
+        let group = grouped() && cx.hook.as_ref().is_some_and(expand::groups);
+        if !group && self.unit_env.is_empty() {
             return self;
         }
-        let Some(hook) = cx.hook.as_ref() else {
-            return self;
-        };
-        if !expand::groups(hook) {
-            return self;
-        }
-        self.group = Some(Group {
-            hook: hook.clone(),
-            cwd: cx.cwd.clone(),
-            env: std::env::vars_os()
-                .filter(|(name, _)| {
-                    !HOOK_ENV
-                        .iter()
-                        .any(|var| name.as_os_str() == OsStr::new(var))
-                })
-                .collect(),
-            stand_in: bundle::scratch_path_max(store, self.suite),
-            arg_max: expand::arg_max(),
-        });
+        self.group = Group::new(cx, self.unit_env, store, self.suite, group);
         self
     }
 }
 
-/// What a decision needs to check that a grouped launch fits the command line (spec 6): the hook, the cwd, the environment
-/// the launch inherits without the five hook variables it replaces, the length a list path takes, and the argument limit.
+/// One environment and argument-size rule for both grouped and single-unit launches.
 struct Group {
     hook: Hook,
     cwd: PathBuf,
-    env: Vec<(OsString, OsString)>,
+    env: FitEnvironment,
     stand_in: usize,
     arg_max: usize,
+    grouped: bool,
+}
+
+enum FitEnvironment {
+    Legacy(RefCell<Vec<(OsString, OsString)>>),
+    Overlay(RawEnvironment),
+}
+
+#[derive(Clone, Copy, Default)]
+struct HookRows {
+    first: usize,
+    total: usize,
+    count: usize,
+}
+
+/// Byte counts for the environment after the overlay's replace-first setenv operations.
+struct RawEnvironment {
+    bytes: usize,
+    hooks: [HookRows; HOOK_ENV.len()],
+}
+
+impl RawEnvironment {
+    fn from_rows<'a>(
+        rows: impl Iterator<Item = &'a [u8]>,
+        overlay: &BTreeMap<String, String>,
+    ) -> Self {
+        let mut bytes = 0;
+        let mut hooks = [HookRows::default(); HOOK_ENV.len()];
+        let mut replaced = BTreeSet::new();
+        for row in rows {
+            let name = row
+                .iter()
+                .position(|byte| *byte == b'=')
+                .map(|at| &row[..at]);
+            let serialized = row.len() + 1 + 8;
+            if let Some(index) =
+                name.and_then(|name| HOOK_ENV.iter().position(|hook| hook.as_bytes() == name))
+            {
+                let hook = &mut hooks[index];
+                if hook.count == 0 {
+                    hook.first = serialized;
+                }
+                hook.count += 1;
+                hook.total += serialized;
+            }
+            if let Some((name, value)) = name
+                .and_then(|name| std::str::from_utf8(name).ok())
+                .and_then(|name| overlay.get_key_value(name))
+            {
+                if replaced.insert(name) {
+                    bytes += name.len() + value.len() + 2 + 8;
+                    continue;
+                }
+            }
+            bytes += serialized;
+        }
+        for (name, value) in overlay {
+            if !replaced.contains(name) {
+                bytes += name.len() + value.len() + 2 + 8;
+            }
+        }
+        Self { bytes, hooks }
+    }
+
+    fn fits(&self, argv: &[OsString], exports: &[(OsString, OsString)], limit: usize) -> bool {
+        let mut bytes = self.bytes + 16;
+        for word in argv {
+            if word.len() > expand::WORD_MAX {
+                return false;
+            }
+            bytes += word.len() + 1 + 8;
+        }
+        for (index, name) in HOOK_ENV.iter().enumerate() {
+            let hook = self.hooks[index];
+            let replacement = exports
+                .iter()
+                .find(|(key, _)| key == OsStr::new(name))
+                .map(|(key, value)| key.len() + value.len() + 2 + 8);
+            match replacement {
+                Some(replacement) if hook.count > 0 => bytes = bytes - hook.first + replacement,
+                Some(replacement) => bytes += replacement,
+                None => bytes -= hook.total,
+            }
+        }
+        bytes <= limit / 2
+    }
+}
+
+/// Snapshot the raw Unix environment in a child. The child does no allocation or environment
+/// mutation after fork, and the parent never reads the unsynchronized `environ` pointer.
+#[cfg(unix)]
+pub(super) fn raw_environment() -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    let mut pipe = [0; 2];
+    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in pipe {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+            return Err(error);
+        }
+    }
+    // Linux uses clone directly so a tracer-failure fork shim cannot turn preflight into a launch.
+    #[cfg(target_os = "linux")]
+    let pid = unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD, 0, 0, 0, 0) as libc::pid_t };
+    #[cfg(not(target_os = "linux"))]
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        return Err(error);
+    }
+    if pid == 0 {
+        unsafe {
+            libc::close(pipe[0]);
+            #[cfg(target_vendor = "apple")]
+            let mut env = *libc::_NSGetEnviron();
+            #[cfg(not(target_vendor = "apple"))]
+            let mut env = {
+                extern "C" {
+                    static mut environ: *mut *mut libc::c_char;
+                }
+                environ
+            };
+            while !env.is_null() && !(*env).is_null() {
+                let row = std::ffi::CStr::from_ptr(*env).to_bytes_with_nul();
+                let mut written = 0;
+                while written < row.len() {
+                    let n = libc::write(
+                        pipe[1],
+                        row.as_ptr().add(written).cast(),
+                        row.len() - written,
+                    );
+                    if n <= 0 {
+                        libc::_exit(1);
+                    }
+                    written += n as usize;
+                }
+                env = env.add(1);
+            }
+            libc::close(pipe[1]);
+            libc::_exit(0);
+        }
+    }
+    unsafe { libc::close(pipe[1]) };
+    let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+    let mut bytes = Vec::new();
+    let read = reader.read_to_end(&mut bytes);
+    // Closing the pipe before waiting also lets a child exit if reading failed.
+    drop(reader);
+    let mut status = 0;
+    let waited = loop {
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if waited < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break waited;
+    };
+    read?;
+    if waited != pid || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        return Err(io::Error::other(
+            "could not snapshot the launch environment",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+pub(super) fn raw_environment() -> io::Result<Vec<u8>> {
+    Err(io::Error::other("raw launch environment is unavailable"))
 }
 
 impl Group {
-    /// Whether the grouped launch of `affected` fits the command line (spec 6): its argv, and its environment with each list
-    /// path at the stand-in length.
+    fn new(
+        cx: &RunCx<'_>,
+        unit_env: &BTreeMap<String, String>,
+        store: &Path,
+        suite: &str,
+        grouped: bool,
+    ) -> Option<Self> {
+        let env = if unit_env.is_empty() {
+            FitEnvironment::Legacy(RefCell::new(
+                std::env::vars_os()
+                    .filter(|(name, _)| {
+                        !HOOK_ENV
+                            .iter()
+                            .any(|var| name.as_os_str() == OsStr::new(var))
+                    })
+                    .collect(),
+            ))
+        } else {
+            let raw = raw_environment().ok()?;
+            if raw.is_empty() {
+                FitEnvironment::Overlay(RawEnvironment::from_rows(std::iter::empty(), unit_env))
+            } else {
+                let rows = raw.strip_suffix(&[0])?.split(|byte| *byte == 0);
+                FitEnvironment::Overlay(RawEnvironment::from_rows(rows, unit_env))
+            }
+        };
+        Some(Self {
+            hook: cx.hook.as_ref()?.clone(),
+            cwd: cx.cwd.clone(),
+            env,
+            stand_in: bundle::scratch_path_max(store, suite),
+            arg_max: expand::arg_max(),
+            grouped,
+        })
+    }
+
+    fn fits_expanded(&self, argv: &[OsString], value: &OsStr, inputs: &OsStr) -> bool {
+        let exports = expand::exports(value, inputs, self.stand_in);
+        match &self.env {
+            FitEnvironment::Legacy(env) => {
+                let mut env = env.borrow_mut();
+                let inherited = env.len();
+                env.extend(exports);
+                let fits = expand::fits(argv, &env, self.arg_max);
+                env.truncate(inherited);
+                fits
+            }
+            FitEnvironment::Overlay(env) => env.fits(argv, &exports, self.arg_max),
+        }
+    }
+
+    fn fits_one(&self, root: &Path, unit: &str, changed: &[String]) -> bool {
+        let list = |_: FileMode, _: Base| Some(OsString::from("x".repeat(self.stand_in)));
+        let Some(launch) = expand::launch(&self.hook, unit, root, &self.cwd, &list) else {
+            return false;
+        };
+        let inputs = expand::inputs_text(root, &self.cwd, changed.iter());
+        self.fits_expanded(&launch.argv, &launch.value, &inputs)
+    }
+
+    /// Whether a grouped launch fits, using the same effective environment as a singleton.
     fn fits(&self, root: &Path, affected: &[Affected]) -> bool {
         let members: Vec<String> = affected
             .iter()
@@ -264,10 +490,29 @@ impl Group {
             &self.cwd,
             affected.iter().flat_map(|affected| affected.changed.iter()),
         );
-        let mut env = self.env.clone();
-        env.extend(expand::exports(&many.value, &inputs, stand_in));
-        expand::fits(&many.argv, &env, self.arg_max)
+        self.fits_expanded(&many.argv, &many.value, &inputs)
     }
+}
+
+pub(super) const UNIT_ENV_FIT: &str =
+    "the unit launch environment does not fit on the command line";
+
+/// No added fit work or behavioral change is made for suites without an overlay.
+pub(super) fn singleton_fit<'a>(
+    cx: &RunCx<'_>,
+    pending: &Pending,
+    store: &Path,
+    launches: impl Iterator<Item = (&'a str, &'a [String])>,
+) -> bool {
+    if pending.unit_env().is_empty() {
+        return true;
+    }
+    let Some(fit) = Group::new(cx, pending.unit_env(), store, pending.suite(), false) else {
+        return false;
+    };
+    launches
+        .into_iter()
+        .all(|(unit, changed)| fit.fits_one(cx.root, unit, changed))
 }
 
 /// Whether grouped launches are on (spec 5.1): the engine is on, and `STOOP_SPLIT_GROUP` holds a true value.
@@ -277,7 +522,7 @@ fn grouped() -> bool {
 
 /// The guard digest the run would record now (spec 3.6). It is built as `attribution::pass` builds its guard, so a
 /// version and the whole proof agree on it.
-fn guard_now(cx: &RunCx<'_>) -> String {
+fn guard_now(cx: &RunCx<'_>, pending: &Pending) -> String {
     let ignore = Ignore::new(
         &cx.o.ignore,
         Some(&cx.root.join(".stoopignore")),
@@ -287,16 +532,18 @@ fn guard_now(cx: &RunCx<'_>) -> String {
         env: cx.env_now.clone(),
         env_excluded: cx.env_excluded.clone(),
         ignore: ignore.patterns(),
+        unit_env: pending.unit_env_digest(),
     }
     .digest()
 }
 
 /// The guard digest the whole proof records, which a version's guard is compared with.
-fn whole_guard(proof: &Proof) -> String {
+fn whole_guard(proof: &Proof, unit_env: Option<String>) -> String {
     LaunchGuard {
         env: proof.env.clone(),
         env_excluded: proof.env_excluded.clone(),
         ignore: proof.ignore.clone().unwrap_or_default(),
+        unit_env,
     }
     .digest()
 }
@@ -358,7 +605,7 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
     }
     // E13 onward: the affected units are known, and explain shows them.
     let shown = Some(pairs(&affected));
-    if whole_guard(proof) != cx.guard {
+    if whole_guard(proof, cx.unit_env_digest.clone()) != cx.guard {
         return verdict(
             Decision::Full(Some(
                 "the environment changed since the last full run".to_owned(),
@@ -602,7 +849,8 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
     // (spec 5.1, 6). A launch that does not fit takes the full form, and the reason says so.
     let whole = affected.len() == cx.roster.len();
     let uncovered = uncovered_changes(cx, view, &current, proof);
-    let as_group = !whole && affected.len() >= 2 && cx.group.is_some();
+    let as_group =
+        !whole && affected.len() >= 2 && cx.group.as_ref().is_some_and(|fit| fit.grouped);
     if as_group
         && !cx
             .group
@@ -617,6 +865,16 @@ fn judge(cx: &Judged<'_>, view: &View) -> Verdict {
             shown,
             clean,
         );
+    }
+    if !as_group
+        && !cx.unit_env.is_empty()
+        && !cx.group.as_ref().is_some_and(|fit| {
+            affected.iter().all(|unit| {
+                fit.fits_one(cx.root, &unit.unit, if whole { &[] } else { &unit.changed })
+            })
+        })
+    {
+        return verdict(Decision::Full(Some(UNIT_ENV_FIT.to_owned())), shown, clean);
     }
     let plan = Plan {
         units: cx.roster.len(),
@@ -663,26 +921,62 @@ pub(super) fn learn(cx: &Judged<'_>, view: &View) -> Result<Vec<String>, &'stati
         return Err("the bundle holds another whole proof");
     }
     let wanted = view.residue.as_ref().is_none_or(|(count, _)| *count > 0);
-    if !wanted {
+    let versions_current = bundle::versions_hold_current_unit_env(
+        cx.unit_env_digest.as_deref(),
+        view.units
+            .values()
+            .flatten()
+            .map(|version| version.unit_env.as_deref()),
+    );
+    if !wanted && versions_current {
         return Err("the residue is known and empty");
     }
+    Ok(learning_units(cx, view, versions_current).0)
+}
+
+fn learning_units(cx: &Judged<'_>, view: &View, versions_current: bool) -> (Vec<String>, bool) {
     let current = Current::of(cx.root, &checked(cx, view));
     let mut units: Vec<String> = analyse(cx, view, &current)
         .into_iter()
         .map(|affected| affected.unit)
         .collect();
-    let mut inexact = inexact_only(cx, view, &current).peekable();
-    if inexact.peek().is_some() {
-        units.extend(inexact.cloned());
-        units.sort_unstable();
+    if !versions_current {
+        units.extend(
+            cx.roster
+                .iter()
+                .filter(|unit| {
+                    view.units.get(*unit).is_some_and(|versions| {
+                        versions
+                            .iter()
+                            .any(|version| version.unit_env != cx.unit_env_digest)
+                    })
+                })
+                .cloned(),
+        );
     }
-    Ok(units)
+    let mut inexact = inexact_only(cx, view, &current).peekable();
+    let has_inexact = inexact.peek().is_some();
+    if has_inexact {
+        units.extend(inexact.cloned());
+    }
+    if !versions_current || has_inexact {
+        units.sort_unstable();
+        units.dedup();
+    }
+    (units, has_inexact)
 }
 
 /// Whether every roster unit holds a valid exact version, which lets the residue be confirmed.
 pub(super) fn holds(cx: &Judged<'_>, view: &View) -> bool {
     let current = Current::of(cx.root, &checked(cx, view));
-    analyse(cx, view, &current).is_empty() && inexact_only(cx, view, &current).next().is_none()
+    bundle::versions_hold_current_unit_env(
+        cx.unit_env_digest.as_deref(),
+        view.units
+            .values()
+            .flatten()
+            .map(|version| version.unit_env.as_deref()),
+    ) && analyse(cx, view, &current).is_empty()
+        && inexact_only(cx, view, &current).next().is_none()
 }
 
 /// Units with a valid inexact version, but no valid exact version, in roster order.
@@ -1473,6 +1767,35 @@ pub(crate) fn learn_line(
     // residue for that same proof (`record`, PR 86 review round 2). Completion then learns each unit without a valid
     // version, whatever the residue was before the run. Explain cannot tell the same-proof case before the run, so it
     // names those units here.
+    if !pending.unit_env().is_empty() {
+        let (units, has_inexact) = match bundle::view(store, pending, key) {
+            None => (pending.units().to_vec(), false),
+            Some(view) => {
+                if view.disabled.is_some() {
+                    return None;
+                }
+                let current = bundle::versions_hold_current_unit_env(
+                    judged.unit_env_digest.as_deref(),
+                    view.units
+                        .values()
+                        .flatten()
+                        .map(|version| version.unit_env.as_deref()),
+                );
+                learning_units(&judged, &view, current)
+            }
+        };
+        if !singleton_fit(
+            cx,
+            pending,
+            store,
+            units.iter().map(|unit| (unit.as_str(), &[][..])),
+        ) {
+            return Some(format!(
+                "stoop: if the full command passes, {UNIT_ENV_FIT}; skipping completion"
+            ));
+        }
+        return learning_line(units.len(), has_inexact);
+    }
     let (lacking, has_inexact) = match bundle::view(store, pending, key) {
         None => (pending.units().len(), false),
         Some(view) => {
@@ -1552,6 +1875,140 @@ pub(crate) fn disagree(store: &Path, pending: &Pending, key: &str, quiet: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_raw_environment_bytes(
+        rows: &[&[u8]],
+        overlay: &[(&str, &str)],
+        exports: &[(&str, &str)],
+        expected: &[&[u8]],
+    ) {
+        let overlay = overlay
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        let env = RawEnvironment::from_rows(rows.iter().copied(), &overlay);
+        let exports: Vec<_> = exports
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect();
+        let argv = [OsString::from("runner"), OsString::from("tests/a.t")];
+        let bytes = 16
+            + argv.iter().map(|word| word.len() + 1 + 8).sum::<usize>()
+            + expected.iter().map(|row| row.len() + 1 + 8).sum::<usize>();
+        assert!(env.fits(&argv, &exports, bytes * 2));
+        assert!(!env.fits(&argv, &exports, bytes * 2 - 1));
+    }
+
+    #[test]
+    fn uenv_raw_fit_counts_duplicate_overridden_rows() {
+        assert_raw_environment_bytes(
+            &[b"MODE=old", b"MODE=long duplicate", b"MODE=third"],
+            &[("MODE", "new")],
+            &[],
+            &[b"MODE=new", b"MODE=long duplicate", b"MODE=third"],
+        );
+    }
+
+    #[test]
+    fn uenv_raw_fit_counts_rows_without_equals() {
+        assert_raw_environment_bytes(
+            &[b"NO_EQUALS", b"A=before"],
+            &[("A", "x")],
+            &[],
+            &[b"NO_EQUALS", b"A=x"],
+        );
+    }
+
+    #[test]
+    fn uenv_raw_fit_counts_empty_rows_and_empty_names() {
+        assert_raw_environment_bytes(
+            &[b"", b"=orphan", b"=odd=value"],
+            &[("A", "x")],
+            &[],
+            &[b"", b"=orphan", b"=odd=value", b"A=x"],
+        );
+    }
+
+    #[test]
+    fn uenv_raw_fit_counts_non_utf8_names_and_values() {
+        assert_raw_environment_bytes(
+            &[b"\xff=nonutf", b"V=\xfe"],
+            &[("V", "x")],
+            &[],
+            &[b"\xff=nonutf", b"V=x"],
+        );
+    }
+
+    #[test]
+    fn uenv_raw_fit_keeps_equals_inside_inherited_values() {
+        assert_raw_environment_bytes(
+            &[b"NAME=val=with=equals", b"OTHER=a=b"],
+            &[("NAME", "new")],
+            &[],
+            &[b"NAME=new", b"OTHER=a=b"],
+        );
+    }
+
+    #[test]
+    fn uenv_raw_fit_keeps_the_inherited_shell_underscore() {
+        assert_raw_environment_bytes(
+            &[b"_=/usr/bin/runner"],
+            &[("A", "x")],
+            &[],
+            &[b"_=/usr/bin/runner", b"A=x"],
+        );
+    }
+
+    #[test]
+    fn uenv_raw_fit_replaces_first_hook_row_and_unsets_all_when_absent() {
+        assert_raw_environment_bytes(
+            &[
+                b"STOOP_CHANGED=first",
+                b"STOOP_CHANGED=second",
+                b"STOOP_UNITS=one",
+                b"STOOP_UNITS=two",
+            ],
+            &[("A", "x")],
+            &[("STOOP_CHANGED", "new")],
+            &[b"STOOP_CHANGED=new", b"STOOP_CHANGED=second", b"A=x"],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uenv_raw_snapshot_observes_environment_after_prior_mutation() {
+        const CHILD: &str = "STOOP_RAW_SNAPSHOT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "run::units::engine::tests::uenv_raw_snapshot_observes_environment_after_prior_mutation",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+            return;
+        }
+        std::env::set_var("UENV_SNAPSHOT_CURRENT", "first");
+        let before = raw_environment().unwrap();
+        assert!(before
+            .split(|byte| *byte == 0)
+            .any(|row| row == b"UENV_SNAPSHOT_CURRENT=first"));
+        std::env::set_var("UENV_SNAPSHOT_CURRENT", "second");
+        let after = raw_environment().unwrap();
+        assert!(after
+            .split(|byte| *byte == 0)
+            .any(|row| row == b"UENV_SNAPSHOT_CURRENT=second"));
+        assert!(!after
+            .split(|byte| *byte == 0)
+            .any(|row| row == b"UENV_SNAPSHOT_CURRENT=first"));
+    }
 
     #[test]
     fn the_switch_is_on_for_a_value_that_is_not_falsy() {
@@ -1670,22 +2127,51 @@ mod tests {
             created,
             exact: true,
             guard: "g".to_owned(),
+            unit_env: None,
             inputs,
             outputs: Vec::new(),
         }
     }
 
     fn judged<'a>(roster: &'a [String], max_age: u64) -> Judged<'a> {
+        static EMPTY: std::sync::LazyLock<BTreeMap<String, String>> =
+            std::sync::LazyLock::new(BTreeMap::new);
         Judged {
             root: Path::new("."),
             suite: "suite",
             roster,
             proofs: &[],
             guard: "g".to_owned(),
+            unit_env: &EMPTY,
+            unit_env_digest: None,
             max_age,
             now: 1_000,
             group: None,
         }
+    }
+
+    #[test]
+    fn a_version_with_another_unit_env_digest_is_invalid() {
+        let guard = |unit_env: &str| {
+            LaunchGuard {
+                env: BTreeMap::new(),
+                env_excluded: Vec::new(),
+                ignore: Vec::new(),
+                unit_env: Some(unit_env.to_owned()),
+            }
+            .digest()
+        };
+        let (view, current) = view_of(Vec::new(), Vec::new());
+        let mut cx = judged(&[], 0);
+        cx.guard = guard("old overlay");
+        let mut saved = version(1_000, Vec::new());
+        saved.guard = cx.guard.clone();
+        assert!(version_reasons(&cx, &view, &current, &saved).0.is_empty());
+        cx.guard = guard("new overlay");
+        assert_eq!(
+            version_reasons(&cx, &view, &current, &saved).0,
+            ["the environment changed"]
+        );
     }
 
     fn inexact_version(inputs: Vec<u32>) -> Version {
@@ -1894,7 +2380,7 @@ mod tests {
             &identify(&root.0.join("only.dat"), true, false).unwrap(),
         );
         let proof = test_proof(vec![live.clone(), only.clone()]);
-        let guard = whole_guard(&proof);
+        let guard = whole_guard(&proof, None);
         let (mut view, _) = view_of(
             vec![
                 ("live.t", vec![version(1_000, vec![0])]),
@@ -2198,7 +2684,7 @@ mod tests {
         inputs.extend(extra);
         inputs.sort_by(|a, b| a.path.cmp(&b.path));
         let proof = test_proof(inputs);
-        let guard = whole_guard(&proof);
+        let guard = whole_guard(&proof, None);
         let (mut view, _) = view_of(
             vec![
                 ("live.t", vec![version(1_000, vec![0])]),
@@ -2223,7 +2709,7 @@ mod tests {
         let (mut proof, mut view, roster) = two_units_judged(&root, Vec::new());
         proof.inputs.retain(|input| input.path != "other.t");
         view.whole = proof.digest();
-        let guard = whole_guard(&proof);
+        let guard = whole_guard(&proof, None);
         let proofs = [proof];
         let cx = Judged {
             root: &root.0,
@@ -2242,7 +2728,7 @@ mod tests {
         let root = TreeDir::new("metadata", &[("live.t", "live"), ("other.t", "other")]);
         // The full command stat'd `policy`, which is a directory then. It is gone now.
         let (proof, view, roster) = two_units_judged(&root, vec![input("policy", "d")]);
-        let guard = whole_guard(&proof);
+        let guard = whole_guard(&proof, None);
         let proofs = [proof];
         let cx = Judged {
             root: &root.0,
@@ -2272,7 +2758,7 @@ mod tests {
         assert!(view.whole_roster.iter().any(|unit| unit == "other.t"));
         // `other.t` was not on the roster of the full run, even though the full command had read its file.
         view.whole_roster = vec!["live.t".to_owned()];
-        let guard = whole_guard(&proof);
+        let guard = whole_guard(&proof, None);
         let proofs = [proof];
         let cx = Judged {
             root: &root.0,
@@ -2293,7 +2779,7 @@ mod tests {
         let root = TreeDir::new("bit", &[("live.t", "live"), ("other.t", "other")]);
         let (proof, view, roster) = two_units_judged(&root, Vec::new());
         fs::set_permissions(root.0.join("live.t"), fs::Permissions::from_mode(0o755)).unwrap();
-        let guard = whole_guard(&proof);
+        let guard = whole_guard(&proof, None);
         let proofs = [proof];
         let cx = Judged {
             root: &root.0,
@@ -2323,7 +2809,7 @@ mod tests {
             } else {
                 std::os::unix::fs::symlink("other.t", &path).unwrap();
             }
-            let guard = whole_guard(&proof);
+            let guard = whole_guard(&proof, None);
             let proofs = [proof];
             let cx = Judged {
                 root: &root.0,
@@ -2346,7 +2832,7 @@ mod tests {
         let root = TreeDir::new("content", &[("live.t", "live"), ("other.t", "other")]);
         let (proof, view, roster) = two_units_judged(&root, Vec::new());
         fs::write(root.0.join("live.t"), "changed").unwrap();
-        let guard = whole_guard(&proof);
+        let guard = whole_guard(&proof, None);
         let proofs = [proof];
         let cx = Judged {
             root: &root.0,

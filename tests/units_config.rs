@@ -648,6 +648,148 @@ options = [{ names = ["--label"], values = 1 }]
 }
 
 #[test]
+fn unit_env_takes_a_table_of_strings_and_refuses_the_rest() {
+    let f = Fixture::new();
+    let prefix = "[[units.suite]]\nid = 'x'\nmatch = ['./runner', '{changed}']\n";
+    for table in [
+        "unit_env = {}\n",
+        "unit_env = { MODE = 'pass', _NAME9 = 'literal $HOME' }\n",
+        "[units.suite.unit_env]\nPATH = '/usr/bin'\n",
+    ] {
+        f.config(&format!("{prefix}{table}"));
+        let out = f.off(&["{changed}"]);
+        assert_ran(&out);
+        assert!(
+            !stderr(&out).contains("ignoring the unit configuration"),
+            "{table}: {}",
+            stderr(&out)
+        );
+    }
+    let boundary = (0..32)
+        .map(|n| format!("V{n} = '{}'", "x".repeat(1000)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    f.config(&format!("{prefix}unit_env = {{ {boundary} }}\n"));
+    let out = f.off(&["{changed}"]);
+    assert_ran(&out);
+    assert!(!stderr(&out).contains("ignoring the unit configuration"));
+
+    let names = "unit_env names are letters, digits and underscores, not starting with a digit or with STOOP_";
+    let limits = "unit_env holds at most 32 variables, each value at most 4096 bytes";
+    let too_many = (0..33)
+        .map(|n| format!("V{n} = 'x'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let too_large = (0..8)
+        .map(|n| format!("V{n} = '{}'", "x".repeat(4096)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let cases = [
+        ("unit_env = 1".to_string(), "invalid type"),
+        ("unit_env = { MODE = 1 }".to_string(), "invalid type"),
+        ("unit_env = { '1MODE' = 'x' }".to_string(), names),
+        ("unit_env = { 'BAD-NAME' = 'x' }".to_string(), names),
+        ("unit_env = { 'É' = 'x' }".to_string(), names),
+        ("unit_env = { STOOP_SPLIT = '1' }".to_string(), names),
+        (
+            "unit_env = { MODE = \"a\\u0000b\" }".to_string(),
+            "unit_env values cannot hold NUL",
+        ),
+        (
+            format!("unit_env = {{ MODE = '{}' }}", "x".repeat(4097)),
+            limits,
+        ),
+        (format!("unit_env = {{ {too_many} }}"), limits),
+        (
+            format!("unit_env = {{ {} = 'x' }}", "A".repeat(256)),
+            "unit_env names hold at most 255 bytes",
+        ),
+        (
+            format!(
+                "unit_env = {{ {} = '{}' }}",
+                "A".repeat(255),
+                "x".repeat(4096)
+            ),
+            "unit_env entries hold at most 4352 bytes including '=' and the terminator",
+        ),
+        (
+            format!("unit_env = {{ {too_large} }}"),
+            "unit_env holds at most 32768 serialized bytes",
+        ),
+    ];
+    for (table, message) in cases {
+        f.config(&format!("{prefix}{table}\n"));
+        let out = f.off(&["{changed}"]);
+        assert_ran(&out);
+        let error = stderr(&out);
+        assert!(error.contains(message), "{table}: {error}");
+        assert!(error.contains(".stoop.toml:4:"), "{table}: {error}");
+        assert!(error.contains("ignoring the unit configuration"), "{error}");
+    }
+}
+
+fn unit_env_size_case(table: &str, refusal: Option<&str>) {
+    let f = Fixture::new();
+    f.config(&format!(
+        "[[units.suite]]\nid = 'x'\nmatch = ['./runner', '{{changed}}']\nunit_env = {{ {table} }}\n"
+    ));
+    let out = f.off(&["{changed}"]);
+    assert_ran(&out);
+    let error = stderr(&out);
+    if let Some(message) = refusal {
+        assert!(error.contains(message), "{error}");
+        assert!(error.contains("ignoring the unit configuration"), "{error}");
+    } else {
+        assert!(
+            !error.contains("ignoring the unit configuration"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn unit_env_rejects_a_name_longer_than_255_bytes() {
+    unit_env_size_case(
+        &format!("{} = 'x'", "A".repeat(256)),
+        Some("unit_env names hold at most 255 bytes"),
+    );
+}
+
+#[test]
+fn unit_env_rejects_an_entry_longer_than_4352_bytes() {
+    unit_env_size_case(
+        &format!("{} = '{}'", "A".repeat(255), "x".repeat(4096)),
+        Some("unit_env entries hold at most 4352 bytes including '=' and the terminator"),
+    );
+}
+
+#[test]
+fn unit_env_rejects_more_than_32768_serialized_bytes() {
+    let entries = (0..8)
+        .map(|n| format!("V{n} = '{}'", "x".repeat(4096)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    unit_env_size_case(
+        &entries,
+        Some("unit_env holds at most 32768 serialized bytes"),
+    );
+}
+
+#[test]
+fn unit_env_accepts_exact_name_entry_and_total_byte_limits() {
+    unit_env_size_case(&format!("{} = 'x'", "A".repeat(255)), None);
+    unit_env_size_case(
+        &format!("{} = '{}'", "A".repeat(254), "x".repeat(4096)),
+        None,
+    );
+    let mut entries = (0..7)
+        .map(|n| format!("V{n} = '{}'", "x".repeat(4096)))
+        .collect::<Vec<_>>();
+    entries.push(format!("V7 = '{}'", "x".repeat(4064)));
+    unit_env_size_case(&entries.join(", "), None);
+}
+
+#[test]
 fn parser_errors_report_the_offending_line() {
     let f = Fixture::new();
     for (text, line) in [
