@@ -1160,19 +1160,59 @@ mod tests {
     #[test]
     fn a_unit_env_is_restored_exactly_after_a_launch() {
         use std::collections::BTreeMap;
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
+        use std::ffi::{CString, OsString};
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::os::unix::process::CommandExt;
 
         const CHILD: &str = "STOOP_UENV_TEST_CHILD";
         if std::env::var_os(CHILD).is_none() {
-            let out = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
+            let path = std::env::current_exe().unwrap();
+            let executable = CString::new(path.as_os_str().as_bytes()).unwrap();
+            let argv = [
+                executable.clone(),
+                CString::new("--exact").unwrap(),
+                CString::new(
                     "run::units::attribution::tests::a_unit_env_is_restored_exactly_after_a_launch",
-                ])
-                .env(CHILD, "1")
-                .output()
-                .unwrap();
+                )
+                .unwrap(),
+            ];
+            let mut env: Vec<CString> = std::env::vars_os()
+                .filter(|(name, _)| name != CHILD && name != "UENV_TEST_DUP")
+                .map(|(name, value)| {
+                    let mut row = name.into_vec();
+                    row.push(b'=');
+                    row.extend(value.into_vec());
+                    CString::new(row).unwrap()
+                })
+                .collect();
+            env.extend([
+                CString::new(format!("{CHILD}=1")).unwrap(),
+                CString::new("UENV_TEST_DUP=first").unwrap(),
+                CString::new("UENV_TEST_DUP=second").unwrap(),
+            ]);
+            let argv_ptrs: Vec<usize> = argv
+                .iter()
+                .map(|word| word.as_ptr() as usize)
+                .chain(std::iter::once(0))
+                .collect();
+            let env_ptrs: Vec<usize> = env
+                .iter()
+                .map(|row| row.as_ptr() as usize)
+                .chain(std::iter::once(0))
+                .collect();
+            let mut child = std::process::Command::new(path);
+            unsafe {
+                child.pre_exec(move || {
+                    let _keep_alive = (&argv, &env);
+                    libc::execve(
+                        executable.as_ptr(),
+                        argv_ptrs.as_ptr().cast(),
+                        env_ptrs.as_ptr().cast(),
+                    );
+                    Err(io::Error::last_os_error())
+                });
+            }
+            let out = child.output().unwrap();
             assert!(
                 out.status.success(),
                 "{}",
@@ -1189,13 +1229,35 @@ mod tests {
         std::env::set_var("UENV_TEST_PRESENT", "before");
         std::env::remove_var("UENV_TEST_MISSING");
         std::env::set_var("UENV_TEST_RAW", &raw);
+        let before = super::super::engine::raw_environment().unwrap();
+        let duplicates: Vec<_> = before
+            .split(|byte| *byte == 0)
+            .filter(|row| row.starts_with(b"UENV_TEST_DUP="))
+            .collect();
+        assert_eq!(
+            duplicates,
+            [b"UENV_TEST_DUP=first".as_slice(), b"UENV_TEST_DUP=second"]
+        );
         let overlay = BTreeMap::from([
             ("UENV_TEST_PRESENT".into(), "after".into()),
             ("UENV_TEST_MISSING".into(), "added".into()),
             ("UENV_TEST_RAW".into(), "utf8".into()),
+            ("UENV_TEST_DUP".into(), "override".into()),
         ]);
         {
             let _guard = super::ScopedEnv::apply(&overlay);
+            let during = super::super::engine::raw_environment().unwrap();
+            let duplicates: Vec<_> = during
+                .split(|byte| *byte == 0)
+                .filter(|row| row.starts_with(b"UENV_TEST_DUP="))
+                .collect();
+            assert_eq!(
+                duplicates,
+                [
+                    b"UENV_TEST_DUP=override".as_slice(),
+                    b"UENV_TEST_DUP=second"
+                ]
+            );
             let argv = [
                 OsString::from("/bin/sh"),
                 OsString::from("-c"),
@@ -1208,6 +1270,7 @@ mod tests {
         assert_eq!(std::env::var_os("UENV_TEST_PRESENT"), Some("before".into()));
         assert_eq!(std::env::var_os("UENV_TEST_MISSING"), None);
         assert_eq!(std::env::var_os("UENV_TEST_RAW"), Some(raw.clone()));
+        assert_eq!(super::super::engine::raw_environment().unwrap(), before);
         let unwound = std::panic::catch_unwind(|| {
             let _guard = super::ScopedEnv::apply(&overlay);
             panic!("exercise unwind");
@@ -1216,6 +1279,7 @@ mod tests {
         assert_eq!(std::env::var_os("UENV_TEST_PRESENT"), Some("before".into()));
         assert_eq!(std::env::var_os("UENV_TEST_MISSING"), None);
         assert_eq!(std::env::var_os("UENV_TEST_RAW"), Some(raw));
+        assert_eq!(super::super::engine::raw_environment().unwrap(), before);
     }
 
     const READ: Touch = Touch {

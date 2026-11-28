@@ -228,10 +228,189 @@ impl<'a> Judged<'a> {
 struct Group {
     hook: Hook,
     cwd: PathBuf,
-    env: RefCell<Vec<(OsString, OsString)>>,
+    env: FitEnvironment,
     stand_in: usize,
     arg_max: usize,
     grouped: bool,
+}
+
+enum FitEnvironment {
+    Legacy(RefCell<Vec<(OsString, OsString)>>),
+    Overlay(RawEnvironment),
+}
+
+#[derive(Clone, Copy, Default)]
+struct HookRows {
+    first: usize,
+    total: usize,
+    count: usize,
+}
+
+/// Byte counts for the environment after the overlay's replace-first setenv operations.
+struct RawEnvironment {
+    bytes: usize,
+    hooks: [HookRows; HOOK_ENV.len()],
+}
+
+impl RawEnvironment {
+    fn from_rows<'a>(
+        rows: impl Iterator<Item = &'a [u8]>,
+        overlay: &BTreeMap<String, String>,
+    ) -> Self {
+        let mut bytes = 0;
+        let mut hooks = [HookRows::default(); HOOK_ENV.len()];
+        let mut replaced = BTreeSet::new();
+        for row in rows {
+            let name = row
+                .iter()
+                .position(|byte| *byte == b'=')
+                .map(|at| &row[..at]);
+            let serialized = row.len() + 1 + 8;
+            if let Some(index) =
+                name.and_then(|name| HOOK_ENV.iter().position(|hook| hook.as_bytes() == name))
+            {
+                let hook = &mut hooks[index];
+                if hook.count == 0 {
+                    hook.first = serialized;
+                }
+                hook.count += 1;
+                hook.total += serialized;
+            }
+            if let Some((name, value)) = name
+                .and_then(|name| std::str::from_utf8(name).ok())
+                .and_then(|name| overlay.get_key_value(name))
+            {
+                if replaced.insert(name) {
+                    bytes += name.len() + value.len() + 2 + 8;
+                    continue;
+                }
+            }
+            bytes += serialized;
+        }
+        for (name, value) in overlay {
+            if !replaced.contains(name) {
+                bytes += name.len() + value.len() + 2 + 8;
+            }
+        }
+        Self { bytes, hooks }
+    }
+
+    fn fits(&self, argv: &[OsString], exports: &[(OsString, OsString)], limit: usize) -> bool {
+        let mut bytes = self.bytes + 16;
+        for word in argv {
+            if word.len() > expand::WORD_MAX {
+                return false;
+            }
+            bytes += word.len() + 1 + 8;
+        }
+        for (index, name) in HOOK_ENV.iter().enumerate() {
+            let hook = self.hooks[index];
+            let replacement = exports
+                .iter()
+                .find(|(key, _)| key == OsStr::new(name))
+                .map(|(key, value)| key.len() + value.len() + 2 + 8);
+            match replacement {
+                Some(replacement) if hook.count > 0 => bytes = bytes - hook.first + replacement,
+                Some(replacement) => bytes += replacement,
+                None => bytes -= hook.total,
+            }
+        }
+        bytes <= limit / 2
+    }
+}
+
+/// Snapshot the raw Unix environment in a child. The child does no allocation or environment
+/// mutation after fork, and the parent never reads the unsynchronized `environ` pointer.
+#[cfg(unix)]
+pub(super) fn raw_environment() -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+
+    let mut pipe = [0; 2];
+    if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in pipe {
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            let error = io::Error::last_os_error();
+            unsafe {
+                libc::close(pipe[0]);
+                libc::close(pipe[1]);
+            }
+            return Err(error);
+        }
+    }
+    // Linux uses clone directly so a tracer-failure fork shim cannot turn preflight into a launch.
+    #[cfg(target_os = "linux")]
+    let pid = unsafe { libc::syscall(libc::SYS_clone, libc::SIGCHLD, 0, 0, 0, 0) as libc::pid_t };
+    #[cfg(not(target_os = "linux"))]
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(pipe[0]);
+            libc::close(pipe[1]);
+        }
+        return Err(error);
+    }
+    if pid == 0 {
+        unsafe {
+            libc::close(pipe[0]);
+            #[cfg(target_vendor = "apple")]
+            let mut env = *libc::_NSGetEnviron();
+            #[cfg(not(target_vendor = "apple"))]
+            let mut env = {
+                extern "C" {
+                    static mut environ: *mut *mut libc::c_char;
+                }
+                environ
+            };
+            while !env.is_null() && !(*env).is_null() {
+                let row = std::ffi::CStr::from_ptr(*env).to_bytes_with_nul();
+                let mut written = 0;
+                while written < row.len() {
+                    let n = libc::write(
+                        pipe[1],
+                        row.as_ptr().add(written).cast(),
+                        row.len() - written,
+                    );
+                    if n <= 0 {
+                        libc::_exit(1);
+                    }
+                    written += n as usize;
+                }
+                env = env.add(1);
+            }
+            libc::close(pipe[1]);
+            libc::_exit(0);
+        }
+    }
+    unsafe { libc::close(pipe[1]) };
+    let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+    let mut bytes = Vec::new();
+    let read = reader.read_to_end(&mut bytes);
+    // Closing the pipe before waiting also lets a child exit if reading failed.
+    drop(reader);
+    let mut status = 0;
+    let waited = loop {
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if waited < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+            continue;
+        }
+        break waited;
+    };
+    read?;
+    if waited != pid || !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+        return Err(io::Error::other(
+            "could not snapshot the launch environment",
+        ));
+    }
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+pub(super) fn raw_environment() -> io::Result<Vec<u8>> {
+    Err(io::Error::other("raw launch environment is unavailable"))
 }
 
 impl Group {
@@ -242,26 +421,29 @@ impl Group {
         suite: &str,
         grouped: bool,
     ) -> Option<Self> {
-        Some(Self {
-            hook: cx.hook.as_ref()?.clone(),
-            cwd: cx.cwd.clone(),
-            env: RefCell::new(
+        let env = if unit_env.is_empty() {
+            FitEnvironment::Legacy(RefCell::new(
                 std::env::vars_os()
                     .filter(|(name, _)| {
                         !HOOK_ENV
                             .iter()
                             .any(|var| name.as_os_str() == OsStr::new(var))
-                            && !name
-                                .to_str()
-                                .is_some_and(|name| unit_env.contains_key(name))
                     })
-                    .chain(
-                        unit_env
-                            .iter()
-                            .map(|(name, value)| (OsString::from(name), OsString::from(value))),
-                    )
                     .collect(),
-            ),
+            ))
+        } else {
+            let raw = raw_environment().ok()?;
+            if raw.is_empty() {
+                FitEnvironment::Overlay(RawEnvironment::from_rows(std::iter::empty(), unit_env))
+            } else {
+                let rows = raw.strip_suffix(&[0])?.split(|byte| *byte == 0);
+                FitEnvironment::Overlay(RawEnvironment::from_rows(rows, unit_env))
+            }
+        };
+        Some(Self {
+            hook: cx.hook.as_ref()?.clone(),
+            cwd: cx.cwd.clone(),
+            env,
             stand_in: bundle::scratch_path_max(store, suite),
             arg_max: expand::arg_max(),
             grouped,
@@ -269,12 +451,18 @@ impl Group {
     }
 
     fn fits_expanded(&self, argv: &[OsString], value: &OsStr, inputs: &OsStr) -> bool {
-        let mut env = self.env.borrow_mut();
-        let inherited = env.len();
-        env.extend(expand::exports(value, inputs, self.stand_in));
-        let fits = expand::fits(argv, &env, self.arg_max);
-        env.truncate(inherited);
-        fits
+        let exports = expand::exports(value, inputs, self.stand_in);
+        match &self.env {
+            FitEnvironment::Legacy(env) => {
+                let mut env = env.borrow_mut();
+                let inherited = env.len();
+                env.extend(exports);
+                let fits = expand::fits(argv, &env, self.arg_max);
+                env.truncate(inherited);
+                fits
+            }
+            FitEnvironment::Overlay(env) => env.fits(argv, &exports, self.arg_max),
+        }
     }
 
     fn fits_one(&self, root: &Path, unit: &str, changed: &[String]) -> bool {
@@ -1687,6 +1875,140 @@ pub(crate) fn disagree(store: &Path, pending: &Pending, key: &str, quiet: bool) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_raw_environment_bytes(
+        rows: &[&[u8]],
+        overlay: &[(&str, &str)],
+        exports: &[(&str, &str)],
+        expected: &[&[u8]],
+    ) {
+        let overlay = overlay
+            .iter()
+            .map(|(name, value)| ((*name).to_owned(), (*value).to_owned()))
+            .collect();
+        let env = RawEnvironment::from_rows(rows.iter().copied(), &overlay);
+        let exports: Vec<_> = exports
+            .iter()
+            .map(|(name, value)| (OsString::from(name), OsString::from(value)))
+            .collect();
+        let argv = [OsString::from("runner"), OsString::from("tests/a.t")];
+        let bytes = 16
+            + argv.iter().map(|word| word.len() + 1 + 8).sum::<usize>()
+            + expected.iter().map(|row| row.len() + 1 + 8).sum::<usize>();
+        assert!(env.fits(&argv, &exports, bytes * 2));
+        assert!(!env.fits(&argv, &exports, bytes * 2 - 1));
+    }
+
+    #[test]
+    fn uenv_raw_fit_counts_duplicate_overridden_rows() {
+        assert_raw_environment_bytes(
+            &[b"MODE=old", b"MODE=long duplicate", b"MODE=third"],
+            &[("MODE", "new")],
+            &[],
+            &[b"MODE=new", b"MODE=long duplicate", b"MODE=third"],
+        );
+    }
+
+    #[test]
+    fn uenv_raw_fit_counts_rows_without_equals() {
+        assert_raw_environment_bytes(
+            &[b"NO_EQUALS", b"A=before"],
+            &[("A", "x")],
+            &[],
+            &[b"NO_EQUALS", b"A=x"],
+        );
+    }
+
+    #[test]
+    fn uenv_raw_fit_counts_empty_rows_and_empty_names() {
+        assert_raw_environment_bytes(
+            &[b"", b"=orphan", b"=odd=value"],
+            &[("A", "x")],
+            &[],
+            &[b"", b"=orphan", b"=odd=value", b"A=x"],
+        );
+    }
+
+    #[test]
+    fn uenv_raw_fit_counts_non_utf8_names_and_values() {
+        assert_raw_environment_bytes(
+            &[b"\xff=nonutf", b"V=\xfe"],
+            &[("V", "x")],
+            &[],
+            &[b"\xff=nonutf", b"V=x"],
+        );
+    }
+
+    #[test]
+    fn uenv_raw_fit_keeps_equals_inside_inherited_values() {
+        assert_raw_environment_bytes(
+            &[b"NAME=val=with=equals", b"OTHER=a=b"],
+            &[("NAME", "new")],
+            &[],
+            &[b"NAME=new", b"OTHER=a=b"],
+        );
+    }
+
+    #[test]
+    fn uenv_raw_fit_keeps_the_inherited_shell_underscore() {
+        assert_raw_environment_bytes(
+            &[b"_=/usr/bin/runner"],
+            &[("A", "x")],
+            &[],
+            &[b"_=/usr/bin/runner", b"A=x"],
+        );
+    }
+
+    #[test]
+    fn uenv_raw_fit_replaces_first_hook_row_and_unsets_all_when_absent() {
+        assert_raw_environment_bytes(
+            &[
+                b"STOOP_CHANGED=first",
+                b"STOOP_CHANGED=second",
+                b"STOOP_UNITS=one",
+                b"STOOP_UNITS=two",
+            ],
+            &[("A", "x")],
+            &[("STOOP_CHANGED", "new")],
+            &[b"STOOP_CHANGED=new", b"STOOP_CHANGED=second", b"A=x"],
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uenv_raw_snapshot_observes_environment_after_prior_mutation() {
+        const CHILD: &str = "STOOP_RAW_SNAPSHOT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "run::units::engine::tests::uenv_raw_snapshot_observes_environment_after_prior_mutation",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(String::from_utf8_lossy(&out.stdout).contains("1 passed"));
+            return;
+        }
+        std::env::set_var("UENV_SNAPSHOT_CURRENT", "first");
+        let before = raw_environment().unwrap();
+        assert!(before
+            .split(|byte| *byte == 0)
+            .any(|row| row == b"UENV_SNAPSHOT_CURRENT=first"));
+        std::env::set_var("UENV_SNAPSHOT_CURRENT", "second");
+        let after = raw_environment().unwrap();
+        assert!(after
+            .split(|byte| *byte == 0)
+            .any(|row| row == b"UENV_SNAPSHOT_CURRENT=second"));
+        assert!(!after
+            .split(|byte| *byte == 0)
+            .any(|row| row == b"UENV_SNAPSHOT_CURRENT=first"));
+    }
 
     #[test]
     fn the_switch_is_on_for_a_value_that_is_not_falsy() {

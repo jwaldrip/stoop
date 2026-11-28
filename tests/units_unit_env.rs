@@ -145,6 +145,172 @@ fn fit_run_with_padding(
     spawning(|| command.output()).unwrap()
 }
 
+const RAW_ENVP_LAUNCHER: &str = r#"
+#include <errno.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+extern char **environ;
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    size_t count = 0;
+    while (environ[count]) ++count;
+    char **env = calloc(count + 3, sizeof(*env));
+    if (!env) return 2;
+    memcpy(env, environ, count * sizeof(*env));
+    const char *mode = getenv("RVW_DUPLICATES");
+    if (mode && (strcmp(mode, "1") == 0 || strcmp(mode, "2") == 0)) {
+        for (int index = 0; index < 2; ++index) {
+            char *row = malloc(55009);
+            if (!row) return 2;
+            if (strcmp(mode, "1") == 0) {
+                memcpy(row, "RVW_DUP=", 8);
+                memset(row + 8, 'a' + index, 55000);
+            } else {
+                memset(row, 'm' + index, 55008);
+            }
+            row[55008] = 0;
+            env[count++] = row;
+        }
+    }
+    execve(argv[1], argv + 1, env);
+    perror("execve");
+    return errno == 0 ? 1 : errno;
+}
+"#;
+
+fn raw_env_launcher(s: &Suite) -> std::path::PathBuf {
+    let source = s.outside.join("raw-env.c");
+    let binary = s.outside.join("raw-env");
+    fs::write(&source, RAW_ENVP_LAUNCHER).unwrap();
+    let out = spawning(|| {
+        std::process::Command::new("cc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+    })
+    .unwrap();
+    assert!(out.status.success(), "{}", text(&out.stderr));
+    binary
+}
+
+fn duplicate_run(s: &Suite, launcher: &std::path::Path, mode: &str, verb: &str) -> Output {
+    use std::os::unix::process::CommandExt;
+    let mut command = std::process::Command::new(launcher);
+    command
+        .current_dir(&s.root)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", &s.outside)
+        .env("LOG", &s.log)
+        .env("STOOP_LEARN_VOLATILE", "0")
+        .env("STOOP_SPLIT", "0")
+        .env("STOOP_SPLIT_GROUP", "0")
+        .env("RVW_DUP", "x")
+        .env("RVW_DUPLICATES", mode);
+    if verb == "direct" {
+        command.arg("./t");
+    } else {
+        command
+            .arg(env!("CARGO_BIN_EXE_stoop"))
+            .arg(verb)
+            .arg("--root")
+            .arg(&s.root)
+            .args(["--", "./t", HOOK]);
+    }
+    unsafe {
+        command.pre_exec(|| {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_STACK, &mut limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            limit.rlim_cur = limit.rlim_cur.min(512 * 1024);
+            if libc::setrlimit(libc::RLIMIT_STACK, &limit) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    spawning(|| command.output()).unwrap()
+}
+
+#[test]
+fn test_rvw_fit_counts_duplicate_inherited_environment_rows() {
+    for duplicates in [false, true] {
+        let mode = if duplicates { "1" } else { "0" };
+        let overlay = large_overlay().replace("{ ", "{ RVW_DUP = 'override', ");
+        let s = setup(Some(&overlay), true);
+        let launcher = raw_env_launcher(&s);
+        ok(&duplicate_run(&s, &launcher, mode, "run"));
+        s.write("src/shared.src", "changed\n");
+        s.clear_log();
+        let explained = duplicate_run(&s, &launcher, mode, "explain");
+        assert_eq!(
+            text(&explained.stderr).contains(FIT_REASON),
+            duplicates,
+            "{}",
+            text(&explained.stderr)
+        );
+        s.clear_log();
+        let out = duplicate_run(&s, &launcher, mode, "run");
+        ok(&out);
+        assert_eq!(code(&duplicate_run(&s, &launcher, mode, "direct")), 0);
+        assert_eq!(
+            text(&out.stderr).contains(FIT_REASON),
+            duplicates,
+            "{}",
+            text(&out.stderr)
+        );
+        let expected = if duplicates {
+            vec![Vec::<String>::new()]
+        } else {
+            vec![
+                vec!["tests/a.t".into()],
+                vec!["tests/b.t".into()],
+                vec!["tests/c.t".into()],
+            ]
+        };
+        // Direct execution also writes to LOG, so compare just the stoop launch records.
+        let all = launches(&s);
+        assert_eq!(&all[..all.len() - 1], expected, "{}", text(&out.stderr));
+    }
+}
+
+#[test]
+fn uenv_fit_counts_inherited_rows_without_equals() {
+    let s = setup(Some(&large_overlay()), true);
+    let launcher = raw_env_launcher(&s);
+    ok(&duplicate_run(&s, &launcher, "2", "run"));
+    s.write("src/shared.src", "changed\n");
+    s.clear_log();
+    let explained = duplicate_run(&s, &launcher, "2", "explain");
+    assert!(
+        text(&explained.stderr).contains(FIT_REASON),
+        "{}",
+        text(&explained.stderr)
+    );
+    s.clear_log();
+    let out = duplicate_run(&s, &launcher, "2", "run");
+    ok(&out);
+    assert!(
+        text(&out.stderr).contains(FIT_REASON),
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(
+        launches(&s),
+        [Vec::<String>::new()],
+        "{}",
+        text(&out.stderr)
+    );
+    assert_eq!(code(&duplicate_run(&s, &launcher, "2", "direct")), 0);
+}
+
 #[test]
 fn test_rvw_valid_overlay_overfills_singleton_aggregate_environment() {
     let s = setup(Some(&large_overlay()), true);
