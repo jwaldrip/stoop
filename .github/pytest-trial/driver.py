@@ -363,7 +363,7 @@ def stale_bytecode(env):
          reason='failed alone while the full command passed')
     # The passing full run has recorded a whole proof for the changed content.
     # Touching only mtime makes pytest recompile, but does not change that proof's
-    # content identity. The ignored pyc is outside its inputs.
+    # content identity. The ignored pyc is outside its inputs (issue #99).
     os.utime(test, ns=(stat.st_atime_ns, stat.st_mtime_ns + 2_000_000_000))
     step(name, TOUCH, root, cmd, env, kind='skip', launches=0,
          proofs=TESTS, residue=('none', 0), status='disabled', stoop=0, direct=1)
